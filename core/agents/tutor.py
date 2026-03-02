@@ -23,6 +23,7 @@ class TutorAgent:
         user_content_override: Optional[str] = None,   # 练习/考试模式用此覆盖
         temperature: float = 0.7,
         max_tokens: int = 2000,
+        history_limit: int = 20,                        # 考试模式传 30
     ) -> TutorResult:
         """Generate teaching response, returns structured TutorResult.
         
@@ -73,9 +74,9 @@ class TutorAgent:
         # 构建 messages：system + 历史轮次 + 当前问题
         messages: List[dict] = [{"role": "system", "content": system_prompt}]
 
-        # 插入历史对话（最多保留最近 20 条，避免 token 超限）
+        # 插入历史对话（最多保留最近 history_limit 条，避免 token 超限）
         if history:
-            for msg in history[-20:]:
+            for msg in history[-history_limit:]:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if role in ("user", "assistant") and content:
@@ -102,6 +103,7 @@ class TutorAgent:
         user_content_override: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 2000,
+        history_limit: int = 20,                        # 考试模式传 30
     ):
         """流式版本的 teach()，返回文本 chunk 生成器。"""
         if user_content_override:
@@ -144,7 +146,7 @@ class TutorAgent:
 
         messages: List[dict] = [{"role": "system", "content": system_prompt}]
         if history:
-            for msg in history[-20:]:
+            for msg in history[-history_limit:]:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if role in ("user", "assistant") and content:

@@ -15,7 +15,9 @@ from core.agents.grader import GraderAgent
 from rag.retrieve import Retriever
 from rag.store_faiss import FAISSStore
 from mcp_tools.client import MCPTools
-from core.orchestration.prompts import PRACTICE_PROMPT, EXAM_PROMPT
+from core.orchestration.prompts import (
+    PRACTICE_PROMPT, EXAM_PROMPT, PRACTICE_SYSTEM, EXAM_SYSTEM
+)
 
 
 class OrchestrationRunner:
@@ -114,7 +116,7 @@ class OrchestrationRunner:
         state: Dict[str, Any] = None,
         history: List[Dict[str, str]] = None,
     ) -> ChatMessage:
-        """对话式练习模式：LLM 根据历史自动判断出题/评分，无需 state。"""
+        """对话式练习模式（非流式），统一走 TutorAgent 执行层。"""
         if history is None:
             history = []
 
@@ -129,42 +131,30 @@ class OrchestrationRunner:
             else:
                 context = "（未找到相关教材，请先上传课程资料）"
 
-        prompt = PRACTICE_PROMPT.format(
+        # 历史错题上下文
+        history_ctx = self._fetch_history_ctx(user_message, course_name)
+
+        workspace_path = self.get_workspace_path(course_name)
+        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
+        MCPTools._context = {"notes_dir": notes_dir}
+
+        result: TutorResult = self.tutor.teach(
+            question=user_message,
             course_name=course_name,
             context=context,
-            question=user_message,
+            allowed_tools=plan.allowed_tools,
+            history=history,
+            system_prompt_override=PRACTICE_SYSTEM + history_ctx,
+            user_content_override=PRACTICE_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=user_message,
+            ),
+            temperature=0.7,
+            max_tokens=2000,
         )
 
-        # 预查询历史错题，注入评分上下文
-        history_ctx = ""
-        try:
-            mem = MCPTools.call_tool("memory_search", query=user_message, course_name=course_name)
-            if mem.get("success") and mem.get("results"):
-                snippets = [
-                    r.get("content", "")[:120]
-                    for r in mem["results"][:2]
-                    if r.get("content")
-                ]
-                if snippets:
-                    history_ctx = "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n" + "\n".join(f"- {s}" for s in snippets)
-        except Exception:
-            pass
-
-        sys_content = "你是一位专业的课程练习导师，负责出题、评分和讲解。严格按照用户提示词中的对话规则执行。" + history_ctx
-        messages: List[dict] = [
-            {"role": "system", "content": sys_content}
-        ]
-        for msg in history[-20:]:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": prompt})
-
-        llm = self.tutor.llm
-        response_text = llm.chat(messages, temperature=0.7, max_tokens=2000)
-
-        # 评分阶段自动保存记录
+        response_text = result.content
         if self._is_practice_grading(response_text):
             saved_path = self._save_practice_record(course_name, user_message, history, response_text)
             self._save_grading_to_memory(course_name, user_message, history, response_text)
@@ -184,7 +174,7 @@ class OrchestrationRunner:
         plan: Plan,
         history: List[Dict[str, str]] = None,
     ):
-        """对话式练习模式流式版本。"""
+        """对话式练习模式（流式），统一走 TutorAgent 执行层。"""
         if history is None:
             history = []
 
@@ -197,43 +187,31 @@ class OrchestrationRunner:
             else:
                 context = "（未找到相关教材，请先上传课程资料）"
 
-        prompt = PRACTICE_PROMPT.format(
+        history_ctx = self._fetch_history_ctx(user_message, course_name)
+
+        workspace_path = self.get_workspace_path(course_name)
+        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
+        MCPTools._context = {"notes_dir": notes_dir}
+
+        collected = []
+        for chunk in self.tutor.teach_stream(
+            question=user_message,
             course_name=course_name,
             context=context,
-            question=user_message,
-        )
-
-        # 预查询历史错题，注入评分上下文
-        history_ctx = ""
-        try:
-            mem = MCPTools.call_tool("memory_search", query=user_message, course_name=course_name)
-            if mem.get("success") and mem.get("results"):
-                snippets = [
-                    r.get("content", "")[:120]
-                    for r in mem["results"][:2]
-                    if r.get("content")
-                ]
-                if snippets:
-                    history_ctx = "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n" + "\n".join(f"- {s}" for s in snippets)
-        except Exception:
-            pass
-
-        sys_content = "你是一位专业的课程练习导师，负责出题、评分和讲解。严格按照用户提示词中的对话规则执行。" + history_ctx
-        messages: List[dict] = [
-            {"role": "system", "content": sys_content}
-        ]
-        for msg in history[-20:]:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": prompt})
-
-        llm = self.tutor.llm
-        collected = []
-        for chunk in llm.chat_stream(messages, temperature=0.7, max_tokens=2000):
+            allowed_tools=plan.allowed_tools,
+            history=history,
+            system_prompt_override=PRACTICE_SYSTEM + history_ctx,
+            user_content_override=PRACTICE_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=user_message,
+            ),
+            temperature=0.7,
+            max_tokens=2000,
+        ):
             collected.append(chunk)
             yield chunk
+
         full_response = "".join(collected)
         if self._is_practice_grading(full_response):
             saved_path = self._save_practice_record(course_name, user_message, history, full_response)
@@ -248,7 +226,7 @@ class OrchestrationRunner:
         plan: Plan,
         history: list = None,
     ) -> ChatMessage:
-        """对话式考试模式：LLM 根据历史自动判断出卷/评分。"""
+        """对话式考试模式（非流式），统一走 TutorAgent 执行层。"""
         if history is None:
             history = []
 
@@ -260,26 +238,24 @@ class OrchestrationRunner:
         else:
             context = "（未找到相关教材，请先上传课程资料）"
 
-        prompt = EXAM_PROMPT.format(
+        result: TutorResult = self.tutor.teach(
+            question=user_message,
             course_name=course_name,
             context=context,
-            question=user_message,
+            allowed_tools=plan.allowed_tools,
+            history=history,
+            system_prompt_override=EXAM_SYSTEM,
+            user_content_override=EXAM_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=user_message,
+            ),
+            temperature=0.5,
+            max_tokens=4000,
+            history_limit=30,
         )
 
-        messages = [
-            {"role": "system", "content": "你是一位严肃公正的考试主考官，严格按照三阶段对话规则执行：阶段一收集配置、阶段二生成试卷、阶段三批改评分。禁止跨阶段操作，禁止在试卷中透露答案。"}
-        ]
-        for msg in history[-30:]:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": prompt})
-
-        llm = self.tutor.llm
-        response_text = llm.chat(messages, temperature=0.5, max_tokens=4000)
-
-        # 批改阶段自动保存记录
+        response_text = result.content
         if self._is_exam_grading(response_text):
             saved_path = self._save_exam_record(course_name, user_message, history, response_text)
             self._save_exam_to_memory(course_name, response_text)
@@ -299,7 +275,7 @@ class OrchestrationRunner:
         plan: Plan,
         history: list = None,
     ):
-        """对话式考试模式流式版本。"""
+        """对话式考试模式（流式），统一走 TutorAgent 执行层。"""
         if history is None:
             history = []
 
@@ -311,27 +287,26 @@ class OrchestrationRunner:
         else:
             context = "（未找到相关教材，请先上传课程资料）"
 
-        prompt = EXAM_PROMPT.format(
+        collected = []
+        for chunk in self.tutor.teach_stream(
+            question=user_message,
             course_name=course_name,
             context=context,
-            question=user_message,
-        )
-
-        messages = [
-            {"role": "system", "content": "你是一位严肃公正的考试主考官，严格按照三阶段对话规则执行：阶段一收集配置、阶段二生成试卷、阶段三批改评分。禁止跨阶段操作，禁止在试卷中透露答案。"}
-        ]
-        for msg in history[-30:]:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": prompt})
-
-        llm = self.tutor.llm
-        collected = []
-        for chunk in llm.chat_stream(messages, temperature=0.5, max_tokens=4000):
+            allowed_tools=plan.allowed_tools,
+            history=history,
+            system_prompt_override=EXAM_SYSTEM,
+            user_content_override=EXAM_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=user_message,
+            ),
+            temperature=0.5,
+            max_tokens=4000,
+            history_limit=30,
+        ):
             collected.append(chunk)
             yield chunk
+
         full_response = "".join(collected)
         if self._is_exam_grading(full_response):
             saved_path = self._save_exam_record(course_name, user_message, history, full_response)
@@ -375,6 +350,25 @@ class OrchestrationRunner:
             return False
         error_signals = ["Error calling LLM", "工具调用失败", "请重试", "API Error"]
         return not any(sig in content for sig in error_signals)
+
+    def _fetch_history_ctx(self, query: str, course_name: str) -> str:
+        """从记忆库预取历史错题片段，返回可追加到 system prompt 的字符串。"""
+        try:
+            mem = MCPTools.call_tool("memory_search", query=query, course_name=course_name)
+            if mem.get("success") and mem.get("results"):
+                snippets = [
+                    r.get("content", "")[:120]
+                    for r in mem["results"][:2]
+                    if r.get("content")
+                ]
+                if snippets:
+                    return (
+                        "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n"
+                        + "\n".join(f"- {s}" for s in snippets)
+                    )
+        except Exception:
+            pass
+        return ""
 
     def _is_practice_grading(self, text: str) -> bool:
         """判断练习模式回复是否为评分阶段。"""
