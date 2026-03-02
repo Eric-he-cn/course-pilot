@@ -6,12 +6,37 @@ from core.orchestration.prompts import GRADER_PROMPT
 from backend.schemas import GradeReport, RetrievedChunk
 
 
+# 只暴露 calculator 给 Grader，不需要其他工具
+_CALCULATOR_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": (
+                "精确计算数学表达式。评分时必须用本工具汇总各得分点分值，"
+                "不得心算。示例：sum([20,15,10,0])、round(20+15+10+0, 1)"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "合法的 Python 数学表达式，如 'sum([20,15,8])'",
+                    }
+                },
+                "required": ["expression"],
+            },
+        },
+    }
+]
+
+
 class GraderAgent:
     """Grader agent for evaluating student answers."""
-    
+
     def __init__(self):
         self.llm = get_llm_client()
-    
+
     def grade(
         self,
         question: str,
@@ -19,21 +44,38 @@ class GraderAgent:
         rubric: str,
         student_answer: str,
         course_name: Optional[str] = None,
+        context: Optional[str] = None,          # 可选：RAG 教材上下文，用于反馈引用
     ) -> GradeReport:
-        """Grade student answer."""
+        """Grade student answer using calculator tool for precise scoring."""
+        # 可选教材上下文
+        rag_ctx = ""
+        if context and context.strip():
+            rag_ctx = f"\n\n【教材参考（可在反馈中引用）】\n{context.strip()[:800]}"
+
         prompt = GRADER_PROMPT.format(
             question=question,
             standard_answer=standard_answer,
             rubric=rubric,
-            student_answer=student_answer
+            student_answer=student_answer,
+            rag_ctx=rag_ctx,
         )
-        
+
         messages = [
-            {"role": "system", "content": "你是一位公正的评分专家。"},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": (
+                    "你是一位公正的评分专家。"
+                    "计算总分时必须调用 calculator 工具，不得自行心算，"
+                    "调用完毕后再输出 JSON 结果。"
+                ),
+            },
+            {"role": "user", "content": prompt},
         ]
-        
-        response = self.llm.chat(messages, temperature=0.3, max_tokens=1000)
+
+        # 使用带工具调用的接口，让 LLM 用 calculator 汇总分值
+        response = self.llm.chat_with_tools(
+            messages, tools=_CALCULATOR_TOOL, temperature=0.2, max_tokens=1200
+        )
         
         # Parse response
         try:
