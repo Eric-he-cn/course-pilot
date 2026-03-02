@@ -18,16 +18,32 @@ class TutorAgent:
         course_name: str,
         context: str,
         allowed_tools: Optional[List[str]] = None,
-        history: Optional[List[dict]] = None
+        history: Optional[List[dict]] = None,
+        system_prompt_override: Optional[str] = None,  # 练习/考试模式用此覆盖
+        user_content_override: Optional[str] = None,   # 练习/考试模式用此覆盖
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
     ) -> TutorResult:
-        """Generate teaching response, returns structured TutorResult."""
-        prompt = TUTOR_PROMPT.format(
-            course_name=course_name,
-            context=context,
-            question=question
-        )
+        """Generate teaching response, returns structured TutorResult.
+        
+        Args:
+            system_prompt_override: 若提供，直接使用此 system prompt（跳过工具规则构建）
+            user_content_override: 若提供，直接使用此内容而非 TUTOR_PROMPT
+        """
+        # 如果有 override，直接用；否则用 TUTOR_PROMPT
+        if user_content_override:
+            prompt = user_content_override
+        else:
+            prompt = TUTOR_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=question
+            )
 
-        if allowed_tools:
+        # system prompt 构建逻辑
+        if system_prompt_override:
+            system_prompt = system_prompt_override
+        elif allowed_tools:
             schemas = get_tool_schemas(allowed_tools)
             tool_desc = "、".join(allowed_tools)
             system_prompt = (
@@ -68,10 +84,11 @@ class TutorAgent:
         messages.append({"role": "user", "content": prompt})
 
         if allowed_tools:
+            schemas = get_tool_schemas(allowed_tools)
             raw = self.llm.chat_with_tools(messages, tools=schemas,
-                                           temperature=0.7, max_tokens=2000)
+                                           temperature=temperature, max_tokens=max_tokens)
             return TutorResult(content=raw)
-        raw = self.llm.chat(messages, temperature=0.7, max_tokens=1500)
+        raw = self.llm.chat(messages, temperature=temperature, max_tokens=max_tokens)
         return TutorResult(content=raw)
 
     def teach_stream(
@@ -80,16 +97,25 @@ class TutorAgent:
         course_name: str,
         context: str,
         allowed_tools: Optional[List[str]] = None,
-        history: Optional[List[dict]] = None
+        history: Optional[List[dict]] = None,
+        system_prompt_override: Optional[str] = None,
+        user_content_override: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
     ):
         """流式版本的 teach()，返回文本 chunk 生成器。"""
-        prompt = TUTOR_PROMPT.format(
-            course_name=course_name,
-            context=context,
-            question=question
-        )
+        if user_content_override:
+            prompt = user_content_override
+        else:
+            prompt = TUTOR_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=question
+            )
 
-        if allowed_tools:
+        if system_prompt_override:
+            system_prompt = system_prompt_override
+        elif allowed_tools:
             schemas = get_tool_schemas(allowed_tools)
             tool_desc = "、".join(allowed_tools)
             system_prompt = (
@@ -126,7 +152,8 @@ class TutorAgent:
         messages.append({"role": "user", "content": prompt})
 
         if allowed_tools:
+            schemas = get_tool_schemas(allowed_tools)
             yield from self.llm.chat_stream_with_tools(messages, tools=schemas,
-                                                       temperature=0.7, max_tokens=2000)
+                                                       temperature=temperature, max_tokens=max_tokens)
         else:
-            yield from self.llm.chat_stream(messages, temperature=0.7, max_tokens=1500)
+            yield from self.llm.chat_stream(messages, temperature=temperature, max_tokens=max_tokens)
