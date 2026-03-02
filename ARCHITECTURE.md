@@ -6,7 +6,7 @@
 
 1. **基于教材的 RAG 系统** - 所有回答都有教材引用
 2. **三种学习模式** - 学习、练习、考试
-3. **多 Agent 协作** - Router、Tutor、QuizMaster、Grader
+3. **多 Agent 协作** - Router（规划）、Tutor（教学/出题/考试）、Grader（练习评卷）
 4. **工具可控集成** - 不同模式限制不同工具
 5. **持久化记忆系统** - SQLite 存储学习历史与薄弱知识点
 6. **完整学习闭环** - 从理解到练习到考试
@@ -27,27 +27,28 @@
 └────────────────────┬────────────────────────────────┘
                      │
 ┌────────────────────▼────────────────────────────────┐
-│            Orchestration Runner (编排器)             │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐  │
-│  │          Router Agent (规划器)                │  │
-│  │   输入: 用户消息 + 模式 + 课程                 │  │
-│  │   输出: Plan (need_rag, allowed_tools, ...)   │  │
-│  └──────────────────────────────────────────────┘  │
-│                     │                                │
-│         ┌───────────┼───────────┐                   │
-│         ▼           ▼           ▼                   │
-│    ┌────────┐ ┌─────────┐ ┌────────┐              │
-│    │ Tutor  │ │QuizMstr │ │ Grader │              │
-│    │ Agent  │ │ Agent   │ │ Agent  │              │
-│    └───┬────┘ └────┬────┘ └───┬────┘              │
-│        │           │           │                     │
-└────────┼───────────┼───────────┼─────────────────────┘
-         │           │           │
-    ┌────▼───┐  ┌───▼────┐  ┌──▼─────┐
-    │  RAG   │  │  MCP   │  │ Memory │
-    │ System │  │ Tools  │  │  (DB)  │
-    └────────┘  └────────┘  └────────┘
+│       OrchestrationRunner                           │
+│  ────────────────────────────────────────────────── │
+│  [LLM] Router Agent → Plan（need_rag / style）      │
+│  [工具] RAG Retriever → FAISS 检索 + 引用            │
+│  [工具] memory_search → 历史错题预取                 │
+│  ────────────────────────────────────────────────── │
+│  路由判断（Python 关键词检测）                        │
+│       ┌──────────────────────┐                      │
+│       │  学习 / 考试 / 练习出题│                      │
+│       ▼                      ▼                      │
+│  ┌──────────┐       ┌──────────────┐               │
+│  │  Tutor   │       │练习答案提交时 │               │
+│  │  Agent   │       │   Grader     │               │
+│  │ (ReAct)  │       │   Agent      │               │
+│  └────┬─────┘       │  (ReAct)     │               │
+│       │             └──────┬───────┘               │
+└───────┼────────────────────┼────────────────────────┘
+        │                    │
+   ┌────▼────┐          ┌───▼────┐
+   │  RAG   │          │ MCP    │  ← 工具：calculator /
+   │ System │          │ Tools  │    websearch / filewriter /
+   └────────┘          └────────┘    memory_search / mindmap / datetime
 ```
 
 ### 2. 核心模块说明
@@ -73,49 +74,48 @@ PDF/TXT/MD/DOCX/PPTX/PPT → 解析 → 分块 → Embedding → FAISS 索引
 #### B. Agent 系统 (core/agents/)
 
 **Router Agent** (router.py)
-- 职责: 分析用户请求，制定执行计划
-- 输入: 用户消息、模式、课程信息
-- 输出: Plan 对象
-- 决策: 是否需要 RAG？允许哪些工具？采用什么风格？
+- 职责：分析用户请求，制定执行计划（每次请求的第一个 LLM 调用）
+- 输入：用户消息、模式、课程信息、用户学习档案（薄弱知识点）
+- 输出：`Plan` 对象（`need_rag`、`style` 字段有效；工具列表由 `policies.py` 硬编码覆盖）
+- **实际局限**：`allowed_tools` 和 `task_type` 被 Runner 强制覆盖，LLM 只有效影响 `need_rag` 和 `style`
 
 **Tutor Agent** (tutor.py)
-- 职责: 教学讲解，概念说明
-- 输入: 问题 + 教材上下文
-- 输出: 结构化教学内容（定义、解释、要点、引用、总结）
-- 特点: 证据优先，必须引用教材；注入用户薄弱知识点画像
+- 职责：学习讲解 / 练习出题 / 考试三阶段（所有非评卷场景）
+- 输入：问题 + RAG 上下文 + 对话历史 + system_prompt_override + user_content_override
+- 输出：流式文本（ReAct 循环，多轮工具调用）
+- 特点：接受 system/user prompt 完全覆盖，让同一个 Agent 适配三种模式；注入用户薄弱知识点画像
+- 工具（学习/练习出题）：全部 6 个；工具（考试）：calculator · memory_search · get_datetime
 
-**QuizMaster Agent** (quizmaster.py)
-- 职责: 生成练习题
-- 输入: 课程、主题、难度、教材上下文
-- 输出: Quiz 对象（题目、标准答案、评分标准）
-- 特点: 基于教材出题，难度可控
+**Grader Agent** (grader.py) — 练习评卷专用
+- 职责：仅在检测到答案提交时由 Runner 路由调用，专职评卷
+- 输入：题目原文（从对话历史提取） + 学生答案原文 + 历史错题上下文
+- 输出：流式文本（逐题对照表 + calculator 得分 + 讲评）
+- ReAct 规则：第1轮必须逐字引用双方答案再判断对错；第2轮必须 call calculator；第3轮输出结果
+- Temperature=0.1（评判高确定性）；仅开放 calculator 工具
 
-**Grader Agent** (grader.py)
-- 职责: 评分和讲评
-- 输入: 题目、标准答案、评分标准、学生答案
-- 输出: GradeReport（分数、反馈、错误分类）
-- 特点: 强制逐题对照表（CoT），给出建设性反馈，标注错误类型
+**QuizMaster Agent** (quizmaster.py) — 当前未启用
+- 保留代码，预埋扩展接口；主流程不调用，出题功能由 TutorAgent 承担
 
 #### C. MCP 工具 (mcp_tools/)
 
 **工具集**:
 
-| 工具 | 学习 | 练习 | 考试 | 功能 |
-|------|:----:|:----:|:----:|------|
-| `calculator` | ✅ | ✅ | ✅ | 数学计算（math/statistics/组合数学/双曲函数/单位换算） |
-| `websearch` | ✅ | ❌ | ❌ | SerpAPI 网页搜索 |
-| `filewriter` | ✅ | ✅ | ❌ | 写入 `notes/` 笔记（`.md` 格式） |
-| `memory_search` | ✅ | ✅ | ❌ | 检索历史练习/错题，自动强化薄弱点 |
-| `mindmap_generator` | ✅ | ❌ | ❌ | 生成 Mermaid 思维导图，支持 SVG/PNG 导出 |
-| `get_datetime` | ✅ | ✅ | ✅ | 查询精确日期时间，避免 LLM 凭训练数据猜测 |
+| 工具 | 学习 | 练习出题 | 练习评卷 | 考试 | 功能 |
+|------|:----:|:------:|:------:|:----:|------|
+| `calculator` | ✅ | ✅ | ✅（必须） | ✅（必须） | 数学计算（math/statistics/组合数学/双曲函数/单位换算） |
+| `websearch` | ✅ | ✅ | ❌ | ❌ | SerpAPI 网页搜索 |
+| `filewriter` | ✅ | ✅ | ❌ | ❌ | 写入 `notes/` 笔记（`.md` 格式） |
+| `memory_search` | ✅ | ✅ | ❌ | ✅ | 检索历史练习/错题，自动强化薄弱点 |
+| `mindmap_generator` | ✅ | ✅ | ❌ | ❌ | 生成 Mermaid 思维导图，支持 SVG/PNG 导出 |
+| `get_datetime` | ✅ | ✅ | ❌ | ✅ | 查询精确日期时间，避免 LLM 凭训练数据猜测 |
 
-**工具策略** (policies.py):
+> 练习评卷由 GraderAgent 独立处理，仅开放 calculator，确保评判聚焦、结果确定。
+
+**工具策略** (policies.py)：
 ```python
-MODE_POLICIES = {
-    "learn":    ["calculator", "websearch", "filewriter", "memory_search", "mindmap_generator", "get_datetime"],
-    "practice": ["calculator", "filewriter", "memory_search", "get_datetime"],
-    "exam":     ["calculator", "get_datetime"]
-}
+# 所有模式共享全部工具集（policies.py commit 91783f2）
+# 工具的实际使用范围由各 Agent 的 system prompt 约束
+ALL_TOOLS = ["calculator", "websearch", "filewriter", "memory_search", "mindmap_generator", "get_datetime"]
 ```
 
 #### D. 记忆系统 (memory/)
@@ -140,40 +140,66 @@ MODE_POLICIES = {
 ```
 用户: "什么是矩阵的秩?"
   ↓
-FastAPI (/chat/stream endpoint) → SSE 流式响应
+FastAPI (/chat/stream) → SSE 流式响应
   ↓
-OrchestrationRunner.run(mode="learn")
+Runner.run_learn_mode_stream()
   ↓
-Router.plan() → Plan(need_rag=True, allowed_tools=["calculator","websearch",...])
+[LLM #1] RouterAgent.plan() → Plan(need_rag=True, style="step_by_step")
   ↓
-Retriever.retrieve("矩阵的秩") → [教材片段1, 片段2, 片段3]
+[工具] Retriever.retrieve("矩阵的秩") → [教材片段1, 片段2, ...]（含页码）
   ↓
-Memory.get_profile_context(course) → 用户薄弱知识点（注入 system prompt）
-  ↓
-Tutor.teach_stream(question, context) → 逐 token 流式回答
-  ↓
-若调用 mindmap_generator → 返回 Mermaid 代码块 → 前端渲染为交互图表
+[LLM #2~N] TutorAgent.teach_stream()  ← ReAct 循环
+  system: TUTOR_PROMPT + 用户学习档案（薄弱知识点）
+  tools:  全部 6 个工具
+  │
+  ├─ 可能 call websearch / mindmap_generator / calculator
+  └─ 流式输出：核心答案 + 详细解释 + [来源N] 引用
 ```
 
 #### 练习模式流程
 
 ```
-【第一轮：出题】
+【出题阶段】
 用户: "给我出一道矩阵秩的题"
   ↓
-QuizMaster.generate_quiz() → Quiz 对象 → 显示题目
+Runner.run_practice_mode_stream()
+  ↓
+[LLM #1] RouterAgent.plan()
+  ↓
+[工具] Retriever.retrieve() → RAG 上下文
+[工具] memory_search()      → 历史错题片段（追加到 system prompt）
+  ↓
+_is_answer_submission() → False（用户在请求出题）
+  ↓
+[LLM #2~N] TutorAgent.teach_stream()  ← ReAct 循环
+  system: PRACTICE_SYSTEM + 历史错题上下文
+  user:   PRACTICE_PROMPT（对话式练习规则）
+  tools:  全部 6 个工具
+  │
+  └─ 可能 call websearch 查找补充题材 → 流式输出题目
 
-【第二轮：评分】
-用户: "答案是..."
+【评卷阶段】
+用户: "1.A  2.正确  3.B..."（提交答案）
   ↓
-runner._is_practice_grading() == True
+Runner.run_practice_mode_stream()
   ↓
-内联 LLM 评分 → 强制先输出 | 题号 | 标准答案 | 学生答案 | 结果 | 对照表
+[LLM #1] RouterAgent.plan()
+[工具] memory_search() → 历史错题上下文
   ↓
-_save_practice_record()    → 写 practices/ JSON 文件
-_save_grading_to_memory()  → 写 SQLite 记忆库 + 更新用户画像
+_is_answer_submission() → True（检测到答案格式）
+_extract_quiz_from_history() → 从对话历史中提取题目原文（纯 Python，无 LLM）
   ↓
-如果 score < 60 → 保存到错题本 (mistakes.jsonl)
+[LLM #2~N] GraderAgent.grade_practice_stream()  ← ReAct 循环
+  system: GRADER_SYSTEM（强制逐字引用原文规则）
+  user:   GRADER_PRACTICE_PROMPT（题目 + 学生答案）
+  tools:  仅 calculator，temperature=0.1
+  │
+  ├─ 轮1：逐题对照表（原文引用标准答案 vs 学生答案，判断对错）
+  ├─ 轮2：call calculator('sum([20, 15, 0, 15, 10])')
+  └─ 轮3：流式输出得分 + 各题讲评 + 易错提醒
+  ↓
+_save_practice_record()   → 写 practices/ Markdown 文件
+_save_grading_to_memory() → 写 SQLite（episodes + user_profiles）
 ```
 
 #### 考试模式流程
@@ -181,16 +207,22 @@ _save_grading_to_memory()  → 写 SQLite 记忆库 + 更新用户画像
 ```
 用户: "来一套线性代数综合测试"
   ↓
-QuizMaster 生成完整试卷（多题）
+Runner.run_exam_mode_stream()
   ↓
-用户一次性提交所有答案
+[LLM #1] RouterAgent.plan()
   ↓
-runner._is_exam_grading() == True
+[工具] Retriever.retrieve(top_k=12) → 大范围 RAG 上下文
   ↓
-内联 LLM 批改 → 输出逐题批改 + 总分 + 薄弱知识点分析
+[LLM #2~N] TutorAgent.teach_stream()  ← ReAct 循环（三阶段对话）
+  system: EXAM_SYSTEM（三阶段规则）
+  user:   EXAM_PROMPT
+  tools:  calculator · memory_search · get_datetime
+  │
+  ├─ 阶段一：对话收集配置（题型/题数/难度）
+  ├─ 阶段二：生成完整试卷（不透露答案）
+  └─ 阶段三：学生提交后，逐题批改 + call calculator + 输出总分
   ↓
-_save_exam_record()       → 写 exams/ JSON 文件
-_save_exam_to_memory()    → 写 SQLite 记忆库 + 更新用户画像
+_is_exam_grading() → True → _save_exam_record() + _save_exam_to_memory()
 ```
 
 ## 🎨 前端界面设计
@@ -286,10 +318,11 @@ similarity = L2      # normalize_embeddings=True 等价余弦
 
 ### 2. Prompt Engineering
 
-- **结构化输出**: 所有 Agent 的 Prompt 生成结构化输出（JSON 或固定格式）
-- **证据优先**: Tutor Agent 强制引用教材
-- **CoT 评分**: Grader/练习评分必须先输出逐题对照表，再计算总分
-- **MCQ 格式**: 选项强制每行一个，判断题带 `（ ）` 括号
+- **system/user override**：TutorAgent 的 `teach_stream()` 接受 `system_prompt_override` 和 `user_content_override`，让同一 Agent 适配学习/练习/考试三种角色，无需多份执行代码
+- **PRACTICE_SYSTEM / EXAM_SYSTEM / GRADER_SYSTEM**：模式专用 system prompt 常量，在 `prompts.py` 集中管理
+- **CoT 强制评分**：GraderAgent 的 `GRADER_PRACTICE_PROMPT` 三步走：先逐字引用 → 判断对错 → calculator 汇总，禁止跳步
+- **证据优先**：学习模式 Tutor 强制引用教材 `[来源N]` 内联标注
+- **结构化输出**：Router 输出 JSON Plan；考试批改输出固定 Markdown 表格格式
 
 ### 3. 错误处理
 
@@ -341,7 +374,10 @@ def new_tool(param):
 - 不同模式不同策略，考试模式防作弊，所有调用可观测
 
 ### 4. Agent 职责分离
-- Router: 规划 · Tutor: 教学 · QuizMaster: 出题 · Grader: 评分
+- Router：规划（need_rag / style）
+- Tutor：学习讲解 · 练习出题 · 考试三阶段（ReAct，全工具集）
+- Grader：练习评卷专用（ReAct，仅 calculator，逐字引用原文对比，temperature=0.1）
+- OrchestrationRunner：硬编码 Python 调度器，串联 RAG + 记忆 + Agent + 持久化，本身不是 LLM
 
 ### 5. 持久化记忆
 - SQLite 跨会话追踪薄弱点，AI 自动在薄弱知识点上加强

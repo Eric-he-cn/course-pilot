@@ -11,22 +11,22 @@
 - 📚 RAG：PDF/TXT/MD/DOCX/PPTX/PPT 解析，FAISS 检索，附页码引用
 - 🛠️ 工具：计算器、网页搜索、文件写入、记忆检索、思维导图、日期时间查询（共 6 个 MCP 工具）
 - 🧠 记忆系统：SQLite 跨会话追踪薄弱知识点，自动强化
-- ⚡ 体验：SSE 流式输出，Mermaid 思维导图渲染与 3× 高清 PNG 导出
+- ⚡ 体验：SSE 流式输出，Mermaid 思维导图渲染与 PNG 导出
 - 🔒 安全：路径穿越防护、并发 chdir 加锁、编码回退、分块死循环保护
 
 ---
 
 ## 模式与工具
 
-| 模式 | 适用场景 | 允许工具 | 自动记录 |
-|------|----------|----------|----------|
-| **学习 (Learn)** | 概念讲解、知识梳理 | 计算器 · 网页搜索 · 文件写入 · 记忆检索 · 思维导图 · 查询时间 | 无 |
-| **练习 (Practice)** | 出题、提交答案、评分讲评 | 计算器 · 文件写入 · 记忆检索 · 查询时间 | `practices/` JSON 练习记录 |
-| **考试 (Exam)** | 模拟考试、自测报告 | 计算器 · 查询时间 | `exams/` JSON 考试记录 |
+| 模式 | 适用场景 | 执行 Agent | 工具（出题/讲解阶段） | 工具（评分阶段） | 自动记录 |
+|------|----------|-----------|---------------------|----------------|----------|
+| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | 全部 6 个 | — | 无 |
+| **练习 (Practice)** | 出题、提交答案、评分讲评 | TutorAgent（出题）+ GraderAgent（评分） | 全部 6 个 | 仅 calculator | `practices/` 练习记录 |
+| **考试 (Exam)** | 模拟考试、自测报告 | TutorAgent（三阶段） | calculator · memory_search · get_datetime | calculator | `exams/` 考试记录 |
 
-- **学习模式**：基于上传教材进行 RAG 检索，每个结论附带文档来源与页码引用；支持网页搜索补充课外知识。
-- **练习模式**：LLM 自动出题评分，完整对话自动保存为 JSONL 练习记录；禁用网页搜索防止作弊。
-- **考试模式**：模拟无辅助考试环境，仅允许计算器，对话结束后保存为考试报告。
+- **学习模式**：基于上传教材 RAG 检索，结论附带文档来源与页码引用；支持网页搜索补充课外知识，可生成思维导图。
+- **练习模式**：TutorAgent 出题（可调用 websearch 查找补充题材），学生提交答案后自动路由至 GraderAgent 专职评卷（强制逐字引用原文对比 + calculator 计分，temperature=0.1，结果确定性强）。
+- **考试模式**：TutorAgent 主导三阶段对话（收集配置→生成试卷→批改评分），批改阶段调用 calculator 汇总分值，结束后保存完整考试报告。
 
 ### RAG 知识库
 
@@ -41,13 +41,24 @@
 ```
 用户请求
    ↓
-Router Agent  ← 决定：需要 RAG？允许什么工具？输出什么格式？
-   ↓
-┌──────────────┬──────────────┬──────────────┐
-Tutor Agent   QuizMaster     Grader Agent
-（学习讲解）  （出题）       （评分讲评）
-   ↓              ↓               ↓
-  RAG          MCP Tools       结果输出
+OrchestrationRunner（Python 调度器）
+   ├─ [LLM] Router Agent  ← 制定 Plan（need_rag / style）
+   ├─ [工具] RAG Retriever ← FAISS 向量检索
+   ├─ [工具] memory_search ← 预取历史错题上下文
+   │
+   ├─ 学习模式 / 考试模式 / 练习出题
+   │      ↓
+   │   Tutor Agent（ReAct 循环）
+   │      ├─ 可调用：calculator · websearch · filewriter
+   │      │          memory_search · mindmap_generator · get_datetime
+   │      └─ 流式输出教学 / 题目 / 考试报告
+   │
+   └─ 练习评卷（检测到答案提交）
+          ↓
+       Grader Agent（ReAct 循环）
+          ├─ 逐字引用原文对比标准答案 vs 学生答案
+          ├─ 调用：calculator（汇总得分）
+          └─ 流式输出评分结果 + 讲评
 ```
 
 ### MCP 工具集成
@@ -55,7 +66,7 @@ Tutor Agent   QuizMaster     Grader Agent
 | 工具 | 功能 |
 |------|------|
 | `calculator` | 数学表达式计算（支持 `math`/`statistics`/组合数学/双曲函数/单位换算，Python 受限 `eval`） |
-| `websearch` | SerpAPI 网页搜索（仅学习模式） |
+| `websearch` | SerpAPI 网页搜索（学习模式 + 练习出题阶段） |
 | `filewriter` | 将笔记写入课程 `notes/` 目录（`.md` 格式） |
 | `memory_search` | 检索历史练习/错题记忆，自动强化薄弱知识点 |
 | `mindmap_generator` | 生成 Mermaid 思维导图，支持导出 SVG / 3× 高清 PNG / 源码 |
@@ -75,11 +86,10 @@ Browser (Streamlit :8501)
     ▼
 FastAPI (:8000)
     │
-    ├─ OrchestrationRunner
-    │    ├─ Router Agent   → Plan (是否用 RAG/工具，输出格式)
-    │    ├─ Tutor Agent    → 教学回答 + 引用
-    │    ├─ QuizMaster     → Quiz JSON
-    │    └─ Grader Agent   → GradeReport JSON
+    ├─ OrchestrationRunner（Python 调度器，非 LLM）
+    │    ├─ Router Agent      → Plan（need_rag / style）
+    │    ├─ Tutor Agent       → 学习讲解 / 练习出题 / 考试三阶段
+    │    └─ Grader Agent      → 练习评卷（ReAct + calculator）
     │
     ├─ RAG Pipeline
     │    ├─ DocumentParser  (ingest.py)
@@ -97,12 +107,12 @@ FastAPI (:8000)
 ```
 
 ### Agent 职责
-| Agent | 输入 | 输出 |
-|-------|------|------|
-| Router | 用户消息 + 模式 | `Plan`（RAG 开关、工具白名单、输出格式） |
-| Tutor | 问题 + RAG 上下文 + 工具结果 | 结构化教学内容 + 引用 |
-| QuizMaster | 主题 + 难度 + RAG 上下文 | `Quiz`（题目 + 答案 + Rubric） |
-| Grader | Quiz + 学生答案 + Rubric | `GradeReport`（分数 + 反馈 + 错误标签） |
+| Agent | 调用时机 | 输入 | 输出 |
+|-------|---------|------|------|
+| Router | 每次请求首先调用 | 用户消息 + 模式 | `Plan`（need_rag、style 等） |
+| Tutor | 学习 / 考试 / 练习出题 | 问题 + RAG 上下文 + 历史 | 教学内容 / 题目 / 考试批改 |
+| Grader | 练习模式检测到答案提交 | 题目原文 + 学生答案 | 逐题对照表 + 得分 + 讲评 |
+| QuizMaster | 未启用（保留代码） | — | — |
 
 ---
 
@@ -278,8 +288,8 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 | 后端 | FastAPI 0.109 + Uvicorn |
 | LLM | OpenAI SDK 兼容（DeepSeek / OpenAI / 本地 Ollama） |
 | 嵌入 | sentence-transformers `BAAI/bge-base-zh-v1.5`（中文，768 维） |
-| 嵌入加速 | PyTorch CUDA 12.8（GPU auto-detect；CPU fallback） |
-| 向量库 | FAISS（CPU / GPU 自动选择） |
+| 嵌入加速 | PyTorch CUDA 12.8（CPU fallback） |
+| 向量库 | FAISS |
 | 文档解析 | PyMuPDF（PDF）、python-docx（DOCX）、python-pptx（PPTX）、pywin32+PowerPoint（PPT） |
 | 数据校验 | Pydantic v2 |
 | 工具搜索 | SerpAPI |
@@ -312,5 +322,5 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 ## 贡献与许可
 - 欢迎提交 Issue / PR，一起完善功能与安全性。
 - 许可证：MIT License
-- 作者：**Eric He** · 更新日期：2026-02-23
+- 作者：**Eric He** · 更新日期：2026-03-02
 
