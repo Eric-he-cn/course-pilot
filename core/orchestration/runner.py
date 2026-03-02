@@ -87,6 +87,14 @@ class OrchestrationRunner:
             allowed_tools=plan.allowed_tools,
             history=history,
         )
+        # 质量检查：若回答过短或包含错误信号，自动重试一次
+        if not self._check_quality(result.content):
+            print("[QualityCheck] 回答质量不足，自动重试")
+            result = self.tutor.teach(
+                user_message, course_name, context,
+                allowed_tools=plan.allowed_tools,
+                history=history,
+            )
 
         # 合并 RAG citations 和 Tutor 内部工具调用产生的 citations
         merged_citations = citations + result.citations if citations else result.citations
@@ -127,8 +135,24 @@ class OrchestrationRunner:
             question=user_message,
         )
 
+        # 预查询历史错题，注入评分上下文
+        history_ctx = ""
+        try:
+            mem = MCPTools.call_tool("memory_search", query=user_message, course_name=course_name)
+            if mem.get("success") and mem.get("results"):
+                snippets = [
+                    r.get("content", "")[:120]
+                    for r in mem["results"][:2]
+                    if r.get("content")
+                ]
+                if snippets:
+                    history_ctx = "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n" + "\n".join(f"- {s}" for s in snippets)
+        except Exception:
+            pass
+
+        sys_content = "你是一位专业的课程练习导师，负责出题、评分和讲解。严格按照用户提示词中的对话规则执行。" + history_ctx
         messages: List[dict] = [
-            {"role": "system", "content": "你是一位专业的课程练习导师，负责出题、评分和讲解。严格按照用户提示词中的对话规则执行。"}
+            {"role": "system", "content": sys_content}
         ]
         for msg in history[-20:]:
             role = msg.get("role", "user")
@@ -179,8 +203,24 @@ class OrchestrationRunner:
             question=user_message,
         )
 
+        # 预查询历史错题，注入评分上下文
+        history_ctx = ""
+        try:
+            mem = MCPTools.call_tool("memory_search", query=user_message, course_name=course_name)
+            if mem.get("success") and mem.get("results"):
+                snippets = [
+                    r.get("content", "")[:120]
+                    for r in mem["results"][:2]
+                    if r.get("content")
+                ]
+                if snippets:
+                    history_ctx = "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n" + "\n".join(f"- {s}" for s in snippets)
+        except Exception:
+            pass
+
+        sys_content = "你是一位专业的课程练习导师，负责出题、评分和讲解。严格按照用户提示词中的对话规则执行。" + history_ctx
         messages: List[dict] = [
-            {"role": "system", "content": "你是一位专业的课程练习导师，负责出题、评分和讲解。严格按照用户提示词中的对话规则执行。"}
+            {"role": "system", "content": sys_content}
         ]
         for msg in history[-20:]:
             role = msg.get("role", "user")
@@ -328,6 +368,13 @@ class OrchestrationRunner:
     # ------------------------------------------------------------------ #
     #  记录检测 & 自动保存辅助方法
     # ------------------------------------------------------------------ #
+
+    def _check_quality(self, content: str) -> bool:
+        """检查 Tutor 回答质量，过短或含错误信号则返回 False。"""
+        if not content or len(content.strip()) < 150:
+            return False
+        error_signals = ["Error calling LLM", "工具调用失败", "请重试", "API Error"]
+        return not any(sig in content for sig in error_signals)
 
     def _is_practice_grading(self, text: str) -> bool:
         """判断练习模式回复是否为评分阶段。"""

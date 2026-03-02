@@ -18,12 +18,29 @@ class QuizMasterAgent:
         difficulty: str,
         context: str
     ) -> Quiz:
-        """Generate a quiz question."""
+        """Generate a quiz question, pre-fetching memory for weak-point targeting."""
+        # 预查询历史错题，优先针对薄弱知识点出题
+        memory_ctx = ""
+        try:
+            from mcp_tools.client import MCPTools
+            mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
+            if mem.get("success") and mem.get("results"):
+                snippets = [
+                    r.get("content", "")[:150]
+                    for r in mem["results"][:3]
+                    if r.get("content")
+                ]
+                if snippets:
+                    memory_ctx = "【历史错题/薄弱点参考】\n" + "\n".join(f"- {s}" for s in snippets)
+        except Exception:
+            pass
+
         prompt = QUIZMASTER_PROMPT.format(
             course_name=course_name,
             topic=topic,
             difficulty=difficulty,
-            context=context
+            context=context,
+            memory_ctx=memory_ctx,
         )
         
         messages = [

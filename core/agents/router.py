@@ -19,11 +19,22 @@ class RouterAgent:
         mode: str,
         course_name: str
     ) -> Plan:
-        """Generate execution plan."""
+        """Generate execution plan, injecting user memory profile for smarter routing."""
+        # 从记忆库拉取用户薄弱知识点，注入 Router prompt 辅助规划
+        weak_points_ctx = ""
+        try:
+            from memory.manager import get_memory_manager
+            profile = get_memory_manager().get_profile_context(course_name)
+            if profile:
+                weak_points_ctx = f"\n\n【用户学习档案（供规划参考）】\n{profile}"
+        except Exception:
+            pass
+
         prompt = ROUTER_PROMPT.format(
             mode=mode,
             course_name=course_name,
-            user_message=user_message
+            user_message=user_message,
+            weak_points_ctx=weak_points_ctx,
         )
         
         messages = [
