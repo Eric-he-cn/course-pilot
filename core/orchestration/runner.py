@@ -138,27 +138,39 @@ class OrchestrationRunner:
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
 
-        result: TutorResult = self.tutor.teach(
-            question=user_message,
-            course_name=course_name,
-            context=context,
-            allowed_tools=plan.allowed_tools,
-            history=history,
-            system_prompt_override=PRACTICE_SYSTEM + history_ctx,
-            user_content_override=PRACTICE_PROMPT.format(
+        # ── 路由判断：答案提交 → GraderAgent；出题/提问 → TutorAgent ──
+        if self._is_answer_submission(user_message, history):
+            print("[Runner] 检测到答案提交，路由至 GraderAgent")
+            quiz_content = self._extract_quiz_from_history(history)
+            chunks = []
+            for chunk in self.grader.grade_practice_stream(
+                quiz_content=quiz_content,
+                student_answer=user_message,
                 course_name=course_name,
-                context=context,
-                question=user_message,
-            ),
-            temperature=0.7,
-            max_tokens=2000,
-        )
-
-        response_text = result.content
-        if self._is_practice_grading(response_text):
+                history_ctx=history_ctx,
+            ):
+                chunks.append(chunk)
+            response_text = "".join(chunks)
             saved_path = self._save_practice_record(course_name, user_message, history, response_text)
             self._save_grading_to_memory(course_name, user_message, history, response_text)
             response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
+        else:
+            result: TutorResult = self.tutor.teach(
+                question=user_message,
+                course_name=course_name,
+                context=context,
+                allowed_tools=plan.allowed_tools,
+                history=history,
+                system_prompt_override=PRACTICE_SYSTEM + history_ctx,
+                user_content_override=PRACTICE_PROMPT.format(
+                    course_name=course_name,
+                    context=context,
+                    question=user_message,
+                ),
+                temperature=0.7,
+                max_tokens=2000,
+            )
+            response_text = result.content
 
         return ChatMessage(
             role="assistant",
@@ -193,30 +205,42 @@ class OrchestrationRunner:
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
 
-        collected = []
-        for chunk in self.tutor.teach_stream(
-            question=user_message,
-            course_name=course_name,
-            context=context,
-            allowed_tools=plan.allowed_tools,
-            history=history,
-            system_prompt_override=PRACTICE_SYSTEM + history_ctx,
-            user_content_override=PRACTICE_PROMPT.format(
+        # ── 路由判断：答案提交 → GraderAgent；出题/提问 → TutorAgent ──
+        if self._is_answer_submission(user_message, history):
+            print("[Runner] 检测到答案提交，路由至 GraderAgent (stream)")
+            quiz_content = self._extract_quiz_from_history(history)
+            collected = []
+            for chunk in self.grader.grade_practice_stream(
+                quiz_content=quiz_content,
+                student_answer=user_message,
                 course_name=course_name,
-                context=context,
-                question=user_message,
-            ),
-            temperature=0.7,
-            max_tokens=2000,
-        ):
-            collected.append(chunk)
-            yield chunk
-
-        full_response = "".join(collected)
-        if self._is_practice_grading(full_response):
+                history_ctx=history_ctx,
+            ):
+                collected.append(chunk)
+                yield chunk
+            full_response = "".join(collected)
             saved_path = self._save_practice_record(course_name, user_message, history, full_response)
             self._save_grading_to_memory(course_name, user_message, history, full_response)
             yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
+        else:
+            collected = []
+            for chunk in self.tutor.teach_stream(
+                question=user_message,
+                course_name=course_name,
+                context=context,
+                allowed_tools=plan.allowed_tools,
+                history=history,
+                system_prompt_override=PRACTICE_SYSTEM + history_ctx,
+                user_content_override=PRACTICE_PROMPT.format(
+                    course_name=course_name,
+                    context=context,
+                    question=user_message,
+                ),
+                temperature=0.7,
+                max_tokens=2000,
+            ):
+                collected.append(chunk)
+                yield chunk
 
     
     def run_exam_mode(
@@ -369,6 +393,49 @@ class OrchestrationRunner:
         except Exception:
             pass
         return ""
+
+    def _is_answer_submission(self, user_message: str, history: list) -> bool:
+        """检测用户是否在提交答案（而非请求出题）。
+
+        判断依据：
+        1. 用户消息含答案提交特征词或答案编号格式。
+        2. 历史中最近一条 assistant 消息包含题目结构。
+        """
+        import re
+        answer_markers = [
+            "第1题", "第一题", "我的答案", "答案如下", "提交答案", "答：",
+        ]
+        has_answer_marker = any(m in user_message for m in answer_markers)
+        # 纯编号+答案组合（如 "1.A  2.B  3.正确"）
+        if re.search(r'[1-9][.、：:]\s*[A-Za-z正确错误√×对]', user_message):
+            has_answer_marker = True
+        # 多行都有 "第X题" 或 "X." 编号
+        if len(re.findall(r'(?:第\d+题|^\d+[.、])', user_message, re.MULTILINE)) >= 2:
+            has_answer_marker = True
+
+        # 最近 assistant 消息是否含题目结构
+        has_quiz_in_history = False
+        for msg in reversed(history[-12:]):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                quiz_signals = ["题目", "选择题", "判断题", "填空题", "简答题",
+                                "第1题", "第一题", "标准答案", "答案选", "下列哪", "以下哪"]
+                if sum(1 for kw in quiz_signals if kw in content) >= 2:
+                    has_quiz_in_history = True
+                break
+
+        return has_answer_marker and has_quiz_in_history
+
+    def _extract_quiz_from_history(self, history: list) -> str:
+        """从历史中提取最近一条 assistant 出题消息作为题目原文。"""
+        for msg in reversed(history[-12:]):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                quiz_signals = ["题目", "选择题", "判断题", "填空题", "简答题",
+                                "第1题", "第一题", "标准答案", "答案选", "下列哪", "以下哪"]
+                if sum(1 for kw in quiz_signals if kw in content) >= 2:
+                    return content
+        return "（未能从历史中提取题目，请检查对话上下文）"
 
     def _is_practice_grading(self, text: str) -> bool:
         """判断练习模式回复是否为评分阶段。"""

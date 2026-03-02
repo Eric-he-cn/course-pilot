@@ -2,7 +2,7 @@
 import json
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import GRADER_PROMPT
+from core.orchestration.prompts import GRADER_PROMPT, GRADER_SYSTEM, GRADER_PRACTICE_PROMPT
 from backend.schemas import GradeReport, RetrievedChunk
 
 
@@ -142,3 +142,54 @@ class GraderAgent:
             mgr.record_practice_result(course_name, score, is_mistake)
         except Exception as e:
             print(f"[Memory] 错题记忆写入失败（不影响评分）: {e}")
+
+    def grade_practice_stream(
+        self,
+        quiz_content: str,
+        student_answer: str,
+        course_name: Optional[str] = None,
+        history_ctx: str = "",
+    ):
+        """专用练习评卷 ReAct 流式方法。
+
+        工作流：
+          1. 逐题核对（必须原文引用标准答案和学生答案）
+          2. 调用 calculator 工具汇总得分
+          3. 输出最终评分结果 + 讲评
+
+        Args:
+            quiz_content: 本次练习题目原文（从对话历史提取）。
+            student_answer: 本轮学生提交的答案原文。
+            course_name: 课程名称，用于注入学习档案上下文。
+            history_ctx: 历史错题上下文字符串（可选，追加到 system prompt）。
+        """
+        system_prompt = GRADER_SYSTEM
+        if history_ctx:
+            system_prompt += f"\n\n{history_ctx}"
+
+        # 注入用户学习档案（薄弱知识点等）
+        try:
+            from memory.manager import get_memory_manager
+            profile_ctx = get_memory_manager().get_profile_context(course_name)
+            if profile_ctx:
+                system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
+        except Exception:
+            pass
+
+        user_prompt = GRADER_PRACTICE_PROMPT.format(
+            quiz_content=quiz_content.strip(),
+            student_answer=student_answer.strip(),
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        print(f"[GraderAgent] 启动练习评卷 ReAct 流式（课程: {course_name}）")
+        yield from self.llm.chat_stream_with_tools(
+            messages,
+            tools=_CALCULATOR_TOOL,
+            temperature=0.1,       # 评卷要求确定性，低温度
+            max_tokens=2500,
+        )
