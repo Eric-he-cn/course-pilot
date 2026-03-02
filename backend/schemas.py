@@ -80,3 +80,78 @@ class ChatResponse(BaseModel):
     """Chat response."""
     message: ChatMessage
     plan: Optional[Plan] = None
+
+
+# ---------------------------------------------------------------------------
+# Structured inter-agent message types
+# ---------------------------------------------------------------------------
+
+class ToolCallLog(BaseModel):
+    """Single tool invocation record."""
+    tool_name: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    result: Any = None
+    success: bool = True
+
+
+class TutorResult(BaseModel):
+    """Structured output from TutorAgent.teach().
+
+    Replaces the raw ``str`` return so downstream runner code can access
+    citations and tool call logs without regex parsing.
+    """
+    content: str
+    citations: List[RetrievedChunk] = Field(default_factory=list)
+    tool_calls_log: List[ToolCallLog] = Field(default_factory=list)
+
+
+class PracticeGradeSignal(BaseModel):
+    """Structured signal extracted from an inline practice-grading response.
+
+    Replaces ad-hoc regex inside ``_save_grading_to_memory`` so the
+    extraction logic is centralised and testable.
+    """
+    score: float = 60.0
+    is_mistake: bool = False
+    mistake_tags: List[str] = Field(default_factory=list)
+    question_summary: str = ""
+    student_answer: str = ""
+
+    @classmethod
+    def from_text(
+        cls,
+        response_text: str,
+        student_answer: str = "",
+        question_summary: str = "",
+    ) -> "PracticeGradeSignal":
+        """Parse score and mistake tags from a free-text grading response."""
+        import re
+
+        score = 60.0
+        m = re.search(r"得分[：:＝=]\s*([0-9]+(?:\.[0-9]+)?)", response_text)
+        if m:
+            score = float(m.group(1))
+        else:
+            m2 = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*/\s*100", response_text)
+            if m2:
+                score = float(m2.group(1))
+
+        mistake_tags: List[str] = []
+        tag_m = re.search(
+            r"[易错提醒错误类型]{2,}[：:]\s*(.+?)(?:\n|$)", response_text
+        )
+        if tag_m:
+            raw = tag_m.group(1).strip()
+            mistake_tags = [
+                t.strip()
+                for t in re.split(r"[,，、；;]", raw)
+                if t.strip()
+            ][:5]
+
+        return cls(
+            score=score,
+            is_mistake=score < 60,
+            mistake_tags=mistake_tags,
+            question_summary=question_summary[:300],
+            student_answer=student_answer[:300],
+        )

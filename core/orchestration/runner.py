@@ -5,7 +5,8 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from backend.schemas import (
-    Plan, ChatMessage, RetrievedChunk, Quiz, GradeReport
+    Plan, ChatMessage, RetrievedChunk, Quiz, GradeReport,
+    TutorResult, PracticeGradeSignal
 )
 from core.agents.router import RouterAgent
 from core.agents.tutor import TutorAgent
@@ -81,15 +82,20 @@ class OrchestrationRunner:
         # 为 filewriter 工具注入当前课程的笔记目录
         from mcp_tools.client import MCPTools
         MCPTools._context = {"notes_dir": notes_dir}
-        response_text = self.tutor.teach(user_message, course_name, context,
-                                         allowed_tools=plan.allowed_tools,
-                                         history=history)
-        
+        result: TutorResult = self.tutor.teach(
+            user_message, course_name, context,
+            allowed_tools=plan.allowed_tools,
+            history=history,
+        )
+
+        # 合并 RAG citations 和 Tutor 内部工具调用产生的 citations
+        merged_citations = citations + result.citations if citations else result.citations
+
         return ChatMessage(
             role="assistant",
-            content=response_text,
-            citations=citations if citations else None,
-            tool_calls=None
+            content=result.content,
+            citations=merged_citations if merged_citations else None,
+            tool_calls=None,
         )
     
     def run_practice_mode(
@@ -335,59 +341,44 @@ class OrchestrationRunner:
         history: list,
         response_text: str,
     ) -> None:
-        """将练习评分结果写入情景记忆（供弱点分析和 memory_search 使用）。"""
+        """将练习评分结果写入情景记忆，使用 PracticeGradeSignal 提取结构化信息。"""
         try:
-            import re as _re
             from memory.manager import get_memory_manager
 
             # 提取题目（历史中最近一条 assistant 消息）
-            question = "（未能提取题目）"
+            question_summary = "（未能提取题目）"
             for msg in reversed(history[-20:]):
                 if msg.get("role") == "assistant":
-                    question = msg.get("content", "")[:300]
+                    question_summary = msg.get("content", "")[:300]
                     break
 
-            # 从评分回复中提取数字得分（支持：得分：80、80/100、80分 等格式）
-            score = 60.0  # 默认中等分，触发 mistake 判断
-            m = _re.search(r"得分[：:＝=]\s*([0-9]+(?:\.[0-9]+)?)", response_text)
-            if m:
-                score = float(m.group(1))
-            else:
-                # 兼容 "80/100" 格式
-                m2 = _re.search(r"([0-9]+(?:\.[0-9]+)?)\s*/\s*100", response_text)
-                if m2:
-                    score = float(m2.group(1))
-
-            is_mistake = score < 60
-            importance = 0.9 if is_mistake else 0.4
-            event_type = "mistake" if is_mistake else "practice"
-            content = (
-                f"题目: {question}\n"
-                f"学生答案: {user_answer[:200]}\n"
-                f"得分: {score:.0f}"
+            # 用结构化方法解析评分和错误标签，替代原内联 regex
+            signal = PracticeGradeSignal.from_text(
+                response_text=response_text,
+                student_answer=user_answer,
+                question_summary=question_summary,
             )
 
-            # 尝试提取错误标签（"易错提醒" 或 "错误类型" 后的文字）
-            mistake_tags: list[str] = []
-            tag_m = _re.search(r"[易错提醒错误类型]{2,}[：:]\s*(.+?)(?:\n|$)", response_text)
-            if tag_m:
-                raw = tag_m.group(1).strip()
-                mistake_tags = [t.strip() for t in _re.split(r"[,，、；;]", raw) if t.strip()][:5]
-            if mistake_tags:
-                content += f"\n错误类型: {', '.join(mistake_tags)}"
+            content = (
+                f"题目: {signal.question_summary}\n"
+                f"学生答案: {signal.student_answer}\n"
+                f"得分: {signal.score:.0f}"
+            )
+            if signal.mistake_tags:
+                content += f"\n错误类型: {', '.join(signal.mistake_tags)}"
 
             mgr = get_memory_manager()
             mgr.save_episode(
                 course_name=course_name,
-                event_type=event_type,
+                event_type="mistake" if signal.is_mistake else "practice",
                 content=content,
-                importance=importance,
-                metadata={"score": score, "tags": mistake_tags},
+                importance=0.9 if signal.is_mistake else 0.4,
+                metadata={"score": signal.score, "tags": signal.mistake_tags},
             )
-            if mistake_tags and is_mistake:
-                mgr.update_weak_points(course_name, mistake_tags)
-            mgr.record_practice_result(course_name, score, is_mistake)
-            print(f"[Memory] 练习{'错题' if is_mistake else '结果'}已记录，得分={score:.0f}")
+            if signal.mistake_tags and signal.is_mistake:
+                mgr.update_weak_points(course_name, signal.mistake_tags)
+            mgr.record_practice_result(course_name, signal.score, signal.is_mistake)
+            print(f"[Memory] 练习{'错题' if signal.is_mistake else '结果'}已记录，得分={signal.score:.0f}")
         except Exception as _e:
             print(f"[Memory] 练习记忆写入失败（不影响评分）: {_e}")
 

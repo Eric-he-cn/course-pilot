@@ -3,7 +3,7 @@ from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import TUTOR_PROMPT
 from mcp_tools.client import get_tool_schemas
-from backend.schemas import RetrievedChunk
+from backend.schemas import RetrievedChunk, TutorResult
 
 
 class TutorAgent:
@@ -19,8 +19,8 @@ class TutorAgent:
         context: str,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None
-    ) -> str:
-        """Generate teaching response, optionally with tool calling and conversation history."""
+    ) -> TutorResult:
+        """Generate teaching response, returns structured TutorResult."""
         prompt = TUTOR_PROMPT.format(
             course_name=course_name,
             context=context,
@@ -68,9 +68,11 @@ class TutorAgent:
         messages.append({"role": "user", "content": prompt})
 
         if allowed_tools:
-            return self.llm.chat_with_tools(messages, tools=schemas,
-                                            temperature=0.7, max_tokens=2000)
-        return self.llm.chat(messages, temperature=0.7, max_tokens=1500)
+            raw = self.llm.chat_with_tools(messages, tools=schemas,
+                                           temperature=0.7, max_tokens=2000)
+            return TutorResult(content=raw)
+        raw = self.llm.chat(messages, temperature=0.7, max_tokens=1500)
+        return TutorResult(content=raw)
 
     def teach_stream(
         self,
