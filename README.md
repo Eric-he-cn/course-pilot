@@ -18,15 +18,16 @@
 
 ## 模式与工具
 
-| 模式 | 适用场景 | 执行 Agent | 工具（出题/讲解阶段） | 工具（评分阶段） | 自动记录 |
-|------|----------|-----------|---------------------|----------------|----------|
-| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | 全部 6 个 | — | 无 |
-| **练习 (Practice)** | 出题、提交答案、评分讲评 | TutorAgent（出题）+ GraderAgent（评分） | 全部 6 个 | 仅 calculator | `practices/` 练习记录 |
-| **考试 (Exam)** | 模拟考试、自测报告 | TutorAgent（三阶段） | calculator · memory_search · get_datetime | calculator | `exams/` 考试记录 |
+| 模式 | 适用场景 | 执行 Agent | 工具可用性（代码层） | 关键约束 | 自动记录 |
+|------|----------|-----------|---------------------|----------|----------|
+| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | `ToolPolicy` 放行全部 6 个工具 | 优先 RAG 引用，可按需调用工具增强回答 | 问答写入 `memory.db`（`qa` episode） |
+| **练习 (Practice)** | 出题、提交答案、评分讲评 | TutorAgent（出题）+ GraderAgent（评分） | 出题阶段：6 工具；评卷阶段：仅 `calculator`（`GraderAgent` 专线） | `_is_answer_submission()` 命中后强制切到评卷链路 | `practices/` Markdown 记录 + `memory.db` |
+| **考试 (Exam)** | 模拟考试、自测报告 | TutorAgent（三阶段） | `ToolPolicy` 放行全部 6 个工具 | 三阶段流程由 `EXAM_SYSTEM` 强约束（配置→出卷→批改） | `exams/` Markdown 记录 + `memory.db` |
 
-- **学习模式**：基于上传教材 RAG 检索，结论附带文档来源与页码引用；支持网页搜索补充课外知识，可生成思维导图。
-- **练习模式**：TutorAgent 出题（可调用 websearch 查找补充题材），学生提交答案后自动路由至 GraderAgent 专职评卷（强制逐字引用原文对比 + calculator 计分，temperature=0.1，结果确定性强）。
-- **考试模式**：TutorAgent 主导三阶段对话（收集配置→生成试卷→批改评分），批改阶段调用 calculator 汇总分值，结束后保存完整考试报告。
+- **学习模式**：基于上传教材 RAG 检索，支持引用来源展示、网页补充检索、思维导图生成与笔记落盘。
+- **练习模式**：TutorAgent 负责出题与讲解；当检测到“提交答案”后，Runner 自动路由至 GraderAgent，按“逐题对照 → calculator 汇总”流程评分并写入练习记录/记忆库。
+- **考试模式**：TutorAgent 按三阶段执行（配置收集→生成试卷→批改报告）；结束后自动保存考试记录并同步记忆。
+- **实现说明**：当前 `core/orchestration/policies.py` 中 `learn/practice/exam` 的 `allowed_tools` 均为 `ALL_TOOLS`。模式差异主要由 Runner 路由与 Prompt 规则控制，而非工具白名单。
 
 ### RAG 知识库
 
@@ -66,7 +67,7 @@ OrchestrationRunner（Python 调度器）
 | 工具 | 功能 |
 |------|------|
 | `calculator` | 数学表达式计算（支持 `math`/`statistics`/组合数学/双曲函数/单位换算，Python 受限 `eval`） |
-| `websearch` | SerpAPI 网页搜索（学习模式 + 练习出题阶段） |
+| `websearch` | SerpAPI 网页搜索（用于补充教材外信息；实际是否调用由当轮模式提示词与任务阶段决定） |
 | `filewriter` | 将笔记写入课程 `notes/` 目录（`.md` 格式） |
 | `memory_search` | 检索历史练习/错题记忆，自动强化薄弱知识点 |
 | `mindmap_generator` | 生成 Mermaid 思维导图，支持导出 SVG / 3× 高清 PNG / 源码 |
@@ -121,11 +122,16 @@ FastAPI (:8000)
 ```
 
 ├── README.md                 ← 本文档
-├── USAGE.md                  ← 使用手册（面向用户）
-├── debug.md                  ← 调试过程记录
+├── docs/
+│   ├── USAGE.md              ← 使用手册（面向用户）
+│   ├── ARCHITECTURE.md       ← 架构设计与数据流
+│   ├── debug.md              ← 调试记录
+│   ├── CONTRIBUTING.md       ← 贡献指南
+│   └── SECURITY.md           ← 安全说明
 ├── requirements.txt
 ├── pyproject.toml
 ├── .env                      ← 本地环境变量（不入库）
+├── rebuild_indexes.py        ← 批量重建全部课程索引
 │
 ├── frontend/
 │   └── streamlit_app.py      ← Streamlit 前端
@@ -155,21 +161,28 @@ FastAPI (:8000)
 │   └── retrieve.py           ← 相似度检索 + 引用格式化
 │
 ├── mcp_tools/
-│   └── client.py             ← MCP 工具实现
+│   ├── client.py             ← 工具实现 + schema + 调用路由
+│   └── server_stdio.py       ← stdio MCP Server（最小协议实现）
+│
+├── memory/
+│   ├── manager.py            ← 记忆检索/写入编排
+│   └── store.py              ← SQLite 存储访问
 │
 ├── tests/
 │   ├── test_basic.py
 │   └── sample_textbook.txt
 │
 └── data/
+    ├── memory/
+    │   └── memory.db         ← SQLite 记忆库（episodes/user_profiles）
     └── workspaces/
         └── <course_name>/
             ├── uploads/      ← 上传的原始文件
             ├── index/        ← FAISS 索引文件
             ├── notes/        ← FileWriter 保存的笔记
             ├── mistakes/     ← 错题本（mistakes.jsonl）
-            ├── practices/    ← 练习记录（自动保存）
-            └── exams/        ← 考试记录（自动保存）
+            ├── practices/    ← 练习记录（自动保存，Markdown）
+            └── exams/        ← 考试记录（自动保存，Markdown）
 ```
 
 ---
@@ -235,7 +248,7 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `CHUNK_SIZE` | — | `600` | 文本分块大小（字符数） |
 | `CHUNK_OVERLAP` | — | `120` | 分块重叠大小（需 < CHUNK_SIZE，建议 20%） |
 | `TOP_K_RESULTS` | — | `6` | 每次检索返回的最大块数 |
-| `SERPAPI_API_KEY` | — | — | SerpAPI 密钥（学习模式网页搜索） |
+| `SERPAPI_API_KEY` | — | — | SerpAPI 密钥（`websearch` 工具依赖，未配置时该工具返回失败并跳过） |
 | `DATA_DIR` | — | `data/workspaces` | 课程数据根目录 |
 
 ---
