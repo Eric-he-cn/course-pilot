@@ -1,4 +1,9 @@
-"""Streamlit frontend for Course Learning Agent."""
+"""
+【模块说明】
+- 主要作用：实现 Streamlit 前端界面，提供课程管理、文件管理与对话交互。
+- 核心函数：stream_chat、render_mermaid、load_workspaces。
+- 关键特性：SSE 流式渲染、引用展示、Mermaid 导图下载。
+"""
 import re
 import streamlit as st
 import requests

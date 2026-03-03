@@ -1,4 +1,8 @@
-"""Tests for local stdio MCP path."""
+"""
+【模块说明】
+- 主要作用：验证本地 stdio MCP 链路可用性与错误语义。
+- 覆盖范围：initialize、tools/list、tools/call、无 fallback 约束。
+"""
 import json
 
 

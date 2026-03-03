@@ -1,4 +1,9 @@
-"""QuizMaster Agent for generating questions."""
+"""
+【模块说明】
+- 主要作用：实现 QuizMasterAgent，用于按主题和难度生成练习题。
+- 核心类：QuizMasterAgent。
+- 核心方法：generate_quiz（结合记忆检索结果出题）。
+"""
 import json
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import QUIZMASTER_PROMPT
@@ -6,7 +11,7 @@ from backend.schemas import Quiz
 
 
 class QuizMasterAgent:
-    """QuizMaster agent for generating practice questions."""
+    """出题 Agent：负责生成结构化练习题。"""
     
     def __init__(self):
         self.llm = get_llm_client()
@@ -18,7 +23,7 @@ class QuizMasterAgent:
         difficulty: str,
         context: str
     ) -> Quiz:
-        """Generate a quiz question, pre-fetching memory for weak-point targeting."""
+        """生成练习题，生成前先检索历史薄弱点。"""
         # 预查询历史错题，优先针对薄弱知识点出题
         memory_ctx = ""
         try:
@@ -50,7 +55,7 @@ class QuizMasterAgent:
         
         response = self.llm.chat(messages, temperature=0.8, max_tokens=1000)
         
-        # Parse response
+        # 解析模型输出
         try:
             if "```json" in response:
                 json_str = response.split("```json")[1].split("```")[0].strip()

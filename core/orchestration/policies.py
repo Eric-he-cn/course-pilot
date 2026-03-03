@@ -1,4 +1,9 @@
-"""Tool policy for different modes."""
+"""
+【模块说明】
+- 主要作用：定义不同模式下的工具可用策略。
+- 核心类：ToolPolicy。
+- 核心方法：get_allowed_tools、is_tool_allowed。
+"""
 from typing import List, Literal
 
 # 所有可用工具的完整列表
@@ -6,7 +11,7 @@ ALL_TOOLS = ["calculator", "websearch", "filewriter", "memory_search", "mindmap_
 
 
 class ToolPolicy:
-    """Define tool access policy for different modes.
+    """定义不同模式的工具访问策略。
 
     三种模式的差异体现在 runner 的工作逻辑和 Prompt 上，而非工具白名单：
     - learn   : Tutor 主导，RAG 讲解 + ReAct 工具调用
@@ -25,10 +30,10 @@ class ToolPolicy:
 
     @staticmethod
     def get_allowed_tools(mode: Literal["learn", "practice", "exam"]) -> List[str]:
-        """Get allowed tools for a mode."""
+        """获取指定模式允许调用的工具列表。"""
         return ToolPolicy.MODE_POLICIES.get(mode, ALL_TOOLS)
 
     @staticmethod
     def is_tool_allowed(tool: str, mode: Literal["learn", "practice", "exam"]) -> bool:
-        """Check if a tool is allowed in a mode."""
+        """判断某工具是否允许在指定模式中使用。"""
         return tool in ToolPolicy.get_allowed_tools(mode)

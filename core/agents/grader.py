@@ -1,9 +1,14 @@
-"""Grader Agent for evaluating answers."""
+"""
+【模块说明】
+- 主要作用：实现 GraderAgent，负责练习评分与讲评。
+- 核心类：GraderAgent。
+- 核心方法：grade（非流式评分）、grade_practice_stream（流式评分）。
+"""
 import json
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import GRADER_PROMPT, GRADER_SYSTEM, GRADER_PRACTICE_PROMPT
-from backend.schemas import GradeReport, RetrievedChunk
+from backend.schemas import GradeReport
 
 
 # 只暴露 calculator 给 Grader，不需要其他工具
@@ -32,7 +37,7 @@ _CALCULATOR_TOOL = [
 
 
 class GraderAgent:
-    """Grader agent for evaluating student answers."""
+    """评分 Agent：负责对答案打分并输出改进建议。"""
 
     def __init__(self):
         self.llm = get_llm_client()
@@ -46,7 +51,7 @@ class GraderAgent:
         course_name: Optional[str] = None,
         context: Optional[str] = None,          # 可选：RAG 教材上下文，用于反馈引用
     ) -> GradeReport:
-        """Grade student answer using calculator tool for precise scoring."""
+        """进行非流式评分，要求通过 calculator 汇总分数。"""
         # 可选教材上下文
         rag_ctx = ""
         if context and context.strip():
@@ -77,7 +82,7 @@ class GraderAgent:
             messages, tools=_CALCULATOR_TOOL, temperature=0.2, max_tokens=1200
         )
         
-        # Parse response
+        # 解析模型输出（优先解析 JSON 代码块）
         try:
             if "```json" in response:
                 json_str = response.split("```json")[1].split("```")[0].strip()
@@ -150,7 +155,7 @@ class GraderAgent:
         course_name: Optional[str] = None,
         history_ctx: str = "",
     ):
-        """专用练习评卷 ReAct 流式方法。
+        """专用练习评卷流式方法。
 
         工作流：
           1. 逐题核对（必须原文引用标准答案和学生答案）

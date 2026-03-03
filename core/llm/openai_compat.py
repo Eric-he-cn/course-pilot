@@ -1,4 +1,9 @@
-"""Core LLM client with OpenAI-compatible interface."""
+"""
+【模块说明】
+- 主要作用：封装 OpenAI 兼容模型调用，提供普通对话与工具调用（含流式）。
+- 核心类：LLMClient。
+- 核心方法：chat/chat_stream、chat_with_tools/chat_stream_with_tools。
+"""
 import os
 import json
 import logging
@@ -11,7 +16,7 @@ load_dotenv()
 
 
 class LLMClient:
-    """OpenAI-compatible LLM client."""
+    """OpenAI 兼容的 LLM 客户端封装。"""
     
     def __init__(
         self,
@@ -35,7 +40,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         **kwargs
     ) -> str:
-        """Send chat completion request."""
+        """发起普通对话请求并返回完整文本。"""
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -158,7 +163,7 @@ class LLMClient:
         temperature: float = 0.7,
         **kwargs
     ):
-        """Send streaming chat completion request."""
+        """发起流式对话请求，逐片段返回文本。"""
         try:
             stream = self.client.chat.completions.create(
                 model=self.model,
@@ -274,7 +279,7 @@ _llm_client = None
 
 
 def get_llm_client() -> LLMClient:
-    """Get or create global LLM client."""
+    """获取全局 LLMClient 单例（不存在时自动创建）。"""
     global _llm_client
     if _llm_client is None:
         _llm_client = LLMClient()

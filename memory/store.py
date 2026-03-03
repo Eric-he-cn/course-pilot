@@ -1,4 +1,9 @@
-"""SQLite-based memory storage for episodes and user profiles."""
+"""
+【模块说明】
+- 主要作用：基于 SQLite 持久化存储情景记忆（episodes）与用户画像（user_profiles）。
+- 核心类：SQLiteMemoryStore。
+- 核心方法：save_episode、search_episodes、get_profile、upsert_profile。
+"""
 import sqlite3
 import json
 import uuid

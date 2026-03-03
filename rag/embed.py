@@ -1,4 +1,9 @@
-"""Embedding generation."""
+"""
+【模块说明】
+- 主要作用：封装嵌入模型加载与向量生成（文档向量 + 查询向量）。
+- 核心类：EmbeddingModel。
+- 核心函数：get_embedding_model（全局单例获取）。
+"""
 import os
 from typing import List
 from sentence_transformers import SentenceTransformer
@@ -12,7 +17,7 @@ _BGE_ZH_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文
 
 
 def _get_bge_query_prefix(model_name: str) -> str:
-    """Return the query instruction prefix for BGE models, or empty string."""
+    """返回 BGE 模型查询前缀（不需要时返回空字符串）。"""
     name = model_name.lower()
     if "bge-m3" in name:
         return ""          # bge-m3 不需要前缀
@@ -41,12 +46,7 @@ def _select_device() -> str:
 
 
 class EmbeddingModel:
-    """Sentence transformer embedding model.
-
-    Supports BGE series (bge-base-zh-v1.5, bge-m3, etc.) with automatic
-    query instruction prefix injection for asymmetric retrieval.
-    Auto-selects GPU (CUDA) when available, falls back to CPU.
-    """
+    """Sentence-Transformer 嵌入模型封装（含设备自动选择与查询前缀处理）。"""
 
     def __init__(self, model_name: str = None):
         if model_name is None:
@@ -61,7 +61,7 @@ class EmbeddingModel:
         print(f"[Embed] 模型={model_name}  设备={self._device}  batch_size={self._batch_size}")
 
     def embed(self, texts: List[str]) -> np.ndarray:
-        """Generate embeddings for document chunks (no prefix)."""
+        """为文档文本列表生成向量（不添加查询前缀）。"""
         return self.model.encode(
             texts,
             batch_size=self._batch_size,
@@ -70,7 +70,7 @@ class EmbeddingModel:
         )
 
     def embed_query(self, query: str) -> np.ndarray:
-        """Generate embedding for a query (with BGE instruction prefix if needed)."""
+        """为查询生成向量（需要时自动添加 BGE 查询前缀）。"""
         prefixed = self._query_prefix + query if self._query_prefix else query
         return self.model.encode(
             [prefixed],
@@ -85,7 +85,7 @@ _embedding_model = None
 
 
 def get_embedding_model() -> EmbeddingModel:
-    """Get or create global embedding model."""
+    """获取全局嵌入模型单例（不存在时自动创建）。"""
     global _embedding_model
     if _embedding_model is None:
         _embedding_model = EmbeddingModel()

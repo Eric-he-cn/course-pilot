@@ -1,13 +1,18 @@
-"""Simple integration tests for the Course Learning Agent."""
+"""
+【模块说明】
+- 主要作用：提供基础集成测试脚本（导入、Schema、RAG、策略、工具）。
+- 核心函数：run_all_tests。
+- 说明：该脚本可直接运行，不依赖 pytest。
+"""
 import sys
 import os
 
-# Add parent directory to path
+# 将项目根目录加入导入路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 def test_imports():
-    """Test that all modules can be imported."""
+    """测试核心模块是否可正常导入。"""
     try:
         from backend.schemas import CourseWorkspace, Plan, Quiz
         from core.llm.openai_compat import LLMClient
@@ -23,12 +28,12 @@ def test_imports():
 
 
 def test_schemas():
-    """Test data schemas."""
+    """测试关键数据模型是否可正确实例化。"""
     try:
         from backend.schemas import Plan, Quiz, GradeReport
         from datetime import datetime
         
-        # Test Plan
+        # 测试 Plan
         plan = Plan(
             need_rag=True,
             allowed_tools=["calculator"],
@@ -38,7 +43,7 @@ def test_schemas():
         )
         assert plan.need_rag == True
         
-        # Test Quiz
+        # 测试 Quiz
         quiz = Quiz(
             question="Test question",
             standard_answer="Test answer",
@@ -55,7 +60,7 @@ def test_schemas():
 
 
 def test_rag_components():
-    """Test RAG components."""
+    """测试 RAG 分块组件。"""
     try:
         from rag.chunk import simple_chunk_text
         
@@ -71,7 +76,7 @@ def test_rag_components():
 
 
 def test_tool_policy():
-    """Test tool policy."""
+    """测试工具策略配置。"""
     try:
         from core.orchestration.policies import ToolPolicy
         
@@ -81,7 +86,7 @@ def test_tool_policy():
         
         exam_tools = ToolPolicy.get_allowed_tools("exam")
         assert "calculator" in exam_tools
-        assert "websearch" not in exam_tools  # Should be disabled in exam
+        assert "websearch" not in exam_tools  # 考试模式应禁用联网搜索
         
         print("✅ Tool policy tests passed")
         return True
@@ -91,16 +96,16 @@ def test_tool_policy():
 
 
 def test_mcp_tools():
-    """Test MCP tools."""
+    """测试 MCP 工具基础能力。"""
     try:
         from mcp_tools.client import MCPTools
         
-        # Test calculator
+        # 测试 calculator
         result = MCPTools.calculator("2 + 2")
         assert result["success"] == True
         assert result["result"] == 4
         
-        # Test websearch
+        # 测试 websearch
         result = MCPTools.websearch("test query")
         assert result["success"] == True
         
@@ -112,7 +117,7 @@ def test_mcp_tools():
 
 
 def run_all_tests():
-    """Run all tests."""
+    """运行全部测试并输出汇总。"""
     print("=" * 60)
     print("Running Course Learning Agent Tests")
     print("=" * 60)

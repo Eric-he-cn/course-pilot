@@ -1,10 +1,8 @@
-"""Local MCP server over stdio for CoursePilot tools.
-
-Implements a minimal JSON-RPC/MCP subset:
-- initialize
-- notifications/initialized
-- tools/list
-- tools/call
+"""
+【模块说明】
+- 主要作用：提供本地 stdio 版 MCP Server，承载工具调用协议入口。
+- 协议子集：initialize / notifications/initialized / tools/list / tools/call。
+- 核心函数：_read_message、_write_message、_handle_request、main。
 """
 import json
 import sys
@@ -18,6 +16,7 @@ _orig_print = builtins.print
 
 
 def _stderr_print(*args, **kwargs):
+    """将所有业务打印重定向到 stderr，避免污染 stdout 协议通道。"""
     kwargs.setdefault("file", sys.stderr)
     return _orig_print(*args, **kwargs)
 
@@ -26,6 +25,7 @@ builtins.print = _stderr_print
 
 
 def _write_message(msg: Dict[str, Any]) -> None:
+    """按 Content-Length 帧格式写出一条 JSON-RPC 消息。"""
     body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
     header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
     sys.stdout.buffer.write(header)
@@ -34,6 +34,7 @@ def _write_message(msg: Dict[str, Any]) -> None:
 
 
 def _read_message() -> Optional[Dict[str, Any]]:
+    """读取并解析一条 Content-Length 帧消息。"""
     headers: Dict[str, str] = {}
     while True:
         line = sys.stdin.buffer.readline()
@@ -56,10 +57,12 @@ def _read_message() -> Optional[Dict[str, Any]]:
 
 
 def _ok(req_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    """构造 JSON-RPC 成功响应。"""
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
 def _err(req_id: Any, code: int, message: str) -> Dict[str, Any]:
+    """构造 JSON-RPC 错误响应。"""
     return {
         "jsonrpc": "2.0",
         "id": req_id,
@@ -68,6 +71,7 @@ def _err(req_id: Any, code: int, message: str) -> Dict[str, Any]:
 
 
 def _handle_request(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """处理单条请求并返回响应（通知类请求返回 None）。"""
     method = msg.get("method", "")
     req_id = msg.get("id")
     params_raw = msg.get("params")
@@ -83,7 +87,7 @@ def _handle_request(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if method == "notifications/initialized":
         return None
 
-    # Notification: no response required.
+    # 通知消息无需响应
     if req_id is None:
         return None
 
@@ -126,6 +130,7 @@ def _handle_request(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def main() -> None:
+    """stdio MCP 主循环。"""
     while True:
         msg = _read_message()
         if msg is None:

@@ -1,11 +1,8 @@
 """
-批量重建所有课程的 FAISS 向量索引。
-
-换用新 embedding 模型（bge-base-zh-v1.5）或调整 CHUNK_SIZE/OVERLAP 后，
-必须重建索引，因为向量维度和分块结果已变化。
-
-运行方法:
-    python rebuild_indexes.py
+【模块说明】
+- 主要作用：批量重建全部课程的 FAISS 索引。
+- 核心函数：rebuild_course、main。
+- 适用场景：更换嵌入模型或调整分块参数后，需重新向量化全部课程。
 """
 
 import os

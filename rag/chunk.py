@@ -1,4 +1,9 @@
-"""Text chunking with overlap."""
+"""
+【模块说明】
+- 主要作用：把解析后的文档文本切分为可检索的小块，并保留元数据。
+- 核心函数：simple_chunk_text、chunk_documents。
+- 设计要点：支持 overlap，并防止 overlap 配置异常导致死循环。
+"""
 import os
 from typing import List, Dict, Any
 
@@ -8,7 +13,7 @@ def simple_chunk_text(
     chunk_size: int = 512,
     overlap: int = 50
 ) -> List[str]:
-    """Simple chunking by character count with overlap."""
+    """按字符长度进行基础分块并支持重叠。"""
     # 防止 overlap >= chunk_size 导致 start 永不前进而死循环
     if chunk_size <= 0:
         chunk_size = 512
@@ -37,7 +42,7 @@ def chunk_documents(
     chunk_size: int = None,
     overlap: int = None
 ) -> List[Dict[str, Any]]:
-    """Chunk documents with metadata preservation."""
+    """对文档页进行分块，同时保留 doc_id/page/chunk_id 元数据。"""
     if chunk_size is None:
         chunk_size = int(os.getenv("CHUNK_SIZE", "512"))
     if overlap is None:

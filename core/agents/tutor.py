@@ -1,13 +1,18 @@
-"""Tutor Agent for learning mode."""
+"""
+【模块说明】
+- 主要作用：实现 TutorAgent，负责学习/练习/考试场景下的教学回答生成。
+- 核心类：TutorAgent。
+- 核心方法：teach（非流式）、teach_stream（流式）、工具规则注入与用户画像注入。
+"""
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import TUTOR_PROMPT
 from mcp_tools.client import get_tool_schemas
-from backend.schemas import RetrievedChunk, TutorResult
+from backend.schemas import TutorResult
 
 
 class TutorAgent:
-    """Tutor agent for teaching and explaining concepts."""
+    """导师 Agent：负责讲解、出题、考试流程中的答案生成。"""
     
     def __init__(self):
         self.llm = get_llm_client()
@@ -25,12 +30,7 @@ class TutorAgent:
         max_tokens: int = 2000,
         history_limit: int = 20,                        # 考试模式传 30
     ) -> TutorResult:
-        """Generate teaching response, returns structured TutorResult.
-        
-        Args:
-            system_prompt_override: 若提供，直接使用此 system prompt（跳过工具规则构建）
-            user_content_override: 若提供，直接使用此内容而非 TUTOR_PROMPT
-        """
+        """生成非流式教学回答，返回结构化 TutorResult。"""
         # 如果有 override，直接用；否则用 TUTOR_PROMPT
         if user_content_override:
             prompt = user_content_override
@@ -105,7 +105,7 @@ class TutorAgent:
         max_tokens: int = 2000,
         history_limit: int = 20,                        # 考试模式传 30
     ):
-        """流式版本的 teach()，返回文本 chunk 生成器。"""
+        """生成流式教学回答，返回文本分片生成器。"""
         if user_content_override:
             prompt = user_content_override
         else:

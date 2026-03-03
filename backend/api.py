@@ -1,4 +1,9 @@
-"""FastAPI backend for Course Learning Agent."""
+"""
+【模块说明】
+- 主要作用：提供后端 HTTP/SSE 接口，承载课程管理、文件上传、索引构建与对话服务。
+- 核心对象：FastAPI app、OrchestrationRunner、workspace 注册表。
+- 核心接口：/workspaces、/upload、/build-index、/chat、/chat/stream。
+"""
 import os
 import logging
 import shutil
@@ -26,7 +31,7 @@ from core.orchestration.runner import OrchestrationRunner
 
 app = FastAPI(title="Course Learning Agent API")
 
-# CORS middleware
+# CORS 中间件配置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,10 +40,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global runner
+# 全局编排器实例
 runner = OrchestrationRunner()
 
-# In-memory workspace registry (in production, use database)
+# 内存工作区注册表（生产环境建议换数据库）
 workspaces = {}
 
 
@@ -76,17 +81,19 @@ load_workspaces_from_disk()
 
 
 class CreateWorkspaceRequest(BaseModel):
+    """创建课程工作区的请求体。"""
     course_name: str
     subject: str
 
 
 class MessageRequest(BaseModel):
+    """通用消息请求体（当前保留扩展位）。"""
     message: str
 
 
 @app.get("/")
 async def root():
-    """Root endpoint."""
+    """健康检查入口。"""
     return {
         "message": "Course Learning Agent API",
         "version": "0.1.0"
@@ -95,7 +102,7 @@ async def root():
 
 @app.post("/workspaces", response_model=CourseWorkspace)
 async def create_workspace(request: CreateWorkspaceRequest):
-    """Create a new course workspace."""
+    """创建课程工作区。"""
     if request.course_name in workspaces:
         raise HTTPException(status_code=400, detail="Workspace already exists")
     
@@ -124,13 +131,13 @@ async def create_workspace(request: CreateWorkspaceRequest):
 
 @app.get("/workspaces", response_model=List[CourseWorkspace])
 async def list_workspaces():
-    """List all workspaces."""
+    """列出全部课程工作区。"""
     return list(workspaces.values())
 
 
 @app.get("/workspaces/{course_name}", response_model=CourseWorkspace)
 async def get_workspace(course_name: str):
-    """Get a specific workspace."""
+    """获取单个课程工作区。"""
     if course_name not in workspaces:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return workspaces[course_name]
@@ -141,7 +148,7 @@ async def upload_document(
     course_name: str,
     file: UploadFile = File(...)
 ):
-    """Upload a document to workspace."""
+    """上传单个教材文件到指定课程。"""
     if course_name not in workspaces:
         raise HTTPException(status_code=404, detail="Workspace not found")
     
@@ -161,12 +168,12 @@ async def upload_document(
 
     upload_path = os.path.join(workspace_path, "uploads", safe_filename)
 
-    # Save file
+    # 保存文件到磁盘
     with open(upload_path, "wb") as f:
         content = await file.read()
         f.write(content)
     
-    # Add to workspace documents
+    # 同步到内存文档列表
     if safe_filename not in workspace.documents:
         workspace.documents.append(safe_filename)
     
@@ -248,7 +255,7 @@ async def delete_workspace_index(course_name: str):
 
 @app.post("/workspaces/{course_name}/build-index")
 async def build_workspace_index(course_name: str):
-    """Build RAG index for workspace."""
+    """为课程构建 RAG 向量索引。"""
     if course_name not in workspaces:
         raise HTTPException(status_code=404, detail="Workspace not found")
     
@@ -272,7 +279,7 @@ async def build_workspace_index(course_name: str):
         if not disk_files:
             raise HTTPException(status_code=400, detail="uploads/ 目录中没有可用文件，请先上传教材")
 
-        # Parse all documents
+        # 解析全部教材文件
         all_pages = []
         failed = []
         for doc_name in disk_files:
@@ -289,13 +296,13 @@ async def build_workspace_index(course_name: str):
                 detail += f" 解析失败的文件：{', '.join(failed)}（PDF 请确认非扫描版；PPTX 请确认文件未损坏）"
             raise HTTPException(status_code=400, detail=detail)
 
-        # Chunk documents
+        # 文档分块
         chunks = chunk_documents(all_pages)
 
-        # Build index
+        # 构建向量索引
         store = build_index(chunks)
 
-        # Save index
+        # 保存索引到磁盘
         index_path = os.path.abspath(workspace.index_path)
         os.makedirs(os.path.dirname(index_path), exist_ok=True)
         store.save(index_path)
@@ -315,11 +322,11 @@ async def build_workspace_index(course_name: str):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Chat endpoint."""
+    """同步对话接口。"""
     if request.course_name not in workspaces:
         raise HTTPException(status_code=404, detail="Workspace not found")
     
-    # Run orchestration
+    # 执行编排主流程
     response_message, plan = runner.run(
         course_name=request.course_name,
         mode=request.mode,

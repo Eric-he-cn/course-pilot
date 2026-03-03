@@ -1,4 +1,9 @@
-"""Prompt templates for all agents."""
+"""
+【模块说明】
+- 主要作用：集中维护 Router/Tutor/Grader/Exam 等 Agent 的提示词模板。
+- 核心内容：ROUTER_PROMPT、TUTOR_PROMPT、PRACTICE_PROMPT、EXAM_PROMPT。
+- 使用方式：由 runner 与各 Agent 按场景选择并注入上下文变量。
+"""
 
 ROUTER_PROMPT = """你是一个课程学习助手的任务规划器。根据用户请求和当前模式，制定执行计划。
 

@@ -1,4 +1,9 @@
-"""Main orchestration runner."""
+"""
+【模块说明】
+- 主要作用：实现系统主编排器，统一调度 Router/Tutor/Grader、RAG、MCP 工具与记忆系统。
+- 核心类：OrchestrationRunner。
+- 核心流程：run/run_stream（总入口）+ 各模式执行（learn/practice/exam）。
+"""
 import os
 import json
 from typing import Dict, Any, List, Optional
@@ -21,14 +26,14 @@ from core.orchestration.prompts import (
 
 
 class OrchestrationRunner:
-    """Main orchestration runner for the course agent system."""
+    """课程学习系统主编排器。"""
     
     def __init__(self, data_dir: str = None):
         if data_dir is None:
             data_dir = os.getenv("DATA_DIR", "./data/workspaces")
         self.data_dir = data_dir
         
-        # Initialize agents
+        # 初始化各 Agent
         self.router = RouterAgent()
         self.tutor = TutorAgent()
         self.quizmaster = QuizMasterAgent()
@@ -36,7 +41,7 @@ class OrchestrationRunner:
         self.tools = MCPTools()
     
     def get_workspace_path(self, course_name: str) -> str:
-        """Get workspace path for a course. Sanitizes course_name to prevent path traversal."""
+        """获取课程工作目录（包含路径穿越防护）。"""
         # 只取最后一个路径组件，防止 ../../../etc 等穿越攻击
         safe_name = os.path.basename(course_name.strip())
         if not safe_name or safe_name in (".", ".."):
@@ -44,7 +49,7 @@ class OrchestrationRunner:
         return os.path.join(self.data_dir, safe_name)
     
     def load_retriever(self, course_name: str) -> Optional[Retriever]:
-        """Load retriever for a course."""
+        """按课程加载检索器（未构建索引时返回 None）。"""
         workspace_path = self.get_workspace_path(course_name)
         index_path = os.path.abspath(os.path.join(workspace_path, "index", "faiss_index"))
         
@@ -62,7 +67,7 @@ class OrchestrationRunner:
         plan: Plan,
         history: List[Dict[str, str]] = None
     ) -> ChatMessage:
-        """Execute learn mode."""
+        """执行学习模式（非流式）。"""
         if history is None:
             history = []
         # Retrieve context if needed
@@ -599,7 +604,7 @@ class OrchestrationRunner:
         state: Dict[str, Any] = None,
         history: List[Dict[str, str]] = None
     ) -> tuple[ChatMessage, Plan]:
-        """Main orchestration entry point."""
+        """主编排入口（非流式）。"""
         if history is None:
             history = []
         # Generate plan

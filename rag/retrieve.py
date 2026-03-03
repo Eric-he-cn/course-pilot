@@ -1,13 +1,18 @@
-"""RAG retrieval with citations."""
+"""
+【模块说明】
+- 主要作用：执行向量检索并生成带引用信息的上下文文本。
+- 核心类：Retriever。
+- 核心方法：retrieve（召回片段）、format_context（拼接引用上下文）。
+"""
 import os
-from typing import List, Dict, Any
+from typing import List
 from rag.store_faiss import FAISSStore
 from rag.embed import get_embedding_model
 from backend.schemas import RetrievedChunk
 
 
 class Retriever:
-    """RAG retriever with citation generation."""
+    """RAG 检索器（支持引用信息组装）。"""
     
     def __init__(self, store: FAISSStore):
         self.store = store
@@ -18,7 +23,7 @@ class Retriever:
         query: str,
         top_k: int = None
     ) -> List[RetrievedChunk]:
-        """Retrieve relevant chunks for a query."""
+        """根据查询召回相关文本片段。"""
         if top_k is None:
             top_k = int(os.getenv("TOP_K_RESULTS", "3"))
         
@@ -38,7 +43,7 @@ class Retriever:
         return retrieved
     
     def format_context(self, chunks: List[RetrievedChunk]) -> str:
-        """Format retrieved chunks as context for LLM."""
+        """把检索片段格式化为可直接注入 LLM 的上下文字符串。"""
         context_parts = []
         for i, chunk in enumerate(chunks):
             citation = f"[来源{i+1}: {chunk.doc_id}"

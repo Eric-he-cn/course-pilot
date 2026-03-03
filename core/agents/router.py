@@ -1,4 +1,9 @@
-"""Router Agent for task planning."""
+"""
+【模块说明】
+- 主要作用：实现 RouterAgent，根据用户输入生成执行计划 Plan。
+- 核心类：RouterAgent。
+- 核心方法：plan（注入用户画像后生成 need_rag/style/allowed_tools 等决策）。
+"""
 import json
 from typing import Dict, Any
 from core.llm.openai_compat import get_llm_client
@@ -8,7 +13,7 @@ from backend.schemas import Plan
 
 
 class RouterAgent:
-    """Router agent for planning task execution."""
+    """路由 Agent：负责把自然语言请求映射为可执行计划。"""
     
     def __init__(self):
         self.llm = get_llm_client()
@@ -19,7 +24,7 @@ class RouterAgent:
         mode: str,
         course_name: str
     ) -> Plan:
-        """Generate execution plan, injecting user memory profile for smarter routing."""
+        """生成执行计划，并注入记忆画像以提升规划准确性。"""
         # 从记忆库拉取用户薄弱知识点，注入 Router prompt 辅助规划
         weak_points_ctx = ""
         try:

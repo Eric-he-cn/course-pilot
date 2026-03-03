@@ -1,4 +1,9 @@
-"""MCP Tools - Calculator, WebSearch (SerpAPI), FileWriter with OpenAI tool schemas."""
+"""
+【模块说明】
+- 主要作用：定义工具 schema、实现本地工具能力，并通过 stdio MCP 客户端发起工具调用。
+- 核心类：_StdioMCPClient、MCPTools。
+- 核心函数：_to_mcp_tools、_get_mcp_client、get_tool_schemas。
+"""
 import atexit
 import json
 import math
@@ -175,11 +180,11 @@ _MCP_CLIENT_LOCK = threading.Lock()
 
 
 class _MCPTransportError(RuntimeError):
-    """Transport/protocol error while talking to local stdio MCP server."""
+    """本地 stdio MCP 通信中的传输或协议错误。"""
 
 
 def _read_framed_message(stream) -> Optional[Dict[str, Any]]:
-    """Read one Content-Length framed JSON message."""
+    """读取一条 Content-Length 帧格式消息并解析为 JSON。"""
     headers: Dict[str, str] = {}
     while True:
         line = stream.readline()
@@ -215,7 +220,7 @@ def _read_framed_message(stream) -> Optional[Dict[str, Any]]:
 
 
 class _StdioMCPClient:
-    """Minimal MCP stdio client for initialize/tools/list/tools/call."""
+    """最小可用的 stdio MCP 客户端（initialize/tools/list/tools/call）。"""
 
     def __init__(
         self,
@@ -460,7 +465,7 @@ class _StdioMCPClient:
 
 
 def _to_mcp_tools() -> List[Dict[str, Any]]:
-    """Convert OpenAI function schemas to MCP tools/list response shape."""
+    """将 OpenAI function schema 转换为 MCP tools/list 输出结构。"""
     mcp_tools: List[Dict[str, Any]] = []
     for schema in TOOL_SCHEMAS:
         fn = schema.get("function") or {}
@@ -518,7 +523,7 @@ def _extract_mermaid_code(text: str) -> str:
 # ── 工具实现 ─────────────────────────────────────────────────────────────────
 
 class MCPTools:
-    """MCP tools implementation with real backends."""
+    """工具实现集合（本地执行层 + MCP 调用入口）。"""
 
     # 由 runner 在每次调用前注入上下文（如 notes_dir）
     _context: Dict[str, Any] = {}
@@ -820,7 +825,7 @@ class MCPTools:
 
     @staticmethod
     def _call_tool_local(tool_name: str, **kwargs) -> Dict[str, Any]:
-        """按名称执行本地工具实现（仅供 MCP server 端调用）。"""
+        """按名称执行本地工具实现（供 MCP server 调用）。"""
         if tool_name == "calculator":
             return MCPTools.calculator(kwargs.get("expression", ""))
         elif tool_name == "websearch":
@@ -852,7 +857,7 @@ class MCPTools:
 
     @staticmethod
     def call_tool(tool_name: str, **kwargs) -> Dict[str, Any]:
-        """按名称调用工具（严格经由 stdio MCP，不做本地 fallback）。"""
+        """按名称调用工具（严格经由 stdio MCP，不做本地回退）。"""
         payload = dict(kwargs)
         # filewriter 的 notes_dir 由 runner 注入上下文；通过 MCP 参数透传给子进程。
         if tool_name == "filewriter" and "notes_dir" not in payload:

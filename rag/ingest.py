@@ -1,4 +1,9 @@
-"""Document ingestion and parsing."""
+"""
+【模块说明】
+- 主要作用：解析多种教材格式并输出统一页面结构，供后续分块与向量化使用。
+- 核心类：DocumentParser。
+- 支持格式：PDF/TXT/MD/DOCX/PPTX/PPT（含 PPT->PPTX 转换）。
+"""
 import os
 import tempfile
 from typing import List, Dict, Any
@@ -17,11 +22,11 @@ except Exception:
 
 
 class DocumentParser:
-    """Parse documents for RAG."""
+    """教材文档解析器。"""
     
     @staticmethod
     def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
-        """Parse PDF and extract text with page numbers."""
+        """解析 PDF 并提取带页码的文本。"""
         pages = []
         try:
             doc = fitz.open(file_path)
@@ -41,7 +46,7 @@ class DocumentParser:
     
     @staticmethod
     def parse_txt(file_path: str) -> List[Dict[str, Any]]:
-        """Parse text file with encoding auto-detection (UTF-8 → GBK → Latin-1)."""
+        """解析文本文件，自动回退编码（UTF-8 → GBK → Latin-1）。"""
         text = None
         for encoding in ('utf-8-sig', 'utf-8', 'gbk', 'latin-1'):
             try:
@@ -64,7 +69,7 @@ class DocumentParser:
     
     @staticmethod
     def parse_docx(file_path: str) -> List[Dict[str, Any]]:
-        """Parse Word document (.docx)."""
+        """解析 Word 文档（.docx）。"""
         try:
             doc = docx.Document(file_path)
             paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -80,7 +85,7 @@ class DocumentParser:
 
     @staticmethod
     def parse_pptx(file_path: str) -> List[Dict[str, Any]]:
-        """Parse PowerPoint document (.pptx). Each slide is treated as one page."""
+        """解析 PPTX（每张幻灯片视作一页）。"""
         if Presentation is None:
             print("Error parsing PPTX: python-pptx 未安装")
             return []
@@ -110,7 +115,7 @@ class DocumentParser:
 
     @staticmethod
     def _convert_ppt_to_pptx(file_path: str) -> str:
-        """Convert legacy .ppt to .pptx via PowerPoint COM (Windows). Returns temp .pptx path."""
+        """通过 Windows PowerPoint COM 将 .ppt 转换为 .pptx，返回临时文件路径。"""
         if win32com is None:
             raise RuntimeError("pywin32 未安装，无法解析 .ppt，请安装 pywin32 或先手动转为 .pptx")
 
@@ -144,7 +149,7 @@ class DocumentParser:
 
     @staticmethod
     def parse_ppt(file_path: str) -> List[Dict[str, Any]]:
-        """Parse legacy .ppt by converting to .pptx first."""
+        """解析旧版 PPT（先转换为 PPTX 再解析）。"""
         temp_pptx = None
         try:
             temp_pptx = DocumentParser._convert_ppt_to_pptx(file_path)
@@ -161,7 +166,7 @@ class DocumentParser:
 
     @staticmethod
     def parse_document(file_path: str) -> List[Dict[str, Any]]:
-        """Parse document based on file extension."""
+        """根据文件扩展名分派到对应解析逻辑。"""
         ext = os.path.splitext(file_path)[1].lower()
         if ext == '.pdf':
             return DocumentParser.parse_pdf(file_path)

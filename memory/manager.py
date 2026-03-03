@@ -1,10 +1,8 @@
-"""MemoryManager — 统一的记忆管理接口。
-
-Phase 1（简易版）：
-- 情景记忆（EpisodicMemory）：存储每次问答/做题/考试事件，SQLite 关键词检索
-- 用户画像（SemanticMemory 简化版）：薄弱知识点 + 偏好风格，SQLite 存储
-
-Phase 3 可在此基础上替换 search_episodes 为向量检索（复用 rag/embed.py）。
+"""
+【模块说明】
+- 主要作用：提供统一记忆管理接口，封装情景记忆读写与用户画像维护。
+- 核心类：MemoryManager。
+- 核心函数：get_memory_manager（全局单例获取）、save/search/get_profile_context。
 """
 import os
 from typing import List, Dict, Any, Optional
@@ -23,7 +21,7 @@ def _get_store() -> SQLiteMemoryStore:
 
 
 class MemoryManager:
-    """统一记忆管理接口，供 runner / grader / MCP tool 调用。"""
+    """统一记忆管理接口，供 Runner、Grader 与 MCP 工具调用。"""
 
     def __init__(self, user_id: str = "default", store: Optional[SQLiteMemoryStore] = None):
         self.user_id = user_id
