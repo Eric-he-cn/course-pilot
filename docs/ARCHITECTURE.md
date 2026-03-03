@@ -104,18 +104,21 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    IN[用户请求] --> RUN[OrchestrationRunner]
-    RUN --> RT[RouterAgent: 生成 Plan]
-    RT --> DEC{mode + 规则判断}
-    DEC -->|learn| TU[TutorAgent]
-    DEC -->|practice 出题| TU
-    DEC -->|practice 交卷| GR[GraderAgent]
-    DEC -->|exam 三阶段| TU
-    TU --> TOOLS[MCP Tools]
-    GR --> CALC[calculator only]
-    TU --> MEMCTX[memory profile 注入]
-    GR --> MEMCTX
-    RUN --> SAVE[记录 practices/exams + memory]
+    IN["用户请求"] --> RUN["OrchestrationRunner"]
+    RUN --> RT["RouterAgent"]
+    RT --> DEC{"mode 判断"}
+
+    DEC --> LEARN["TutorAgent (learn)"]
+    DEC --> PRACTICE_Q["TutorAgent (practice 出题)"]
+    DEC --> PRACTICE_G["GraderAgent (practice 评卷)"]
+    DEC --> EXAM["TutorAgent (exam 三阶段)"]
+
+    LEARN --> TOOLS["MCP Tools"]
+    PRACTICE_Q --> TOOLS
+    EXAM --> TOOLS
+    PRACTICE_G --> CALC["calculator only"]
+
+    RUN --> SAVE["记录 practices/exams + memory"]
 ```
 
 **B2. 各 Agent 的职责边界**

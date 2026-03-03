@@ -220,12 +220,41 @@ if "show_help" not in st.session_state:
     st.session_state.show_help = False
 
 
+@st.cache_data(ttl=3, show_spinner=False)
+def fetch_workspaces_cached(api_base: str):
+    """Cached workspace list to avoid blocking every rerun."""
+    try:
+        response = requests.get(f"{api_base}/workspaces", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def fetch_workspace_files_cached(api_base: str, course_name: str):
+    """Cached file/index status for a workspace."""
+    fallback = {"files": [], "index_built": False, "index_mtime": None}
+    try:
+        resp = requests.get(f"{api_base}/workspaces/{course_name}/files", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return fallback
+
+
+def invalidate_api_cache():
+    """Clear cached API snapshots after mutating operations."""
+    fetch_workspaces_cached.clear()
+    fetch_workspace_files_cached.clear()
+
+
 def load_workspaces():
     """Load available workspaces."""
     try:
-        response = requests.get(f"{API_BASE}/workspaces")
-        if response.status_code == 200:
-            st.session_state.workspaces = response.json()
+        st.session_state.workspaces = fetch_workspaces_cached(API_BASE)
     except Exception as e:
         st.error(f"加载课程失败: {e}")
 
@@ -239,6 +268,7 @@ def create_workspace(course_name: str, subject: str):
         )
         if response.status_code == 200:
             st.success(f"课程 '{course_name}' 创建成功！")
+            invalidate_api_cache()
             load_workspaces()
             return True
         else:
@@ -276,6 +306,7 @@ def build_index(course_name: str):
         )
         if response.status_code == 200:
             data = response.json()
+            fetch_workspace_files_cached.clear()
             st.success(f"索引构建成功！共 {data['num_chunks']} 个文本块")
             return True
         else:
@@ -401,6 +432,7 @@ with st.sidebar:
     
     # Load workspaces
     if st.button("🔄 刷新课程列表"):
+        fetch_workspaces_cached.clear()
         load_workspaces()
     
     # Create new workspace
@@ -419,6 +451,8 @@ with st.sidebar:
     
     # Select workspace
     st.markdown("### 📖 选择课程")
+    if not st.session_state.workspaces:
+        load_workspaces()
     if st.session_state.workspaces:
         course_names = [w["course_name"] for w in st.session_state.workspaces]
         selected = st.selectbox(
@@ -449,7 +483,7 @@ with st.sidebar:
     
     # Knowledge base management
     if st.session_state.current_course:
-        st.markdown("### � 文件与索引")
+        st.markdown("### 📁 文件与索引")
 
         # ── 上传区 ──────────────────────────────────
         with st.expander("📤 上传资料", expanded=False):
@@ -461,16 +495,12 @@ with st.sidebar:
             )
             if uploaded_file and st.button("⬆ 上传"):
                 if upload_file(st.session_state.current_course, uploaded_file):
+                    fetch_workspace_files_cached.clear()
                     st.success(f"✅ {uploaded_file.name} 上传成功")
-                    st.rerun()
 
         # ── 文件列表 ─────────────────────────────────
         course = st.session_state.current_course
-        try:
-            resp = requests.get(f"{API_BASE}/workspaces/{course}/files", timeout=5)
-            fdata = resp.json() if resp.status_code == 200 else {"files": [], "index_built": False, "index_mtime": None}
-        except Exception:
-            fdata = {"files": [], "index_built": False, "index_mtime": None}
+        fdata = fetch_workspace_files_cached(API_BASE, course)
 
         files = fdata.get("files", [])
         index_built = fdata.get("index_built", False)
@@ -491,6 +521,7 @@ with st.sidebar:
                                 dr = requests.delete(
                                     f"{API_BASE}/workspaces/{course}/files/{f['name']}", timeout=10)
                                 if dr.status_code == 200:
+                                    fetch_workspace_files_cached.clear()
                                     st.success(f"已删除 {f['name']}")
                                     st.rerun()
                                 else:
@@ -518,6 +549,7 @@ with st.sidebar:
                     try:
                         dr = requests.delete(f"{API_BASE}/workspaces/{course}/index", timeout=10)
                         if dr.status_code == 200:
+                            fetch_workspace_files_cached.clear()
                             st.warning("索引已删除")
                             st.rerun()
                         else:
@@ -554,7 +586,6 @@ if st.session_state.current_course:
         with btn_col2:
             if st.button("🗑 清空", use_container_width=True, help="清空当前对话历史"):
                 st.session_state.chat_history = []
-                st.rerun()
 
     # ── 帮助面板（可折叠） ───────────────────────────────────────────────────
     if st.session_state.show_help:
@@ -670,8 +701,6 @@ if st.session_state.current_course:
                 "citations": citations,
                 "mermaid_blocks": mermaid_blocks,
             })
-        
-        st.rerun()
 
 else:
     inject_mode_css("learn")
