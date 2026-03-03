@@ -73,6 +73,34 @@ OrchestrationRunner（Python 调度器）
 | `mindmap_generator` | 生成 Mermaid 思维导图，支持导出 SVG / 3× 高清 PNG / 源码 |
 | `get_datetime` | 返回当前精确日期、时间、星期，避免 LLM 凭训练数据回答时效性问题 |
 
+说明：工具调用路径统一为 `OpenAI tool call -> MCPTools.call_tool -> stdio MCP -> server_stdio.py -> 本地工具实现`，不做本地直调 fallback。
+
+#### MCP 实现细节（当前版本）
+
+**1) 传输与协议**
+- 传输层：本地 `stdio`（`Content-Length` 帧）；
+- 协议子集：`initialize / notifications/initialized / tools/list / tools/call`；
+- 协议版本：`2024-11-05`。
+
+**2) Client 侧（`mcp_tools/client.py`）**
+- `_StdioMCPClient` 作为单例客户端，按需懒启动 `python -m mcp_tools.server_stdio`；
+- 启动后先握手：`initialize`，再发送 `notifications/initialized`；
+- 每次 `tools/call` 使用 JSON-RPC 请求 ID 做请求/响应匹配；
+- 进程异常时自动重连 1 次；进程退出时通过 `atexit` 清理子进程。
+
+**3) Server 侧（`mcp_tools/server_stdio.py`）**
+- `stdout` 仅输出协议帧，业务 `print` 重定向到 `stderr`，避免污染协议通道；
+- `tools/list` 返回由 `_to_mcp_tools()` 转换后的 MCP 工具定义（`name/description/inputSchema`）；
+- `tools/call` 调用 `MCPTools._call_tool_local()` 执行真实工具逻辑并返回结构化结果。
+
+**4) 严格仅 MCP 语义**
+- `MCPTools.call_tool()` 统一走 `mcp_stdio`，不再回退本地直调；
+- 返回体附加 `via: "mcp_stdio"` 便于观测；
+- 通道异常时返回标准错误结构（`success=false` + `error`），由上层 Agent 决定如何继续回答。
+
+**5) 上下文透传**
+- `filewriter` 的 `notes_dir` 由 Runner 注入后，通过 MCP 参数透传给子进程执行，保证写入当前课程目录。
+
 ### 实时流式输出
 
 后端通过 **Server-Sent Events (SSE)** 逐 token 推送，前端 Streamlit 实时渲染，减少等待感。

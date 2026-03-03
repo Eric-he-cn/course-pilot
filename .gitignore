@@ -40,7 +40,11 @@ venv.bak/
 
 # Data
 data/workspaces/
+data/memory/
 *.pdf
+*.db
+*.sqlite
+*.sqlite3
 
 # Documentation files should be included
 !README.md

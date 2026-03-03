@@ -125,9 +125,10 @@ class LLMClient:
                     logger.debug("[tools] execute name=%s args=%s", tool_name, tool_args)
                     tool_result = MCPTools.call_tool(tool_name, **tool_args)
                     logger.info(
-                        "[tools] executed name=%s success=%s elapsed_ms=%.1f",
+                        "[tools] executed name=%s success=%s via=%s elapsed_ms=%.1f",
                         tool_name,
                         bool(tool_result.get("success", False)),
+                        tool_result.get("via", "unknown"),
                         (perf_counter() - t_tool) * 1000,
                     )
                     logger.debug("[tools] result name=%s body=%s", tool_name, str(tool_result)[:300])
@@ -246,9 +247,10 @@ class LLMClient:
                     logger.debug("[stream_tools] execute name=%s args=%s", tool_name, tool_args)
                     tool_result = MCPTools.call_tool(tool_name, **tool_args)
                     logger.info(
-                        "[stream_tools] executed name=%s success=%s elapsed_ms=%.1f",
+                        "[stream_tools] executed name=%s success=%s via=%s elapsed_ms=%.1f",
                         tool_name,
                         bool(tool_result.get("success", False)),
+                        tool_result.get("via", "unknown"),
                         (perf_counter() - t_tool) * 1000,
                     )
                     logger.debug("[stream_tools] result name=%s body=%s", tool_name, str(tool_result)[:300])

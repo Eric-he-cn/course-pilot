@@ -142,7 +142,7 @@ flowchart TD
 
 **C1. MCP 接口层：如何调用工具**
 
-当前项目采用“本地单 MCP Server + stdio”的形态，并保留本地直调 fallback：
+当前项目采用“本地单 MCP Server + stdio”的形态，工具调用严格走 MCP，不做本地直调 fallback。
 
 ```mermaid
 sequenceDiagram
@@ -152,20 +152,47 @@ sequenceDiagram
     participant MCPS as server_stdio.py
     participant LOC as MCPTools._call_tool_local
 
-    LLM->>CLI: tool_name + arguments
+    Note over CLI,MCPC: 首次调用懒启动子进程: python -m mcp_tools.server_stdio
+    MCPC->>MCPS: initialize(protocolVersion=2024-11-05)
+    MCPS-->>MCPC: capabilities/tools + serverInfo
+    MCPC->>MCPS: notifications/initialized
     CLI->>MCPC: JSON-RPC tools/call (stdio)
     MCPC->>MCPS: Content-Length framing
     MCPS->>LOC: 执行具体工具逻辑
     LOC-->>MCPS: 结果 JSON
     MCPS-->>MCPC: MCP result
     MCPC-->>CLI: 结构化结果
-    Note over CLI: 若 stdio 调用失败，自动 fallback 到 LOC
+    Note over MCPC: IO 异常自动重连 1 次
+    Note over CLI: 失败返回 success=false, via=mcp_stdio
 ```
 
 **接口实现要点**
-- `mcp_tools/server_stdio.py`：实现 `initialize / tools/list / tools/call` 最小 MCP 子集。
-- `mcp_tools/client.py`：`_StdioMCPClient` 负责子进程、请求 ID、帧协议与响应解析。
-- 失败降级：`call_tool()` 在 stdio 异常时回退 `_call_tool_local()`，保证主流程可用性。
+- `mcp_tools/client.py::_StdioMCPClient`
+  - 负责子进程生命周期（懒启动、复用、关闭）；
+  - 负责 `Content-Length` 帧读写、JSON-RPC id 匹配、超时控制；
+  - 首次握手执行 `initialize -> notifications/initialized`；
+  - 通道异常时自动重连 1 次。
+- `mcp_tools/server_stdio.py`
+  - 实现 `initialize / notifications/initialized / tools/list / tools/call`；
+  - `stdout` 仅输出协议帧，`print` 重定向到 `stderr`；
+  - 参数类型异常返回 `-32602`，未知方法返回 `-32601`，服务异常返回 `-32000`。
+- `mcp_tools/client.py::_to_mcp_tools`
+  - 将 OpenAI function schema 转为 MCP `tools/list` 结构：
+  - 字段：`name` / `description` / `inputSchema`。
+- `MCPTools.call_tool()`
+  - 强制通过 MCP 调用；
+  - 返回体统一补充 `via: "mcp_stdio"`；
+  - 失败时只返回错误结构，不会执行本地 fallback。
+
+**C1.1 上下文透传（filewriter）**
+- 主进程 Runner 注入 `MCPTools._context["notes_dir"]`；
+- 调用 `filewriter` 时将 `notes_dir` 作为 arguments 透传给 MCP server；
+- 子进程中的本地工具实现据此写入当前课程目录，避免写到默认路径。
+
+**C1.2 为什么这样设计**
+- 统一工具执行通道：便于审计、观测与故障定位（日志可统一追踪 `via=mcp_stdio`）；
+- 协议边界清晰：工具能力在 server 侧，本地业务可逐步替换为远程 MCP 服务；
+- 失败行为可预期：严格仅 MCP，避免“有时走协议、有时本地直调”的不一致。
 
 **C2. MCP 工具层：具体能力与约束**
 

@@ -70,7 +70,18 @@ def _err(req_id: Any, code: int, message: str) -> Dict[str, Any]:
 def _handle_request(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     method = msg.get("method", "")
     req_id = msg.get("id")
-    params = msg.get("params") or {}
+    params_raw = msg.get("params")
+    if params_raw is None:
+        params = {}
+    elif isinstance(params_raw, dict):
+        params = params_raw
+    else:
+        if req_id is None:
+            return None
+        return _err(req_id, -32602, "Invalid params: params must be object")
+
+    if method == "notifications/initialized":
+        return None
 
     # Notification: no response required.
     if req_id is None:

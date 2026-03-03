@@ -1,10 +1,15 @@
 """MCP Tools - Calculator, WebSearch (SerpAPI), FileWriter with OpenAI tool schemas."""
+import atexit
 import json
-import os
 import math
+import os
+import subprocess
 import statistics
+import sys
+import threading
+import time
 import requests
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 
 # ── OpenAI Function Calling Schema 定义 ─────────────────────────────────────
@@ -164,6 +169,333 @@ TOOL_SCHEMAS = [
     }
 ]
 
+_MCP_PROTOCOL_VERSION = "2024-11-05"
+_MCP_CLIENT: Optional["_StdioMCPClient"] = None
+_MCP_CLIENT_LOCK = threading.Lock()
+
+
+class _MCPTransportError(RuntimeError):
+    """Transport/protocol error while talking to local stdio MCP server."""
+
+
+def _read_framed_message(stream) -> Optional[Dict[str, Any]]:
+    """Read one Content-Length framed JSON message."""
+    headers: Dict[str, str] = {}
+    while True:
+        line = stream.readline()
+        if line == b"":
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        decoded = line.decode("ascii", errors="replace").strip()
+        if ":" in decoded:
+            key, value = decoded.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
+    length_raw = headers.get("content-length", "")
+    if not length_raw:
+        raise _MCPTransportError("Missing Content-Length header")
+    try:
+        length = int(length_raw)
+    except ValueError as ex:
+        raise _MCPTransportError(f"Invalid Content-Length: {length_raw}") from ex
+    if length < 0:
+        raise _MCPTransportError(f"Negative Content-Length: {length}")
+
+    payload = stream.read(length)
+    if len(payload) != length:
+        raise _MCPTransportError("Incomplete payload from MCP server")
+    try:
+        msg = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as ex:
+        raise _MCPTransportError(f"Invalid JSON payload: {ex}") from ex
+    if not isinstance(msg, dict):
+        raise _MCPTransportError("MCP payload is not a JSON object")
+    return msg
+
+
+class _StdioMCPClient:
+    """Minimal MCP stdio client for initialize/tools/list/tools/call."""
+
+    def __init__(
+        self,
+        server_module: str = "mcp_tools.server_stdio",
+        request_timeout: float = 20.0,
+    ):
+        self.server_module = server_module
+        self.request_timeout = float(request_timeout)
+        self.python_executable = os.getenv("MCP_PYTHON_BIN") or sys.executable or "python"
+        self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self._proc: Optional[subprocess.Popen] = None
+        self._next_request_id = 0
+        self._initialized = False
+        self._lock = threading.RLock()
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._initialized = False
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _is_alive_locked(self) -> bool:
+        return (
+            self._proc is not None
+            and self._proc.poll() is None
+            and self._proc.stdin is not None
+            and self._proc.stdout is not None
+        )
+
+    def _spawn_locked(self) -> None:
+        self._close_locked()
+        try:
+            self._proc = subprocess.Popen(
+                [self.python_executable, "-m", self.server_module],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,  # inherit parent stderr for diagnostics
+                cwd=self.project_root,
+                bufsize=0,
+            )
+        except Exception as ex:
+            raise _MCPTransportError(f"Failed to start MCP server: {ex}") from ex
+        self._initialized = False
+
+    def _next_id_locked(self) -> int:
+        self._next_request_id += 1
+        return self._next_request_id
+
+    def _write_message_locked(self, msg: Dict[str, Any]) -> None:
+        if not self._is_alive_locked():
+            raise _MCPTransportError("MCP server process is not running")
+        assert self._proc is not None and self._proc.stdin is not None
+        body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        try:
+            self._proc.stdin.write(header)
+            self._proc.stdin.write(body)
+            self._proc.stdin.flush()
+        except Exception as ex:
+            raise _MCPTransportError(f"Failed to write MCP message: {ex}") from ex
+
+    def _read_one_message_locked(self, timeout: float) -> Dict[str, Any]:
+        if not self._is_alive_locked():
+            raise _MCPTransportError("MCP server process is not running")
+        assert self._proc is not None and self._proc.stdout is not None
+
+        holder: Dict[str, Any] = {}
+        err_holder: Dict[str, Exception] = {}
+
+        def _reader() -> None:
+            try:
+                holder["msg"] = _read_framed_message(self._proc.stdout)
+            except Exception as ex:
+                err_holder["err"] = ex
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            raise _MCPTransportError(f"Timed out waiting MCP response ({timeout:.1f}s)")
+        if "err" in err_holder:
+            ex = err_holder["err"]
+            if isinstance(ex, _MCPTransportError):
+                raise ex
+            raise _MCPTransportError(f"Failed to read MCP response: {ex}") from ex
+        msg = holder.get("msg")
+        if msg is None:
+            raise _MCPTransportError("MCP server closed stdout")
+        return msg
+
+    def _wait_response_locked(self, req_id: int) -> Dict[str, Any]:
+        deadline = time.monotonic() + self.request_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _MCPTransportError("Timed out waiting matching MCP response id")
+            msg = self._read_one_message_locked(timeout=remaining)
+            if msg.get("id") == req_id:
+                return msg
+
+    def _ensure_ready_locked(self) -> None:
+        if not self._is_alive_locked():
+            self._spawn_locked()
+        if not self._initialized:
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
+        req_id = self._next_id_locked()
+        initialize_msg = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": _MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "clientInfo": {"name": "coursepilot-local-client", "version": "0.1.0"},
+            },
+        }
+        self._write_message_locked(initialize_msg)
+        response = self._wait_response_locked(req_id)
+        if "error" in response:
+            err = response.get("error") or {}
+            code = err.get("code")
+            message = err.get("message", "unknown error")
+            raise _MCPTransportError(f"MCP initialize failed ({code}): {message}")
+
+        self._write_message_locked(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            }
+        )
+        self._initialized = True
+
+    def _restart(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def _rpc_once(self, method: str, params: Optional[Dict[str, Any]], is_notification: bool) -> Dict[str, Any]:
+        with self._lock:
+            self._ensure_ready_locked()
+            if is_notification:
+                payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+                self._write_message_locked(payload)
+                return {}
+
+            req_id = self._next_id_locked()
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": method,
+                "params": params or {},
+            }
+            self._write_message_locked(payload)
+            return self._wait_response_locked(req_id)
+
+    def rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        for attempt in range(2):
+            try:
+                return self._rpc_once(method, params, is_notification=False)
+            except _MCPTransportError:
+                if attempt == 1:
+                    raise
+                self._restart()
+        raise _MCPTransportError("Unreachable retry state")
+
+    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        for attempt in range(2):
+            try:
+                self._rpc_once(method, params, is_notification=True)
+                return
+            except _MCPTransportError:
+                if attempt == 1:
+                    raise
+                self._restart()
+
+    def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        resp = self.rpc("tools/call", {"name": tool_name, "arguments": arguments or {}})
+        if "error" in resp:
+            err = resp.get("error") or {}
+            code = err.get("code")
+            message = err.get("message", "unknown error")
+            raise RuntimeError(f"MCP tools/call failed ({code}): {message}")
+
+        result = resp.get("result") or {}
+        content = result.get("content") or []
+        text_payload = ""
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_payload = item.get("text", "")
+                break
+        if not text_payload:
+            return {
+                "tool": tool_name,
+                "error": "MCP 返回缺少文本内容",
+                "success": False,
+                "via": "mcp_stdio",
+            }
+
+        try:
+            parsed = json.loads(text_payload)
+        except json.JSONDecodeError as ex:
+            return {
+                "tool": tool_name,
+                "error": f"MCP 返回的 tool payload 不是合法 JSON: {ex}",
+                "success": False,
+                "via": "mcp_stdio",
+            }
+        if not isinstance(parsed, dict):
+            return {
+                "tool": tool_name,
+                "error": "MCP 返回的 tool payload 不是对象",
+                "success": False,
+                "via": "mcp_stdio",
+            }
+
+        parsed.setdefault("tool", tool_name)
+        if "success" not in parsed:
+            parsed["success"] = not bool(result.get("isError", False))
+        parsed["via"] = "mcp_stdio"
+        return parsed
+
+
+def _to_mcp_tools() -> List[Dict[str, Any]]:
+    """Convert OpenAI function schemas to MCP tools/list response shape."""
+    mcp_tools: List[Dict[str, Any]] = []
+    for schema in TOOL_SCHEMAS:
+        fn = schema.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        input_schema = fn.get("parameters") or {"type": "object", "properties": {}}
+        mcp_tools.append(
+            {
+                "name": name,
+                "description": fn.get("description", ""),
+                "inputSchema": input_schema,
+            }
+        )
+    return mcp_tools
+
+
+def _get_mcp_client() -> _StdioMCPClient:
+    global _MCP_CLIENT
+    with _MCP_CLIENT_LOCK:
+        if _MCP_CLIENT is None:
+            _MCP_CLIENT = _StdioMCPClient()
+        return _MCP_CLIENT
+
+
+def _shutdown_mcp_client() -> None:
+    global _MCP_CLIENT
+    with _MCP_CLIENT_LOCK:
+        if _MCP_CLIENT is not None:
+            _MCP_CLIENT.close()
+            _MCP_CLIENT = None
+
+
+atexit.register(_shutdown_mcp_client)
+
 
 def get_tool_schemas(allowed_tools: List[str]) -> List[Dict]:
     """根据允许的工具名列表筛选 schema。"""
@@ -203,6 +535,33 @@ class MCPTools:
             def _pstdev(data): return statistics.pstdev(data)
             def _pvariance(data): return statistics.pvariance(data)
             def _mode(data): return statistics.mode(data)
+            # 兼容低版本 Python（math.comb/perm/lcm 可能不存在）
+            def _comb(n, k):
+                if hasattr(math, "comb"):
+                    return math.comb(n, k)
+                n = int(n)
+                k = int(k)
+                if n < 0 or k < 0 or k > n:
+                    raise ValueError("n and k must satisfy n>=0 and 0<=k<=n")
+                return math.factorial(n) // (math.factorial(k) * math.factorial(n - k))
+
+            def _perm(n, k=None):
+                if hasattr(math, "perm"):
+                    return math.perm(n, k) if k is not None else math.perm(n)
+                n = int(n)
+                k = int(n if k is None else k)
+                if n < 0 or k < 0 or k > n:
+                    raise ValueError("n and k must satisfy n>=0 and 0<=k<=n")
+                return math.factorial(n) // math.factorial(n - k)
+
+            def _lcm(a, b):
+                if hasattr(math, "lcm"):
+                    return math.lcm(a, b)
+                a = int(a)
+                b = int(b)
+                if a == 0 or b == 0:
+                    return 0
+                return abs(a * b) // math.gcd(a, b)
 
             safe_globals = {
                 "__builtins__": {},
@@ -224,12 +583,13 @@ class MCPTools:
                 "round": round, "trunc": math.trunc,
                 # 组合数学
                 "factorial": math.factorial,
-                "comb": math.comb,   # C(n,k) = nCr
-                "perm": math.perm,   # P(n,k) = nPr
-                "gcd": math.gcd, "lcm": math.lcm,
+                "comb": _comb,   # C(n,k) = nCr
+                "perm": _perm,   # P(n,k) = nPr
+                "gcd": math.gcd, "lcm": _lcm,
                 # 几何/向量
                 "hypot": math.hypot,
-                "fmod": math.fmod, "remainder": math.remainder,
+                "fmod": math.fmod,
+                "remainder": getattr(math, "remainder", math.fmod),
                 # 统计
                 "mean": _mean, "median": _median,
                 "stdev": _stdev, "variance": _variance,
@@ -459,8 +819,8 @@ class MCPTools:
             return {"tool": "memory_search", "error": str(ex), "success": False}
 
     @staticmethod
-    def call_tool(tool_name: str, **kwargs) -> Dict[str, Any]:
-        """按名称调用工具。"""
+    def _call_tool_local(tool_name: str, **kwargs) -> Dict[str, Any]:
+        """按名称执行本地工具实现（仅供 MCP server 端调用）。"""
         if tool_name == "calculator":
             return MCPTools.calculator(kwargs.get("expression", ""))
         elif tool_name == "websearch":
@@ -480,7 +840,7 @@ class MCPTools:
         elif tool_name == "get_datetime":
             return MCPTools.get_datetime(kwargs.get("timezone"))
         elif tool_name == "filewriter":
-            notes_dir = MCPTools._context.get("notes_dir", "./data/notes")
+            notes_dir = kwargs.get("notes_dir") or MCPTools._context.get("notes_dir", "./data/notes")
             return MCPTools.filewriter(
                 filename=kwargs.get("filename", "note.md"),
                 content=kwargs.get("content", ""),
@@ -489,3 +849,25 @@ class MCPTools:
             )
         else:
             return {"tool": tool_name, "error": f"未知工具: {tool_name}", "success": False}
+
+    @staticmethod
+    def call_tool(tool_name: str, **kwargs) -> Dict[str, Any]:
+        """按名称调用工具（严格经由 stdio MCP，不做本地 fallback）。"""
+        payload = dict(kwargs)
+        # filewriter 的 notes_dir 由 runner 注入上下文；通过 MCP 参数透传给子进程。
+        if tool_name == "filewriter" and "notes_dir" not in payload:
+            payload["notes_dir"] = MCPTools._context.get("notes_dir", "./data/notes")
+
+        try:
+            result = _get_mcp_client().call_tool(tool_name, payload)
+            if isinstance(result, dict):
+                result.setdefault("tool", tool_name)
+                result.setdefault("via", "mcp_stdio")
+            return result
+        except Exception as ex:
+            return {
+                "tool": tool_name,
+                "error": f"MCP 调用失败: {ex}",
+                "success": False,
+                "via": "mcp_stdio",
+            }

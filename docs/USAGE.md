@@ -267,6 +267,7 @@ data/workspaces/<课程名>/practices/practice_YYYYMMDD_HHMMSS.json
 ## 7. MCP 工具使用
 
 工具由 AI 自动调用，用户无需手动触发，了解其能力有助于更好地提问。
+当前版本的工具执行统一走本地 `stdio MCP` 链路；若 MCP 通道异常，会返回工具错误，不会退回本地直调。
 
 ### 7.1 计算器
 
