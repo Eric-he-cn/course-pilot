@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -44,12 +44,9 @@ data/workspaces/
 
 # Documentation files should be included
 !README.md
-!USAGE.md
-!ARCHITECTURE.md
-!CONTRIBUTING.md
+!docs/*.md
 !tests/*.txt
 !tests/*.md
-
 # Logs
 *.log
 logs/
@@ -66,3 +63,4 @@ htmlcov/
 # Temporary files
 tmp/
 temp/
+

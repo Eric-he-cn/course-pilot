@@ -1,4 +1,4 @@
-# CoursePilot — 大学课程学习 Agent（Multi-Agent + RAG + MCP）
+﻿# CoursePilot — 大学课程学习 Agent（Multi-Agent + RAG + MCP）
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue.svg) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg) ![Streamlit](https://img.shields.io/badge/Streamlit-1.31-red.svg) ![LLM](https://img.shields.io/badge/LLM-DeepSeek%20Chat%20%7C%20OpenAI-blueviolet.svg) ![FAISS](https://img.shields.io/badge/Vector%20DB-FAISS-orange.svg) ![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
 

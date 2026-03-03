@@ -55,68 +55,147 @@
 
 #### A. RAG 系统 (rag/)
 
-**功能**: 文档检索增强生成
+RAG 在本项目里不是“可选增强”，而是回答可信度的核心基础设施。它承担两个职责：
+1. 把课程资料转为可检索知识索引。
+2. 在对话时返回带出处的上下文，供 LLM 进行有依据生成。
 
-**流程**:
+**A1. 离线建库链路（上传资料后触发）**
+
+```mermaid
+flowchart LR
+    U[上传文件 PDF/TXT/MD/DOCX/PPTX/PPT] --> I[ingest.py 解析文本与页码]
+    I --> C[chunk.py 分块 chunk_size / overlap]
+    C --> E[embed.py 生成向量]
+    E --> F[store_faiss.py 写入 FAISS + 元数据]
+    F --> IDX[(workspace/index/faiss_index.faiss + .pkl)]
 ```
-PDF/TXT/MD/DOCX/PPTX/PPT → 解析 → 分块 → Embedding → FAISS 索引
-                                          ↓
-用户查询 → Embedding → 相似度检索 → Top-K 结果 → 带引用的上下文
+
+**A2. 在线检索链路（每次问答按需触发）**
+
+```mermaid
+flowchart LR
+    Q[用户问题] --> QE[同一嵌入模型编码查询]
+    QE --> R[retrieve.py 相似度检索 Top-K]
+    R --> X[格式化上下文 + doc_id/page/score]
+    X --> LLM[注入 Prompt 给 Tutor/Grader]
+    LLM --> OUT[生成回答并附引用]
 ```
 
-**关键文件**:
-- `ingest.py`: 文档解析 (支持 PDF, TXT, MD, DOCX, PPTX, PPT)
-- `chunk.py`: 文本分块 (滑窗 + overlap)
-- `embed.py`: 向量嵌入 (Sentence Transformers)
-- `store_faiss.py`: FAISS 向量存储（平铺文件 `.faiss` + `.pkl`，线程锁保护）
-- `retrieve.py`: 检索 + 引用生成
+**A3. 关键实现细节**
+- 文档解析层：`ingest.py` 负责多格式统一抽取，保留页码/来源信息，供引用回传使用。
+- 分块层：`chunk.py` 使用滑窗重叠，避免知识点跨块断裂；`overlap` 主要用于提升召回完整性。
+- 嵌入层：`embed.py` 使用 `BAAI/bge-base-zh-v1.5`，并支持 `cuda/cpu/auto`。
+- 索引层：`store_faiss.py` 将向量与元数据落盘；检索时读取 `.faiss + .pkl` 形成可回溯上下文。
+- 检索层：`retrieve.py` 输出不仅是文本片段，还包含 `doc_id/page/score`，为“证据式回答”提供基础。
 
-#### B. Agent 系统 (core/agents/)
+**A4. 性能与正确性权衡**
+- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升。
+- `chunk_size` 越大，上下文语义更完整但定位更粗；越小则相反。
+- 当前是“向量召回 + LLM 综合”模式，不是固定模板拼接，因此引用与解释能兼顾可读性。
 
-**Router Agent** (router.py)
-- 职责：分析用户请求，制定执行计划（每次请求的第一个 LLM 调用）
-- 输入：用户消息、模式、课程信息、用户学习档案（薄弱知识点）
-- 输出：`Plan` 对象（`need_rag`、`style` 字段有效；工具列表由 `policies.py` 硬编码覆盖）
-- **实际局限**：`allowed_tools` 和 `task_type` 被 Runner 强制覆盖，LLM 只有效影响 `need_rag` 和 `style`
+#### B. Multi-Agent 系统 (core/agents/)
 
-**Tutor Agent** (tutor.py)
-- 职责：学习讲解 / 练习出题 / 考试三阶段（所有非评卷场景）
-- 输入：问题 + RAG 上下文 + 对话历史 + system_prompt_override + user_content_override
-- 输出：流式文本（ReAct 循环，多轮工具调用）
-- 特点：接受 system/user prompt 完全覆盖，让同一个 Agent 适配三种模式；注入用户薄弱知识点画像
-- 工具（学习/练习出题）：全部 6 个；工具（考试）：calculator · memory_search · get_datetime
+本项目的 Multi-Agent 本质是“中心编排 + 专职 Agent”：
+- 编排者是 `OrchestrationRunner`（Python 决策与路由）。
+- Router/Tutor/Grader 分别负责规划、教学/出题/考试、评卷。
+- Agent 不是并行自治群体，而是受 Runner 控制的可替换执行单元。
 
-**Grader Agent** (grader.py) — 练习评卷专用
-- 职责：仅在检测到答案提交时由 Runner 路由调用，专职评卷
-- 输入：题目原文（从对话历史提取） + 学生答案原文 + 历史错题上下文
-- 输出：流式文本（逐题对照表 + calculator 得分 + 讲评）
-- ReAct 规则：第1轮必须逐字引用双方答案再判断对错；第2轮必须 call calculator；第3轮输出结果
-- Temperature=0.1（评判高确定性）；仅开放 calculator 工具
+**B1. 控制流总图**
 
-**QuizMaster Agent** (quizmaster.py) — 当前未启用
-- 保留代码，预埋扩展接口；主流程不调用，出题功能由 TutorAgent 承担
-
-#### C. MCP 工具 (mcp_tools/)
-
-**工具集**:
-
-| 工具 | 学习 | 练习出题 | 练习评卷 | 考试 | 功能 |
-|------|:----:|:------:|:------:|:----:|------|
-| `calculator` | ✅ | ✅ | ✅（必须） | ✅（必须） | 数学计算（math/statistics/组合数学/双曲函数/单位换算） |
-| `websearch` | ✅ | ✅ | ❌ | ❌ | SerpAPI 网页搜索 |
-| `filewriter` | ✅ | ✅ | ❌ | ❌ | 写入 `notes/` 笔记（`.md` 格式） |
-| `memory_search` | ✅ | ✅ | ❌ | ✅ | 检索历史练习/错题，自动强化薄弱点 |
-| `mindmap_generator` | ✅ | ✅ | ❌ | ❌ | 生成 Mermaid 思维导图，支持 SVG/PNG 导出 |
-| `get_datetime` | ✅ | ✅ | ❌ | ✅ | 查询精确日期时间，避免 LLM 凭训练数据猜测 |
-
-> 练习评卷由 GraderAgent 独立处理，仅开放 calculator，确保评判聚焦、结果确定。
-
-**工具策略** (policies.py)：
-```python
-# 所有模式共享全部工具集（policies.py commit 91783f2）
-# 工具的实际使用范围由各 Agent 的 system prompt 约束
-ALL_TOOLS = ["calculator", "websearch", "filewriter", "memory_search", "mindmap_generator", "get_datetime"]
+```mermaid
+flowchart TD
+    IN[用户请求] --> RUN[OrchestrationRunner]
+    RUN --> RT[RouterAgent: 生成 Plan]
+    RT --> DEC{mode + 规则判断}
+    DEC -->|learn| TU[TutorAgent]
+    DEC -->|practice 出题| TU
+    DEC -->|practice 交卷| GR[GraderAgent]
+    DEC -->|exam 三阶段| TU
+    TU --> TOOLS[MCP Tools]
+    GR --> CALC[calculator only]
+    TU --> MEMCTX[memory profile 注入]
+    GR --> MEMCTX
+    RUN --> SAVE[记录 practices/exams + memory]
 ```
+
+**B2. 各 Agent 的职责边界**
+- Router (`router.py`)：把自然语言请求映射为 `Plan`（是否需要 RAG、回答风格等）；是每轮第一个 LLM 调用。
+- Tutor (`tutor.py`)：统一承载学习讲解、练习出题、考试流程；通过 `system_prompt_override/user_content_override` 适配不同模式。
+- Grader (`grader.py`)：仅用于练习评卷；提示词和工具权限更严格，输出确定性优先。
+
+**B3. Runner 的“强约束”机制**
+- 工具权限最终由 `policies.py` 与 Runner 决定，不完全信任 Router 产出的 `allowed_tools`。
+- 练习模式通过 `_is_answer_submission()` 进行分支，避免“用户提交答案却继续出题”。
+- 评卷链路将题目原文与学生答案原文一起输入，降低幻觉评分概率。
+
+**B4. 为什么这样设计**
+- 保持“LLM 做语言推理，Python 做流程控制”的可控性。
+- 降低提示词漂移导致的流程失控风险。
+- 便于做日志追踪和故障定位（router/rag/tools/stream 各阶段可观测）。
+
+#### C. MCP 接口与工具系统 (mcp_tools/)
+
+这一层建议分成两部分理解：接口层（MCP 协议）与能力层（具体工具实现）。
+
+**C1. MCP 接口层：如何调用工具**
+
+当前项目采用“本地单 MCP Server + stdio”的形态，并保留本地直调 fallback：
+
+```mermaid
+sequenceDiagram
+    participant LLM as LLM Function Call
+    participant CLI as MCPTools.call_tool
+    participant MCPC as _StdioMCPClient
+    participant MCPS as server_stdio.py
+    participant LOC as MCPTools._call_tool_local
+
+    LLM->>CLI: tool_name + arguments
+    CLI->>MCPC: JSON-RPC tools/call (stdio)
+    MCPC->>MCPS: Content-Length framing
+    MCPS->>LOC: 执行具体工具逻辑
+    LOC-->>MCPS: 结果 JSON
+    MCPS-->>MCPC: MCP result
+    MCPC-->>CLI: 结构化结果
+    Note over CLI: 若 stdio 调用失败，自动 fallback 到 LOC
+```
+
+**接口实现要点**
+- `mcp_tools/server_stdio.py`：实现 `initialize / tools/list / tools/call` 最小 MCP 子集。
+- `mcp_tools/client.py`：`_StdioMCPClient` 负责子进程、请求 ID、帧协议与响应解析。
+- 失败降级：`call_tool()` 在 stdio 异常时回退 `_call_tool_local()`，保证主流程可用性。
+
+**C2. MCP 工具层：具体能力与约束**
+
+```mermaid
+flowchart LR
+    TOOLREQ[Tool Call] --> POLICY[模式与提示词约束]
+    POLICY --> T1[calculator]
+    POLICY --> T2[websearch]
+    POLICY --> T3[filewriter]
+    POLICY --> T4[memory_search]
+    POLICY --> T5[mindmap_generator]
+    POLICY --> T6[get_datetime]
+    T1 --> RES[统一 JSON 结果 success/error]
+    T2 --> RES
+    T3 --> RES
+    T4 --> RES
+    T5 --> RES
+    T6 --> RES
+```
+
+**工具执行语义**
+- `calculator`：确定性计算工具，评卷链路必须调用，避免心算误差。
+- `websearch`：远程信息补充，主要用于学习/出题，不进入考试评卷。
+- `filewriter`：写入课程 `notes/`，路径由 Runner 注入上下文控制。
+- `memory_search`：检索历史问答/错题，强化个性化教学与复习建议。
+- `mindmap_generator`：生成 Mermaid 代码，前端渲染并支持导出。
+- `get_datetime`：时效信息由工具提供，避免模型“记忆型时间错误”。
+
+**C3. 工具权限模型**
+- “能不能调工具”由两层共同决定：
+1. `policies.py` 的允许集合。
+2. 各 Agent system prompt 的行为规则（尤其是考试与评卷阶段）。
+- 练习评卷阶段额外收紧：由 GraderAgent 专线处理，工具仅 `calculator`。
 
 #### D. 记忆系统 (memory/)
 

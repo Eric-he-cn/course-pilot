@@ -1,7 +1,9 @@
 """Core LLM client with OpenAI-compatible interface."""
 import os
 import json
+import logging
 from typing import List, Dict, Any, Optional
+from time import perf_counter
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -54,20 +56,20 @@ class LLMClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """带 Function Calling 的对话，支持多轮工具调用直到 LLM 停止请求工具。"""
-        import logging
-        logger = logging.getLogger("chat_with_tools")
+        logger = logging.getLogger("llm.tools")
         from mcp_tools.client import MCPTools
 
         if not tools:
             return self.chat(messages, temperature, max_tokens)
 
         tool_names = [t["function"]["name"] for t in tools]
-        logger.info(f"[Tools] 可用工具: {tool_names}")
+        logger.info("[tools] call.start tools=%s", tool_names)
         messages = list(messages)
         max_rounds = 6  # 最多 6 轮工具调用，防止死循环
 
         try:
             for round_idx in range(max_rounds):
+                t_llm = perf_counter()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
@@ -80,11 +82,20 @@ class LLMClient:
 
                 # LLM 不再调用工具，返回最终答案
                 if not msg.tool_calls:
-                    logger.info(f"[Tools] 第 {round_idx+1} 轮：LLM 完成回答，未请求更多工具")
+                    logger.info(
+                        "[tools] round=%d no_more_tool_calls llm_ms=%.1f",
+                        round_idx + 1,
+                        (perf_counter() - t_llm) * 1000,
+                    )
                     return msg.content or ""
 
-                logger.info(f"[Tools] 第 {round_idx+1} 轮：LLM 请求调用工具: "
-                            f"{[tc.function.name for tc in msg.tool_calls]}")
+                requested = [tc.function.name for tc in msg.tool_calls]
+                logger.info(
+                    "[tools] round=%d requested=%s llm_ms=%.1f",
+                    round_idx + 1,
+                    requested,
+                    (perf_counter() - t_llm) * 1000,
+                )
 
                 # 把 assistant 消息加入历史
                 messages.append({
@@ -110,9 +121,16 @@ class LLMClient:
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
-                    logger.info(f"[Tools] 执行工具 '{tool_name}'，参数: {tool_args}")
+                    t_tool = perf_counter()
+                    logger.debug("[tools] execute name=%s args=%s", tool_name, tool_args)
                     tool_result = MCPTools.call_tool(tool_name, **tool_args)
-                    logger.info(f"[Tools] 工具 '{tool_name}' 结果: {str(tool_result)[:300]}")
+                    logger.info(
+                        "[tools] executed name=%s success=%s elapsed_ms=%.1f",
+                        tool_name,
+                        bool(tool_result.get("success", False)),
+                        (perf_counter() - t_tool) * 1000,
+                    )
+                    logger.debug("[tools] result name=%s body=%s", tool_name, str(tool_result)[:300])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -120,7 +138,7 @@ class LLMClient:
                     })
 
             # 超过最大轮数，做一次不带工具的最终调用
-            logger.warning("[Tools] 已达最大工具调用轮数，强制生成最终回答")
+            logger.warning("[tools] max_rounds_reached=%d force_final_completion=1", max_rounds)
             final = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -130,7 +148,7 @@ class LLMClient:
             return final.choices[0].message.content or ""
 
         except Exception as e:
-            print(f"[chat_with_tools] 工具调用失败，降级为普通对话: {e}")
+            logger.exception("[tools] call.error fallback_to_plain_chat=1")
             return self.chat(messages, temperature, max_tokens)
 
     def chat_stream(
@@ -162,8 +180,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
     ):
         """工具调用（非流式）后，将最终回答流式输出，返回生成器。"""
-        import logging
-        logger = logging.getLogger("chat_stream_with_tools")
+        logger = logging.getLogger("llm.stream_tools")
         from mcp_tools.client import MCPTools
 
         if not tools:
@@ -171,12 +188,13 @@ class LLMClient:
             return
 
         tool_names = [t["function"]["name"] for t in tools]
-        logger.info(f"[StreamTools] 可用工具: {tool_names}")
+        logger.info("[stream_tools] call.start tools=%s", tool_names)
         messages = list(messages)
         max_rounds = 6
 
         try:
             for round_idx in range(max_rounds):
+                t_llm = perf_counter()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
@@ -188,13 +206,22 @@ class LLMClient:
                 msg = response.choices[0].message
 
                 if not msg.tool_calls:
-                    logger.info(f"[StreamTools] 第 {round_idx+1} 轮：工具调用完毕，开始流式输出")
+                    logger.info(
+                        "[stream_tools] round=%d no_more_tool_calls llm_ms=%.1f start_stream=1",
+                        round_idx + 1,
+                        (perf_counter() - t_llm) * 1000,
+                    )
                     # 工具调用结束，用当前 messages 做流式最终回答
                     yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
                     return
 
-                logger.info(f"[StreamTools] 第 {round_idx+1} 轮：调用工具 "
-                            f"{[tc.function.name for tc in msg.tool_calls]}")
+                requested = [tc.function.name for tc in msg.tool_calls]
+                logger.info(
+                    "[stream_tools] round=%d requested=%s llm_ms=%.1f",
+                    round_idx + 1,
+                    requested,
+                    (perf_counter() - t_llm) * 1000,
+                )
 
                 messages.append({
                     "role": "assistant",
@@ -215,20 +242,27 @@ class LLMClient:
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
-                    logger.info(f"[StreamTools] 执行工具 '{tool_name}'，参数: {tool_args}")
+                    t_tool = perf_counter()
+                    logger.debug("[stream_tools] execute name=%s args=%s", tool_name, tool_args)
                     tool_result = MCPTools.call_tool(tool_name, **tool_args)
-                    logger.info(f"[StreamTools] 工具 '{tool_name}' 结果: {str(tool_result)[:300]}")
+                    logger.info(
+                        "[stream_tools] executed name=%s success=%s elapsed_ms=%.1f",
+                        tool_name,
+                        bool(tool_result.get("success", False)),
+                        (perf_counter() - t_tool) * 1000,
+                    )
+                    logger.debug("[stream_tools] result name=%s body=%s", tool_name, str(tool_result)[:300])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": json.dumps(tool_result, ensure_ascii=False)
                     })
 
-            logger.warning("[StreamTools] 已达最大工具调用轮数，流式输出最终回答")
+            logger.warning("[stream_tools] max_rounds_reached=%d force_stream_final=1", max_rounds)
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
 
         except Exception as e:
-            logger.error(f"[StreamTools] 流式工具调用失败: {e}")
+            logger.exception("[stream_tools] call.error fallback_to_stream_plain=1")
             yield f"（工具调用出错，降级回答）\n"
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
 

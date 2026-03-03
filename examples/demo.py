@@ -1,4 +1,4 @@
-"""
+﻿"""
 Demo script showing how to use the Course Learning Agent system.
 
 This script demonstrates:
@@ -13,7 +13,7 @@ import sys
 # Note: This is a demonstration script. To actually run it:
 # 1. Install dependencies: pip install -r requirements.txt
 # 2. Configure .env with your API key
-# 3. Run: python demo.py
+# 3. Run: python examples/demo.py
 
 
 def demo_workflow():
@@ -25,7 +25,7 @@ def demo_workflow():
     print()
     
     # Step 1: Setup
-    print("📋 Step 1: Initial Setup")
+    print("馃搵 Step 1: Initial Setup")
     print("-" * 70)
     print("1. Clone the repository")
     print("2. Install dependencies: pip install -r requirements.txt")
@@ -33,39 +33,39 @@ def demo_workflow():
     print()
     
     # Step 2: Start services
-    print("🚀 Step 2: Start Services")
+    print("馃殌 Step 2: Start Services")
     print("-" * 70)
     print("Terminal 1: python backend/api.py")
     print("Terminal 2: streamlit run frontend/streamlit_app.py")
     print()
     
     # Step 3: Create workspace
-    print("📚 Step 3: Create Course Workspace")
+    print("馃摎 Step 3: Create Course Workspace")
     print("-" * 70)
     print("In the Streamlit UI:")
-    print("  1. Click '➕ 创建新课程'")
-    print("  2. Enter course name: '线性代数'")
-    print("  3. Enter subject: '数学'")
-    print("  4. Click '创建'")
+    print("  1. Click '鉃?鍒涘缓鏂拌绋?")
+    print("  2. Enter course name: '绾挎€т唬鏁?")
+    print("  3. Enter subject: '鏁板'")
+    print("  4. Click '鍒涘缓'")
     print()
     
     # Step 4: Upload documents
-    print("📄 Step 4: Upload Course Materials")
+    print("馃搫 Step 4: Upload Course Materials")
     print("-" * 70)
     print("Upload sample documents:")
     print("  - tests/sample_textbook.txt (provided)")
     print("  - Your own PDF/TXT/MD files")
     print()
-    print("Then click '🔨 构建索引' to build the RAG index")
+    print("Then click '馃敤 鏋勫缓绱㈠紩' to build the RAG index")
     print()
     
     # Step 5: Learn Mode
-    print("📖 Step 5: Use Learn Mode")
+    print("馃摉 Step 5: Use Learn Mode")
     print("-" * 70)
     print("Example queries:")
-    print("  ✓ '什么是矩阵的秩？'")
-    print("  ✓ '解释线性相关和线性无关'")
-    print("  ✓ '如何计算矩阵的秩？'")
+    print("  鉁?'浠€涔堟槸鐭╅樀鐨勭З锛?")
+    print("  鉁?'瑙ｉ噴绾挎€х浉鍏冲拰绾挎€ф棤鍏?")
+    print("  鉁?'濡備綍璁＄畻鐭╅樀鐨勭З锛?")
     print()
     print("Expected output:")
     print("  - Structured answer with definitions")
@@ -74,10 +74,10 @@ def demo_workflow():
     print()
     
     # Step 6: Practice Mode
-    print("✍️ Step 6: Use Practice Mode")
+    print("鉁嶏笍 Step 6: Use Practice Mode")
     print("-" * 70)
     print("Example workflow:")
-    print("  1. User: '给我出一道关于矩阵秩的中等难度练习题'")
+    print("  1. User: '缁欐垜鍑轰竴閬撳叧浜庣煩闃电З鐨勪腑绛夐毦搴︾粌涔犻'")
     print("  2. System: [Generates question with rubric]")
     print("  3. User: [Submits answer]")
     print("  4. System: [Provides score, feedback, and mistake analysis]")
@@ -87,11 +87,11 @@ def demo_workflow():
     print()
     
     # Step 7: Exam Mode
-    print("📝 Step 7: Use Exam Mode")
+    print("馃摑 Step 7: Use Exam Mode")
     print("-" * 70)
     print("Example workflow:")
     print("  1. Switch to 'Exam Mode' in sidebar")
-    print("  2. User: '开始线性代数第一章测试'")
+    print("  2. User: '寮€濮嬬嚎鎬т唬鏁扮涓€绔犳祴璇?")
     print("  3. System: [Generates exam question]")
     print("     Note: WebSearch is disabled in this mode")
     print("  4. User: [Submits answer]")
@@ -99,7 +99,7 @@ def demo_workflow():
     print()
     
     # Step 8: Review
-    print("📊 Step 8: Review and Analyze")
+    print("馃搳 Step 8: Review and Analyze")
     print("-" * 70)
     print("Check your progress:")
     print("  - View mistake log: data/workspaces/<course>/mistakes/")
@@ -108,10 +108,10 @@ def demo_workflow():
     print()
     
     print("=" * 70)
-    print("✅ Demo workflow complete!")
+    print("鉁?Demo workflow complete!")
     print("=" * 70)
     print()
-    print("💡 Tips:")
+    print("馃挕 Tips:")
     print("  - Use specific terminology for better RAG retrieval")
     print("  - Each mode has different tool permissions")
     print("  - All answers include textbook citations")
@@ -127,43 +127,43 @@ def show_api_examples():
     print("=" * 70)
     print()
     
-    print("1️⃣ Create Workspace:")
+    print("1锔忊儯 Create Workspace:")
     print("-" * 70)
     print("""
 POST http://localhost:8000/workspaces
 Content-Type: application/json
 
 {
-    "course_name": "线性代数",
-    "subject": "数学"
+    "course_name": "绾挎€т唬鏁?,
+    "subject": "鏁板"
 }
 """)
     
-    print("2️⃣ Upload Document:")
+    print("2锔忊儯 Upload Document:")
     print("-" * 70)
     print("""
-POST http://localhost:8000/workspaces/线性代数/upload
+POST http://localhost:8000/workspaces/绾挎€т唬鏁?upload
 Content-Type: multipart/form-data
 
 file: <your_file.pdf>
 """)
     
-    print("3️⃣ Build Index:")
+    print("3锔忊儯 Build Index:")
     print("-" * 70)
     print("""
-POST http://localhost:8000/workspaces/线性代数/build-index
+POST http://localhost:8000/workspaces/绾挎€т唬鏁?build-index
 """)
     
-    print("4️⃣ Chat (Learn Mode):")
+    print("4锔忊儯 Chat (Learn Mode):")
     print("-" * 70)
     print("""
 POST http://localhost:8000/chat
 Content-Type: application/json
 
 {
-    "course_name": "线性代数",
+    "course_name": "绾挎€т唬鏁?,
     "mode": "learn",
-    "message": "什么是矩阵的秩？",
+    "message": "浠€涔堟槸鐭╅樀鐨勭З锛?,
     "history": []
 }
 
@@ -174,7 +174,7 @@ Response:
         "content": "[Structured teaching content]",
         "citations": [
             {
-                "text": "矩阵的秩定义为...",
+                "text": "鐭╅樀鐨勭З瀹氫箟涓?..",
                 "doc_id": "sample_textbook.txt",
                 "page": null,
                 "score": 0.85
@@ -198,38 +198,38 @@ def show_architecture():
     print("=" * 70)
     print()
     print("""
-┌─────────────┐
-│  Streamlit  │  Frontend UI (port 8501)
-│   Frontend  │  - Course selection
-└──────┬──────┘  - Mode switching
-       │         - Chat interface
-       │ HTTP
-┌──────▼──────┐
-│   FastAPI   │  Backend API (port 8000)
-│   Backend   │  - Workspace management
-└──────┬──────┘  - Document upload
-       │         - Chat endpoint
-       │
-┌──────▼──────────────────┐
-│  Orchestration Runner   │  Core orchestration
-│                         │
-│  ┌─────────────────┐   │
-│  │  Router Agent   │   │  Planning
-│  └────────┬────────┘   │
-│           │            │
-│  ┌────────▼────────┐   │
-│  │  Tutor Agent    │   │  Teaching (Learn mode)
-│  │  QuizMaster     │   │  Question gen (Practice/Exam)
-│  │  Grader Agent   │   │  Evaluation (Practice/Exam)
-│  └────────┬────────┘   │
-└───────────┼────────────┘
-            │
-    ┌───────┼───────┐
-    │       │       │
-┌───▼───┐ ┌─▼──┐ ┌─▼─────┐
-│  RAG  │ │MCP │ │Output │
-│System │ │Tool│ │Format │
-└───────┘ └────┘ └───────┘
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?
+鈹? Streamlit  鈹? Frontend UI (port 8501)
+鈹?  Frontend  鈹? - Course selection
+鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹? - Mode switching
+       鈹?        - Chat interface
+       鈹?HTTP
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈻尖攢鈹€鈹€鈹€鈹€鈹€鈹?
+鈹?  FastAPI   鈹? Backend API (port 8000)
+鈹?  Backend   鈹? - Workspace management
+鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹? - Document upload
+       鈹?        - Chat endpoint
+       鈹?
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈻尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?
+鈹? Orchestration Runner   鈹? Core orchestration
+鈹?                        鈹?
+鈹? 鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?  鈹?
+鈹? 鈹? Router Agent   鈹?  鈹? Planning
+鈹? 鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?  鈹?
+鈹?          鈹?           鈹?
+鈹? 鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈻尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?  鈹?
+鈹? 鈹? Tutor Agent    鈹?  鈹? Teaching (Learn mode)
+鈹? 鈹? QuizMaster     鈹?  鈹? Question gen (Practice/Exam)
+鈹? 鈹? Grader Agent   鈹?  鈹? Evaluation (Practice/Exam)
+鈹? 鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?  鈹?
+鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹?
+            鈹?
+    鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹尖攢鈹€鈹€鈹€鈹€鈹€鈹€鈹?
+    鈹?      鈹?      鈹?
+鈹屸攢鈹€鈹€鈻尖攢鈹€鈹€鈹?鈹屸攢鈻尖攢鈹€鈹?鈹屸攢鈻尖攢鈹€鈹€鈹€鈹€鈹?
+鈹? RAG  鈹?鈹侻CP 鈹?鈹侽utput 鈹?
+鈹係ystem 鈹?鈹俆ool鈹?鈹侳ormat 鈹?
+鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹?鈹斺攢鈹€鈹€鈹€鈹?鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹?
 
 Key Components:
 - RAG: Document parsing, chunking, embedding, retrieval
@@ -249,8 +249,9 @@ if __name__ == "__main__":
         show_architecture()
     
     print()
-    print("💻 For detailed documentation, see:")
+    print("馃捇 For detailed documentation, see:")
     print("   - README.md: Overview and quick start")
-    print("   - USAGE.md: Detailed usage examples")
-    print("   - ARCHITECTURE.md: System design details")
+    print("   - docs/USAGE.md: Detailed usage examples")
+    print("   - docs/ARCHITECTURE.md: System design details")
     print()
+

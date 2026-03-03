@@ -1,6 +1,6 @@
-# 使用手册 — Your AI Study Agent
+﻿# 使用手册 — Your AI Study Agent
 
-> 本手册面向日常使用者，按操作流程逐步说明。如需开发/部署细节请参阅 [README.md](README.md)。
+> 本手册面向日常使用者，按操作流程逐步说明。如需开发/部署细节请参阅 [README.md](../README.md)。
 
 ---
 
