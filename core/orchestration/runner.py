@@ -3,6 +3,8 @@
 - 主要作用：实现系统主编排器，统一调度 Router/Tutor/Grader、RAG、MCP 工具与记忆系统。
 - 核心类：OrchestrationRunner。
 - 核心流程：run/run_stream（总入口）+ 各模式执行（learn/practice/exam）。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
 import json
@@ -70,7 +72,7 @@ class OrchestrationRunner:
         """执行学习模式（非流式）。"""
         if history is None:
             history = []
-        # Retrieve context if needed
+        # 关键步骤：按 plan 决定是否执行 RAG 检索并准备 citations。
         context = ""
         citations = []
         
@@ -83,7 +85,7 @@ class OrchestrationRunner:
             else:
                 context = "（未找到相关教材，请先上传课程资料）"
         
-        # Generate teaching response
+        # 关键步骤：组装 Tutor 入参并触发生成。
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         # 为 filewriter 工具注入当前课程的笔记目录
@@ -400,11 +402,21 @@ class OrchestrationRunner:
         try:
             mem = MCPTools.call_tool("memory_search", query=query, course_name=course_name)
             if mem.get("success") and mem.get("results"):
-                snippets = [
-                    r.get("content", "")[:120]
-                    for r in mem["results"][:2]
-                    if r.get("content")
-                ]
+                snippets = []
+                for r in mem["results"][:2]:
+                    text = ""
+                    if isinstance(r, dict):
+                        text = (
+                            r.get("content")
+                            or r.get("summary")
+                            or r.get("text")
+                            or ""
+                        )
+                    elif isinstance(r, str):
+                        text = r
+                    text = text.strip()
+                    if text:
+                        snippets.append(text[:120])
                 if snippets:
                     return (
                         "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n"
@@ -496,16 +508,17 @@ class OrchestrationRunner:
                 content += f"\n错误类型: {', '.join(signal.mistake_tags)}"
 
             mgr = get_memory_manager()
-            mgr.save_episode(
+            mgr.record_event(
                 course_name=course_name,
                 event_type="mistake" if signal.is_mistake else "practice",
                 content=content,
                 importance=0.9 if signal.is_mistake else 0.4,
                 metadata={"score": signal.score, "tags": signal.mistake_tags},
+                score=signal.score,
+                concepts=signal.mistake_tags,
+                update_weak_points=signal.is_mistake,
+                increment_practice=True,
             )
-            if signal.mistake_tags and signal.is_mistake:
-                mgr.update_weak_points(course_name, signal.mistake_tags)
-            mgr.record_practice_result(course_name, signal.score, signal.is_mistake)
             print(f"[Memory] 练习{'错题' if signal.is_mistake else '结果'}已记录，得分={signal.score:.0f}")
         except Exception as _e:
             print(f"[Memory] 练习记忆写入失败（不影响评分）: {_e}")
@@ -611,6 +624,71 @@ class OrchestrationRunner:
             f.write(md)
         return f"exams/{filename}"
 
+    def _save_exam_to_memory(self, course_name: str, response_text: str) -> None:
+        """将考试批改结果写入情景记忆，并同步薄弱知识点到用户画像。"""
+        try:
+            import re
+            from memory.manager import get_memory_manager
+
+            # 提取总分（兼容“总得分：88 / 100”、“总分: 72分”等写法）
+            score = None
+            score_patterns = [
+                r"(?:总得分|总分)[：:\s]*([0-9]+(?:\.[0-9]+)?)\s*/\s*100",
+                r"(?:总得分|总分)[：:\s]*([0-9]+(?:\.[0-9]+)?)\s*分",
+            ]
+            for pattern in score_patterns:
+                m = re.search(pattern, response_text)
+                if m:
+                    score = float(m.group(1))
+                    break
+
+            # 提取薄弱知识点（兼容“薄弱知识点：A、B”与项目符号列表）
+            weak_points: List[str] = []
+            block = re.search(
+                r"薄弱知识点[：:\s]*([\s\S]{0,300})(?:\n## |\n---|\Z)",
+                response_text,
+            )
+            if block:
+                section = block.group(1)
+                bullet_items = re.findall(r"(?:^|\n)\s*[-*•]\s*([^\n]{1,40})", section)
+                if bullet_items:
+                    weak_points = [x.strip() for x in bullet_items if x.strip()]
+                else:
+                    inline = re.sub(r"[\r\n]+", " ", section).strip()
+                    weak_points = [
+                        x.strip()
+                        for x in re.split(r"[,，、；;]", inline)
+                        if x.strip()
+                    ]
+            weak_points = weak_points[:8]
+
+            # 生成可检索摘要，避免把完整长文原样入库
+            excerpt = response_text.strip().replace("\r", "")
+            excerpt = re.sub(r"\n{3,}", "\n\n", excerpt)[:900]
+            content = "考试批改摘要：\n" + excerpt
+            if score is not None:
+                content = f"考试总分: {score:.0f}/100\n" + content
+            if weak_points:
+                content += f"\n薄弱知识点: {', '.join(weak_points)}"
+
+            mgr = get_memory_manager()
+            importance = 0.9 if (score is not None and score < 60) else 0.6
+            mgr.record_event(
+                course_name=course_name,
+                event_type="exam",
+                content=content,
+                importance=importance,
+                metadata={"score": score, "weak_points": weak_points},
+                score=score,
+                concepts=weak_points,
+                update_weak_points=bool(weak_points),
+            )
+            print(
+                f"[Memory] 考试记录已写入 memory.db（score={score if score is not None else 'N/A'}）"
+            )
+        except Exception as _e:
+            print(f"[Memory] 考试记忆写入失败（不影响主流程）: {_e}")
+
     def run(
         self,
         course_name: str,
@@ -622,10 +700,10 @@ class OrchestrationRunner:
         """主编排入口（非流式）。"""
         if history is None:
             history = []
-        # Generate plan
+        # 关键步骤：先由 Router 产出本轮执行计划（是否检索、允许工具等）。
         plan = self.router.plan(user_message, mode, course_name)
         
-        # Execute based on mode
+        # 关键步骤：根据模式分发到 learn/practice/exam 专用流程。
         if mode == "learn":
             response = self.run_learn_mode(course_name, user_message, plan, history)
         elif mode == "practice":
@@ -690,14 +768,14 @@ class OrchestrationRunner:
             content = f"问题: {user_message}"
             if doc_ids:
                 content += f"\n参考来源: {', '.join(dict.fromkeys(doc_ids))}"
-            mgr.save_episode(
+            mgr.record_event(
                 course_name=course_name,
                 event_type="qa",
                 content=content,
                 importance=0.5,
                 metadata={"doc_ids": doc_ids},
+                increment_qa=True,
             )
-            mgr.increment_qa_count(course_name)
         except Exception as _mem_err:
             print(f"[Memory] 写入情景记忆失败（不影响输出）: {_mem_err}")
 

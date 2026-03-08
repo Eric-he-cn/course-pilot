@@ -3,6 +3,8 @@
 - 主要作用：基于 SQLite 持久化存储情景记忆（episodes）与用户画像（user_profiles）。
 - 核心类：SQLiteMemoryStore。
 - 核心方法：save_episode、search_episodes、get_profile、upsert_profile。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import sqlite3
 import json
@@ -53,6 +55,7 @@ class SQLiteMemoryStore:
                     user_id     TEXT NOT NULL,
                     course_name TEXT NOT NULL,
                     weak_points TEXT DEFAULT '[]',   -- JSON list of str
+                    concept_mastery TEXT DEFAULT '{}', -- JSON dict: concept -> {mastery, attempts, avg_score}
                     pref_style  TEXT DEFAULT 'step_by_step',
                     total_qa    INTEGER DEFAULT 0,
                     total_practice INTEGER DEFAULT 0,
@@ -61,6 +64,13 @@ class SQLiteMemoryStore:
                     PRIMARY KEY (user_id, course_name)
                 );
             """)
+            # 兼容历史数据库：若旧表不存在 concept_mastery 列，自动补齐。
+            cols = conn.execute("PRAGMA table_info(user_profiles)").fetchall()
+            col_names = {r[1] for r in cols}
+            if "concept_mastery" not in col_names:
+                conn.execute(
+                    "ALTER TABLE user_profiles ADD COLUMN concept_mastery TEXT DEFAULT '{}'"
+                )
 
     # ── 情景记忆 CRUD ─────────────────────────────────────────────────────────
 
@@ -192,6 +202,7 @@ class SQLiteMemoryStore:
                 "user_id": user_id,
                 "course_name": course_name,
                 "weak_points": [],
+                "concept_mastery": {},
                 "pref_style": "step_by_step",
                 "total_qa": 0,
                 "total_practice": 0,
@@ -203,6 +214,12 @@ class SQLiteMemoryStore:
             d["weak_points"] = json.loads(d["weak_points"])
         except Exception:
             d["weak_points"] = []
+        try:
+            d["concept_mastery"] = json.loads(d.get("concept_mastery", "{}") or "{}")
+            if not isinstance(d["concept_mastery"], dict):
+                d["concept_mastery"] = {}
+        except Exception:
+            d["concept_mastery"] = {}
         return d
 
     def upsert_profile(self, user_id: str, course_name: str, **fields) -> None:
@@ -212,20 +229,24 @@ class SQLiteMemoryStore:
         # weak_points 序列化
         if isinstance(profile.get("weak_points"), list):
             profile["weak_points"] = json.dumps(profile["weak_points"], ensure_ascii=False)
+        # concept_mastery 序列化
+        if isinstance(profile.get("concept_mastery"), dict):
+            profile["concept_mastery"] = json.dumps(profile["concept_mastery"], ensure_ascii=False)
         profile["updated_at"] = datetime.now().isoformat()
 
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO user_profiles
-                    (user_id, course_name, weak_points, pref_style,
+                    (user_id, course_name, weak_points, concept_mastery, pref_style,
                      total_qa, total_practice, avg_score, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
                     course_name,
                     profile["weak_points"],
+                    profile["concept_mastery"],
                     profile["pref_style"],
                     profile["total_qa"],
                     profile["total_practice"],
