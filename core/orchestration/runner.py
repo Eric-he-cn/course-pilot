@@ -196,13 +196,19 @@ class OrchestrationRunner:
             history = []
 
         context = ""
+        citations_dicts = []
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
                 chunks = retriever.retrieve(user_message)
                 context = retriever.format_context(chunks)
+                citations_dicts = [c.model_dump() for c in chunks]
             else:
                 context = "（未找到相关教材，请先上传课程资料）"
+
+        # 与 learn 模式保持一致：先发送 citations 事件给前端缓存
+        if citations_dicts:
+            yield {"__citations__": citations_dicts}
 
         history_ctx = self._fetch_history_ctx(user_message, course_name)
 
@@ -221,7 +227,8 @@ class OrchestrationRunner:
                 course_name=course_name,
                 history_ctx=history_ctx,
             ):
-                collected.append(chunk)
+                if isinstance(chunk, str):
+                    collected.append(chunk)
                 yield chunk
             full_response = "".join(collected)
             saved_path = self._save_practice_record(course_name, user_message, history, full_response)
@@ -244,7 +251,8 @@ class OrchestrationRunner:
                 temperature=0.7,
                 max_tokens=2000,
             ):
-                collected.append(chunk)
+                if isinstance(chunk, str):
+                    collected.append(chunk)
                 yield chunk
 
     
@@ -309,12 +317,18 @@ class OrchestrationRunner:
             history = []
 
         context = ""
+        citations_dicts = []
         retriever = self.load_retriever(course_name)
         if retriever:
             chunks = retriever.retrieve(user_message, top_k=12)
             context = retriever.format_context(chunks)
+            citations_dicts = [c.model_dump() for c in chunks]
         else:
             context = "（未找到相关教材，请先上传课程资料）"
+
+        # 与 learn 模式保持一致：先发送 citations 事件给前端缓存
+        if citations_dicts:
+            yield {"__citations__": citations_dicts}
 
         collected = []
         for chunk in self.tutor.teach_stream(
@@ -333,7 +347,8 @@ class OrchestrationRunner:
             max_tokens=4000,
             history_limit=30,
         ):
-            collected.append(chunk)
+            if isinstance(chunk, str):
+                collected.append(chunk)
             yield chunk
 
         full_response = "".join(collected)

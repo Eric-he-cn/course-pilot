@@ -11,7 +11,7 @@ from core.orchestration.prompts import GRADER_PROMPT, GRADER_SYSTEM, GRADER_PRAC
 from backend.schemas import GradeReport
 
 
-# 只暴露 calculator 给 Grader，不需要其他工具
+"""只暴露 calculator 给 Grader，不需要其他工具。"""
 _CALCULATOR_TOOL = [
     {
         "type": "function",
@@ -35,37 +35,38 @@ _CALCULATOR_TOOL = [
     }
 ]
 
-
+"""GraderAgent：负责对答案评分、讲评，并按需写入记忆系统。"""
 class GraderAgent:
-    """评分 Agent：负责对答案打分并输出改进建议。"""
+    """评分 Agent 主体。"""
 
+    """初始化 GraderAgent，复用全局 LLM 客户端。"""
     def __init__(self):
         self.llm = get_llm_client()
 
-    def grade(
-        self,
-        question: str,
-        standard_answer: str,
-        rubric: str,
-        student_answer: str,
-        course_name: Optional[str] = None,
-        context: Optional[str] = None,          # 可选：RAG 教材上下文，用于反馈引用
-    ) -> GradeReport:
-        """进行非流式评分，要求通过 calculator 汇总分数。"""
-        # 可选教材上下文
-        rag_ctx = ""
+    """评分解析与消息组装辅助。"""
+
+    """从模型输出中提取 JSON 负载。"""
+    @staticmethod
+    def _extract_json_payload(response_text: str) -> dict:
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0].strip()
+        else:
+            json_str = response_text.strip()
+        return json.loads(json_str)
+
+    """把可选教材上下文压缩为评分提示词片段。"""
+    @staticmethod
+    def _build_rag_ctx(context: Optional[str]) -> str:
         if context and context.strip():
-            rag_ctx = f"\n\n【教材参考（可在反馈中引用）】\n{context.strip()[:800]}"
+            return f"\n\n【教材参考（可在反馈中引用）】\n{context.strip()[:800]}"
+        return ""
 
-        prompt = GRADER_PROMPT.format(
-            question=question,
-            standard_answer=standard_answer,
-            rubric=rubric,
-            student_answer=student_answer,
-            rag_ctx=rag_ctx,
-        )
-
-        messages = [
+    """组装非流式评分消息列表。"""
+    @staticmethod
+    def _build_grade_messages(prompt: str) -> List[dict]:
+        return [
             {
                 "role": "system",
                 "content": (
@@ -77,28 +78,54 @@ class GraderAgent:
             {"role": "user", "content": prompt},
         ]
 
-        # 使用带工具调用的接口，让 LLM 用 calculator 汇总分值
+    """构建评分解析失败时的兜底报告。"""
+    @staticmethod
+    def _build_default_report() -> GradeReport:
+        return GradeReport(
+            score=0.0,
+            feedback="评分时出错，请重试。",
+            mistake_tags=[],
+            references=[],
+        )
+
+    """进行非流式评分，要求通过 calculator 汇总分数。"""
+    def grade(
+        self,
+        question: str,
+        standard_answer: str,
+        rubric: str,
+        student_answer: str,
+        course_name: Optional[str] = None,
+        context: Optional[str] = None,          # 可选：RAG 教材上下文，用于反馈引用
+    ) -> GradeReport:
+        # 1) 组装提示词
+        rag_ctx = self._build_rag_ctx(context)
+
+        prompt = GRADER_PROMPT.format(
+            question=question,
+            standard_answer=standard_answer,
+            rubric=rubric,
+            student_answer=student_answer,
+            rag_ctx=rag_ctx,
+        )
+
+        # 2) 组装消息并调用模型
+        messages = self._build_grade_messages(prompt)
+
         response = self.llm.chat_with_tools(
             messages, tools=_CALCULATOR_TOOL, temperature=0.2, max_tokens=1200
         )
         
-        # 解析模型输出（优先解析 JSON 代码块）
+        # 3) 解析模型输出
         try:
-            if "```json" in response:
-                json_str = response.split("```json")[1].split("```")[0].strip()
-            elif "```" in response:
-                json_str = response.split("```")[1].split("```")[0].strip()
-            else:
-                json_str = response.strip()
-            
-            grade_dict = json.loads(json_str)
+            grade_dict = self._extract_json_payload(response)
             report = GradeReport(
                 score=float(grade_dict.get("score", 0)),
                 feedback=grade_dict.get("feedback", ""),
                 mistake_tags=grade_dict.get("mistake_tags", []),
                 references=[]
             )
-            # 写入记忆（course_name 可能为 None，此时跳过）
+            # 4) 写入记忆（course_name 为空时跳过）
             if course_name:
                 self._save_to_memory(
                     course_name=course_name,
@@ -110,13 +137,9 @@ class GraderAgent:
             return report
         except Exception as e:
             print(f"Error parsing grade: {e}")
-            return GradeReport(
-                score=0.0,
-                feedback="评分时出错，请重试。",
-                mistake_tags=[],
-                references=[]
-            )
+            return self._build_default_report()
 
+    """将练习结果写入情景记忆（错题重要性=0.9，正确=0.4）。"""
     def _save_to_memory(
         self,
         course_name: str,
@@ -125,7 +148,6 @@ class GraderAgent:
         score: float,
         mistake_tags: List[str],
     ) -> None:
-        """将练习结果写入情景记忆（错题重要性=0.9，正确=0.4）。"""
         try:
             from memory.manager import get_memory_manager
             mgr = get_memory_manager()
@@ -148,6 +170,20 @@ class GraderAgent:
         except Exception as e:
             print(f"[Memory] 错题记忆写入失败（不影响评分）: {e}")
 
+    """
+    专用练习评卷流式方法。
+
+    工作流：
+      1. 逐题核对（必须原文引用标准答案和学生答案）
+      2. 调用 calculator 工具汇总得分
+      3. 输出最终评分结果 + 讲评
+
+    Args:
+        quiz_content: 本次练习题目原文（从对话历史提取）。
+        student_answer: 本轮学生提交的答案原文。
+        course_name: 课程名称，用于注入学习档案上下文。
+        history_ctx: 历史错题上下文字符串（可选，追加到 system prompt）。
+    """
     def grade_practice_stream(
         self,
         quiz_content: str,
@@ -155,24 +191,12 @@ class GraderAgent:
         course_name: Optional[str] = None,
         history_ctx: str = "",
     ):
-        """专用练习评卷流式方法。
-
-        工作流：
-          1. 逐题核对（必须原文引用标准答案和学生答案）
-          2. 调用 calculator 工具汇总得分
-          3. 输出最终评分结果 + 讲评
-
-        Args:
-            quiz_content: 本次练习题目原文（从对话历史提取）。
-            student_answer: 本轮学生提交的答案原文。
-            course_name: 课程名称，用于注入学习档案上下文。
-            history_ctx: 历史错题上下文字符串（可选，追加到 system prompt）。
-        """
+        # 1) 组装 system prompt（含历史错题上下文）
         system_prompt = GRADER_SYSTEM
         if history_ctx:
             system_prompt += f"\n\n{history_ctx}"
 
-        # 注入用户学习档案（薄弱知识点等）
+        # 2) 注入用户学习档案（失败不影响主流程）
         try:
             from memory.manager import get_memory_manager
             profile_ctx = get_memory_manager().get_profile_context(course_name)
@@ -181,6 +205,7 @@ class GraderAgent:
         except Exception:
             pass
 
+        # 3) 组装消息并流式评分
         user_prompt = GRADER_PRACTICE_PROMPT.format(
             quiz_content=quiz_content.strip(),
             student_answer=student_answer.strip(),

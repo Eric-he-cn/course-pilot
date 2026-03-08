@@ -1,22 +1,89 @@
 """
 【模块说明】
-- 主要作用：执行向量检索并生成带引用信息的上下文文本。
+- 主要作用：执行 RAG 检索并生成带引用信息的上下文文本。
 - 核心类：Retriever。
-- 核心方法：retrieve（召回片段）、format_context（拼接引用上下文）。
+- 核心方法：retrieve（dense/bm25/hybrid 召回）、format_context（拼接引用上下文）。
 """
 import os
-from typing import List
-from rag.store_faiss import FAISSStore
-from rag.embed import get_embedding_model
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from rag.lexical import BM25Index
 from backend.schemas import RetrievedChunk
+
+if TYPE_CHECKING:
+    from rag.store_faiss import FAISSStore
 
 
 class Retriever:
     """RAG 检索器（支持引用信息组装）。"""
     
-    def __init__(self, store: FAISSStore):
+    def __init__(self, store: "FAISSStore"):
         self.store = store
-        self.embedding_model = get_embedding_model()
+        self._embedding_model = None
+        self.lexical_index = BM25Index(
+            self.store.chunks,
+            k1=self._env_float("BM25_K1", 1.5),
+            b=self._env_float("BM25_B", 0.75),
+        )
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.getenv(name, str(default))))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _chunk_key(chunk: Dict[str, Any]) -> str:
+        if chunk.get("chunk_id"):
+            return str(chunk["chunk_id"])
+        return f"{chunk.get('doc_id', '')}:{chunk.get('page', '')}:{hash(chunk.get('text', ''))}"
+
+    def _get_embedding_model(self):
+        if self._embedding_model is None:
+            from rag.embed import get_embedding_model
+            self._embedding_model = get_embedding_model()
+        return self._embedding_model
+
+    def _dense_search(self, query: str, top_k: int) -> List[Tuple[Dict[str, Any], float]]:
+        query_embedding = self._get_embedding_model().embed_query(query)
+        return self.store.search(query_embedding, top_k)
+
+    def _fuse_with_rrf(
+        self,
+        dense_results: List[Tuple[Dict[str, Any], float]],
+        bm25_results: List[Tuple[Dict[str, Any], float]],
+        top_k: int,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        rrf_k = self._env_int("HYBRID_RRF_K", 60)
+        dense_weight = self._env_float("HYBRID_DENSE_WEIGHT", 1.0)
+        bm25_weight = self._env_float("HYBRID_BM25_WEIGHT", 1.0)
+
+        fused_scores: Dict[str, float] = {}
+        chunk_ref: Dict[str, Dict[str, Any]] = {}
+
+        for rank, (chunk, _) in enumerate(dense_results, start=1):
+            key = self._chunk_key(chunk)
+            fused_scores[key] = fused_scores.get(key, 0.0) + dense_weight / (rrf_k + rank)
+            chunk_ref[key] = chunk
+
+        for rank, (chunk, _) in enumerate(bm25_results, start=1):
+            key = self._chunk_key(chunk)
+            fused_scores[key] = fused_scores.get(key, 0.0) + bm25_weight / (rrf_k + rank)
+            chunk_ref[key] = chunk
+
+        ranked = sorted(
+            ((key, score) for key, score in fused_scores.items()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return [(chunk_ref[key], float(score)) for key, score in ranked[:top_k]]
     
     def retrieve(
         self,
@@ -25,10 +92,26 @@ class Retriever:
     ) -> List[RetrievedChunk]:
         """根据查询召回相关文本片段。"""
         if top_k is None:
-            top_k = int(os.getenv("TOP_K_RESULTS", "3"))
-        
-        query_embedding = self.embedding_model.embed_query(query)
-        results = self.store.search(query_embedding, top_k)
+            top_k = self._env_int("TOP_K_RESULTS", 3)
+        else:
+            top_k = max(1, int(top_k))
+
+        mode = os.getenv("RETRIEVAL_MODE", "hybrid").strip().lower()
+        if mode not in {"dense", "bm25", "hybrid"}:
+            mode = "hybrid"
+
+        if mode == "dense":
+            results = self._dense_search(query, top_k)
+        elif mode == "bm25":
+            results = self.lexical_index.search(query, top_k)
+        else:
+            dense_multiplier = self._env_int("HYBRID_DENSE_CANDIDATES_MULTIPLIER", 3)
+            bm25_multiplier = self._env_int("HYBRID_BM25_CANDIDATES_MULTIPLIER", 3)
+            dense_k = max(top_k, top_k * dense_multiplier)
+            bm25_k = max(top_k, top_k * bm25_multiplier)
+            dense_results = self._dense_search(query, dense_k)
+            bm25_results = self.lexical_index.search(query, bm25_k)
+            results = self._fuse_with_rrf(dense_results, bm25_results, top_k)
         
         retrieved = []
         for chunk, score in results:

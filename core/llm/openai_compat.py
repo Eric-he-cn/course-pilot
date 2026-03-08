@@ -189,6 +189,17 @@ class LLMClient:
         logger = logging.getLogger("llm.stream_tools")
         from mcp_tools.client import MCPTools
 
+        def _status_for_tool(tool_name: str) -> str:
+            mapping = {
+                "calculator": "正在使用计算器工具...",
+                "websearch": "正在进行网络搜索...",
+                "memory_search": "正在检索历史记忆...",
+                "mindmap_generator": "正在生成思维导图结构...",
+                "filewriter": "正在写入笔记文件...",
+                "get_datetime": "正在查询当前日期时间...",
+            }
+            return mapping.get(tool_name, f"正在调用工具：{tool_name}...")
+
         if not tools:
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
             return
@@ -199,6 +210,7 @@ class LLMClient:
         max_rounds = 6
 
         try:
+            yield {"__status__": "模型正在分析问题..."}
             for round_idx in range(max_rounds):
                 t_llm = perf_counter()
                 response = self.client.chat.completions.create(
@@ -217,6 +229,7 @@ class LLMClient:
                         round_idx + 1,
                         (perf_counter() - t_llm) * 1000,
                     )
+                    yield {"__status__": "正在整理最终回答..."}
                     # 工具调用结束，用当前 messages 做流式最终回答
                     yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
                     return
@@ -228,6 +241,8 @@ class LLMClient:
                     requested,
                     (perf_counter() - t_llm) * 1000,
                 )
+                for tool_name in dict.fromkeys(requested):
+                    yield {"__status__": _status_for_tool(tool_name)}
 
                 messages.append({
                     "role": "assistant",
@@ -266,10 +281,12 @@ class LLMClient:
                     })
 
             logger.warning("[stream_tools] max_rounds_reached=%d force_stream_final=1", max_rounds)
+            yield {"__status__": "工具调用轮次已达上限，正在整理答案..."}
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
 
         except Exception as e:
             logger.exception("[stream_tools] call.error fallback_to_stream_plain=1")
+            yield {"__status__": "工具调用异常，正在降级生成回答..."}
             yield f"（工具调用出错，降级回答）\n"
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
 

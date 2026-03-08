@@ -8,10 +8,10 @@
 
 ## 速览
 - 🎯 三种模式：学习讲解 / 智能出题+评分 / 模拟考试
-- 📚 RAG：PDF/TXT/MD/DOCX/PPTX/PPT 解析，FAISS 检索，附页码引用
+- 📚 RAG：PDF/TXT/MD/DOCX/PPTX/PPT 解析，Hybrid 检索（FAISS + BM25），附页码引用
 - 🛠️ 工具：计算器、网页搜索、文件写入、记忆检索、思维导图、日期时间查询（共 6 个 MCP 工具）
 - 🧠 记忆系统：SQLite 跨会话追踪薄弱知识点，自动强化
-- ⚡ 体验：SSE 流式输出，Mermaid 思维导图渲染与 PNG 导出
+- ⚡ 体验：SSE 流式输出 + 执行进度提示，Mermaid 思维导图渲染与 PNG 导出
 - 🔒 安全：路径穿越防护、并发 chdir 加锁、编码回退、分块死循环保护
 
 ---
@@ -33,9 +33,11 @@
 
 - 支持 **PDF / TXT / MD / DOCX / PPTX / PPT** 六种格式
 - 文本分块 + FAISS 向量索引（嵌入模型：`BAAI/bge-base-zh-v1.5`，专为中文优化）
+- 检索模式支持 `dense / bm25 / hybrid`，默认 `hybrid`（RRF 融合）
 - GPU 自动加速：有 NVIDIA GPU 时自动使用 CUDA，batch_size 256；无 GPU 退回 CPU
 - TXT/MD 文件自动检测编码（UTF-8 → GBK → Latin-1 回退）
 - 检索结果携带文档名、页码、相关度分数
+- `TOP_K_RESULTS` 控制默认返回数量；考试模式内部固定 `top_k=12`
 
 ### 多 Agent 编排
 
@@ -44,7 +46,7 @@
    ↓
 OrchestrationRunner（Python 调度器）
    ├─ [LLM] Router Agent  ← 制定 Plan（need_rag / style）
-   ├─ [工具] RAG Retriever ← FAISS 向量检索
+   ├─ [工具] RAG Retriever ← Hybrid 检索（FAISS + BM25）
    ├─ [工具] memory_search ← 预取历史错题上下文
    │
    ├─ 学习模式 / 考试模式 / 练习出题
@@ -104,6 +106,10 @@ OrchestrationRunner（Python 调度器）
 ### 实时流式输出
 
 后端通过 **Server-Sent Events (SSE)** 逐 token 推送，前端 Streamlit 实时渲染，减少等待感。
+
+- 前端会展示当前执行阶段（如“模型分析中 / 检索中 / 工具调用中 / 整理答案中”），避免“卡死感”。
+- 每轮回答只展示当前轮检索到的引用来源；历史回答保留各自引用，不会混入当前轮引用。
+- 为降低引用编号串扰，前端传历史给后端前会清理 assistant 历史中的 `[来源N]` 标记。
 
 ---
 
@@ -185,8 +191,9 @@ FastAPI (:8000)
 │   ├── ingest.py             ← PDF/TXT/MD/DOCX/PPTX/PPT 解析
 │   ├── chunk.py              ← 文本分块（含重叠保护）
 │   ├── embed.py              ← sentence-transformers 嵌入
+│   ├── lexical.py            ← BM25 词法检索
 │   ├── store_faiss.py        ← FAISS 向量索引（线程安全）
-│   └── retrieve.py           ← 相似度检索 + 引用格式化
+│   └── retrieve.py           ← dense/bm25/hybrid 检索 + 引用格式化
 │
 ├── mcp_tools/
 │   ├── client.py             ← 工具实现 + schema + 调用路由
@@ -240,6 +247,14 @@ EMBEDDING_BATCH_SIZE=256                # GPU 推荐 128-512；CPU 推荐 32
 CHUNK_SIZE=600
 CHUNK_OVERLAP=120
 TOP_K_RESULTS=6
+RETRIEVAL_MODE=hybrid                     # dense / bm25 / hybrid
+BM25_K1=1.5
+BM25_B=0.75
+HYBRID_RRF_K=60
+HYBRID_DENSE_WEIGHT=1.0
+HYBRID_BM25_WEIGHT=1.0
+HYBRID_DENSE_CANDIDATES_MULTIPLIER=3
+HYBRID_BM25_CANDIDATES_MULTIPLIER=3
 
 # MCP（可选）
 SERPAPI_API_KEY=your_serpapi_key
@@ -275,7 +290,15 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `EMBEDDING_BATCH_SIZE` | — | `256`（GPU）/ `32`（CPU） | encode batch 大小 |
 | `CHUNK_SIZE` | — | `600` | 文本分块大小（字符数） |
 | `CHUNK_OVERLAP` | — | `120` | 分块重叠大小（需 < CHUNK_SIZE，建议 20%） |
-| `TOP_K_RESULTS` | — | `6` | 每次检索返回的最大块数 |
+| `TOP_K_RESULTS` | — | `6` | 默认检索返回块数（考试模式内部固定 `top_k=12`） |
+| `RETRIEVAL_MODE` | — | `hybrid` | 检索模式：`dense` / `bm25` / `hybrid` |
+| `BM25_K1` | — | `1.5` | BM25 参数 `k1` |
+| `BM25_B` | — | `0.75` | BM25 参数 `b` |
+| `HYBRID_RRF_K` | — | `60` | RRF 融合常数 |
+| `HYBRID_DENSE_WEIGHT` | — | `1.0` | dense 分支融合权重 |
+| `HYBRID_BM25_WEIGHT` | — | `1.0` | bm25 分支融合权重 |
+| `HYBRID_DENSE_CANDIDATES_MULTIPLIER` | — | `3` | dense 候选池倍数（`top_k * 倍数`） |
+| `HYBRID_BM25_CANDIDATES_MULTIPLIER` | — | `3` | bm25 候选池倍数（`top_k * 倍数`） |
 | `SERPAPI_API_KEY` | — | — | SerpAPI 密钥（`websearch` 工具依赖，未配置时该工具返回失败并跳过） |
 | `DATA_DIR` | — | `data/workspaces` | 课程数据根目录 |
 
@@ -318,7 +341,10 @@ POST   /chat/stream                          # SSE 流式对话
   ]
 }
 ```
-SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
+SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。  
+流式中可能出现以下元事件：
+- `{"__citations__": [...]}`：当前轮引用元数据（文档名/页码/分数/原文片段）
+- `{"__status__": "..."}`：当前执行状态提示（检索/工具调用/答案整理）
 
 ---
 

@@ -30,7 +30,7 @@
 │       OrchestrationRunner                           │
 │  ────────────────────────────────────────────────── │
 │  [LLM] Router Agent → Plan（need_rag / style）      │
-│  [工具] RAG Retriever → FAISS 检索 + 引用            │
+│  [工具] RAG Retriever → Hybrid 检索 + 引用           │
 │  [工具] memory_search → 历史错题预取                 │
 │  ────────────────────────────────────────────────── │
 │  路由判断（Python 关键词检测）                        │
@@ -75,7 +75,11 @@ flowchart LR
 ```mermaid
 flowchart LR
     Q[用户问题] --> QE[同一嵌入模型编码查询]
-    QE --> R[retrieve.py 相似度检索 Top-K]
+    QE --> D[Dense 检索：FAISS Top-K]
+    Q --> B[BM25 词法检索 Top-K]
+    D --> F[RRF 融合排序]
+    B --> F
+    F --> R[retrieve.py 输出融合结果]
     R --> X[格式化上下文 + doc_id/page/score]
     X --> LLM[注入 Prompt 给 Tutor/Grader]
     LLM --> OUT[生成回答并附引用]
@@ -86,12 +90,13 @@ flowchart LR
 - 分块层：`chunk.py` 使用滑窗重叠，避免知识点跨块断裂；`overlap` 主要用于提升召回完整性。
 - 嵌入层：`embed.py` 使用 `BAAI/bge-base-zh-v1.5`，并支持 `cuda/cpu/auto`。
 - 索引层：`store_faiss.py` 将向量与元数据落盘；检索时读取 `.faiss + .pkl` 形成可回溯上下文。
-- 检索层：`retrieve.py` 输出不仅是文本片段，还包含 `doc_id/page/score`，为“证据式回答”提供基础。
+- 检索层：`retrieve.py` 支持 `dense / bm25 / hybrid` 三种模式（默认 `hybrid`），输出包含 `doc_id/page/score` 的可引用片段。
+- 融合层：Hybrid 使用 RRF（Reciprocal Rank Fusion）合并 dense 与 bm25 候选，兼顾语义召回与术语精确匹配。
 
 **A4. 性能与正确性权衡**
-- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升。
+- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升；考试模式固定 `top_k=12`，学习/练习走 `TOP_K_RESULTS`。
 - `chunk_size` 越大，上下文语义更完整但定位更粗；越小则相反。
-- 当前是“向量召回 + LLM 综合”模式，不是固定模板拼接，因此引用与解释能兼顾可读性。
+- `hybrid` 模式通常比纯向量召回更稳健，尤其在课程术语/缩写/公式关键词场景。
 
 #### B. Multi-Agent 系统 (core/agents/)
 
@@ -262,7 +267,9 @@ Runner.run_learn_mode_stream()
   tools:  全部 6 个工具
   │
   ├─ 可能 call websearch / mindmap_generator / calculator
-  └─ 流式输出：核心答案 + 详细解释 + [来源N] 引用
+  ├─ 流式元事件：`__status__`（模型分析/工具调用/整理答案）
+  ├─ 流式元事件：`__citations__`（当前轮引用）
+  └─ 流式输出：核心答案 + 详细解释 + [来源N] 引用（仅当前轮）
 ```
 
 #### 练习模式流程
@@ -285,7 +292,9 @@ _is_answer_submission() → False（用户在请求出题）
   user:   PRACTICE_PROMPT（对话式练习规则）
   tools:  全部 6 个工具
   │
-  └─ 可能 call websearch 查找补充题材 → 流式输出题目
+  ├─ 可能 call websearch 查找补充题材
+  ├─ 流式元事件：`__status__` + `__citations__`
+  └─ 流式输出题目（引用仅归属当前轮）
 
 【评卷阶段】
 用户: "1.A  2.正确  3.B..."（提交答案）
@@ -305,7 +314,7 @@ _extract_quiz_from_history() → 从对话历史中提取题目原文（纯 Pyth
   │
   ├─ 轮1：逐题对照表（原文引用标准答案 vs 学生答案，判断对错）
   ├─ 轮2：call calculator('sum([20, 15, 0, 15, 10])')
-  └─ 轮3：流式输出得分 + 各题讲评 + 易错提醒
+  └─ 轮3：流式输出得分 + 各题讲评 + 易错提醒（必要时伴随 `__status__` 事件）
   ↓
 _save_practice_record()   → 写 practices/ Markdown 文件
 _save_grading_to_memory() → 写 SQLite（episodes + user_profiles）
@@ -329,7 +338,7 @@ Runner.run_exam_mode_stream()
   │
   ├─ 阶段一：对话收集配置（题型/题数/难度）
   ├─ 阶段二：生成完整试卷（不透露答案）
-  └─ 阶段三：学生提交后，逐题批改 + call calculator + 输出总分
+  └─ 阶段三：学生提交后，逐题批改 + call calculator + 输出总分（流式附带 `__status__`）
   ↓
 _is_exam_grading() → True → _save_exam_record() + _save_exam_to_memory()
 ```
@@ -371,6 +380,9 @@ _is_exam_grading() → True → _save_exam_record() + _save_exam_to_memory()
 4. **文件管理**: 侧边栏显示文件大小/日期，支持单独删除文件、删除索引
 5. **清空历史**: 主区域一键清空对话历史
 6. **实时流式**: SSE 逐 token 推送，前端 Streamlit 实时拼接渲染
+7. **执行状态提示**: 前端接收 `__status__` 元事件，展示“检索中/调用工具中/整理答案中”
+8. **当前轮引用隔离**: 前端仅显示当前轮 `__citations__`，不把历史引用混入当前回答
+9. **低刷新策略**: 课程创建使用 `st.form` 批量提交 + API 缓存 TTL 提升，减少无效整页重跑
 
 ## 📊 数据存储结构
 
@@ -421,8 +433,11 @@ batch_size = 256  # GPU；CPU 时降为 32
 
 **检索策略**:
 ```python
-top_k = 6            # 返回前6个最相关片段
-similarity = L2      # normalize_embeddings=True 等价余弦
+retrieval_mode = "hybrid"   # dense / bm25 / hybrid
+top_k = 6                   # 学习/练习默认；考试模式在 Runner 中覆盖为 12
+hybrid_rrf_k = 60
+hybrid_dense_weight = 1.0
+hybrid_bm25_weight = 1.0
 ```
 
 ### 2. Prompt Engineering

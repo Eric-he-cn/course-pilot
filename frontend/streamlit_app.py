@@ -38,6 +38,13 @@ def extract_mermaid_blocks(text: str):
     return cleaned, blocks
 
 
+def strip_source_markers(text: str) -> str:
+    """移除历史消息中的 [来源N] 标记，避免旧引用编号干扰当前回答。"""
+    if not text:
+        return text
+    return re.sub(r"\[来源\d+\]", "", text)
+
+
 def render_mermaid(mermaid_code: str, idx: int = 0, height: int = 520) -> None:
     """使用 Mermaid CDN + components.html 渲染思维导图，并提供 SVG/PNG 下载按钮。"""
     import streamlit.components.v1 as components
@@ -225,7 +232,7 @@ if "show_help" not in st.session_state:
     st.session_state.show_help = False
 
 
-@st.cache_data(ttl=3, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_workspaces_cached(api_base: str):
     """Cached workspace list to avoid blocking every rerun."""
     try:
@@ -237,7 +244,7 @@ def fetch_workspaces_cached(api_base: str):
     return []
 
 
-@st.cache_data(ttl=3, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_workspace_files_cached(api_base: str, course_name: str):
     """Cached file/index status for a workspace."""
     fallback = {"files": [], "index_built": False, "index_mtime": None}
@@ -333,7 +340,13 @@ def send_message(course_name: str, mode: str, message: str):
         # 取当前消息之前的最多 20 条历史（[-21:-1] 排除最后一条刚 append 的用户消息，避免重复）
         history = st.session_state.chat_history[-21:-1] if st.session_state.chat_history else []
         # 只保留 role 和 content 字段
-        history_payload = [{"role": m["role"], "content": m["content"]} for m in history]
+        history_payload = []
+        for m in history:
+            role = m["role"]
+            content = m["content"]
+            if role == "assistant":
+                content = strip_source_markers(content)
+            history_payload.append({"role": role, "content": content})
         response = requests.post(
             f"{API_BASE}/chat",
             json={
@@ -364,7 +377,13 @@ def stream_chat(course_name: str, mode: str, message: str):
     import json as _json
     # 取当前消息之前的最多 20 条历史（[-21:-1] 排除最后一条刚 append 的用户消息，避免重复）
     history = st.session_state.chat_history[-21:-1] if st.session_state.chat_history else []
-    history_payload = [{"role": m["role"], "content": m["content"]} for m in history]
+    history_payload = []
+    for m in history:
+        role = m["role"]
+        content = m["content"]
+        if role == "assistant":
+            content = strip_source_markers(content)
+        history_payload.append({"role": role, "content": content})
     payload = {
         "course_name": course_name,
         "mode": mode,
@@ -444,10 +463,17 @@ with st.sidebar:
     if "expander_open" not in st.session_state:
         st.session_state.expander_open = False
     with st.expander("➕ 创建新课程", expanded=st.session_state.expander_open):
-        new_course_name = st.text_input("课程名称", key="new_course_name")
-        new_subject = st.text_input("学科标签", key="new_subject", 
-                                    placeholder="例如：线性代数、通信原理")
-        if st.button("创建"):
+        # 用 form 批量提交，避免输入每个字符都触发整页 rerun
+        with st.form("create_workspace_form", clear_on_submit=False):
+            new_course_name = st.text_input("课程名称", key="new_course_name")
+            new_subject = st.text_input(
+                "学科标签",
+                key="new_subject",
+                placeholder="例如：线性代数、通信原理",
+            )
+            create_submitted = st.form_submit_button("创建")
+
+        if create_submitted:
             st.session_state.expander_open = True
             if new_course_name and new_subject:
                 create_workspace(new_course_name, new_subject)
@@ -594,11 +620,7 @@ if st.session_state.current_course:
 
     # ── 帮助面板（可折叠） ───────────────────────────────────────────────────
     if st.session_state.show_help:
-
         st.markdown(HELP_CONTENT, unsafe_allow_html=True)
-        if st.button("✖ 关闭帮助"):
-            st.session_state.show_help = False
-            st.rerun()
 
     st.markdown("---")
 
@@ -673,39 +695,84 @@ if st.session_state.current_course:
         # 单独收集文本，避免依赖 st.write_stream 返回类型（新版 Streamlit 返回 StreamingOutput 而非 str）
         collected_chunks: list[str] = []
         st.session_state._pending_citations = []  # 在流开始前初始化
-
-        def _collecting_stream():
-            for chunk in stream_chat(
-                st.session_state.current_course,
-                st.session_state.current_mode,
-                user_input,
-            ):
-                # 拦截 citations 元数据事件，不渲染到气泡，仅存于 session_state
-                if isinstance(chunk, dict) and "__citations__" in chunk:
-                    st.session_state._pending_citations = chunk["__citations__"]
-                    continue  # 跳过 yield，防止 st.write_stream 把 dict 渲染成乱码
-                if isinstance(chunk, str):
-                    collected_chunks.append(chunk)
-                yield chunk
+        assistant_payload = None
 
         with st.chat_message("assistant"):
+            progress_placeholder = st.empty()
+
+            def _collecting_stream():
+                for chunk in stream_chat(
+                    st.session_state.current_course,
+                    st.session_state.current_mode,
+                    user_input,
+                ):
+                    # 拦截 citations 元数据事件，不渲染到气泡，仅存于 session_state
+                    if isinstance(chunk, dict) and "__citations__" in chunk:
+                        st.session_state._pending_citations = chunk["__citations__"]
+                        continue  # 跳过 yield，防止 st.write_stream 把 dict 渲染成乱码
+
+                    # 进度事件：显示当前正在执行的阶段，避免“卡死感”
+                    if isinstance(chunk, dict) and "__status__" in chunk:
+                        status_text = str(chunk.get("__status__", "")).strip()
+                        if status_text:
+                            progress_placeholder.caption(f"⏳ {status_text}")
+                        continue
+
+                    if isinstance(chunk, str):
+                        collected_chunks.append(chunk)
+                    yield chunk
+
             st.write_stream(_collecting_stream())
+            progress_placeholder.empty()
 
-        full_response = "".join(collected_chunks)
-
-        if full_response:
+            full_response = "".join(collected_chunks)
             # 捕获流式过程中拦截到的 citations
             citations = st.session_state.pop("_pending_citations", None) or None
-            # 提取 mermaid 代码块，避免 markdown 渲染失败
-            cleaned_response, mermaid_codes = extract_mermaid_blocks(full_response)
-            mermaid_blocks = [{"code": c, "title": "思维导图"} for c in mermaid_codes]
-            # 把完整回答加入对话历史（存储时转换定界符，方便后续重渲染）
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": fix_latex(cleaned_response),
-                "citations": citations,
-                "mermaid_blocks": mermaid_blocks,
-            })
+
+            if full_response:
+                # 提取 mermaid 代码块，避免 markdown 渲染失败
+                cleaned_response, mermaid_codes = extract_mermaid_blocks(full_response)
+                mermaid_blocks = [{"code": c, "title": "思维导图"} for c in mermaid_codes]
+
+                # 关键修复：当前轮流式结束后，立即在当前气泡里展示引用来源
+                if citations:
+                    with st.expander(f"📑 查看引用来源（共 {len(citations)} 条）"):
+                        for i, citation in enumerate(citations):
+                            page_str = f"  第 {citation['page']} 页" if citation.get("page") else ""
+                            score_str = f"  相关度 {citation['score']:.2f}" if citation.get("score") is not None else ""
+                            st.markdown(
+                                f"**[来源{i+1}]** `{citation['doc_id']}`{page_str}{score_str}"
+                            )
+                            preview = citation["text"][:300].replace("\n", " ").strip()
+                            if len(citation["text"]) > 300:
+                                preview += "…"
+                            st.caption(preview)
+                            if i < len(citations) - 1:
+                                st.divider()
+
+                # 同一轮直接渲染 mermaid，避免必须下一轮才看到图
+                for m_idx, mb in enumerate(mermaid_blocks):
+                    render_mermaid(mb["code"], idx=abs(hash(mb["code"])) % 100000, height=520)
+                    with st.expander("📄 下载 Mermaid 源码"):
+                        safe_title = re.sub(r"[^\w\-]", "_", mb.get("title", "mindmap"))
+                        st.download_button(
+                            label="⬇ 下载 .md 文件",
+                            data=f"```mermaid\n{mb['code']}\n```",
+                            file_name=f"{safe_title}.md",
+                            mime="text/markdown",
+                            key=f"dl_md_now_{abs(hash(mb['code'])) % 100000}_{m_idx}",
+                        )
+
+                assistant_payload = {
+                    "role": "assistant",
+                    "content": fix_latex(cleaned_response),
+                    "citations": citations,
+                    "mermaid_blocks": mermaid_blocks,
+                }
+
+        if assistant_payload:
+            # 把完整回答加入对话历史，保证刷新后仍能复现引用与导图
+            st.session_state.chat_history.append(assistant_payload)
 
 else:
     inject_mode_css("learn")

@@ -63,10 +63,21 @@ def test_rag_components():
     """测试 RAG 分块组件。"""
     try:
         from rag.chunk import simple_chunk_text
+        from rag.lexical import BM25Index
         
         text = "This is a test. " * 100
         chunks = simple_chunk_text(text, chunk_size=50, overlap=10)
         assert len(chunks) > 0
+
+        # 轻量验证 BM25 词法检索可用
+        bm25_chunks = [
+            {"text": "线性代数中矩阵和特征值是核心概念", "doc_id": "a.md", "page": 1, "chunk_id": "a1"},
+            {"text": "通信原理关注调制解调与信道编码", "doc_id": "b.md", "page": 1, "chunk_id": "b1"},
+        ]
+        bm25 = BM25Index(bm25_chunks)
+        hits = bm25.search("矩阵 特征值", top_k=1)
+        assert len(hits) == 1
+        assert hits[0][0]["doc_id"] == "a.md"
         
         print(f"✅ RAG test passed - generated {len(chunks)} chunks")
         return True

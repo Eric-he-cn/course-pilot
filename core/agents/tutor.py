@@ -10,13 +10,91 @@ from core.orchestration.prompts import TUTOR_PROMPT
 from mcp_tools.client import get_tool_schemas
 from backend.schemas import TutorResult
 
-
+"""
+TutorAgent：统一承载学习讲解、练习出题、考试对话等生成任务。
+职责：组装消息、注入工具与用户画像规则、调用 LLM 返回文本。
+"""
 class TutorAgent:
-    """导师 Agent：负责讲解、出题、考试流程中的答案生成。"""
     
+    """初始化 TutorAgent，复用全局 LLM 客户端。"""
     def __init__(self):
         self.llm = get_llm_client()
+
+    """统一组装消息列表（system + history + user），仅负责提示词与消息构造。"""
+    def _build_messages(
+        self,
+        question: str,
+        course_name: str,
+        context: str,
+        allowed_tools: Optional[List[str]] = None,
+        history: Optional[List[dict]] = None,
+        system_prompt_override: Optional[str] = None,
+        user_content_override: Optional[str] = None,
+        history_limit: int = 20,
+        stream_mode: bool = False,
+    ) -> List[dict]:
+        if user_content_override:
+            prompt = user_content_override
+        else:
+            prompt = TUTOR_PROMPT.format(
+                course_name=course_name,
+                context=context,
+                question=question
+            )
+
+        if system_prompt_override:
+            system_prompt = system_prompt_override
+        elif allowed_tools:
+            tool_desc = "、".join(allowed_tools)
+            if stream_mode:
+                rule_2 = (
+                    "2. 优先从数据库中获取数据，遇到超出知识库的信息或者需要网络查询的信息"
+                    "（新闻/网络资料/日期/天气等），可以调用 websearch 工具，但仍然以数据库为准。"
+                )
+            else:
+                rule_2 = "2. 优先从数据库中获取数据，遇到超出知识库的信息或者需要网络查询的信息，可以调用 websearch 工具。"
+            system_prompt = (
+                f"你是一位专业的大学课程导师。"
+                f"你可以使用以下工具：{tool_desc}。"
+                f"规则：\n"
+                f"1. 遇到数学计算，必须调用 calculator 工具，不要自己心算。\n"
+                f"{rule_2}\n"
+                f"3. 用户明确要求保存笔记，必须调用 filewriter 工具，文件名用中文，格式为 .md。\n"
+                f"4. 用户要求生成思维导图或知识点汇总，必须调用 mindmap_generator 工具。\n"
+                f"5. 如果该知识点用户之前问过或做错过，可以调用 memory_search 工具检索历史记录。\n"
+                f"6. 遇到询问当前日期、时间、星期几等时效性问题，必须调用 get_datetime 工具，不得凭记忆或训练数据回答。\n"
+                f"7. 禁止编造工具调用结果，必须等待工具真实返回后再回答。"
+            )
+        else:
+            system_prompt = "你是一位专业的大学课程导师。"
+
+        # 注入用户画像（薄弱知识点等），失败不影响主流程
+        try:
+            from memory.manager import get_memory_manager
+            profile_ctx = get_memory_manager().get_profile_context(course_name)
+            if profile_ctx:
+                system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
+        except Exception:
+            pass
+
+        messages: List[dict] = [{"role": "system", "content": system_prompt}]
+        if history:
+            for msg in history[-history_limit:]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    """根据 allowed_tools 解析工具 schema；返回 None 表示本轮不启用工具。"""
+    @staticmethod
+    def _resolve_tool_schemas(allowed_tools: Optional[List[str]]) -> Optional[List[dict]]:
+        if not allowed_tools:
+            return None
+        return get_tool_schemas(allowed_tools)
     
+    """非流式教学回答入口：组装消息后按工具配置调用模型并返回 TutorResult。"""
     def teach(
         self,
         question: str,
@@ -30,68 +108,29 @@ class TutorAgent:
         max_tokens: int = 2000,
         history_limit: int = 20,                        # 考试模式传 30
     ) -> TutorResult:
-        """生成非流式教学回答，返回结构化 TutorResult。"""
-        # 如果有 override，直接用；否则用 TUTOR_PROMPT
-        if user_content_override:
-            prompt = user_content_override
-        else:
-            prompt = TUTOR_PROMPT.format(
-                course_name=course_name,
-                context=context,
-                question=question
-            )
+        # 1) 统一组装 messages
+        messages = self._build_messages(
+            question=question,
+            course_name=course_name,
+            context=context,
+            allowed_tools=allowed_tools,
+            history=history,
+            system_prompt_override=system_prompt_override,
+            user_content_override=user_content_override,
+            history_limit=history_limit,
+            stream_mode=False,
+        )
 
-        # system prompt 构建逻辑
-        if system_prompt_override:
-            system_prompt = system_prompt_override
-        elif allowed_tools:
-            schemas = get_tool_schemas(allowed_tools)
-            tool_desc = "、".join(allowed_tools)
-            system_prompt = (
-                f"你是一位专业的大学课程导师。"
-                f"你可以使用以下工具：{tool_desc}。"
-                f"规则：\n"
-                f"1. 遇到数学计算，必须调用 calculator 工具，不要自己心算。\n"
-                f"2. 优先从数据库中获取数据，遇到超出知识库的信息或者需要网络查询的信息，可以调用 websearch 工具。\n"
-                f"3. 用户明确要求保存笔记，必须调用 filewriter 工具，文件名用中文，格式为 .md。\n"
-                f"4. 用户要求生成思维导图或知识点汇总，必须调用 mindmap_generator 工具。\n"
-                f"5. 如果该知识点用户之前问过或做错过，可以调用 memory_search 工具检索历史记录。\n"
-                f"6. 遇到询问当前日期、时间、星期几等时效性问题，必须调用 get_datetime 工具，不得凭记忆或训练数据回答。\n"
-                f"7. 禁止编造工具调用结果，必须等待工具真实返回后再回答。"
-            )
-        else:
-            system_prompt = "你是一位专业的大学课程导师。"
-
-        # 注入用户画像（薄弱知识点等），失败不影响主流程
-        try:
-            from memory.manager import get_memory_manager
-            profile_ctx = get_memory_manager().get_profile_context(course_name)
-            if profile_ctx:
-                system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
-        except Exception:
-            pass
-
-        # 构建 messages：system + 历史轮次 + 当前问题
-        messages: List[dict] = [{"role": "system", "content": system_prompt}]
-
-        # 插入历史对话（最多保留最近 history_limit 条，避免 token 超限）
-        if history:
-            for msg in history[-history_limit:]:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
-
-        messages.append({"role": "user", "content": prompt})
-
-        if allowed_tools:
-            schemas = get_tool_schemas(allowed_tools)
+        # 2) 根据是否启用工具调用不同 LLM 接口
+        schemas = self._resolve_tool_schemas(allowed_tools)
+        if schemas:
             raw = self.llm.chat_with_tools(messages, tools=schemas,
                                            temperature=temperature, max_tokens=max_tokens)
             return TutorResult(content=raw)
         raw = self.llm.chat(messages, temperature=temperature, max_tokens=max_tokens)
         return TutorResult(content=raw)
 
+    """流式教学回答入口：组装消息后按工具配置流式返回回答片段。"""
     def teach_stream(
         self,
         question: str,
@@ -105,56 +144,22 @@ class TutorAgent:
         max_tokens: int = 2000,
         history_limit: int = 20,                        # 考试模式传 30
     ):
-        """生成流式教学回答，返回文本分片生成器。"""
-        if user_content_override:
-            prompt = user_content_override
-        else:
-            prompt = TUTOR_PROMPT.format(
-                course_name=course_name,
-                context=context,
-                question=question
-            )
+        # 1) 统一组装 messages
+        messages = self._build_messages(
+            question=question,
+            course_name=course_name,
+            context=context,
+            allowed_tools=allowed_tools,
+            history=history,
+            system_prompt_override=system_prompt_override,
+            user_content_override=user_content_override,
+            history_limit=history_limit,
+            stream_mode=True,
+        )
 
-        if system_prompt_override:
-            system_prompt = system_prompt_override
-        elif allowed_tools:
-            schemas = get_tool_schemas(allowed_tools)
-            tool_desc = "、".join(allowed_tools)
-            system_prompt = (
-                f"你是一位专业的大学课程导师。"
-                f"你可以使用以下工具：{tool_desc}。"
-                f"规则：\n"
-                f"1. 遇到数学计算，必须调用 calculator 工具，不要自己心算。\n"
-                f"2. 优先从数据库中获取数据，遇到超出知识库的信息或者需要网络查询的信息（新闻/网络资料/日期/天气等），可以调用 websearch 工具，但仍然以数据库为准。\n"
-                f"3. 用户明确要求保存笔记，必须调用 filewriter 工具，文件名用中文，格式为 .md。\n"
-                f"4. 用户要求生成思维导图或知识点汇总，必须调用 mindmap_generator 工具。\n"
-                f"5. 如果该知识点用户之前问过或做错过，可以调用 memory_search 工具检索历史记录。\n"
-                f"6. 遇到询问当前日期、时间、星期几等时效性问题，必须调用 get_datetime 工具，不得凭记忆或训练数据回答。\n"
-                f"7. 禁止编造工具调用结果，必须等待工具真实返回后再回答。"
-            )
-        else:
-            system_prompt = "你是一位专业的大学课程导师。"
-
-        # 注入用户画像（薄弱知识点等），失败不影响主流程
-        try:
-            from memory.manager import get_memory_manager
-            profile_ctx = get_memory_manager().get_profile_context(course_name)
-            if profile_ctx:
-                system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
-        except Exception:
-            pass
-
-        messages: List[dict] = [{"role": "system", "content": system_prompt}]
-        if history:
-            for msg in history[-history_limit:]:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": prompt})
-
-        if allowed_tools:
-            schemas = get_tool_schemas(allowed_tools)
+        # 2) 根据是否启用工具选择流式调用接口
+        schemas = self._resolve_tool_schemas(allowed_tools)
+        if schemas:
             yield from self.llm.chat_stream_with_tools(messages, tools=schemas,
                                                        temperature=temperature, max_tokens=max_tokens)
         else:
