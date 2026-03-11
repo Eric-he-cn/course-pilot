@@ -277,12 +277,14 @@ class OrchestrationRunner:
             self._save_grading_to_memory(course_name, user_message, history, response_text)
             response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
-            topic, difficulty = self._resolve_quiz_request(user_message)
+            topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
             quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
                 topic=topic,
                 difficulty=difficulty,
                 context=context,
+                num_questions=num_questions,
+                question_type=question_type,
             )
             response_text = self._render_quiz_message(quiz)
             tool_calls = self._build_quiz_meta_tool_call(quiz)
@@ -359,12 +361,14 @@ class OrchestrationRunner:
             self._save_grading_to_memory(course_name, user_message, history, full_response)
             yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
-            topic, difficulty = self._resolve_quiz_request(user_message)
+            topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
             quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
                 topic=topic,
                 difficulty=difficulty,
                 context=context,
+                num_questions=num_questions,
+                question_type=question_type,
             )
             yield {"__tool_calls__": self._build_quiz_meta_tool_call(quiz)}
             yield self._render_quiz_message(quiz)
@@ -587,12 +591,14 @@ class OrchestrationRunner:
             pass
         return ""
 
-    """从用户出题请求中解析主题与难度（轻量规则，失败回退默认值）。"""
+    """从用户出题请求中解析主题、难度、题量与题型（轻量规则，失败回退默认值）。"""
     @staticmethod
-    def _resolve_quiz_request(user_message: str) -> tuple[str, str]:
+    def _resolve_quiz_request(user_message: str) -> tuple[str, str, int, str]:
+        import re
+
         text = (user_message or "").strip()
         if not text:
-            return "当前课程核心知识点", "medium"
+            return "当前课程核心知识点", "medium", 1, "简答题"
 
         lowered = text.lower()
         difficulty = "medium"
@@ -603,13 +609,53 @@ class OrchestrationRunner:
         elif any(k in text for k in ["中等", "普通"]) or "medium" in lowered:
             difficulty = "medium"
 
+        # 解析题量：支持阿拉伯数字与常见中文数字（默认 1，最大 20）。
+        num_questions = 1
+        count_match = re.search(r"(\d{1,2})\s*(?:道|题|个|条)", text)
+        if count_match:
+            num_questions = int(count_match.group(1))
+        else:
+            zh_map = {
+                "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+                "十一": 11, "十二": 12, "十三": 13, "十四": 14, "十五": 15,
+                "十六": 16, "十七": 17, "十八": 18, "十九": 19, "二十": 20,
+            }
+            for zh, value in sorted(zh_map.items(), key=lambda x: len(x[0]), reverse=True):
+                if re.search(fr"{zh}\s*(?:道|题|个|条)", text):
+                    num_questions = value
+                    break
+        num_questions = max(1, min(num_questions, 20))
+
+        # 解析题型：未指定时交给命题器自动决定。
+        question_type = "综合题"
+        if any(k in text for k in ["判断题", "判断"]):
+            question_type = "判断题"
+        elif any(k in text for k in ["单选", "选择题", "多选"]):
+            question_type = "选择题"
+        elif "填空" in text:
+            question_type = "填空题"
+        elif "简答" in text:
+            question_type = "简答题"
+        elif "论述" in text:
+            question_type = "论述题"
+        elif "计算" in text:
+            question_type = "计算题"
+
         topic = text
         # 去除常见口语前缀，保留核心主题短语
         for prefix in ["给我出", "帮我出", "请出", "出", "来", "我想练习"]:
             if topic.startswith(prefix):
                 topic = topic[len(prefix):].strip()
+        topic = re.sub(r"\d{1,2}\s*(?:道|题|个|条)", "", topic)
+        topic = re.sub(r"(?:一|二|两|三|四|五|六|七|八|九|十|十一|十二|十三|十四|十五|十六|十七|十八|十九|二十)\s*(?:道|题|个|条)", "", topic)
+        topic = re.sub(r"(判断题|选择题|单选题|多选题|填空题|简答题|论述题|计算题)", "", topic)
+        topic = re.sub(r"^(关于|有关)", "", topic).strip()
+        if topic.endswith("的") and len(topic) > 2:
+            topic = topic[:-1].strip()
+        topic = re.sub(r"[，,。；;!！]+$", "", topic).strip()
         topic = topic[:120] if topic else text[:120]
-        return topic, difficulty
+        return topic, difficulty, num_questions, question_type
 
     """将 Quiz 结构渲染为学生可见题面。"""
     @staticmethod
@@ -617,7 +663,7 @@ class OrchestrationRunner:
         return (
             "## 练习题\n\n"
             f"{quiz.question}\n\n"
-            "请回答上述问题，回答完毕后我会为你评分并给出详细讲解。"
+            "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。"
         )
 
     """将 Quiz 元数据挂载到内部 tool_calls，避免污染正文显示。"""
@@ -701,7 +747,50 @@ class OrchestrationRunner:
                         has_quiz_in_history = True
                     break
 
-        return has_answer_marker and has_quiz_in_history
+        if not has_quiz_in_history:
+            return False
+
+        # 放宽判定：已出题后，像“错误/正确/A”这类短答案也应进入评分阶段。
+        normalized = (user_message or "").strip().lower()
+        simple_answers = {
+            "a", "b", "c", "d", "ab", "ac", "ad", "bc", "bd", "cd", "abcd",
+            "对", "错", "正确", "错误", "true", "false", "√", "×",
+        }
+        if normalized in simple_answers:
+            return True
+
+        compact_answer = re.fullmatch(
+            r"(?:[a-dA-D]|正确|错误|对|错|√|×)(?:[\s,，、;/；]+(?:[a-dA-D]|正确|错误|对|错|√|×)){0,19}",
+            (user_message or "").strip(),
+        )
+        if compact_answer:
+            return True
+
+        request_like = any(
+            k in user_message for k in [
+                "出题", "再来", "下一题", "继续出", "给我出", "帮我出", "来一道",
+                "练习题", "判断题", "选择题", "填空题", "简答题", "论述题", "计算题",
+            ]
+        )
+        if re.search(
+            r"(?:给我|帮我|请)?\s*(?:再)?出\s*(?:[一二两三四五六七八九十\d]+\s*)?(?:道|题|个|条)",
+            user_message,
+        ):
+            request_like = True
+        if re.search(r"(来|再来)\s*一\s*(?:道|题)", user_message):
+            request_like = True
+        if re.search(r"下一\s*题", user_message):
+            request_like = True
+        ask_like = any(
+            k in user_message for k in ["什么", "为什么", "怎么", "解释", "提示", "再讲", "请讲"]
+        ) or ("?" in user_message or "？" in user_message)
+
+        if has_answer_marker:
+            return True
+        if len((user_message or "").strip()) <= 24 and not request_like and not ask_like:
+            return True
+
+        return False
 
     """检测考试模式是否为“提交答案”阶段。"""
     def _is_exam_answer_submission(self, user_message: str, history: list) -> bool:

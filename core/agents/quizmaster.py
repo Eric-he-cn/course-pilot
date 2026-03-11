@@ -86,29 +86,100 @@ class QuizMasterAgent:
         }
         return mapping.get(raw, fallback if fallback in {"easy", "medium", "hard"} else "medium")
 
+    """规范化题量，限制到 1~20。"""
+    @staticmethod
+    def _normalize_num_questions(value: Any, fallback: int = 1) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = int(fallback or 1)
+        return max(1, min(parsed, 20))
+
+    """规范化题型字段，统一为有限集合。"""
+    @staticmethod
+    def _normalize_question_type(value: str, fallback: str = "综合题") -> str:
+        raw = (value or "").strip()
+        if not raw:
+            raw = fallback or "综合题"
+        mapping = {
+            "判断": "判断题",
+            "判断题": "判断题",
+            "单选": "选择题",
+            "多选": "选择题",
+            "选择": "选择题",
+            "选择题": "选择题",
+            "填空": "填空题",
+            "填空题": "填空题",
+            "简答": "简答题",
+            "简答题": "简答题",
+            "论述": "论述题",
+            "论述题": "论述题",
+            "计算": "计算题",
+            "计算题": "计算题",
+            "综合": "综合题",
+            "综合题": "综合题",
+        }
+        return mapping.get(raw, raw if raw.endswith("题") else "综合题")
+
+    """清理模型输出中的隐藏注释和控制字符，避免污染前端题面。"""
+    @staticmethod
+    def _sanitize_text(value: Any) -> str:
+        import re
+
+        text = str(value or "")
+        text = re.sub(r"<!--[\s\S]*?-->", "", text)
+        text = re.sub(r"\[INTERNAL_[^\]]*\][\s\S]*", "", text)
+        text = text.replace("\ufeff", "").replace("\u200b", "")
+        return text.strip()
+
     """构建“出题计划”提示词（Plan 阶段）。"""
     @staticmethod
-    def _build_plan_prompt(user_request: str, default_difficulty: str, memory_ctx: str) -> str:
+    def _build_plan_prompt(
+        user_request: str,
+        default_difficulty: str,
+        requested_num_questions: int,
+        requested_question_type: str,
+        memory_ctx: str,
+    ) -> str:
         return f"""你是练习命题规划器。请根据用户请求先生成“出题计划”。
 
 用户请求：{user_request}
 默认难度：{default_difficulty}
+期望题量：{requested_num_questions}
+期望题型：{requested_question_type}
 {memory_ctx}
 
 请只输出 JSON，字段如下：
 {{
   "topic": "本次出题的核心知识点",
+  "num_questions": 题目数量（1-20）,
   "difficulty": "easy|medium|hard",
-  "question_type": "选择题/判断题/填空题/简答题",
+  "question_type": "选择题/判断题/填空题/简答题/论述题/计算题/综合题",
   "focus_points": ["知识点1", "知识点2"]
 }}
 """
 
-    """Plan 阶段：从用户请求中抽取主题与难度。"""
-    def _plan_quiz(self, user_request: str, default_difficulty: str, memory_ctx: str) -> Dict[str, Any]:
+    """Plan 阶段：从用户请求中抽取主题、题量、题型与难度。"""
+    def _plan_quiz(
+        self,
+        user_request: str,
+        default_difficulty: str,
+        requested_num_questions: int,
+        requested_question_type: str,
+        memory_ctx: str,
+    ) -> Dict[str, Any]:
         messages = [
             {"role": "system", "content": "你是一个严谨的出题规划器，只输出 JSON。"},
-            {"role": "user", "content": self._build_plan_prompt(user_request, default_difficulty, memory_ctx)},
+            {
+                "role": "user",
+                "content": self._build_plan_prompt(
+                    user_request=user_request,
+                    default_difficulty=default_difficulty,
+                    requested_num_questions=requested_num_questions,
+                    requested_question_type=requested_question_type,
+                    memory_ctx=memory_ctx,
+                ),
+            },
         ]
         try:
             response = self.llm.chat(messages, temperature=0.2, max_tokens=600)
@@ -116,17 +187,25 @@ class QuizMasterAgent:
             if not isinstance(plan, dict):
                 return {
                     "topic": user_request,
+                    "num_questions": self._normalize_num_questions(requested_num_questions),
                     "difficulty": self._normalize_difficulty(default_difficulty),
-                    "question_type": "简答题",
+                    "question_type": self._normalize_question_type(requested_question_type, "综合题"),
                     "focus_points": [],
                 }
             return {
                 "topic": str(plan.get("topic", user_request)).strip() or user_request,
+                "num_questions": self._normalize_num_questions(
+                    plan.get("num_questions", requested_num_questions),
+                    requested_num_questions,
+                ),
                 "difficulty": self._normalize_difficulty(
                     str(plan.get("difficulty", default_difficulty)),
                     self._normalize_difficulty(default_difficulty),
                 ),
-                "question_type": str(plan.get("question_type", "简答题")).strip() or "简答题",
+                "question_type": self._normalize_question_type(
+                    str(plan.get("question_type", requested_question_type)),
+                    requested_question_type,
+                ),
                 "focus_points": plan.get("focus_points", [])
                 if isinstance(plan.get("focus_points", []), list)
                 else [],
@@ -134,8 +213,9 @@ class QuizMasterAgent:
         except Exception:
             return {
                 "topic": user_request,
+                "num_questions": self._normalize_num_questions(requested_num_questions),
                 "difficulty": self._normalize_difficulty(default_difficulty),
-                "question_type": "简答题",
+                "question_type": self._normalize_question_type(requested_question_type, "综合题"),
                 "focus_points": [],
             }
 
@@ -350,7 +430,9 @@ JSON 示例：
         course_name: str,
         topic: str,
         difficulty: str,
-        context: str
+        context: str,
+        num_questions: int = 1,
+        question_type: str = "综合题",
     ) -> Quiz:
         # 1) 预查询历史错题，优先针对薄弱知识点出题
         memory_ctx = ""
@@ -365,10 +447,17 @@ JSON 示例：
         quiz_plan = self._plan_quiz(
             user_request=topic,
             default_difficulty=difficulty,
+            requested_num_questions=num_questions,
+            requested_question_type=question_type,
             memory_ctx=memory_ctx,
         )
         planned_topic = quiz_plan["topic"]
+        planned_num_questions = self._normalize_num_questions(quiz_plan.get("num_questions", num_questions), num_questions)
         planned_difficulty = quiz_plan["difficulty"]
+        planned_question_type = self._normalize_question_type(
+            str(quiz_plan.get("question_type", question_type)),
+            question_type,
+        )
 
         # 2) 必要时补充外部上下文（单次调用，避免工具风暴）
         external_ctx = self._build_external_ctx(planned_topic)
@@ -380,6 +469,8 @@ JSON 示例：
             difficulty=planned_difficulty,
             context=context,
             memory_ctx=memory_ctx,
+            num_questions=planned_num_questions,
+            question_type=planned_question_type,
         )
         prompt += (
             "\n\n【内部出题计划（请执行但不要原样复述）】\n"
@@ -402,6 +493,11 @@ JSON 示例：
         # 5) 解析模型输出
         try:
             quiz_dict = self._extract_json_payload(response)
+            quiz_dict["question"] = self._sanitize_text(quiz_dict.get("question", ""))
+            quiz_dict["standard_answer"] = self._sanitize_text(quiz_dict.get("standard_answer", ""))
+            quiz_dict["rubric"] = self._sanitize_text(quiz_dict.get("rubric", ""))
+            quiz_dict["chapter"] = self._sanitize_text(quiz_dict.get("chapter", planned_topic))
+            quiz_dict["concept"] = self._sanitize_text(quiz_dict.get("concept", ""))
             quiz_dict["difficulty"] = self._normalize_difficulty(
                 str(quiz_dict.get("difficulty", planned_difficulty)),
                 planned_difficulty,

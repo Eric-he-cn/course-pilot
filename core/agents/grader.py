@@ -99,21 +99,73 @@ class GraderAgent:
 要求：
 1. 只输出 JSON，不要输出解释文字。
 2. JSON 字段包含：
-   - checks: 逐题核对清单（数组）
-   - score_formula: 计算总分的公式字符串（例如 sum([...])）
+   - question_steps: 按题号顺序的逐题步骤（数组，每项含 question_no 和 action）
+   - final_step: 最后一步固定为“调用 calculator 汇总总分”
+   - score_formula: 计算总分的公式字符串模板（例如 sum([q1_score,q2_score,...])）
    - key_mistakes: 可能的错误类型（数组）
 3. 不要输出最终分数与讲评正文。
+4. 必须保证：每道题恰好一个步骤；计算总分只能在最后一步执行。
 
 JSON 示例：
 {{
-  "checks": ["核对第1题选项一致性", "核对第2题关键步骤"],
-  "score_formula": "sum([20,15,10,0,15])",
+  "question_steps": [
+    {{"question_no": 1, "action": "核对第1题标准答案与学生答案并给分"}},
+    {{"question_no": 2, "action": "核对第2题标准答案与学生答案并给分"}}
+  ],
+  "final_step": "调用 calculator 汇总总分",
+  "score_formula": "sum([q1_score,q2_score])",
   "key_mistakes": ["概念性错误", "步骤缺失"]
 }}
 """
 
+    """从题面文本中提取题号序列，供逐题计划兜底构建。"""
+    @staticmethod
+    def _extract_question_numbers(quiz_content: str) -> List[int]:
+        import re
+
+        numbers: List[int] = []
+        seen = set()
+        for match in re.finditer(r"(?:^|\n)\s*(?:第\s*(\d+)\s*题|(\d+)\s*[\.、:：)])", quiz_content or ""):
+            raw = match.group(1) or match.group(2)
+            if not raw:
+                continue
+            try:
+                n = int(raw)
+            except Exception:
+                continue
+            if n <= 0 or n in seen:
+                continue
+            seen.add(n)
+            numbers.append(n)
+        if not numbers:
+            numbers = [1]
+        return numbers
+
+    """构建练习评分计划的本地兜底版本（每题一步 + 最后计算总分）。"""
+    @classmethod
+    def _build_default_practice_plan(cls, quiz_content: str) -> dict:
+        q_numbers = cls._extract_question_numbers(quiz_content)
+        question_steps = [
+            {
+                "question_no": n,
+                "action": f"核对第{n}题标准答案与学生答案，给出该题得分与讲评",
+            }
+            for n in q_numbers
+        ]
+        score_formula = "sum([" + ",".join(f"q{n}_score" for n in q_numbers) + "])"
+        return {
+            "question_steps": question_steps,
+            "final_step": "调用 calculator 汇总总分",
+            "score_formula": score_formula,
+            "checks": [f"核对第{n}题" for n in q_numbers],
+            "key_mistakes": [],
+            "question_count": len(q_numbers),
+        }
+
     """生成评分内部计划；失败时返回可兜底的空计划。"""
     def _generate_practice_plan(self, quiz_content: str, student_answer: str) -> dict:
+        default_plan = self._build_default_practice_plan(quiz_content)
+        q_numbers = [item["question_no"] for item in default_plan["question_steps"]]
         messages = [
             {"role": "system", "content": "你是一个严谨的评卷计划器，只输出 JSON。"},
             {"role": "user", "content": self._build_practice_plan_prompt(quiz_content, student_answer)},
@@ -122,16 +174,50 @@ JSON 示例：
             response = self.llm.chat(messages, temperature=0.1, max_tokens=800)
             plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
-                return {"checks": [], "score_formula": "", "key_mistakes": []}
+                return default_plan
+
+            raw_steps = plan.get("question_steps", [])
+            normalized_steps = []
+            seen = set()
+            if isinstance(raw_steps, list):
+                for item in raw_steps:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        q_no = int(item.get("question_no", 0))
+                    except Exception:
+                        continue
+                    if q_no not in q_numbers or q_no in seen:
+                        continue
+                    action = str(item.get("action", "")).strip() or f"核对第{q_no}题并给分"
+                    normalized_steps.append({"question_no": q_no, "action": action[:100]})
+                    seen.add(q_no)
+            if len(normalized_steps) != len(q_numbers):
+                normalized_steps = default_plan["question_steps"]
+
+            final_step = str(plan.get("final_step", "")).strip() or default_plan["final_step"]
+            score_formula = str(plan.get("score_formula", "")).strip()[:220]
+            if not score_formula:
+                score_formula = default_plan["score_formula"]
+
+            checks = plan.get("checks", [])
+            if not isinstance(checks, list):
+                checks = default_plan["checks"]
+
+            key_mistakes = plan.get("key_mistakes", [])
+            if not isinstance(key_mistakes, list):
+                key_mistakes = []
+
             return {
-                "checks": plan.get("checks", []) if isinstance(plan.get("checks", []), list) else [],
-                "score_formula": str(plan.get("score_formula", ""))[:200],
-                "key_mistakes": plan.get("key_mistakes", [])
-                if isinstance(plan.get("key_mistakes", []), list)
-                else [],
+                "question_steps": normalized_steps,
+                "final_step": final_step,
+                "score_formula": score_formula,
+                "checks": checks,
+                "key_mistakes": key_mistakes,
+                "question_count": len(normalized_steps),
             }
         except Exception:
-            return {"checks": [], "score_formula": "", "key_mistakes": []}
+            return default_plan
 
     """构建考试评分“内部计划”提示词（仅内部使用）。"""
     @staticmethod
@@ -307,7 +393,13 @@ JSON 示例：
             "\n\n【内部评分计划（不要在最终回答中复述本段原文）】\n"
             + json.dumps(practice_plan, ensure_ascii=False)
         )
-        system_prompt += "\n请严格按内部评分计划执行，再给出最终评分与讲评。"
+        system_prompt += (
+            "\n请严格按内部评分计划执行，再给出最终评分与讲评。"
+            "\n执行硬约束："
+            "\n1. 必须按 question_steps 的题号顺序逐题评分，每一步只评一道题。"
+            "\n2. 所有题目评分完成后，最后一步再调用 calculator 汇总总分。"
+            "\n3. 评分依据只能来自题目内标准答案，不得自行改写标准结论。"
+        )
 
         # 2) 注入用户学习档案（失败不影响主流程）
         try:
