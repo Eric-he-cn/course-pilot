@@ -3,6 +3,8 @@
 - 主要作用：解析多种教材格式并输出统一页面结构，供后续分块与向量化使用。
 - 核心类：DocumentParser。
 - 支持格式：PDF/TXT/MD/DOCX/PPTX/PPT（含 PPT->PPTX 转换）。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
 import tempfile

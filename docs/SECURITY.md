@@ -2,7 +2,7 @@
 
 本文档描述 CoursePilot 项目当前代码状态下的安全控制、已知风险与生产部署建议。
 
-- 最后更新：2026-03-01
+- 最后更新：2026-03-11
 - 适用范围：当前仓库代码（开发/测试环境）
 - 声明：本项目尚未进行独立第三方安全审计
 
@@ -29,8 +29,8 @@
 
 ### 1.2 工具调用与权限控制
 
-1. 模式级工具白名单  
-`core/orchestration/policies.py` 对 `learn/practice/exam` 三种模式进行工具权限隔离，考试模式不允许 `websearch`。
+1. 统一 MCP 调用与运行时约束  
+工具调用统一走 `MCPTools.call_tool -> mcp_stdio`，无本地 fallback；`core/orchestration/policies.py` 当前对三模式均放行 `ALL_TOOLS`，实际权限收敛由 Runner 路由与 Agent 内部实现（如 Grader 仅允许 `calculator`）保证。
 
 2. 计算器受限执行环境  
 `mcp_tools/client.py` 的 `calculator` 使用受限 `eval`：

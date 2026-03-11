@@ -3,6 +3,8 @@
 - 主要作用：实现 Streamlit 前端界面，提供课程管理、文件管理与对话交互。
 - 核心函数：stream_chat、render_mermaid、load_workspaces。
 - 关键特性：SSE 流式渲染、引用展示、Mermaid 导图下载。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import re
 import streamlit as st
@@ -119,7 +121,7 @@ function dlPNG(){{
     components.html(html_code, height=height, scrolling=True)
 
 
-# API endpoint
+# 后端 API 地址：默认连接本机服务，可通过环境变量覆盖。
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 # ── 模式主题色 ───────────────────────────────────────────────────────────────
@@ -219,7 +221,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize session state
+# 初始化会话状态：前端交互中的临时状态统一放在 session_state。
 if "current_course" not in st.session_state:
     st.session_state.current_course = None
 if "current_mode" not in st.session_state:
@@ -234,7 +236,7 @@ if "show_help" not in st.session_state:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_workspaces_cached(api_base: str):
-    """Cached workspace list to avoid blocking every rerun."""
+    """获取课程列表缓存，避免页面每次 rerun 都阻塞等待接口。"""
     try:
         response = requests.get(f"{api_base}/workspaces", timeout=5)
         if response.status_code == 200:
@@ -246,7 +248,7 @@ def fetch_workspaces_cached(api_base: str):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_workspace_files_cached(api_base: str, course_name: str):
-    """Cached file/index status for a workspace."""
+    """获取课程文件与索引状态缓存，减少重复请求。"""
     fallback = {"files": [], "index_built": False, "index_mtime": None}
     try:
         resp = requests.get(f"{api_base}/workspaces/{course_name}/files", timeout=5)
@@ -258,13 +260,13 @@ def fetch_workspace_files_cached(api_base: str, course_name: str):
 
 
 def invalidate_api_cache():
-    """Clear cached API snapshots after mutating operations."""
+    """在上传/删除/重建后清空缓存，避免前端读到旧状态。"""
     fetch_workspaces_cached.clear()
     fetch_workspace_files_cached.clear()
 
 
 def load_workspaces():
-    """Load available workspaces."""
+    """加载可用课程工作区列表。"""
     try:
         st.session_state.workspaces = fetch_workspaces_cached(API_BASE)
     except Exception as e:
@@ -272,7 +274,7 @@ def load_workspaces():
 
 
 def create_workspace(course_name: str, subject: str):
-    """Create a new workspace."""
+    """创建新课程工作区。"""
     try:
         response = requests.post(
             f"{API_BASE}/workspaces",
@@ -295,7 +297,7 @@ def create_workspace(course_name: str, subject: str):
 
 
 def upload_file(course_name: str, file):
-    """Upload a file to workspace."""
+    """上传课程资料文件到后端工作区。"""
     try:
         files = {"file": (file.name, file, file.type)}
         response = requests.post(
@@ -310,7 +312,7 @@ def upload_file(course_name: str, file):
 
 
 def build_index(course_name: str):
-    """Build RAG index for workspace."""
+    """为课程构建 RAG 索引。"""
     try:
         response = requests.post(
             f"{API_BASE}/workspaces/{course_name}/build-index",
@@ -335,7 +337,7 @@ def build_index(course_name: str):
 
 
 def send_message(course_name: str, mode: str, message: str):
-    """Send a chat message with history."""
+    """发送非流式对话请求，并携带裁剪后的历史。"""
     try:
         # 取当前消息之前的最多 20 条历史（[-21:-1] 排除最后一条刚 append 的用户消息，避免重复）
         history = st.session_state.chat_history[-21:-1] if st.session_state.chat_history else []
@@ -346,7 +348,10 @@ def send_message(course_name: str, mode: str, message: str):
             content = m["content"]
             if role == "assistant":
                 content = strip_source_markers(content)
-            history_payload.append({"role": role, "content": content})
+            payload = {"role": role, "content": content}
+            if role == "assistant" and m.get("tool_calls"):
+                payload["tool_calls"] = m.get("tool_calls")
+            history_payload.append(payload)
         response = requests.post(
             f"{API_BASE}/chat",
             json={
@@ -383,7 +388,10 @@ def stream_chat(course_name: str, mode: str, message: str):
         content = m["content"]
         if role == "assistant":
             content = strip_source_markers(content)
-        history_payload.append({"role": role, "content": content})
+        payload_item = {"role": role, "content": content}
+        if role == "assistant" and m.get("tool_calls"):
+            payload_item["tool_calls"] = m.get("tool_calls")
+        history_payload.append(payload_item)
     payload = {
         "course_name": course_name,
         "mode": mode,
@@ -422,7 +430,7 @@ def stream_chat(course_name: str, mode: str, message: str):
         yield f"（流式输出失败：{e}）"
 
 
-# Main UI
+# 页面主 UI：先渲染顶栏和侧边栏，再渲染主内容区。
 st.markdown("""
 <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0.2rem;">
   <h1 style="margin:0; font-size:2rem;">📚 CoursePilot — 你的课程学习 AI 助手</h1>
@@ -450,16 +458,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.markdown("---")
 
-# Sidebar
+# 侧边栏：课程管理、模式切换、文件上传与索引管理入口。
 with st.sidebar:
     st.header("⚙️ 设置")
     
-    # Load workspaces
+    # 步骤1：刷新课程列表，确保前后端状态一致。
     if st.button("🔄 刷新课程列表"):
         fetch_workspaces_cached.clear()
         load_workspaces()
     
-    # Create new workspace
+    # 步骤2：创建课程工作区。
     if "expander_open" not in st.session_state:
         st.session_state.expander_open = False
     with st.expander("➕ 创建新课程", expanded=st.session_state.expander_open):
@@ -480,7 +488,7 @@ with st.sidebar:
             else:
                 st.warning("请填写课程名称和学科标签")
     
-    # Select workspace
+    # 步骤3：选择当前课程。
     st.markdown("### 📖 选择课程")
     if not st.session_state.workspaces:
         load_workspaces()
@@ -497,7 +505,7 @@ with st.sidebar:
     else:
         st.info("暂无课程，请创建新课程")
     
-    # Mode selection
+    # 步骤4：切换学习模式（learn/practice/exam）。
     st.markdown("### 🎯 学习模式")
     mode = st.radio(
         "选择模式",
@@ -512,7 +520,7 @@ with st.sidebar:
     if mode != st.session_state.current_mode:
         st.session_state.current_mode = mode
     
-    # Knowledge base management
+    # 步骤5：管理知识库文件与索引。
     if st.session_state.current_course:
         st.markdown("### 📁 文件与索引")
 
@@ -595,7 +603,7 @@ with st.sidebar:
                 st.rerun()
 
 
-# Main content
+# 主内容区：展示状态栏、历史消息和流式回复。
 if st.session_state.current_course:
     # 注入模式主题色
     inject_mode_css(st.session_state.current_mode)
@@ -637,12 +645,12 @@ if st.session_state.current_course:
         unsafe_allow_html=True,
     )
 
-    # Display chat history
+    # 渲染历史消息：包含正文、引用、工具调用记录与导图。
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(fix_latex(msg["content"]))
             
-            # Display citations if available
+            # 渲染引用来源（仅显示该条消息自己的 citations）。
             if msg.get("citations"):
                 with st.expander(f"📑 查看引用来源（共 {len(msg['citations'])} 条）"):
                     for i, citation in enumerate(msg["citations"]):
@@ -658,13 +666,17 @@ if st.session_state.current_course:
                         if i < len(msg["citations"]) - 1:
                             st.divider()
             
-            # Display tool calls if available
-            if msg.get("tool_calls"):
+            # 渲染工具调用记录（便于排查工具链路）。
+            visible_tool_calls = [
+                tc for tc in (msg.get("tool_calls") or [])
+                if not (isinstance(tc, dict) and tc.get("type") == "internal_meta")
+            ]
+            if visible_tool_calls:
                 with st.expander("🔧 工具调用"):
-                    for tool_call in msg["tool_calls"]:
+                    for tool_call in visible_tool_calls:
                         st.json(tool_call)
 
-            # Render mermaid blocks if available
+            # 渲染 Mermaid 思维导图代码块。
             for m_idx, mb in enumerate(msg.get("mermaid_blocks") or []):
                 render_mermaid(mb["code"], idx=abs(hash(mb["code"])) % 100000, height=520)
                 with st.expander("📄 下载 Mermaid 源码"):
@@ -677,17 +689,17 @@ if st.session_state.current_course:
                         key=f"dl_md_{abs(hash(mb['code'])) % 100000}_{m_idx}",
                     )
 
-    # Chat input
+    # 输入区：提交后写入历史并触发流式请求。
     user_input = st.chat_input("输入你的问题...")
     
     if user_input:
-        # Add user message to history
+        # 步骤1：先把用户消息写入历史，保证刷新后可回放。
         st.session_state.chat_history.append({
             "role": "user",
             "content": user_input
         })
         
-        # Display user message
+        # 步骤2：立即回显用户消息，降低等待感。
         with st.chat_message("user"):
             st.markdown(user_input)
         
@@ -695,6 +707,7 @@ if st.session_state.current_course:
         # 单独收集文本，避免依赖 st.write_stream 返回类型（新版 Streamlit 返回 StreamingOutput 而非 str）
         collected_chunks: list[str] = []
         st.session_state._pending_citations = []  # 在流开始前初始化
+        st.session_state._pending_tool_calls = []  # 保存内部 tool_calls 元数据
         assistant_payload = None
 
         with st.chat_message("assistant"):
@@ -710,6 +723,11 @@ if st.session_state.current_course:
                     if isinstance(chunk, dict) and "__citations__" in chunk:
                         st.session_state._pending_citations = chunk["__citations__"]
                         continue  # 跳过 yield，防止 st.write_stream 把 dict 渲染成乱码
+
+                    # 工具元数据事件：用于下一轮评分，不在当前对话中显示
+                    if isinstance(chunk, dict) and "__tool_calls__" in chunk:
+                        st.session_state._pending_tool_calls = chunk["__tool_calls__"] or []
+                        continue
 
                     # 进度事件：显示当前正在执行的阶段，避免“卡死感”
                     if isinstance(chunk, dict) and "__status__" in chunk:
@@ -728,6 +746,7 @@ if st.session_state.current_course:
             full_response = "".join(collected_chunks)
             # 捕获流式过程中拦截到的 citations
             citations = st.session_state.pop("_pending_citations", None) or None
+            tool_calls = st.session_state.pop("_pending_tool_calls", None) or None
 
             if full_response:
                 # 提取 mermaid 代码块，避免 markdown 渲染失败
@@ -767,6 +786,7 @@ if st.session_state.current_course:
                     "role": "assistant",
                     "content": fix_latex(cleaned_response),
                     "citations": citations,
+                    "tool_calls": tool_calls,
                     "mermaid_blocks": mermaid_blocks,
                 }
 

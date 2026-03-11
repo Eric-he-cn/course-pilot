@@ -3,6 +3,8 @@
 - 主要作用：提供本地 stdio 版 MCP Server，承载工具调用协议入口。
 - 协议子集：initialize / notifications/initialized / tools/list / tools/call。
 - 核心函数：_read_message、_write_message、_handle_request、main。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
 import sys

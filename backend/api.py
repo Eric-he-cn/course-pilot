@@ -3,6 +3,8 @@
 - 主要作用：提供后端 HTTP/SSE 接口，承载课程管理、文件上传、索引构建与对话服务。
 - 核心对象：FastAPI app、OrchestrationRunner、workspace 注册表。
 - 核心接口：/workspaces、/upload、/build-index、/chat、/chat/stream。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
 import logging
@@ -14,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 
-# 配置日志，显示工具调用详情
+"""basicConfig: 配置全局日志记录，设置日志级别、格式和时间格式,方便后续在代码中使用 logging 模块记录日志。"""
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -31,7 +33,7 @@ from core.orchestration.runner import OrchestrationRunner
 
 app = FastAPI(title="Course Learning Agent API")
 
-# CORS 中间件配置
+"""CORS 中间件配置,允许所有来源的跨域请求，适用于开发阶段。生产环境建议根据实际情况限制 allow_origins。"""
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,9 +48,11 @@ runner = OrchestrationRunner()
 # 内存工作区注册表（生产环境建议换数据库）
 workspaces = {}
 
-
+"""启动时从磁盘扫描已有 workspace 目录恢复数据.
+    - 目的：在 API 启动时自动加载之前创建的课程工作区，确保重启后数据不丢失。
+    - 实现方式：扫描 data/ 目录下的子目录，每个子目录代表一个课程工作区，读取其 uploads/ 目录中的文件列表，
+        并构建 CourseWorkspace 对象注册到内存中。同时确保所有必要的子目录存在。"""
 def load_workspaces_from_disk():
-    """启动时从磁盘扫描已有 workspace 目录恢复数据。"""
     data_dir = os.path.abspath(runner.data_dir)
     if not os.path.exists(data_dir):
         return
@@ -253,6 +257,11 @@ async def delete_workspace_index(course_name: str):
     return {"message": "索引已删除"}
 
 
+
+"""为课程构建 RAG 向量索引。
+    - 目的：根据课程已上传的教材文件，解析文本内容，分块处理，并构建 FAISS 向量索引，供后续对话检索使用。
+    - 实现方式：首先验证课程工作区存在，然后扫描 uploads/ 目录获取文件列表，解析每个文件提取文本内容，进行分块处理，
+        最后调用 build_index 构建 FAISS 索引，并保存到磁盘。"""
 @app.post("/workspaces/{course_name}/build-index")
 async def build_workspace_index(course_name: str):
     """为课程构建 RAG 向量索引。"""
@@ -319,7 +328,9 @@ async def build_workspace_index(course_name: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"构建索引时发生错误: {str(e)}")
 
-
+"""同步对话接口。
+    - 目的：提供一个 HTTP POST 接口，接受用户消息和对话历史
+        进行处理，并返回生成的回复消息和执行计划。"""
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """同步对话接口。"""

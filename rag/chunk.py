@@ -3,6 +3,8 @@
 - 主要作用：把解析后的文档文本切分为可检索的小块，并保留元数据。
 - 核心函数：simple_chunk_text、chunk_documents。
 - 设计要点：支持 overlap，并防止 overlap 配置异常导致死循环。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
 from typing import List, Dict, Any

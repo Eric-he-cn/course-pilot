@@ -20,14 +20,15 @@
 
 | 模式 | 适用场景 | 执行 Agent | 工具可用性（代码层） | 关键约束 | 自动记录 |
 |------|----------|-----------|---------------------|----------|----------|
-| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | `ToolPolicy` 放行全部 6 个工具 | 优先 RAG 引用，可按需调用工具增强回答 | 问答写入 `memory.db`（`qa` episode） |
-| **练习 (Practice)** | 出题、提交答案、评分讲评 | TutorAgent（出题）+ GraderAgent（评分） | 出题阶段：6 工具；评卷阶段：仅 `calculator`（`GraderAgent` 专线） | `_is_answer_submission()` 命中后强制切到评卷链路 | `practices/` Markdown 记录 + `memory.db` |
-| **考试 (Exam)** | 模拟考试、自测报告 | TutorAgent（三阶段） | `ToolPolicy` 放行全部 6 个工具 | 三阶段流程由 `EXAM_SYSTEM` 强约束（配置→出卷→批改） | `exams/` Markdown 记录 + `memory.db` |
+| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | `ToolPolicy` 放行全部 6 个工具（运行时按 Agent 规则约束） | 优先 RAG 引用，按需 ReAct 调用工具 | 问答写入 `memory.db`（`qa` episode） |
+| **练习 (Practice)** | 出题、提交答案、评分讲评 | QuizMasterAgent（出题）+ GraderAgent（评分讲解） | 出题阶段：按需最小工具（主要 `websearch/get_datetime`）；评卷阶段：仅 `calculator` | `_is_answer_submission()` 命中后强制切到 Grader 评卷链路 | `practices/` Markdown 记录 + `memory.db` |
+| **考试 (Exam)** | 模拟考试、自测报告 | QuizMasterAgent（出卷）+ GraderAgent（批改讲解） | 出卷阶段：按需最小工具（主要 `websearch/get_datetime`）；批改阶段：仅 `calculator` | `_is_exam_answer_submission()` 命中后进入 Grader 评卷链路 | `exams/` Markdown 记录 + `memory.db` |
 
 - **学习模式**：基于上传教材 RAG 检索，支持引用来源展示、网页补充检索、思维导图生成与笔记落盘。
-- **练习模式**：TutorAgent 负责出题与讲解；当检测到“提交答案”后，Runner 自动路由至 GraderAgent，按“逐题对照 → calculator 汇总”流程评分并写入练习记录/记忆库。
-- **考试模式**：TutorAgent 按三阶段执行（配置收集→生成试卷→批改报告）；结束后自动保存考试记录并同步记忆。
-- **实现说明**：当前 `core/orchestration/policies.py` 中 `learn/practice/exam` 的 `allowed_tools` 均为 `ALL_TOOLS`。模式差异主要由 Runner 路由与 Prompt 规则控制，而非工具白名单。
+- **练习模式**：QuizMaster 负责出题（Plan-Solve + 按需外部信息），提交答案后 Runner 自动路由至 Grader，按“逐题对照 → calculator 汇总 → 讲评”流程输出并落盘。
+- **考试模式**：QuizMaster 负责出卷（返回试卷正文 + 内部答案元数据），交卷后 Grader 负责批改与讲解；结束后自动保存考试记录并同步记忆。
+- **实现说明**：当前 `core/orchestration/policies.py` 中 `learn/practice/exam` 的 `allowed_tools` 均为 `ALL_TOOLS`。模式差异主要来自 Runner 路由和 Agent 内部实现约束，不是白名单本身。
+- **方法论标签**：Router=`Plan+Replan`，Tutor=`ReAct`，QuizMaster=`Plan-Solve`，Grader=`Plan + ReAct-Solve(calculator only)`。
 
 ### RAG 知识库
 
@@ -45,22 +46,28 @@
 用户请求
    ↓
 OrchestrationRunner（Python 调度器）
-   ├─ [LLM] Router Agent  ← 制定 Plan（need_rag / style）
+   ├─ [LLM] Router Agent  ← 制定 Plan（need_rag / style）并在失败时 Replan 一次
    ├─ [工具] RAG Retriever ← Hybrid 检索（FAISS + BM25）
    ├─ [工具] memory_search ← 预取历史错题上下文
    │
-   ├─ 学习模式 / 考试模式 / 练习出题
+   ├─ 学习模式
    │      ↓
-   │   Tutor Agent（ReAct 循环）
+   │   Tutor Agent（ReAct）
    │      ├─ 可调用：calculator · websearch · filewriter
    │      │          memory_search · mindmap_generator · get_datetime
-   │      └─ 流式输出教学 / 题目 / 考试报告
+   │      └─ 流式输出教学回答
    │
-   └─ 练习评卷（检测到答案提交）
+   ├─ 练习/考试出题
+   │      ↓
+   │   QuizMaster Agent（Plan-Solve）
+   │      ├─ 默认不走工具循环，仅按需调用 MCP（websearch/get_datetime）
+   │      └─ 输出题目/试卷 + 内部元数据（quiz_meta / exam_meta）
+   │
+   └─ 练习/考试评卷（检测到答案提交）
           ↓
-       Grader Agent（ReAct 循环）
-          ├─ 逐字引用原文对比标准答案 vs 学生答案
-          ├─ 调用：calculator（汇总得分）
+       Grader Agent（Plan + ReAct-Solve）
+          ├─ 先做内部评卷计划（不展示）
+          ├─ 仅调用 calculator 汇总得分
           └─ 流式输出评分结果 + 讲评
 ```
 
@@ -122,9 +129,10 @@ Browser (Streamlit :8501)
 FastAPI (:8000)
     │
     ├─ OrchestrationRunner（Python 调度器，非 LLM）
-    │    ├─ Router Agent      → Plan（need_rag / style）
-    │    ├─ Tutor Agent       → 学习讲解 / 练习出题 / 考试三阶段
-    │    └─ Grader Agent      → 练习评卷（ReAct + calculator）
+    │    ├─ Router Agent      → Plan + Replan（need_rag / style）
+    │    ├─ Tutor Agent       → 学习讲解（ReAct）
+    │    ├─ QuizMaster Agent  → 练习出题 / 考试出卷（Plan-Solve）
+    │    └─ Grader Agent      → 练习/考试评卷讲解（Plan + ReAct-Solve）
     │
     ├─ RAG Pipeline
     │    ├─ DocumentParser  (ingest.py)
@@ -144,10 +152,10 @@ FastAPI (:8000)
 ### Agent 职责
 | Agent | 调用时机 | 输入 | 输出 |
 |-------|---------|------|------|
-| Router | 每次请求首先调用 | 用户消息 + 模式 | `Plan`（need_rag、style 等） |
-| Tutor | 学习 / 考试 / 练习出题 | 问题 + RAG 上下文 + 历史 | 教学内容 / 题目 / 考试批改 |
-| Grader | 练习模式检测到答案提交 | 题目原文 + 学生答案 | 逐题对照表 + 得分 + 讲评 |
-| QuizMaster | 未启用（保留代码） | — | — |
+| Router | 每次请求首先调用；必要时触发一次重规划 | 用户消息 + 模式 + 失败原因（重规划时） | `Plan`（need_rag、style、output_format） |
+| Tutor | 学习模式主执行 | 问题 + RAG 上下文 + 历史 | 教学内容（可含引用/工具结果） |
+| QuizMaster | 练习出题 / 考试出卷 | 请求 + RAG 上下文 + 历史错题上下文 | 题目/试卷正文 + 内部元数据 |
+| Grader | 练习/考试检测到答案提交 | 题目或试卷原文 + 学生答案 + 历史错题上下文 | 逐题对照 + 得分 + 讲评 |
 
 ---
 
@@ -389,5 +397,5 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 ## 贡献与许可
 - 欢迎提交 Issue / PR，一起完善功能与安全性。
 - 许可证：MIT License
-- 作者：**Eric He** · 更新日期：2026-03-02
+- 作者：**Eric He** · 更新日期：2026-03-11
 

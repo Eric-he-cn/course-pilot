@@ -3,6 +3,8 @@
 - 主要作用：封装嵌入模型加载与向量生成（文档向量 + 查询向量）。
 - 核心类：EmbeddingModel。
 - 核心函数：get_embedding_model（全局单例获取）。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
 from typing import List

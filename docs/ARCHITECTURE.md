@@ -6,8 +6,8 @@
 
 1. **基于教材的 RAG 系统** - 所有回答都有教材引用
 2. **三种学习模式** - 学习、练习、考试
-3. **多 Agent 协作** - Router（规划）、Tutor（教学/出题/考试）、Grader（练习评卷）
-4. **工具可控集成** - 不同模式限制不同工具
+3. **多 Agent 协作** - Router（Plan+Replan）、Tutor（学习 ReAct）、QuizMaster（出题/出卷 Plan-Solve）、Grader（评卷讲解）
+4. **工具标准化集成** - 全部工具统一走 MCP `mcp_stdio`，无本地 fallback
 5. **持久化记忆系统** - SQLite 存储学习历史与薄弱知识点
 6. **完整学习闭环** - 从理解到练习到考试
 
@@ -30,25 +30,17 @@
 │       OrchestrationRunner                           │
 │  ────────────────────────────────────────────────── │
 │  [LLM] Router Agent → Plan（need_rag / style）      │
+│                  └→ 失败触发 Replan（单次重试）       │
 │  [工具] RAG Retriever → Hybrid 检索 + 引用           │
 │  [工具] memory_search → 历史错题预取                 │
 │  ────────────────────────────────────────────────── │
-│  路由判断（Python 关键词检测）                        │
-│       ┌──────────────────────┐                      │
-│       │  学习 / 考试 / 练习出题│                      │
-│       ▼                      ▼                      │
-│  ┌──────────┐       ┌──────────────┐               │
-│  │  Tutor   │       │练习答案提交时 │               │
-│  │  Agent   │       │   Grader     │               │
-│  │ (ReAct)  │       │   Agent      │               │
-│  └────┬─────┘       │  (ReAct)     │               │
-│       │             └──────┬───────┘               │
-└───────┼────────────────────┼────────────────────────┘
-        │                    │
-   ┌────▼────┐          ┌───▼────┐
-   │  RAG   │          │ MCP    │  ← 工具：calculator /
-   │ System │          │ Tools  │    websearch / filewriter /
-   └────────┘          └────────┘    memory_search / mindmap / datetime
+│  路由判断（Runner 硬编码）                           │
+│       ┌──────────────────────────────┐              │
+│       │ learn -> Tutor（ReAct）      │              │
+│       │ practice/exam 出题 -> QuizMaster│           │
+│       │ answer 提交 -> Grader         │              │
+│       └──────────────────────────────┘              │
+└─────────────────────────────────────────────────────┘
 ```
 
 ### 2. 核心模块说明
@@ -102,7 +94,7 @@ flowchart LR
 
 本项目的 Multi-Agent 本质是“中心编排 + 专职 Agent”：
 - 编排者是 `OrchestrationRunner`（Python 决策与路由）。
-- Router/Tutor/Grader 分别负责规划、教学/出题/考试、评卷。
+- Router/Tutor/QuizMaster/Grader 分别负责规划、学习讲解、出题出卷、评卷讲解。
 - Agent 不是并行自治群体，而是受 Runner 控制的可替换执行单元。
 
 **B1. 控制流总图**
@@ -111,30 +103,35 @@ flowchart LR
 flowchart TD
     IN["用户请求"] --> RUN["OrchestrationRunner"]
     RUN --> RT["RouterAgent"]
-    RT --> DEC{"mode 判断"}
+    RT --> PLAN["Plan"]
+    PLAN --> DEC{"mode + 是否提交答案"}
 
-    DEC --> LEARN["TutorAgent (learn)"]
-    DEC --> PRACTICE_Q["TutorAgent (practice 出题)"]
+    DEC --> LEARN["TutorAgent (learn, ReAct)"]
+    DEC --> PRACTICE_Q["QuizMasterAgent (practice 出题)"]
+    DEC --> EXAM_Q["QuizMasterAgent (exam 出卷)"]
     DEC --> PRACTICE_G["GraderAgent (practice 评卷)"]
-    DEC --> EXAM["TutorAgent (exam 三阶段)"]
+    DEC --> EXAM_G["GraderAgent (exam 批改)"]
 
-    LEARN --> TOOLS["MCP Tools"]
+    LEARN --> TOOLS["MCP Tools (mcp_stdio)"]
     PRACTICE_Q --> TOOLS
-    EXAM --> TOOLS
+    EXAM_Q --> TOOLS
     PRACTICE_G --> CALC["calculator only"]
+    EXAM_G --> CALC
 
     RUN --> SAVE["记录 practices/exams + memory"]
 ```
 
 **B2. 各 Agent 的职责边界**
-- Router (`router.py`)：把自然语言请求映射为 `Plan`（是否需要 RAG、回答风格等）；是每轮第一个 LLM 调用。
-- Tutor (`tutor.py`)：统一承载学习讲解、练习出题、考试流程；通过 `system_prompt_override/user_content_override` 适配不同模式。
-- Grader (`grader.py`)：仅用于练习评卷；提示词和工具权限更严格，输出确定性优先。
+- Router (`router.py`)：把自然语言请求映射为 `Plan`（need_rag/style/output_format）；当执行失败时支持一次 `replan()`。
+- Tutor (`tutor.py`)：学习模式主执行，采用 ReAct 工具循环输出教学回答。
+- QuizMaster (`quizmaster.py`)：练习出题与考试出卷主执行，采用 Plan-Solve；默认不做工具循环，仅在必要时直调 MCP（主要 `websearch/get_datetime`）。
+- Grader (`grader.py`)：练习/考试评卷主执行，采用“先内部计划、再 ReAct-Solve”两阶段；工具仅 `calculator`。
 
 **B3. Runner 的“强约束”机制**
-- 工具权限最终由 `policies.py` 与 Runner 决定，不完全信任 Router 产出的 `allowed_tools`。
 - 练习模式通过 `_is_answer_submission()` 进行分支，避免“用户提交答案却继续出题”。
-- 评卷链路将题目原文与学生答案原文一起输入，降低幻觉评分概率。
+- 考试模式通过 `_is_exam_answer_submission()` 进行分支，出卷与批改职责分离。
+- 练习与考试均使用内部元数据通道（`quiz_meta/exam_meta`）传递标准答案与评分信息，走 `tool_calls` 内部字段，不向用户展示。
+- Replan 触发条件为检索为空 / 工具失败 / 回答质量偏低，且仅重跑一次以控制副作用。
 
 **B4. 为什么这样设计**
 - 保持“LLM 做语言推理，Python 做流程控制”的可控性。
@@ -227,10 +224,11 @@ flowchart LR
 - `get_datetime`：时效信息由工具提供，避免模型“记忆型时间错误”。
 
 **C3. 工具权限模型**
-- “能不能调工具”由两层共同决定：
-1. `policies.py` 的允许集合。
-2. 各 Agent system prompt 的行为规则（尤其是考试与评卷阶段）。
-- 练习评卷阶段额外收紧：由 GraderAgent 专线处理，工具仅 `calculator`。
+- 当前实现中 `ToolPolicy` 对三模式均放行 `ALL_TOOLS`。
+- 实际“能不能调工具”由两层共同决定：
+1. Runner 的分支路由（learn/practice/exam + 是否提交答案）。
+2. 各 Agent 的内部实现与提示词规则（尤其是 QuizMaster 的最小外部调用、Grader 的 `calculator` 专线）。
+- 练习/考试评卷阶段额外收紧：由 GraderAgent 专线处理，工具仅 `calculator`。
 
 #### D. 记忆系统 (memory/)
 
@@ -287,14 +285,14 @@ Runner.run_practice_mode_stream()
   ↓
 _is_answer_submission() → False（用户在请求出题）
   ↓
-[LLM #2~N] TutorAgent.teach_stream()  ← ReAct 循环
-  system: PRACTICE_SYSTEM + 历史错题上下文
-  user:   PRACTICE_PROMPT（对话式练习规则）
-  tools:  全部 6 个工具
+[LLM #2] QuizMaster.generate_quiz()  ← Plan-Solve
+  plan:  _plan_quiz()（topic/difficulty/question_type/focus_points）
+  solve: 基于 QUIZMASTER_PROMPT 生成结构化题目 JSON
+  tools: 默认不循环；必要时直调 MCP（websearch/get_datetime）
   │
-  ├─ 可能 call websearch 查找补充题材
-  ├─ 流式元事件：`__status__` + `__citations__`
-  └─ 流式输出题目（引用仅归属当前轮）
+  ├─ 生成题目正文（可见）
+  ├─ 生成 `quiz_meta`（内部 tool_calls，不展示）
+  └─ 流式返回题目 + 元数据事件（`__tool_calls__`）
 
 【评卷阶段】
 用户: "1.A  2.正确  3.B..."（提交答案）
@@ -307,7 +305,8 @@ Runner.run_practice_mode_stream()
 _is_answer_submission() → True（检测到答案格式）
 _extract_quiz_from_history() → 从对话历史中提取题目原文（纯 Python，无 LLM）
   ↓
-[LLM #2~N] GraderAgent.grade_practice_stream()  ← ReAct 循环
+[LLM #2] GraderAgent._generate_practice_plan()  ← 内部计划（不展示）
+[LLM #3~N] GraderAgent.grade_practice_stream()  ← ReAct-Solve
   system: GRADER_SYSTEM（强制逐字引用原文规则）
   user:   GRADER_PRACTICE_PROMPT（题目 + 学生答案）
   tools:  仅 calculator，temperature=0.1
@@ -331,16 +330,21 @@ Runner.run_exam_mode_stream()
   ↓
 [工具] Retriever.retrieve(top_k=12) → 大范围 RAG 上下文
   ↓
-[LLM #2~N] TutorAgent.teach_stream()  ← ReAct 循环（三阶段对话）
-  system: EXAM_SYSTEM（三阶段规则）
-  user:   EXAM_PROMPT
-  tools:  calculator · memory_search · get_datetime
+[LLM #2] QuizMaster.generate_exam_paper()  ← Plan-Solve
+  plan:  _plan_exam()（scope/num_questions/difficulty_ratio）
+  solve: 基于 EXAM_GENERATOR_PROMPT 生成结构化试卷 JSON
+  tools: 默认不循环；必要时直调 MCP（websearch/get_datetime）
   │
-  ├─ 阶段一：对话收集配置（题型/题数/难度）
-  ├─ 阶段二：生成完整试卷（不透露答案）
-  └─ 阶段三：学生提交后，逐题批改 + call calculator + 输出总分（流式附带 `__status__`）
+  ├─ 输出试卷正文（可见）
+  ├─ 输出 `exam_meta`（answer_sheet/total_score，内部 tool_calls）
+  └─ 等待学生一次性提交答案
   ↓
-_is_exam_grading() → True → _save_exam_record() + _save_exam_to_memory()
+_is_exam_answer_submission() → True
+  ↓
+[LLM #3] GraderAgent._generate_exam_plan()（内部计划）
+[LLM #4~N] GraderAgent.grade_exam_stream()（ReAct-Solve + calculator）
+  ↓
+_save_exam_record() + _save_exam_to_memory()
 ```
 
 ## 🎨 前端界面设计
@@ -403,9 +407,9 @@ data/
         ├── mistakes/          # 错题本
         │   └── mistakes.jsonl
         ├── practices/         # 练习记录
-        │   └── practice_20260222_143000.json
+        │   └── 练习记录_20260222_143000.md
         └── exams/             # 考试记录
-            └── exam_20260222_160000.json
+            └── 考试记录_20260222_160000.md
 ```
 
 ### mistakes.jsonl 格式
@@ -442,11 +446,11 @@ hybrid_bm25_weight = 1.0
 
 ### 2. Prompt Engineering
 
-- **system/user override**：TutorAgent 的 `teach_stream()` 接受 `system_prompt_override` 和 `user_content_override`，让同一 Agent 适配学习/练习/考试三种角色，无需多份执行代码
-- **PRACTICE_SYSTEM / EXAM_SYSTEM / GRADER_SYSTEM**：模式专用 system prompt 常量，在 `prompts.py` 集中管理
-- **CoT 强制评分**：GraderAgent 的 `GRADER_PRACTICE_PROMPT` 三步走：先逐字引用 → 判断对错 → calculator 汇总，禁止跳步
-- **证据优先**：学习模式 Tutor 强制引用教材 `[来源N]` 内联标注
-- **结构化输出**：Router 输出 JSON Plan；考试批改输出固定 Markdown 表格格式
+- **Router 重规划**：Router 先输出 Plan，执行失败信号触发一次 Replan（原因入参显式传入）。
+- **QuizMaster Plan-Solve**：先抽取出题/出卷计划，再生成结构化 JSON；降低直接长文本生成漂移。
+- **Grader 两阶段**：先生成内部评卷计划，再 ReAct 执行评分讲解，且仅允许 `calculator`。
+- **证据优先**：学习模式 Tutor 强制引用教材 `[来源N]` 内联标注。
+- **元数据内通道**：练习/考试标准答案通过 `quiz_meta/exam_meta` 进入历史 `tool_calls`，不污染可见正文。
 
 ### 3. 错误处理
 
@@ -495,12 +499,14 @@ def new_tool(param):
 ```
 
 ### 3. 工具策略控制
-- 不同模式不同策略，考试模式防作弊，所有调用可观测
+- `ToolPolicy` 目前对三模式均放行 6 工具；实际差异由 Runner 路由和 Agent 内部实现约束。
+- 全部工具统一走 `mcp_stdio`，日志可通过 `via=mcp_stdio` 观测。
 
 ### 4. Agent 职责分离
 - Router：规划（need_rag / style）
-- Tutor：学习讲解 · 练习出题 · 考试三阶段（ReAct，全工具集）
-- Grader：练习评卷专用（ReAct，仅 calculator，逐字引用原文对比，temperature=0.1）
+- Tutor：学习讲解（ReAct）
+- QuizMaster：练习出题 + 考试出卷（Plan-Solve，按需最小外部工具）
+- Grader：练习/考试评卷讲解（Plan + ReAct-Solve，仅 calculator）
 - OrchestrationRunner：硬编码 Python 调度器，串联 RAG + 记忆 + Agent + 持久化，本身不是 LLM
 
 ### 5. 持久化记忆

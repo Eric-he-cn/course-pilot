@@ -3,6 +3,8 @@
 - 主要作用：封装 OpenAI 兼容模型调用，提供普通对话与工具调用（含流式）。
 - 核心类：LLMClient。
 - 核心方法：chat/chat_stream、chat_with_tools/chat_stream_with_tools。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
 import json
@@ -85,7 +87,7 @@ class LLMClient:
                 )
                 msg = response.choices[0].message
 
-                # LLM 不再调用工具，返回最终答案
+                # 关键步骤：当模型本轮不再请求工具时，直接返回最终文本。
                 if not msg.tool_calls:
                     logger.info(
                         "[tools] round=%d no_more_tool_calls llm_ms=%.1f",
@@ -102,7 +104,7 @@ class LLMClient:
                     (perf_counter() - t_llm) * 1000,
                 )
 
-                # 把 assistant 消息加入历史
+                # 关键步骤：把模型的 tool_calls 意图写回消息历史，供下一轮参考。
                 messages.append({
                     "role": "assistant",
                     "content": msg.content,
@@ -119,7 +121,7 @@ class LLMClient:
                     ],
                 })
 
-                # 执行每个工具并把结果加入历史
+                # 关键步骤：逐个执行工具，并把工具输出写入 tool 角色消息。
                 for tool_call in msg.tool_calls:
                     tool_name = tool_call.function.name
                     try:
@@ -143,7 +145,7 @@ class LLMClient:
                         "content": json.dumps(tool_result, ensure_ascii=False)
                     })
 
-            # 超过最大轮数，做一次不带工具的最终调用
+            # 兜底策略：超过最大轮数后，不再继续调用工具，直接请求一次最终回答。
             logger.warning("[tools] max_rounds_reached=%d force_final_completion=1", max_rounds)
             final = self.client.chat.completions.create(
                 model=self.model,
@@ -230,7 +232,7 @@ class LLMClient:
                         (perf_counter() - t_llm) * 1000,
                     )
                     yield {"__status__": "正在整理最终回答..."}
-                    # 工具调用结束，用当前 messages 做流式最终回答
+                    # 关键步骤：工具回合结束后，基于完整消息历史开始最终流式输出。
                     yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
                     return
 
@@ -291,7 +293,7 @@ class LLMClient:
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
 
 
-# Global LLM client instance
+# 全局 LLMClient 单例：避免每次请求重复创建 HTTP 客户端与连接池。
 _llm_client = None
 
 

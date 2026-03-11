@@ -3,6 +3,8 @@
 - 主要作用：定义工具 schema、实现本地工具能力，并通过 stdio MCP 客户端发起工具调用。
 - 核心类：_StdioMCPClient、MCPTools。
 - 核心函数：_to_mcp_tools、_get_mcp_client、get_tool_schemas。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import atexit
 import json
@@ -18,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 
 # ── OpenAI Function Calling Schema 定义 ─────────────────────────────────────
-
+"""定义一组工具的 schema，符合 OpenAI function calling 的规范。每个工具包含名称、描述和输入参数的 JSON Schema。"""
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -179,12 +181,15 @@ _MCP_CLIENT: Optional["_StdioMCPClient"] = None
 _MCP_CLIENT_LOCK = threading.Lock()
 
 
+
 class _MCPTransportError(RuntimeError):
     """本地 stdio MCP 通信中的传输或协议错误。"""
 
 
+"""读取一条 Content-Length 帧格式消息并解析为 JSON。
+- 目的：从 MCP 服务器的 stdout 中读取一条完整的消息，解析其 Content-Length 头部并返回 JSON 对象。
+- 实现方式：先读取头部直到空行，解析 Content-Length，然后读取指定长度的负载并解析为 JSON。"""
 def _read_framed_message(stream) -> Optional[Dict[str, Any]]:
-    """读取一条 Content-Length 帧格式消息并解析为 JSON。"""
     headers: Dict[str, str] = {}
     while True:
         line = stream.readline()
@@ -219,6 +224,10 @@ def _read_framed_message(stream) -> Optional[Dict[str, Any]]:
     return msg
 
 
+"""_StdioMCPClient: 一个最小可用的 stdio MCP 客户端实现。
+- 目的：通过启动一个子进程运行 MCP 服务器模块，并通过标准输入输出进行 JSON-RPC 通信，实现 MCP 客户端功能。
+- 实现方式：使用 subprocess 启动服务器模块，定义方法发送 JSON-RPC 请求并等待响应，处理工具调用结果。
+- 主要方法：rpc（发送请求并等待响应）、notify（发送通知）、call_tool（调用工具并处理结果）。"""
 class _StdioMCPClient:
     """最小可用的 stdio MCP 客户端（initialize/tools/list/tools/call）。"""
 
@@ -276,7 +285,8 @@ class _StdioMCPClient:
                 [self.python_executable, "-m", self.server_module],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=None,  # inherit parent stderr for diagnostics
+                # 关键点：stderr 继承父进程，便于直接在后端日志中观察 MCP 子进程异常。
+                stderr=None,
                 cwd=self.project_root,
                 bufsize=0,
             )
@@ -463,9 +473,8 @@ class _StdioMCPClient:
         parsed["via"] = "mcp_stdio"
         return parsed
 
-
+"""将 OpenAI function schema 转换为 MCP tools/list 输出结构。"""
 def _to_mcp_tools() -> List[Dict[str, Any]]:
-    """将 OpenAI function schema 转换为 MCP tools/list 输出结构。"""
     mcp_tools: List[Dict[str, Any]] = []
     for schema in TOOL_SCHEMAS:
         fn = schema.get("function") or {}
@@ -482,7 +491,7 @@ def _to_mcp_tools() -> List[Dict[str, Any]]:
         )
     return mcp_tools
 
-
+"""_get_mcp_client: 获取全局的 MCP 客户端实例，确保线程安全的单例模式。"""
 def _get_mcp_client() -> _StdioMCPClient:
     global _MCP_CLIENT
     with _MCP_CLIENT_LOCK:
@@ -521,9 +530,13 @@ def _extract_mermaid_code(text: str) -> str:
 
 
 # ── 工具实现 ─────────────────────────────────────────────────────────────────
-
+""" MCPTools: 定义工具实现集合，包含本地执行逻辑和 MCP 调用入口。
+        每个工具方法实现具体功能，并通过 call_tool 方法调用 MCP 服务器执行工具调用。
+    实现方式：每个工具方法（如 calculator、get_datetime）实现具体功能逻辑，处理输入参数并返回结果。
+        call_tool 方法负责调用 MCP 服务器执行工具调用，并处理返回结果或错误。
+    主要工具：calculator、get_datetime、websearch、memory_search、mindmap_generator、filewriter。
+    """
 class MCPTools:
-    """工具实现集合（本地执行层 + MCP 调用入口）。"""
 
     # 由 runner 在每次调用前注入上下文（如 notes_dir）
     _context: Dict[str, Any] = {}
@@ -806,18 +819,29 @@ class MCPTools:
                     "message": "未找到相关历史记录",
                     "success": True,
                 }
-            formatted = []
+            results = []
             for ep in episodes:
                 etype = {"qa": "问答", "mistake": "错题", "practice": "练习",
                          "exam": "考试"}.get(ep.get("event_type", ""), ep.get("event_type", ""))
                 date_str = ep.get("created_at", "")[:10]
                 flag = "⚠️ " if ep.get("importance", 0) >= 0.8 else ""
-                formatted.append(f"[{date_str} {etype}] {flag}{ep['content'][:200]}")
+                summary = f"[{date_str} {etype}] {flag}{ep.get('content', '')[:200]}"
+                results.append(
+                    {
+                        "id": ep.get("id", ""),
+                        "event_type": ep.get("event_type", ""),
+                        "created_at": ep.get("created_at", ""),
+                        "importance": ep.get("importance", 0.0),
+                        "content": ep.get("content", ""),
+                        "metadata": ep.get("metadata", {}),
+                        "summary": summary,
+                    }
+                )
             return {
                 "tool": "memory_search",
                 "query": query,
-                "results": formatted,
-                "count": len(formatted),
+                "results": results,
+                "count": len(results),
                 "success": True,
             }
         except Exception as ex:

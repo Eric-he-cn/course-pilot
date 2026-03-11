@@ -257,7 +257,7 @@ class MCPTools:
 mode: Literal["learn", "practice", "exam", "my_mode"]
 ```
 
-2. 在 `core/orchestration/policies.py` 配置策略：
+2. 在 `core/orchestration/policies.py` 与 Runner/Agent 约束中配置工具策略：
 
 ```python
 MODE_POLICIES = {
@@ -265,6 +265,8 @@ MODE_POLICIES = {
     "my_mode": ["calculator", "my_tool"]
 }
 ```
+
+说明：当前主分支对 `learn/practice/exam` 使用 `ALL_TOOLS`，实际工具收敛主要靠 Runner 路由与 Agent 内部实现。新增模式时请同时评估这两层约束，而不只改白名单。
 
 3. 在 `core/orchestration/runner.py` 实现逻辑：
 

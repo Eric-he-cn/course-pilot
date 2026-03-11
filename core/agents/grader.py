@@ -3,11 +3,18 @@
 - 主要作用：实现 GraderAgent，负责练习评分与讲评。
 - 核心类：GraderAgent。
 - 核心方法：grade（非流式评分）、grade_practice_stream（流式评分）。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import GRADER_PROMPT, GRADER_SYSTEM, GRADER_PRACTICE_PROMPT
+from core.orchestration.prompts import (
+    GRADER_PROMPT,
+    GRADER_SYSTEM,
+    GRADER_PRACTICE_PROMPT,
+    GRADER_EXAM_PROMPT,
+)
 from backend.schemas import GradeReport
 
 
@@ -77,6 +84,101 @@ class GraderAgent:
             },
             {"role": "user", "content": prompt},
         ]
+
+    """构建练习评分“内部计划”提示词（仅供模型内部规划，不向用户展示）。"""
+    @staticmethod
+    def _build_practice_plan_prompt(quiz_content: str, student_answer: str) -> str:
+        return f"""请为本次练习评卷生成一个“内部执行计划”，用于后续评分阶段。
+
+【题目（来自本次练习）】
+{quiz_content}
+
+【学生提交的答案】
+{student_answer}
+
+要求：
+1. 只输出 JSON，不要输出解释文字。
+2. JSON 字段包含：
+   - checks: 逐题核对清单（数组）
+   - score_formula: 计算总分的公式字符串（例如 sum([...])）
+   - key_mistakes: 可能的错误类型（数组）
+3. 不要输出最终分数与讲评正文。
+
+JSON 示例：
+{{
+  "checks": ["核对第1题选项一致性", "核对第2题关键步骤"],
+  "score_formula": "sum([20,15,10,0,15])",
+  "key_mistakes": ["概念性错误", "步骤缺失"]
+}}
+"""
+
+    """生成评分内部计划；失败时返回可兜底的空计划。"""
+    def _generate_practice_plan(self, quiz_content: str, student_answer: str) -> dict:
+        messages = [
+            {"role": "system", "content": "你是一个严谨的评卷计划器，只输出 JSON。"},
+            {"role": "user", "content": self._build_practice_plan_prompt(quiz_content, student_answer)},
+        ]
+        try:
+            response = self.llm.chat(messages, temperature=0.1, max_tokens=800)
+            plan = self._extract_json_payload(response)
+            if not isinstance(plan, dict):
+                return {"checks": [], "score_formula": "", "key_mistakes": []}
+            return {
+                "checks": plan.get("checks", []) if isinstance(plan.get("checks", []), list) else [],
+                "score_formula": str(plan.get("score_formula", ""))[:200],
+                "key_mistakes": plan.get("key_mistakes", [])
+                if isinstance(plan.get("key_mistakes", []), list)
+                else [],
+            }
+        except Exception:
+            return {"checks": [], "score_formula": "", "key_mistakes": []}
+
+    """构建考试评分“内部计划”提示词（仅内部使用）。"""
+    @staticmethod
+    def _build_exam_plan_prompt(exam_paper: str, student_answer: str) -> str:
+        return f"""你是考试评卷计划器。请输出本次评卷的内部计划（JSON）。
+
+【试卷】
+{exam_paper}
+
+【学生答案】
+{student_answer}
+
+要求：
+1. 只输出 JSON，不要输出解释。
+2. 字段必须包含：
+   - checks: 逐题核对步骤数组
+   - score_formula: 汇总总分的公式（用于 calculator）
+   - weak_points_hint: 可能的薄弱点数组
+
+JSON 示例：
+{{
+  "checks": ["核对第1题答案匹配", "核对第2题步骤完整性"],
+  "score_formula": "sum([10,8,0,15])",
+  "weak_points_hint": ["概念边界不清", "步骤缺失"]
+}}
+"""
+
+    """生成考试评分内部计划。"""
+    def _generate_exam_plan(self, exam_paper: str, student_answer: str) -> dict:
+        messages = [
+            {"role": "system", "content": "你是一个严谨的考试评卷计划器，只输出 JSON。"},
+            {"role": "user", "content": self._build_exam_plan_prompt(exam_paper, student_answer)},
+        ]
+        try:
+            response = self.llm.chat(messages, temperature=0.1, max_tokens=900)
+            plan = self._extract_json_payload(response)
+            if not isinstance(plan, dict):
+                return {"checks": [], "score_formula": "", "weak_points_hint": []}
+            return {
+                "checks": plan.get("checks", []) if isinstance(plan.get("checks", []), list) else [],
+                "score_formula": str(plan.get("score_formula", ""))[:200],
+                "weak_points_hint": plan.get("weak_points_hint", [])
+                if isinstance(plan.get("weak_points_hint", []), list)
+                else [],
+            }
+        except Exception:
+            return {"checks": [], "score_formula": "", "weak_points_hint": []}
 
     """构建评分解析失败时的兜底报告。"""
     @staticmethod
@@ -191,10 +293,21 @@ class GraderAgent:
         course_name: Optional[str] = None,
         history_ctx: str = "",
     ):
+        # 0) 第一阶段：先生成内部评分计划（不对用户展示）
+        practice_plan = self._generate_practice_plan(
+            quiz_content=quiz_content,
+            student_answer=student_answer,
+        )
+
         # 1) 组装 system prompt（含历史错题上下文）
         system_prompt = GRADER_SYSTEM
         if history_ctx:
             system_prompt += f"\n\n{history_ctx}"
+        system_prompt += (
+            "\n\n【内部评分计划（不要在最终回答中复述本段原文）】\n"
+            + json.dumps(practice_plan, ensure_ascii=False)
+        )
+        system_prompt += "\n请严格按内部评分计划执行，再给出最终评分与讲评。"
 
         # 2) 注入用户学习档案（失败不影响主流程）
         try:
@@ -222,4 +335,55 @@ class GraderAgent:
             tools=_CALCULATOR_TOOL,
             temperature=0.1,       # 评卷要求确定性，低温度
             max_tokens=2500,
+        )
+
+    """
+    考试评卷流式方法（评分 + 讲解）。
+
+    工作流：
+      1. 内部生成评卷计划（不展示）
+      2. 逐题核对并调用 calculator 汇总总分
+      3. 输出批改报告（含逐题详批与复习建议）
+    """
+    def grade_exam_stream(
+        self,
+        exam_paper: str,
+        student_answer: str,
+        course_name: Optional[str] = None,
+        history_ctx: str = "",
+    ):
+        exam_plan = self._generate_exam_plan(exam_paper=exam_paper, student_answer=student_answer)
+
+        system_prompt = GRADER_SYSTEM
+        if history_ctx:
+            system_prompt += f"\n\n{history_ctx}"
+        system_prompt += (
+            "\n\n【内部评卷计划（不要在最终回答中复述本段）】\n"
+            + json.dumps(exam_plan, ensure_ascii=False)
+        )
+        system_prompt += "\n请严格按内部评卷计划执行，并输出完整批改讲解。"
+
+        try:
+            from memory.manager import get_memory_manager
+            profile_ctx = get_memory_manager().get_profile_context(course_name)
+            if profile_ctx:
+                system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
+        except Exception:
+            pass
+
+        user_prompt = GRADER_EXAM_PROMPT.format(
+            exam_paper=exam_paper.strip(),
+            student_answer=student_answer.strip(),
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        print(f"[GraderAgent] 启动考试评卷 ReAct 流式（课程: {course_name}）")
+        yield from self.llm.chat_stream_with_tools(
+            messages,
+            tools=_CALCULATOR_TOOL,
+            temperature=0.1,
+            max_tokens=3200,
         )

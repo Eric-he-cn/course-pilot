@@ -22,9 +22,7 @@ from core.agents.grader import GraderAgent
 from rag.retrieve import Retriever
 from rag.store_faiss import FAISSStore
 from mcp_tools.client import MCPTools
-from core.orchestration.prompts import (
-    PRACTICE_PROMPT, EXAM_PROMPT, PRACTICE_SYSTEM, EXAM_SYSTEM
-)
+# 说明：练习/考试的出题与评分已拆分到 QuizMaster/Grader，Runner 只负责编排与持久化。
 
 
 class OrchestrationRunner:
@@ -41,6 +39,103 @@ class OrchestrationRunner:
         self.quizmaster = QuizMasterAgent()
         self.grader = GraderAgent()
         self.tools = MCPTools()
+        # 保存本轮执行元信息，供 Replan 判定使用。
+        self._last_run_meta: Dict[str, Any] = {}
+
+    """执行质量量化：长度、句子数和异常信号综合判断。"""
+    @staticmethod
+    def _quality_metrics(content: str) -> Dict[str, Any]:
+        import re
+
+        text = (content or "").strip()
+        min_chars = int(os.getenv("REPLAN_MIN_CHARS", "160"))
+        min_sentences = int(os.getenv("REPLAN_MIN_SENTENCES", "2"))
+        sentence_count = len(re.findall(r"[。！？!?\.]", text))
+        bad_signals = [
+            "Error calling LLM",
+            "工具调用失败",
+            "请重试",
+            "（工具调用出错",
+            "MCP tools/call failed",
+        ]
+        has_bad_signal = any(sig in text for sig in bad_signals)
+        too_short = len(text) < min_chars
+        too_few_sentences = sentence_count < min_sentences
+        low_quality = has_bad_signal or too_short or too_few_sentences
+        return {
+            "low_quality": low_quality,
+            "chars": len(text),
+            "sentences": sentence_count,
+            "has_bad_signal": has_bad_signal,
+            "min_chars": min_chars,
+            "min_sentences": min_sentences,
+        }
+
+    """检测工具链路失败信号（模型回复中显式暴露错误）。"""
+    @staticmethod
+    def _has_tool_failure_signal(content: str) -> bool:
+        text = (content or "")
+        signals = [
+            "工具调用失败",
+            "（工具调用出错",
+            "MCP tools/call failed",
+            "\"success\": false",
+            "Error calling LLM",
+        ]
+        return any(sig in text for sig in signals)
+
+    """收集本轮是否需要触发 Replan 的原因。"""
+    def _collect_replan_reasons(
+        self,
+        mode: str,
+        plan: Plan,
+        response: ChatMessage,
+    ) -> List[str]:
+        reasons: List[str] = []
+        meta = self._last_run_meta or {}
+
+        # 存在写文件/写记忆副作用的分支不做 Replan，防止重复写入。
+        if meta.get("has_side_effect"):
+            return reasons
+
+        if plan.need_rag and meta.get("retrieval_empty"):
+            reasons.append("检索为空（索引缺失或未召回到有效片段）")
+
+        if self._has_tool_failure_signal(response.content):
+            reasons.append("工具失败（调用失败或工具错误信号）")
+
+        qm = self._quality_metrics(response.content)
+        if qm["low_quality"]:
+            reasons.append(
+                "回答质量偏低"
+                f"(chars={qm['chars']}/{qm['min_chars']}, "
+                f"sentences={qm['sentences']}/{qm['min_sentences']}, "
+                f"bad_signal={int(qm['has_bad_signal'])})"
+            )
+        return reasons
+
+    """按模式执行一次，作为 Replan 前后复用的统一分发入口。"""
+    def _run_mode_once(
+        self,
+        course_name: str,
+        mode: str,
+        user_message: str,
+        plan: Plan,
+        state: Dict[str, Any] = None,
+        history: List[Dict[str, str]] = None,
+    ) -> ChatMessage:
+        if mode == "learn":
+            return self.run_learn_mode(course_name, user_message, plan, history)
+        if mode == "practice":
+            return self.run_practice_mode(course_name, user_message, plan, state, history)
+        if mode == "exam":
+            return self.run_exam_mode(course_name, user_message, plan, history)
+        return ChatMessage(
+            role="assistant",
+            content=f"未知模式: {mode}",
+            citations=None,
+            tool_calls=None,
+        )
     
     def get_workspace_path(self, course_name: str) -> str:
         """获取课程工作目录（包含路径穿越防护）。"""
@@ -72,6 +167,7 @@ class OrchestrationRunner:
         """执行学习模式（非流式）。"""
         if history is None:
             history = []
+        retrieval_empty = False
         # 关键步骤：按 plan 决定是否执行 RAG 检索并准备 citations。
         context = ""
         citations = []
@@ -80,9 +176,14 @@ class OrchestrationRunner:
             retriever = self.load_retriever(course_name)
             if retriever:
                 chunks = retriever.retrieve(user_message)
-                context = retriever.format_context(chunks)
-                citations = chunks
+                if chunks:
+                    context = retriever.format_context(chunks)
+                    citations = chunks
+                else:
+                    retrieval_empty = True
+                    context = "（检索未命中有效教材片段，本轮将基于通用知识和已有上下文回答）"
             else:
+                retrieval_empty = True
                 context = "（未找到相关教材，请先上传课程资料）"
         
         # 关键步骤：组装 Tutor 入参并触发生成。
@@ -107,6 +208,11 @@ class OrchestrationRunner:
 
         # 合并 RAG citations 和 Tutor 内部工具调用产生的 citations
         merged_citations = citations + result.citations if citations else result.citations
+        self._last_run_meta = {
+            "mode": "learn",
+            "retrieval_empty": retrieval_empty,
+            "has_side_effect": False,
+        }
 
         return ChatMessage(
             role="assistant",
@@ -123,9 +229,10 @@ class OrchestrationRunner:
         state: Dict[str, Any] = None,
         history: List[Dict[str, str]] = None,
     ) -> ChatMessage:
-        """对话式练习模式（非流式），统一走 TutorAgent 执行层。"""
+        """对话式练习模式（非流式）：出题走 QuizMaster，交卷走 Grader。"""
         if history is None:
             history = []
+        retrieval_empty = False
 
         context = ""
         citations = []
@@ -133,9 +240,14 @@ class OrchestrationRunner:
             retriever = self.load_retriever(course_name)
             if retriever:
                 chunks = retriever.retrieve(user_message)
-                context = retriever.format_context(chunks)
-                citations = chunks
+                if chunks:
+                    context = retriever.format_context(chunks)
+                    citations = chunks
+                else:
+                    retrieval_empty = True
+                    context = "（检索未命中有效教材片段，本轮将基于已有上下文出题）"
             else:
+                retrieval_empty = True
                 context = "（未找到相关教材，请先上传课程资料）"
 
         # 历史错题上下文
@@ -144,9 +256,11 @@ class OrchestrationRunner:
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
+        tool_calls = None
 
-        # ── 路由判断：答案提交 → GraderAgent；出题/提问 → TutorAgent ──
-        if self._is_answer_submission(user_message, history):
+        # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
+        answer_submission = self._is_answer_submission(user_message, history)
+        if answer_submission:
             print("[Runner] 检测到答案提交，路由至 GraderAgent")
             quiz_content = self._extract_quiz_from_history(history)
             chunks = []
@@ -156,34 +270,35 @@ class OrchestrationRunner:
                 course_name=course_name,
                 history_ctx=history_ctx,
             ):
-                chunks.append(chunk)
+                if isinstance(chunk, str):
+                    chunks.append(chunk)
             response_text = "".join(chunks)
             saved_path = self._save_practice_record(course_name, user_message, history, response_text)
             self._save_grading_to_memory(course_name, user_message, history, response_text)
             response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
-            result: TutorResult = self.tutor.teach(
-                question=user_message,
+            topic, difficulty = self._resolve_quiz_request(user_message)
+            quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
+                topic=topic,
+                difficulty=difficulty,
                 context=context,
-                allowed_tools=plan.allowed_tools,
-                history=history,
-                system_prompt_override=PRACTICE_SYSTEM + history_ctx,
-                user_content_override=PRACTICE_PROMPT.format(
-                    course_name=course_name,
-                    context=context,
-                    question=user_message,
-                ),
-                temperature=0.7,
-                max_tokens=2000,
             )
-            response_text = result.content
+            response_text = self._render_quiz_message(quiz)
+            tool_calls = self._build_quiz_meta_tool_call(quiz)
+
+        self._last_run_meta = {
+            "mode": "practice",
+            "retrieval_empty": retrieval_empty,
+            "answer_submission": answer_submission,
+            "has_side_effect": answer_submission,
+        }
 
         return ChatMessage(
             role="assistant",
             content=response_text,
             citations=citations if citations else None,
-            tool_calls=None,
+            tool_calls=tool_calls,
         )
 
     def run_practice_mode_stream(
@@ -193,9 +308,10 @@ class OrchestrationRunner:
         plan: Plan,
         history: List[Dict[str, str]] = None,
     ):
-        """对话式练习模式（流式），统一走 TutorAgent 执行层。"""
+        """对话式练习模式（流式）：交卷走 Grader 流式，出题走 QuizMaster。"""
         if history is None:
             history = []
+        retrieval_empty = False
 
         context = ""
         citations_dicts = []
@@ -203,9 +319,14 @@ class OrchestrationRunner:
             retriever = self.load_retriever(course_name)
             if retriever:
                 chunks = retriever.retrieve(user_message)
-                context = retriever.format_context(chunks)
-                citations_dicts = [c.model_dump() for c in chunks]
+                if chunks:
+                    context = retriever.format_context(chunks)
+                    citations_dicts = [c.model_dump() for c in chunks]
+                else:
+                    retrieval_empty = True
+                    context = "（检索未命中有效教材片段，本轮将基于已有上下文出题）"
             else:
+                retrieval_empty = True
                 context = "（未找到相关教材，请先上传课程资料）"
 
         # 与 learn 模式保持一致：先发送 citations 事件给前端缓存
@@ -218,8 +339,9 @@ class OrchestrationRunner:
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
 
-        # ── 路由判断：答案提交 → GraderAgent；出题/提问 → TutorAgent ──
-        if self._is_answer_submission(user_message, history):
+        # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
+        answer_submission = self._is_answer_submission(user_message, history)
+        if answer_submission:
             print("[Runner] 检测到答案提交，路由至 GraderAgent (stream)")
             quiz_content = self._extract_quiz_from_history(history)
             collected = []
@@ -237,25 +359,22 @@ class OrchestrationRunner:
             self._save_grading_to_memory(course_name, user_message, history, full_response)
             yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
-            collected = []
-            for chunk in self.tutor.teach_stream(
-                question=user_message,
+            topic, difficulty = self._resolve_quiz_request(user_message)
+            quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
+                topic=topic,
+                difficulty=difficulty,
                 context=context,
-                allowed_tools=plan.allowed_tools,
-                history=history,
-                system_prompt_override=PRACTICE_SYSTEM + history_ctx,
-                user_content_override=PRACTICE_PROMPT.format(
-                    course_name=course_name,
-                    context=context,
-                    question=user_message,
-                ),
-                temperature=0.7,
-                max_tokens=2000,
-            ):
-                if isinstance(chunk, str):
-                    collected.append(chunk)
-                yield chunk
+            )
+            yield {"__tool_calls__": self._build_quiz_meta_tool_call(quiz)}
+            yield self._render_quiz_message(quiz)
+
+        self._last_run_meta = {
+            "mode": "practice",
+            "retrieval_empty": retrieval_empty,
+            "answer_submission": answer_submission,
+            "has_side_effect": answer_submission,
+        }
 
     
     def run_exam_mode(
@@ -265,46 +384,68 @@ class OrchestrationRunner:
         plan: Plan,
         history: list = None,
     ) -> ChatMessage:
-        """对话式考试模式（非流式），统一走 TutorAgent 执行层。"""
+        """对话式考试模式（非流式）：出卷走 QuizMaster，交卷评分讲解走 Grader。"""
         if history is None:
             history = []
+        retrieval_empty = False
 
         context = ""
         retriever = self.load_retriever(course_name)
         if retriever:
             chunks = retriever.retrieve(user_message, top_k=12)
-            context = retriever.format_context(chunks)
+            if chunks:
+                context = retriever.format_context(chunks)
+            else:
+                retrieval_empty = True
+                context = "（检索未命中有效教材片段，本轮将基于已有上下文生成试卷/评分）"
         else:
+            retrieval_empty = True
             context = "（未找到相关教材，请先上传课程资料）"
 
-        result: TutorResult = self.tutor.teach(
-            question=user_message,
-            course_name=course_name,
-            context=context,
-            allowed_tools=plan.allowed_tools,
-            history=history,
-            system_prompt_override=EXAM_SYSTEM,
-            user_content_override=EXAM_PROMPT.format(
+        history_ctx = self._fetch_history_ctx(user_message, course_name)
+        answer_submission = self._is_exam_answer_submission(user_message, history)
+        tool_calls = None
+        if answer_submission:
+            exam_paper = self._extract_exam_from_history(history)
+            chunks = []
+            for chunk in self.grader.grade_exam_stream(
+                exam_paper=exam_paper,
+                student_answer=user_message,
                 course_name=course_name,
-                context=context,
-                question=user_message,
-            ),
-            temperature=0.5,
-            max_tokens=4000,
-            history_limit=30,
-        )
-
-        response_text = result.content
-        if self._is_exam_grading(response_text):
+                history_ctx=history_ctx,
+            ):
+                if isinstance(chunk, str):
+                    chunks.append(chunk)
+            response_text = "".join(chunks)
             saved_path = self._save_exam_record(course_name, user_message, history, response_text)
             self._save_exam_to_memory(course_name, response_text)
             response_text += f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
+        else:
+            exam_payload = self.quizmaster.generate_exam_paper(
+                course_name=course_name,
+                user_request=user_message,
+                context=context,
+            )
+            if not isinstance(exam_payload, dict):
+                exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
+            response_text = str(exam_payload.get("content", "")).strip()
+            tool_calls = self._build_exam_meta_tool_call(
+                exam_payload.get("answer_sheet", []),
+                int(exam_payload.get("total_score", 0)),
+            )
+
+        self._last_run_meta = {
+            "mode": "exam",
+            "retrieval_empty": retrieval_empty,
+            "exam_grading": answer_submission,
+            "has_side_effect": answer_submission,
+        }
 
         return ChatMessage(
             role="assistant",
             content=response_text,
             citations=None,
-            tool_calls=None,
+            tool_calls=tool_calls,
         )
 
     def run_exam_mode_stream(
@@ -314,50 +455,70 @@ class OrchestrationRunner:
         plan: Plan,
         history: list = None,
     ):
-        """对话式考试模式（流式），统一走 TutorAgent 执行层。"""
+        """对话式考试模式（流式）：交卷走 Grader 流式，出卷走 QuizMaster。"""
         if history is None:
             history = []
+        retrieval_empty = False
 
         context = ""
         citations_dicts = []
         retriever = self.load_retriever(course_name)
         if retriever:
             chunks = retriever.retrieve(user_message, top_k=12)
-            context = retriever.format_context(chunks)
-            citations_dicts = [c.model_dump() for c in chunks]
+            if chunks:
+                context = retriever.format_context(chunks)
+                citations_dicts = [c.model_dump() for c in chunks]
+            else:
+                retrieval_empty = True
+                context = "（检索未命中有效教材片段，本轮将基于已有上下文生成试卷/评分）"
         else:
+            retrieval_empty = True
             context = "（未找到相关教材，请先上传课程资料）"
 
         # 与 learn 模式保持一致：先发送 citations 事件给前端缓存
         if citations_dicts:
             yield {"__citations__": citations_dicts}
 
-        collected = []
-        for chunk in self.tutor.teach_stream(
-            question=user_message,
-            course_name=course_name,
-            context=context,
-            allowed_tools=plan.allowed_tools,
-            history=history,
-            system_prompt_override=EXAM_SYSTEM,
-            user_content_override=EXAM_PROMPT.format(
+        history_ctx = self._fetch_history_ctx(user_message, course_name)
+        answer_submission = self._is_exam_answer_submission(user_message, history)
+        if answer_submission:
+            exam_paper = self._extract_exam_from_history(history)
+            collected = []
+            for chunk in self.grader.grade_exam_stream(
+                exam_paper=exam_paper,
+                student_answer=user_message,
                 course_name=course_name,
-                context=context,
-                question=user_message,
-            ),
-            temperature=0.5,
-            max_tokens=4000,
-            history_limit=30,
-        ):
-            if isinstance(chunk, str):
-                collected.append(chunk)
-            yield chunk
-
-        full_response = "".join(collected)
-        if self._is_exam_grading(full_response):
+                history_ctx=history_ctx,
+            ):
+                if isinstance(chunk, str):
+                    collected.append(chunk)
+                yield chunk
+            full_response = "".join(collected)
             saved_path = self._save_exam_record(course_name, user_message, history, full_response)
             self._save_exam_to_memory(course_name, full_response)
             yield f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
+        else:
+            exam_payload = self.quizmaster.generate_exam_paper(
+                course_name=course_name,
+                user_request=user_message,
+                context=context,
+            )
+            if not isinstance(exam_payload, dict):
+                exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
+            yield {
+                "__tool_calls__": self._build_exam_meta_tool_call(
+                    exam_payload.get("answer_sheet", []),
+                    int(exam_payload.get("total_score", 0)),
+                )
+            }
+            yield str(exam_payload.get("content", "")).strip()
+
+        self._last_run_meta = {
+            "mode": "exam",
+            "retrieval_empty": retrieval_empty,
+            "exam_grading": answer_submission,
+            "has_side_effect": answer_submission,
+        }
 
     def _save_mistake(
         self,
@@ -426,6 +587,89 @@ class OrchestrationRunner:
             pass
         return ""
 
+    """从用户出题请求中解析主题与难度（轻量规则，失败回退默认值）。"""
+    @staticmethod
+    def _resolve_quiz_request(user_message: str) -> tuple[str, str]:
+        text = (user_message or "").strip()
+        if not text:
+            return "当前课程核心知识点", "medium"
+
+        lowered = text.lower()
+        difficulty = "medium"
+        if any(k in text for k in ["简单", "基础", "入门"]) or "easy" in lowered:
+            difficulty = "easy"
+        elif any(k in text for k in ["困难", "综合", "挑战"]) or "hard" in lowered:
+            difficulty = "hard"
+        elif any(k in text for k in ["中等", "普通"]) or "medium" in lowered:
+            difficulty = "medium"
+
+        topic = text
+        # 去除常见口语前缀，保留核心主题短语
+        for prefix in ["给我出", "帮我出", "请出", "出", "来", "我想练习"]:
+            if topic.startswith(prefix):
+                topic = topic[len(prefix):].strip()
+        topic = topic[:120] if topic else text[:120]
+        return topic, difficulty
+
+    """将 Quiz 结构渲染为学生可见题面。"""
+    @staticmethod
+    def _render_quiz_message(quiz: Quiz) -> str:
+        return (
+            "## 练习题\n\n"
+            f"{quiz.question}\n\n"
+            "请回答上述问题，回答完毕后我会为你评分并给出详细讲解。"
+        )
+
+    """将 Quiz 元数据挂载到内部 tool_calls，避免污染正文显示。"""
+    @staticmethod
+    def _build_quiz_meta_tool_call(quiz: Quiz) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "internal_meta",
+                "name": "quiz_meta",
+                "payload": {
+                    "question": quiz.question,
+                    "standard_answer": quiz.standard_answer,
+                    "rubric": quiz.rubric,
+                    "chapter": quiz.chapter,
+                    "concept": quiz.concept,
+                    "difficulty": quiz.difficulty,
+                },
+            }
+        ]
+
+    """将考试答案表挂载到内部 tool_calls，供交卷评分阶段使用。"""
+    @staticmethod
+    def _build_exam_meta_tool_call(answer_sheet: List[Dict[str, Any]], total_score: int) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "internal_meta",
+                "name": "exam_meta",
+                "payload": {
+                    "answer_sheet": answer_sheet or [],
+                    "total_score": int(total_score or 0),
+                },
+            }
+        ]
+
+    """从历史里提取内部元数据。"""
+    @staticmethod
+    def _extract_internal_meta(history: list, name: str) -> Optional[Dict[str, Any]]:
+        for msg in reversed(history[-30:]):
+            if msg.get("role") != "assistant":
+                continue
+            tcs = msg.get("tool_calls") or []
+            if not isinstance(tcs, list):
+                continue
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                if tc.get("type") == "internal_meta" and tc.get("name") == name:
+                    payload = tc.get("payload")
+                    if isinstance(payload, dict):
+                        return payload
+        return None
+
     def _is_answer_submission(self, user_message: str, history: list) -> bool:
         """检测用户是否在提交答案（而非请求出题）。
 
@@ -446,20 +690,71 @@ class OrchestrationRunner:
             has_answer_marker = True
 
         # 最近 assistant 消息是否含题目结构
-        has_quiz_in_history = False
-        for msg in reversed(history[-12:]):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                quiz_signals = ["题目", "选择题", "判断题", "填空题", "简答题",
-                                "第1题", "第一题", "标准答案", "答案选", "下列哪", "以下哪"]
-                if sum(1 for kw in quiz_signals if kw in content) >= 2:
-                    has_quiz_in_history = True
-                break
+        has_quiz_in_history = bool(self._extract_internal_meta(history, "quiz_meta"))
+        if not has_quiz_in_history:
+            for msg in reversed(history[-12:]):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    quiz_signals = ["题目", "选择题", "判断题", "填空题", "简答题",
+                                    "第1题", "第一题", "标准答案", "答案选", "下列哪", "以下哪"]
+                    if sum(1 for kw in quiz_signals if kw in content) >= 2:
+                        has_quiz_in_history = True
+                    break
 
         return has_answer_marker and has_quiz_in_history
 
+    """检测考试模式是否为“提交答案”阶段。"""
+    def _is_exam_answer_submission(self, user_message: str, history: list) -> bool:
+        import re
+
+        answer_markers = [
+            "第1题", "第一题", "我的答案", "答案如下", "提交答案", "答：",
+        ]
+        has_answer_marker = any(m in user_message for m in answer_markers)
+        if re.search(r'[1-9][.、：:]\s*[A-Za-z正确错误√×对]', user_message):
+            has_answer_marker = True
+        if len(re.findall(r'(?:第\d+题|^\d+[.、])', user_message, re.MULTILINE)) >= 2:
+            has_answer_marker = True
+
+        has_exam_in_history = bool(self._extract_internal_meta(history, "exam_meta"))
+        if not has_exam_in_history:
+            for msg in reversed(history[-20:]):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    exam_signals = ["模拟考试试卷", "考试须知", "第一部分", "总分"]
+                    if sum(1 for kw in exam_signals if kw in content) >= 2:
+                        has_exam_in_history = True
+                    break
+        return has_answer_marker and has_exam_in_history
+
     def _extract_quiz_from_history(self, history: list) -> str:
         """从历史中提取最近一条 assistant 出题消息作为题目原文。"""
+        meta = self._extract_internal_meta(history, "quiz_meta")
+        if meta:
+            question = str(meta.get("question", "")).strip()
+            standard_answer = str(meta.get("standard_answer", "")).strip()
+            rubric = str(meta.get("rubric", "")).strip()
+            chapter = str(meta.get("chapter", "")).strip()
+            concept = str(meta.get("concept", "")).strip()
+            difficulty = str(meta.get("difficulty", "")).strip()
+            parts = [
+                "【题目】",
+                question or "（题干缺失）",
+                "",
+                "【标准答案】",
+                standard_answer or "（标准答案缺失）",
+                "",
+                "【评分标准】",
+                rubric or "（评分标准缺失）",
+            ]
+            if chapter:
+                parts.extend(["", f"【章节】{chapter}"])
+            if concept:
+                parts.extend([f"【知识点】{concept}"])
+            if difficulty:
+                parts.extend([f"【难度】{difficulty}"])
+            return "\n".join(parts)
+
         for msg in reversed(history[-12:]):
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
@@ -468,6 +763,38 @@ class OrchestrationRunner:
                 if sum(1 for kw in quiz_signals if kw in content) >= 2:
                     return content
         return "（未能从历史中提取题目，请检查对话上下文）"
+
+    """从历史中提取最近一份考试试卷原文。"""
+    def _extract_exam_from_history(self, history: list) -> str:
+        meta = self._extract_internal_meta(history, "exam_meta")
+        if meta:
+            visible_exam = ""
+            for msg in reversed(history[-20:]):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    signals = ["模拟考试试卷", "第一部分", "考试须知"]
+                    if sum(1 for kw in signals if kw in content) >= 2:
+                        visible_exam = content
+                        break
+            hidden_meta = {
+                "answer_sheet": meta.get("answer_sheet", []) or [],
+                "total_score": int(meta.get("total_score", 0) or 0),
+            }
+            if not visible_exam:
+                visible_exam = "# 模拟考试试卷\n\n（未在历史中提取到试卷正文）"
+            return (
+                f"{visible_exam}\n\n"
+                "[INTERNAL_EXAM_META]\n"
+                f"{json.dumps(hidden_meta, ensure_ascii=False)}"
+            )
+
+        for msg in reversed(history[-20:]):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                signals = ["模拟考试试卷", "第一部分", "考试须知"]
+                if sum(1 for kw in signals if kw in content) >= 2:
+                    return content
+        return "（未能从历史中提取试卷，请检查对话上下文）"
 
     def _is_practice_grading(self, text: str) -> bool:
         """判断练习模式回复是否为评分阶段。"""
@@ -522,11 +849,6 @@ class OrchestrationRunner:
             print(f"[Memory] 练习{'错题' if signal.is_mistake else '结果'}已记录，得分={signal.score:.0f}")
         except Exception as _e:
             print(f"[Memory] 练习记忆写入失败（不影响评分）: {_e}")
-
-    def _is_exam_grading(self, text: str) -> bool:
-        """判断考试模式回复是否为批改阶段。"""
-        keywords = ["批改报告", "逐题详批", "评分总表", "总得分", "总分", "考后建议", "薄弱知识点"]
-        return sum(1 for kw in keywords if kw in text) >= 2
 
     def _save_practice_record(self, course_name: str, user_message: str, history: list, response_text: str) -> str:
         """保存练习题记录（题目、用户答案、评分解析），返回相对路径。
@@ -702,22 +1024,29 @@ class OrchestrationRunner:
             history = []
         # 关键步骤：先由 Router 产出本轮执行计划（是否检索、允许工具等）。
         plan = self.router.plan(user_message, mode, course_name)
-        
-        # 关键步骤：根据模式分发到 learn/practice/exam 专用流程。
-        if mode == "learn":
-            response = self.run_learn_mode(course_name, user_message, plan, history)
-        elif mode == "practice":
-            response = self.run_practice_mode(course_name, user_message, plan, state, history)
-        elif mode == "exam":
-            response = self.run_exam_mode(course_name, user_message, plan, history)
-        else:
-            response = ChatMessage(
-                role="assistant",
-                content=f"未知模式: {mode}",
-                citations=None,
-                tool_calls=None
-            )
-        
+
+        # 先执行一次主流程，再根据执行信号决定是否单次 Replan。
+        response = self._run_mode_once(course_name, mode, user_message, plan, state, history)
+        enable_replan = os.getenv("ENABLE_ROUTER_REPLAN", "1") == "1"
+        if enable_replan:
+            reasons = self._collect_replan_reasons(mode, plan, response)
+            if reasons:
+                reason_text = "；".join(reasons)
+                print(f"[Replan] trigger=1 mode={mode} reasons={reason_text}")
+                new_plan = self.router.replan(
+                    user_message=user_message,
+                    mode=mode,
+                    course_name=course_name,
+                    previous_plan=plan,
+                    reason=reason_text,
+                )
+                if new_plan.model_dump() != plan.model_dump():
+                    print("[Replan] plan_changed=1 rerun=1")
+                    plan = new_plan
+                    response = self._run_mode_once(course_name, mode, user_message, plan, state, history)
+                else:
+                    print("[Replan] plan_changed=0 skip_rerun=1")
+
         return response, plan
 
     def run_learn_mode_stream(
@@ -791,6 +1120,21 @@ class OrchestrationRunner:
         if history is None:
             history = []
         plan = self.router.plan(user_message, mode, course_name)
+        enable_replan = os.getenv("ENABLE_ROUTER_REPLAN", "1") == "1"
+        if enable_replan and plan.need_rag:
+            # 流式场景不宜在输出后重跑；仅在开流前做一次“索引缺失”预重规划。
+            if self.load_retriever(course_name) is None:
+                reason = "检索为空（索引缺失或未构建）"
+                new_plan = self.router.replan(
+                    user_message=user_message,
+                    mode=mode,
+                    course_name=course_name,
+                    previous_plan=plan,
+                    reason=reason,
+                )
+                if new_plan.model_dump() != plan.model_dump():
+                    print(f"[Replan] stream_precheck mode={mode} reason={reason}")
+                    plan = new_plan
 
         if mode == "learn":
             yield from self.run_learn_mode_stream(course_name, user_message, plan, history)

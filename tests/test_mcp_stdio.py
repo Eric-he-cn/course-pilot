@@ -2,6 +2,8 @@
 【模块说明】
 - 主要作用：验证本地 stdio MCP 链路可用性与错误语义。
 - 覆盖范围：initialize、tools/list、tools/call、无 fallback 约束。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
 

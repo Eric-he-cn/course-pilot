@@ -3,6 +3,8 @@
 - 主要作用：提供轻量级 BM25 词法检索能力，作为向量检索的补充。
 - 核心类：BM25Index。
 - 设计要点：不依赖第三方 BM25 库，默认支持中英文混合分词。
+- 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
+- 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import math
 import re
@@ -84,4 +86,3 @@ class BM25Index:
             reverse=True,
         )
         return [(self.chunks[idx], float(score)) for idx, score in ranked[:top_k]]
-
