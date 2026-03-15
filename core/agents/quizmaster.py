@@ -7,6 +7,7 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
+import logging
 from typing import Dict, Any
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import QUIZMASTER_PROMPT, EXAM_GENERATOR_PROMPT
@@ -22,6 +23,7 @@ class QuizMasterAgent:
     """初始化 QuizMasterAgent，复用全局 LLM 客户端。"""
     def __init__(self):
         self.llm = get_llm_client()
+        self.logger = logging.getLogger("agent.quizmaster")
 
     """提示词与解析辅助。"""
 
@@ -504,8 +506,11 @@ JSON 示例：
             )
             return Quiz(**quiz_dict)
         except Exception as e:
-            print(f"Error parsing quiz: {e}")
-            return self._build_default_quiz(topic=planned_topic, difficulty=planned_difficulty)
+            err = str(e).strip() or "unknown_parse_error"
+            self.logger.warning("[quiz] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
+            fallback = self._build_default_quiz(topic=planned_topic, difficulty=planned_difficulty)
+            fallback.question = f"生成题目时出错（解析失败：{err}），请重试。"
+            return fallback
 
     """生成考试试卷主入口：Plan-Solve 生成结构化试卷并附隐藏答案。"""
     def generate_exam_paper(
@@ -564,12 +569,14 @@ JSON 示例：
         try:
             exam_json = self._extract_json_payload(response)
             return self._render_exam_paper(course_name=course_name, exam_json=exam_json)
-        except Exception:
+        except Exception as e:
+            err = str(e).strip() or "unknown_parse_error"
+            self.logger.warning("[exam] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
             # 解析失败时退化为原始文本，至少保证可继续交互。
             return {
                 "content": (
                     f"# 《{course_name}》模拟考试试卷\n\n"
-                    "系统未能结构化解析试卷，以下为原始生成内容：\n\n"
+                    f"系统未能结构化解析试卷（{err}），以下为原始生成内容：\n\n"
                     + response
                 ),
                 "answer_sheet": [],

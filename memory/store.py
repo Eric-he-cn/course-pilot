@@ -106,6 +106,9 @@ class SQLiteMemoryStore:
         event_types: Optional[List[str]] = None,
         top_k: int = 5,
         min_importance: float = 0.0,
+        mode: Optional[str] = None,
+        agent: Optional[str] = None,
+        phase: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         基于关键词的情景记忆检索（Phase 1 简易版）。
@@ -138,7 +141,7 @@ class SQLiteMemoryStore:
             ORDER BY importance DESC, created_at DESC
             LIMIT ?
         """
-        params.append(top_k)
+        params.append(max(top_k * 5, top_k))
 
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -150,7 +153,16 @@ class SQLiteMemoryStore:
                 d["metadata"] = json.loads(d["metadata"])
             except Exception:
                 d["metadata"] = {}
+            meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+            if mode and str(meta.get("mode", "")).strip() != str(mode).strip():
+                continue
+            if agent and str(meta.get("agent", "")).strip() != str(agent).strip():
+                continue
+            if phase and str(meta.get("phase", "")).strip() != str(phase).strip():
+                continue
             results.append(d)
+            if len(results) >= top_k:
+                break
         return results
 
     def get_recent_episodes(

@@ -9,12 +9,18 @@
 import os
 import logging
 import shutil
+import uuid
+import contextvars
+from queue import Empty, Queue
+from threading import Thread
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
+from time import perf_counter
+from core.metrics import add_event, trace_scope
 
 """basicConfig: 配置全局日志记录，设置日志级别、格式和时间格式,方便后续在代码中使用 logging 模块记录日志。"""
 logging.basicConfig(
@@ -22,6 +28,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S"
 )
+logger = logging.getLogger("backend.api")
 
 from backend.schemas import (
     CourseWorkspace, ChatRequest, ChatResponse, ChatMessage
@@ -336,15 +343,64 @@ async def chat(request: ChatRequest):
     """同步对话接口。"""
     if request.course_name not in workspaces:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    
-    # 执行编排主流程
-    response_message, plan = runner.run(
-        course_name=request.course_name,
-        mode=request.mode,
-        user_message=request.message,
-        state={},
-        history=[m.model_dump() for m in request.history] if request.history else []
+    request_id = uuid.uuid4().hex[:12]
+    history = [m.model_dump() for m in request.history] if request.history else []
+    t0 = perf_counter()
+    logger.info(
+        "[chat] request.start request_id=%s course=%s mode=%s history_len=%d",
+        request_id,
+        request.course_name,
+        request.mode,
+        len(history),
     )
+    try:
+        with trace_scope(
+            {
+                "request_id": request_id,
+                "course_name": request.course_name,
+                "mode": request.mode,
+                "api": "/chat",
+            }
+        ) as trace:
+            add_event(
+                "api_request_start",
+                request_id=request_id,
+                api="/chat",
+                mode=request.mode,
+                course_name=request.course_name,
+                history_len=len(history),
+            )
+            # 执行编排主流程
+            response_message, plan = runner.run(
+                course_name=request.course_name,
+                mode=request.mode,
+                user_message=request.message,
+                state={},
+                history=history,
+            )
+            elapsed_ms = (perf_counter() - t0) * 1000.0
+            add_event(
+                "api_request_end",
+                request_id=request_id,
+                api="/chat",
+                success=True,
+                elapsed_ms=elapsed_ms,
+            )
+            logger.info(
+                "[chat] request.done request_id=%s trace_id=%s elapsed_ms=%.1f",
+                request_id,
+                trace.trace_id,
+                elapsed_ms,
+            )
+    except Exception as e:
+        elapsed_ms = (perf_counter() - t0) * 1000.0
+        logger.exception(
+            "[chat] request.error request_id=%s elapsed_ms=%.1f err=%s",
+            request_id,
+            elapsed_ms,
+            str(e),
+        )
+        raise
     
     return ChatResponse(
         message=response_message,
@@ -359,24 +415,120 @@ async def chat_stream(request: ChatRequest):
     if request.course_name not in workspaces:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    request_id = uuid.uuid4().hex[:12]
     history = [m.model_dump() for m in request.history] if request.history else []
+    heartbeat_sec = float(os.getenv("SSE_HEARTBEAT_SEC", "8"))
+    t0 = perf_counter()
+    logger.info(
+        "[chat.stream] request.start request_id=%s course=%s mode=%s history_len=%d",
+        request_id,
+        request.course_name,
+        request.mode,
+        len(history),
+    )
 
     def event_generator():
+        first_chunk_latency_ms = None
+        emitted_chunks = 0
+        q: Queue = Queue()
+
+        def _emit(payload):
+            nonlocal first_chunk_latency_ms, emitted_chunks
+            if first_chunk_latency_ms is None:
+                first_chunk_latency_ms = (perf_counter() - t0) * 1000.0
+            emitted_chunks += 1
+            return f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        def _runner_worker():
+            try:
+                for chunk in runner.run_stream(
+                    course_name=request.course_name,
+                    mode=request.mode,
+                    user_message=request.message,
+                    state={},
+                    history=history,
+                ):
+                    q.put(("chunk", chunk))
+                q.put(("done", None))
+            except Exception as ex:
+                q.put(("error", ex))
+
         try:
-            for chunk in runner.run_stream(
-                course_name=request.course_name,
-                mode=request.mode,
-                user_message=request.message,
-                state={},
-                history=history,
-            ):
-                if chunk:
-                    # 用 JSON 序列化 chunk，换行符等特殊字符会被转义，不会破坏 SSE 行格式
-                    yield f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n"
+            with trace_scope(
+                {
+                    "request_id": request_id,
+                    "course_name": request.course_name,
+                    "mode": request.mode,
+                    "api": "/chat/stream",
+                }
+            ) as trace:
+                add_event(
+                    "api_request_start",
+                    request_id=request_id,
+                    api="/chat/stream",
+                    mode=request.mode,
+                    course_name=request.course_name,
+                    history_len=len(history),
+                )
+                worker_ctx = contextvars.copy_context()
+                worker = Thread(target=lambda: worker_ctx.run(_runner_worker), daemon=True)
+                worker.start()
+                while True:
+                    try:
+                        kind, payload = q.get(timeout=heartbeat_sec)
+                    except Empty:
+                        yield _emit({"__status__": "后端仍在处理，正在继续推理..."})
+                        continue
+                    if kind == "chunk":
+                        if payload:
+                            # 用 JSON 序列化 chunk，换行符等特殊字符会被转义，不会破坏 SSE 行格式
+                            yield _emit(payload)
+                        continue
+                    if kind == "error":
+                        raise payload
+                    if kind == "done":
+                        break
+                elapsed_ms = (perf_counter() - t0) * 1000.0
+                add_event(
+                    "api_request_end",
+                    request_id=request_id,
+                    api="/chat/stream",
+                    success=True,
+                    elapsed_ms=elapsed_ms,
+                    first_chunk_latency_ms=first_chunk_latency_ms,
+                    emitted_chunks=emitted_chunks,
+                )
+                logger.info(
+                    "[chat.stream] request.done request_id=%s trace_id=%s first_chunk_ms=%.1f elapsed_ms=%.1f emitted_chunks=%d",
+                    request_id,
+                    trace.trace_id,
+                    float(first_chunk_latency_ms or -1.0),
+                    elapsed_ms,
+                    emitted_chunks,
+                )
         except Exception as e:
             import traceback
             traceback.print_exc()
-            yield f"data: {_json.dumps(f'（生成回答时出错：{e}）', ensure_ascii=False)}\n\n"
+            elapsed_ms = (perf_counter() - t0) * 1000.0
+            add_event(
+                "api_request_end",
+                request_id=request_id,
+                api="/chat/stream",
+                success=False,
+                elapsed_ms=elapsed_ms,
+                first_chunk_latency_ms=first_chunk_latency_ms,
+                emitted_chunks=emitted_chunks,
+                error=str(e),
+            )
+            logger.exception(
+                "[chat.stream] request.error request_id=%s first_chunk_ms=%.1f elapsed_ms=%.1f emitted_chunks=%d err=%s",
+                request_id,
+                float(first_chunk_latency_ms or -1.0),
+                elapsed_ms,
+                emitted_chunks,
+                str(e),
+            )
+            yield _emit(f"（生成回答时出错：{e}）")
         finally:
             yield "data: [DONE]\n\n"
 

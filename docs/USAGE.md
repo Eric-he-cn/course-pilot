@@ -109,7 +109,7 @@ curl -X DELETE http://localhost:8000/workspaces/线性代数
 > 如果有 NVIDIA GPU（驱动 ≥ 570），会自动切换 CUDA 加速，构建速度约快 5–8 倍。  
 > 每次新增或替换教材后，都需要重新点击构建索引。  
 > 批量重建所有课程可在项目根目录运行：`python rebuild_indexes.py`
-> 当前检索默认是 `hybrid`（Dense + BM25 融合）；考试模式会自动扩大召回范围（`top_k=12`）。
+> 当前检索默认是 `hybrid`（Dense + BM25 融合）；分模式 top-k 默认为：学习/练习 `4`，考试 `6`。
 
 ### 3.6 检索参数（.env）
 
@@ -129,7 +129,7 @@ HYBRID_BM25_CANDIDATES_MULTIPLIER=3
 
 说明：
 - 学习/练习模式默认使用 `TOP_K_RESULTS`。
-- 考试模式内部固定 `top_k=12`（不受 `TOP_K_RESULTS` 影响）。
+- 分模式 top-k：学习/练习 `RAG_TOPK_LEARN_PRACTICE=4`，考试 `RAG_TOPK_EXAM=6`。
 
 ### 3.4 文件管理
 
@@ -532,4 +532,26 @@ cp data/memory/memory.db backup/memory.db
 
 > 如遇其他问题，请查看后端终端输出日志，或提交 [GitHub Issue](https://github.com/Eric-he-cn/your_AI_study_agent/issues)。
 
-更新日期：2026-03-11
+---
+
+## 11. V2 新能力速查
+
+### 11.1 流式状态不再“卡死”
+
+- 前端会显示阶段状态：连接后端 → 模型分析 → 工具调用 → 继续推理 → 输出答案。
+- 如果后端长时间无新 chunk，会收到心跳状态“后端仍在处理”。
+- 若最终无正文，会明确提示并建议查看后端日志，不再留空白气泡。
+
+### 11.2 上下文压缩策略
+
+- 系统默认启用统一预算器，不需要用户额外操作。
+- 压缩优先级：历史 > RAG > 记忆 > 硬截断。
+- 学习/练习默认 `top_k=4`，考试默认 `top_k=6`。
+
+### 11.3 benchmark 与断点续跑
+
+- 运行脚本：`python scripts/perf/bench_runner.py ...`
+- 支持 checkpoint：中断后再次运行会自动跳过已完成样本。
+- 结果目录包含：`baseline_raw.jsonl`、`baseline_summary.json`、`baseline_summary.md`、`baseline_checkpoint.json`。
+
+更新日期：2026-03-15

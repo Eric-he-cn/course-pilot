@@ -127,3 +127,28 @@
 - 解决思路：FAISS 以平铺文件形式保存为 `{path}.faiss` + `{path}.pkl`，而非目录；原代码用 `os.path.isdir()` 检测必然为 False。
 - 解决步骤：`api.py` 中检测逻辑改为 `os.path.exists(f"{index_path}.faiss")`；删除逻辑改为 `os.remove()` 分别删除两个文件，替换原来的 `shutil.rmtree()`。
 - 解决结果：索引状态正确显示，构建/重建/删除操作均生效。
+
+## 22. 流式状态停在“检索历史记忆”
+- 发现问题：前端长期显示 `memory_search` 状态，之后突然直接出最终答案，用户感知为“卡住”。
+- 解决思路：工具执行后必须有“继续推理”状态，且后端长等待期间要有心跳事件。
+- 解决步骤：
+  - `openai_compat.py::chat_stream_with_tools` 在每轮工具执行后发送 `工具调用完成，继续推理中...`；
+  - `backend/api.py::/chat/stream` 增加 SSE 心跳状态（默认每 8 秒）。
+- 解决结果：前端状态链路闭环，长耗时时仍可见“正在处理”反馈。
+
+## 23. API 入口缺少请求级日志，跨层定位困难
+- 发现问题：日志分散在 runner/llm，缺少统一请求入口和耗时汇总。
+- 解决思路：在 API 层增加 request_id + trace_id 结构化日志，并记录首包/总耗时。
+- 解决步骤：
+  - `/chat`、`/chat/stream` 增加 `request.start/request.done/request.error`；
+  - 注入 `trace_scope`，将 `request_id` 写入 trace meta，便于串联下游日志。
+- 解决结果：可按同一 `request_id` 追踪 API→Runner→LLM/tool 全链路。
+
+## 24. 根目录和 perf 目录历史临时文件堆积
+- 发现问题：根目录残留调试脚本，`data/perf_runs` 混入 smoke 目录，影响可读性。
+- 解决思路：按“归档优先，不硬删除”清理。
+- 解决步骤：
+  - 调试文件移动到 `tools/debug_archive/20260315_v2/`；
+  - 非 canonical perf 结果移动到 `data/perf_runs/_archive/20260315_v2_cleanup/`；
+  - 两处均生成 `ARCHIVE_INDEX.md`。
+- 解决结果：主目录只保留 canonical baseline/after 和正式运行入口。

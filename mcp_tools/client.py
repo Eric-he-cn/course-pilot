@@ -93,6 +93,22 @@ TOOL_SCHEMAS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "只检索指定类型：qa/mistake/practice，不传则检索全部"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "按模式过滤记忆，如 learn/practice/exam"
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "按写入 agent 过滤，如 tutor/grader/runner"
+                    },
+                    "phase": {
+                        "type": "string",
+                        "description": "按阶段过滤，如 answer/grade/review"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回条数，默认 5"
                     }
                 },
                 "required": ["query", "course_name"]
@@ -799,8 +815,15 @@ class MCPTools:
             return {"tool": "mindmap_generator", "error": str(ex), "success": False}
 
     @staticmethod
-    def memory_search(query: str, course_name: str,
-                      event_types: List[str] = None) -> Dict[str, Any]:
+    def memory_search(
+        query: str,
+        course_name: str,
+        event_types: List[str] = None,
+        mode: str = None,
+        agent: str = None,
+        phase: str = None,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
         """检索用户历史记忆（情景记忆）。"""
         try:
             from memory.manager import get_memory_manager
@@ -809,7 +832,10 @@ class MCPTools:
                 query=query,
                 course_name=course_name,
                 event_types=event_types,
-                top_k=5,
+                top_k=max(1, int(top_k or 5)),
+                mode=mode,
+                agent=agent,
+                phase=phase,
             )
             if not episodes:
                 return {
@@ -859,6 +885,10 @@ class MCPTools:
                 query=kwargs.get("query", ""),
                 course_name=kwargs.get("course_name", ""),
                 event_types=kwargs.get("event_types"),
+                mode=kwargs.get("mode"),
+                agent=kwargs.get("agent"),
+                phase=kwargs.get("phase"),
+                top_k=kwargs.get("top_k", 5),
             )
         elif tool_name == "mindmap_generator":
             return MCPTools.mindmap_generator(
@@ -882,21 +912,39 @@ class MCPTools:
     @staticmethod
     def call_tool(tool_name: str, **kwargs) -> Dict[str, Any]:
         """按名称调用工具（严格经由 stdio MCP，不做本地回退）。"""
+        t0 = time.perf_counter()
         payload = dict(kwargs)
         # filewriter 的 notes_dir 由 runner 注入上下文；通过 MCP 参数透传给子进程。
         if tool_name == "filewriter" and "notes_dir" not in payload:
             payload["notes_dir"] = MCPTools._context.get("notes_dir", "./data/notes")
 
+        result: Dict[str, Any]
         try:
             result = _get_mcp_client().call_tool(tool_name, payload)
             if isinstance(result, dict):
                 result.setdefault("tool", tool_name)
                 result.setdefault("via", "mcp_stdio")
-            return result
+            success = bool(isinstance(result, dict) and result.get("success", False))
         except Exception as ex:
-            return {
+            result = {
                 "tool": tool_name,
                 "error": f"MCP 调用失败: {ex}",
                 "success": False,
                 "via": "mcp_stdio",
             }
+            success = False
+
+        try:
+            from core.metrics import add_event as _add_event
+
+            _add_event(
+                "tool_call",
+                tool_name=tool_name,
+                tool_ms=(time.perf_counter() - t0) * 1000.0,
+                tool_success=success,
+                success=success,
+            )
+        except Exception:
+            pass
+
+        return result

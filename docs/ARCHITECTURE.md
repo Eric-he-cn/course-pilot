@@ -86,7 +86,7 @@ flowchart LR
 - 融合层：Hybrid 使用 RRF（Reciprocal Rank Fusion）合并 dense 与 bm25 候选，兼顾语义召回与术语精确匹配。
 
 **A4. 性能与正确性权衡**
-- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升；考试模式固定 `top_k=12`，学习/练习走 `TOP_K_RESULTS`。
+- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升；V2 默认分模式配置：学习/练习 `top_k=4`，考试 `top_k=6`。
 - `chunk_size` 越大，上下文语义更完整但定位更粗；越小则相反。
 - `hybrid` 模式通常比纯向量召回更稳健，尤其在课程术语/缩写/公式关键词场景。
 
@@ -328,7 +328,7 @@ Runner.run_exam_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
   ↓
-[工具] Retriever.retrieve(top_k=12) → 大范围 RAG 上下文
+[工具] Retriever.retrieve(top_k=6) → 大范围 RAG 上下文
   ↓
 [LLM #2] QuizMaster.generate_exam_paper()  ← Plan-Solve
   plan:  _plan_exam()（scope/num_questions/difficulty_ratio）
@@ -438,7 +438,7 @@ batch_size = 256  # GPU；CPU 时降为 32
 **检索策略**:
 ```python
 retrieval_mode = "hybrid"   # dense / bm25 / hybrid
-top_k = 6                   # 学习/练习默认；考试模式在 Runner 中覆盖为 12
+top_k = 4                   # 学习/练习默认；考试模式在 Runner 中覆盖为 6
 hybrid_rrf_k = 60
 hybrid_dense_weight = 1.0
 hybrid_bm25_weight = 1.0
@@ -553,3 +553,32 @@ gunicorn backend.api:app -w 4 -k uvicorn.workers.UvicornWorker
 ✅ **可追溯的知识系统** - 证据优先 + 引用标注  
 ✅ **持久化记忆增强** - 跨会话弱点追踪与强化  
 ✅ **可扩展的架构** - 模块化 + Agent 编排  
+
+---
+
+## V2 架构增量（2026-03）
+
+### 1. 统一上下文预算器（ContextBudgeter）
+
+- 接入点：`OrchestrationRunner` 在进入 Agent 前统一裁剪。
+- 顺序固定：`历史（最近轮+摘要） -> RAG（句级压缩） -> Memory（短片段） -> 硬截断`。
+- 目标：在不改外部 API 的前提下，降低中间轮 prompt 膨胀，稳定延迟。
+
+### 2. RAG V2（分层切分 + 句级压缩）
+
+- 分块策略：`fixed | chapter_hybrid`（默认 `chapter_hybrid`，失败回退 `fixed`）。
+- 章节识别：`第X章 / Chapter X / Markdown 标题`。
+- 元数据新增：`chapter`、`section`，引用仍绑定原 chunk。
+- 检索后压缩：每个 chunk 只保留 top-N 相关句（关键词重叠评分）。
+
+### 3. 可观测性增强
+
+- API 层新增请求级日志（`request_id`、history 长度、首包耗时、总耗时、异常）。
+- metrics trace 贯通 API/Runner/LLM/tool 事件，支持 `request_id + trace_id` 关联。
+- 流式链路增加心跳状态，避免前端长期停在单一状态。
+
+### 4. 性能评测体系
+
+- 基准脚本：`scripts/perf/bench_runner.py`。
+- 数据集：`benchmarks/cases_v1.jsonl` + `benchmarks/rag_gold_v1.jsonl`。
+- 产物：`raw/summary/checkpoint`，支持断点续跑和 baseline/after 对比。

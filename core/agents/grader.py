@@ -350,7 +350,13 @@ JSON 示例：
                 event_type=event_type,
                 content=content,
                 importance=importance,
-                metadata={"score": score, "tags": mistake_tags},
+                metadata={
+                    "score": score,
+                    "tags": mistake_tags,
+                    "mode": "practice",
+                    "agent": "grader",
+                    "phase": "grade",
+                },
             )
             if mistake_tags and is_mistake:
                 mgr.update_weak_points(course_name, mistake_tags)

@@ -67,6 +67,9 @@ class MemoryManager:
         event_types: Optional[List[str]] = None,
         top_k: int = 3,
         min_importance: float = 0.0,
+        mode: Optional[str] = None,
+        agent: Optional[str] = None,
+        phase: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """按关键词检索历史情景记忆，返回 list[dict]。"""
         return self._store.search_episodes(
@@ -76,6 +79,9 @@ class MemoryManager:
             event_types=event_types,
             top_k=top_k,
             min_importance=min_importance,
+            mode=mode,
+            agent=agent,
+            phase=phase,
         )
 
     def get_recent_episodes(
@@ -200,6 +206,9 @@ class MemoryManager:
         update_weak_points: bool = False,
         increment_qa: bool = False,
         increment_practice: bool = False,
+        mode: Optional[str] = None,
+        agent: Optional[str] = None,
+        phase: Optional[str] = None,
     ) -> str:
         """统一记忆写入口：一次调用同时写情景记忆与用户画像。"""
         concept_list = self._normalize_concepts(concepts)
@@ -208,6 +217,12 @@ class MemoryManager:
             meta["score"] = score
         if concept_list and "concepts" not in meta:
             meta["concepts"] = concept_list
+        if mode and "mode" not in meta:
+            meta["mode"] = mode
+        if agent and "agent" not in meta:
+            meta["agent"] = agent
+        if phase and "phase" not in meta:
+            meta["phase"] = phase
 
         eid = self.save_episode(
             course_name=course_name,

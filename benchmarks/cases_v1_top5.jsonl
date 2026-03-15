@@ -1,0 +1,5 @@
+{"case_id":"learn_01","mode":"learn","course_name":"矩阵理论","message":"矩阵的秩是什么？给出定义和一个简单例子。","history":[]}
+{"case_id":"learn_02","mode":"learn","course_name":"矩阵理论","message":"行秩和列秩有什么关系？","history":[]}
+{"case_id":"learn_03","mode":"learn","course_name":"矩阵理论","message":"为什么初等变换不改变矩阵的秩？","history":[]}
+{"case_id":"learn_04","mode":"learn","course_name":"矩阵理论","message":"如何用阶梯形矩阵计算 rank(A)？","history":[]}
+{"case_id":"learn_05","mode":"learn","course_name":"矩阵理论","message":"解释可逆矩阵与满秩矩阵的关系。","history":[]}

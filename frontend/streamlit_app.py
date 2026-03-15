@@ -398,12 +398,14 @@ def stream_chat(course_name: str, mode: str, message: str):
         "message": message,
         "history": history_payload,
     }
+    # 先发送连接状态，避免前端“无响应感”。
+    yield {"__status__": f"正在连接后端服务（{API_BASE}）..."}
     try:
         with requests.post(
             f"{API_BASE}/chat/stream",
             json=payload,
             stream=True,
-            timeout=180,
+            timeout=(8, None),  # connect timeout=8s, read timeout=无限(流式长连接)
         ) as resp:
             if resp.status_code != 200:
                 try:
@@ -412,7 +414,8 @@ def stream_chat(course_name: str, mode: str, message: str):
                     detail = resp.text or f"HTTP {resp.status_code}"
                 yield f"（请求失败：{detail}）"
                 return
-            for raw_line in resp.iter_lines():
+            # chunk_size=1 可降低客户端缓冲导致的首包延迟，提升流式体感。
+            for raw_line in resp.iter_lines(chunk_size=1, decode_unicode=True):
                 if raw_line:
                     line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
                     if line.startswith("data: "):
@@ -425,7 +428,9 @@ def stream_chat(course_name: str, mode: str, message: str):
                         except _json.JSONDecodeError:
                             yield data
     except requests.exceptions.Timeout:
-        yield "（请求超时，请稍后重试）"
+        yield "（连接后端超时：请检查后端服务是否启动，或网络代理设置）"
+    except requests.exceptions.ConnectionError:
+        yield f"（无法连接后端：{API_BASE}。请先启动 `python -m backend.api`）"
     except Exception as e:
         yield f"（流式输出失败：{e}）"
 
@@ -712,6 +717,7 @@ if st.session_state.current_course:
 
         with st.chat_message("assistant"):
             progress_placeholder = st.empty()
+            saw_status_event = [False]
 
             def _collecting_stream():
                 for chunk in stream_chat(
@@ -733,6 +739,7 @@ if st.session_state.current_course:
                     if isinstance(chunk, dict) and "__status__" in chunk:
                         status_text = str(chunk.get("__status__", "")).strip()
                         if status_text:
+                            saw_status_event[0] = True
                             progress_placeholder.caption(f"⏳ {status_text}")
                         continue
 
@@ -788,6 +795,17 @@ if st.session_state.current_course:
                     "citations": citations,
                     "tool_calls": tool_calls,
                     "mermaid_blocks": mermaid_blocks,
+                }
+            elif saw_status_event[0]:
+                # 兜底：后端仅返回状态事件但没有正文时，明确提示而不是留空白气泡。
+                fallback = "（后端已完成处理，但未返回正文。请查看后端日志并重试。）"
+                st.markdown(fallback)
+                assistant_payload = {
+                    "role": "assistant",
+                    "content": fallback,
+                    "citations": citations,
+                    "tool_calls": tool_calls,
+                    "mermaid_blocks": [],
                 }
 
         if assistant_payload:

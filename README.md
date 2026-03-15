@@ -8,10 +8,10 @@
 
 ## 速览
 - 🎯 三种模式：学习讲解 / 智能出题+评分 / 模拟考试
-- 📚 RAG：PDF/TXT/MD/DOCX/PPTX/PPT 解析，Hybrid 检索（FAISS + BM25），附页码引用
+- 📚 RAG：PDF/TXT/MD/DOCX/PPTX/PPT 解析，Hybrid 检索（FAISS + BM25）+ 章节分层切分 + 句级压缩，附页码引用
 - 🛠️ 工具：计算器、网页搜索、文件写入、记忆检索、思维导图、日期时间查询（共 6 个 MCP 工具）
 - 🧠 记忆系统：SQLite 跨会话追踪薄弱知识点，自动强化
-- ⚡ 体验：SSE 流式输出 + 执行进度提示，Mermaid 思维导图渲染与 PNG 导出
+- ⚡ 体验：SSE 流式输出 + 执行进度提示（含心跳兜底），Mermaid 思维导图渲染与 PNG 导出
 - 🔒 安全：路径穿越防护、并发 chdir 加锁、编码回退、分块死循环保护
 
 ---
@@ -38,7 +38,7 @@
 - GPU 自动加速：有 NVIDIA GPU 时自动使用 CUDA，batch_size 256；无 GPU 退回 CPU
 - TXT/MD 文件自动检测编码（UTF-8 → GBK → Latin-1 回退）
 - 检索结果携带文档名、页码、相关度分数
-- `TOP_K_RESULTS` 控制默认返回数量；考试模式内部固定 `top_k=12`
+- 分模式 `top_k`：`learn/practice=4`，`exam=6`（可用环境变量覆盖）
 
 ### 多 Agent 编排
 
@@ -255,7 +255,10 @@ EMBEDDING_BATCH_SIZE=256                # GPU 推荐 128-512；CPU 推荐 32
 CHUNK_SIZE=600
 CHUNK_OVERLAP=120
 TOP_K_RESULTS=6
+RAG_TOPK_LEARN_PRACTICE=4
+RAG_TOPK_EXAM=6
 RETRIEVAL_MODE=hybrid                     # dense / bm25 / hybrid
+CHUNK_STRATEGY=chapter_hybrid             # fixed / chapter_hybrid
 BM25_K1=1.5
 BM25_B=0.75
 HYBRID_RRF_K=60
@@ -263,6 +266,18 @@ HYBRID_DENSE_WEIGHT=1.0
 HYBRID_BM25_WEIGHT=1.0
 HYBRID_DENSE_CANDIDATES_MULTIPLIER=3
 HYBRID_BM25_CANDIDATES_MULTIPLIER=3
+
+# Context Budget（V2）
+CTX_TOTAL_TOKENS=8192
+CTX_SAFETY_MARGIN=256
+CB_HISTORY_RECENT_TURNS=6
+CB_HISTORY_SUMMARY_MAX_TOKENS=700
+CB_RAG_MAX_TOKENS=1800
+CB_MEMORY_MAX_TOKENS=450
+CB_RAG_SENT_PER_CHUNK=2
+CB_RAG_SENT_MAX_CHARS=120
+CB_MEMORY_TOPK=2
+CB_MEMORY_ITEM_MAX_CHARS=100
 
 # MCP（可选）
 SERPAPI_API_KEY=your_serpapi_key
@@ -298,7 +313,7 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `EMBEDDING_BATCH_SIZE` | — | `256`（GPU）/ `32`（CPU） | encode batch 大小 |
 | `CHUNK_SIZE` | — | `600` | 文本分块大小（字符数） |
 | `CHUNK_OVERLAP` | — | `120` | 分块重叠大小（需 < CHUNK_SIZE，建议 20%） |
-| `TOP_K_RESULTS` | — | `6` | 默认检索返回块数（考试模式内部固定 `top_k=12`） |
+| `TOP_K_RESULTS` | — | `6` | 默认检索返回块数（兜底值，优先使用分模式 top-k） |
 | `RETRIEVAL_MODE` | — | `hybrid` | 检索模式：`dense` / `bm25` / `hybrid` |
 | `BM25_K1` | — | `1.5` | BM25 参数 `k1` |
 | `BM25_B` | — | `0.75` | BM25 参数 `b` |
@@ -309,6 +324,16 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `HYBRID_BM25_CANDIDATES_MULTIPLIER` | — | `3` | bm25 候选池倍数（`top_k * 倍数`） |
 | `SERPAPI_API_KEY` | — | — | SerpAPI 密钥（`websearch` 工具依赖，未配置时该工具返回失败并跳过） |
 | `DATA_DIR` | — | `data/workspaces` | 课程数据根目录 |
+
+### V2 新增关键参数
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CHUNK_STRATEGY` | `chapter_hybrid` | 分块策略：`fixed` 或 `chapter_hybrid`（失败自动回退 `fixed`） |
+| `RAG_TOPK_LEARN_PRACTICE` | `4` | 学习/练习模式检索 top-k |
+| `RAG_TOPK_EXAM` | `6` | 考试模式检索 top-k |
+| `CTX_TOTAL_TOKENS` | `8192` | 上下文预算总 token |
+| `CTX_SAFETY_MARGIN` | `256` | 预算安全边界，避免贴边超限 |
+| `CB_*` | 见 `.env` 示例 | History/RAG/Memory 三段预算和压缩参数 |
 
 ---
 
@@ -372,6 +397,27 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 
 ---
 
+## 性能评测模块（V2）
+
+- 评测入口：`scripts/perf/bench_runner.py`
+- 基准用例：`benchmarks/cases_v1.jsonl`，RAG 标注：`benchmarks/rag_gold_v1.jsonl`
+- 支持 checkpoint 续跑：中断后按 `case_id#repeat` 去重，继续未完成任务
+- 产物目录：`data/perf_runs/<profile>/`
+  - `baseline_raw.jsonl`：逐条原始结果
+  - `baseline_summary.json`：聚合指标
+  - `baseline_summary.md`：可读报告
+  - `baseline_checkpoint.json`：断点状态
+- 核心指标：token、TTFT、LLM/RAG/端到端耗时、tool 成功率、RAG 命中率、error/replan 等
+
+## 日志与可观测性（V2）
+
+- `backend/api.py` 为 `/chat`、`/chat/stream` 增加请求级日志：`request_id`、`history_len`、首包耗时、总耗时、异常摘要。
+- API 层通过 `trace_scope` 注入 trace，上下游事件可按 `request_id + trace_id` 串联。
+- 流式 SSE 增加心跳状态：长时间无 chunk 时主动推送“后端仍在处理”。
+- 工具链新增状态闭环：`memory_search` 后会显式进入“工具调用完成，继续推理中”。
+
+---
+
 ## 安全与可靠性
 - **文件上传**：`basename` 净化 + 扩展名白名单（`.pdf .txt .md .docx .pptx .ppt`），阻断路径穿越与非法格式。
 - **课程名称**：`get_workspace_path()` 强制 `basename`，拒绝 `../` 等非法输入。
@@ -397,5 +443,16 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 ## 贡献与许可
 - 欢迎提交 Issue / PR，一起完善功能与安全性。
 - 许可证：MIT License
-- 作者：**Eric He** · 更新日期：2026-03-11
+- 作者：**Eric He** · 更新日期：2026-03-15
+
+## V2 更新日志
+
+- 新增统一 `ContextBudgeter`：按 `history -> rag -> memory -> hard_truncate` 分层裁剪。
+- RAG 升级为 `chapter_hybrid` 分层切分，支持章节识别与 `chapter/section` 元数据。
+- 检索后增加句级压缩（关键词重叠评分），默认每块保留少量高相关句。
+- 工具流优化：避免重复最终生成，补 `final_output_source/final_output_regen/tool_round_count` 埋点。
+- 新增工具去重与 `memory_search` 抑制策略，减少同轮重复调用。
+- 新增性能评测体系：metrics 采集、benchmark 用例、checkpoint 续跑、summary/delta 报告。
+- 流式链路改进：前端状态展示与后端心跳事件闭环，排查体验更稳定。
+- 请求级日志补齐：`/chat` 与 `/chat/stream` 可用 `request_id` 跨层追踪。
 

@@ -1,0 +1,3 @@
+{"case_id":"learn_01","mode":"learn","course_name":"矩阵理论","message":"矩阵的秩是什么？给出定义和一个简单例子。","history":[]}
+{"case_id":"practice_01","mode":"practice","course_name":"矩阵理论","message":"给我出一道关于矩阵秩的中等难度练习题。","history":[]}
+{"case_id":"exam_01","mode":"exam","course_name":"矩阵理论","message":"生成一份覆盖矩阵秩与线性相关的模拟试卷。","history":[]}

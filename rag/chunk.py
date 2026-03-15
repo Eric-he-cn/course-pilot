@@ -7,6 +7,7 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
+import re
 from typing import List, Dict, Any
 
 
@@ -50,21 +51,111 @@ def chunk_documents(
     if overlap is None:
         overlap = int(os.getenv("CHUNK_OVERLAP", "50"))
     
+    strategy = os.getenv("CHUNK_STRATEGY", "chapter_hybrid").strip().lower()
+    if strategy not in {"fixed", "chapter_hybrid"}:
+        strategy = "chapter_hybrid"
+
     all_chunks = []
-    
-    for page in pages:
-        text = page["text"]
-        page_num = page.get("page")
-        doc_id = page["doc_id"]
-        
-        chunks = simple_chunk_text(text, chunk_size, overlap)
-        
-        for i, chunk_text in enumerate(chunks):
-            all_chunks.append({
-                "text": chunk_text,
-                "doc_id": doc_id,
-                "page": page_num,
-                "chunk_id": f"{doc_id}_p{page_num}_c{i}" if page_num else f"{doc_id}_c{i}"
-            })
-    
-    return all_chunks
+
+    def _fixed_chunking() -> List[Dict[str, Any]]:
+        out = []
+        for page in pages:
+            text = page["text"]
+            page_num = page.get("page")
+            doc_id = page["doc_id"]
+            chunks = simple_chunk_text(text, chunk_size, overlap)
+            for i, chunk_text in enumerate(chunks):
+                out.append({
+                    "text": chunk_text,
+                    "doc_id": doc_id,
+                    "page": page_num,
+                    "chunk_id": f"{doc_id}_p{page_num}_c{i}" if page_num else f"{doc_id}_c{i}",
+                    "chapter": None,
+                    "section": None,
+                })
+        return out
+
+    if strategy == "fixed":
+        return _fixed_chunking()
+
+    try:
+        # chapter_hybrid：按章节/标题优先切分，失败时自动回退 fixed。
+        for page in pages:
+            text = page["text"]
+            page_num = page.get("page")
+            doc_id = page["doc_id"]
+            lines = text.splitlines()
+            current_chapter = "未知章节"
+            current_section = "正文"
+            section_buf: List[str] = []
+            sections: List[Dict[str, str]] = []
+
+            def flush_section() -> None:
+                body = "\n".join(section_buf).strip()
+                if body:
+                    sections.append(
+                        {
+                            "chapter": current_chapter,
+                            "section": current_section,
+                            "text": body,
+                        }
+                    )
+
+            for line in lines:
+                s = line.strip()
+                if not s:
+                    section_buf.append(line)
+                    continue
+                chapter_hit = re.match(r"^(第[一二三四五六七八九十百零\d]+章)\s*(.*)$", s)
+                chapter_en_hit = re.match(r"^(chapter\s+\d+)\b[:：\s-]*(.*)$", s, re.IGNORECASE)
+                md_head_hit = re.match(r"^(#{1,6})\s+(.+)$", s)
+
+                if chapter_hit:
+                    flush_section()
+                    section_buf = []
+                    current_chapter = chapter_hit.group(1)
+                    current_section = chapter_hit.group(2).strip() or "正文"
+                    continue
+                if chapter_en_hit:
+                    flush_section()
+                    section_buf = []
+                    current_chapter = chapter_en_hit.group(1).strip()
+                    current_section = chapter_en_hit.group(2).strip() or "正文"
+                    continue
+                if md_head_hit:
+                    flush_section()
+                    section_buf = []
+                    level = len(md_head_hit.group(1))
+                    title = md_head_hit.group(2).strip()
+                    if level <= 2:
+                        current_chapter = title
+                        current_section = "正文"
+                    else:
+                        current_section = title
+                    continue
+                section_buf.append(line)
+
+            flush_section()
+            if not sections:
+                sections = [{"chapter": None, "section": None, "text": text}]
+
+            chunk_idx = 0
+            for sec in sections:
+                chunks = simple_chunk_text(sec["text"], chunk_size, overlap)
+                for chunk_text in chunks:
+                    all_chunks.append({
+                        "text": chunk_text,
+                        "doc_id": doc_id,
+                        "page": page_num,
+                        "chunk_id": f"{doc_id}_p{page_num}_c{chunk_idx}" if page_num else f"{doc_id}_c{chunk_idx}",
+                        "chapter": sec.get("chapter"),
+                        "section": sec.get("section"),
+                    })
+                    chunk_idx += 1
+
+        if not all_chunks:
+            return _fixed_chunking()
+        return all_chunks
+    except Exception:
+        # 章节识别失败时自动回退 fixed。
+        return _fixed_chunking()

@@ -99,7 +99,7 @@ def test_tool_policy():
         
         exam_tools = ToolPolicy.get_allowed_tools("exam")
         assert "calculator" in exam_tools
-        assert "websearch" not in exam_tools  # 考试模式应禁用联网搜索
+        assert "websearch" in exam_tools  # 根据最新策略，考试模式也不再屏蔽任何工具
         
         print("✅ Tool policy tests passed")
         return True

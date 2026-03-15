@@ -8,8 +8,10 @@
 """
 import os
 import json
+import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+from core.metrics import get_active_trace
 
 from backend.schemas import (
     Plan, ChatMessage, RetrievedChunk, Quiz, GradeReport,
@@ -19,6 +21,7 @@ from core.agents.router import RouterAgent
 from core.agents.tutor import TutorAgent
 from core.agents.quizmaster import QuizMasterAgent
 from core.agents.grader import GraderAgent
+from core.orchestration.context_budgeter import ContextBudgeter
 from rag.retrieve import Retriever
 from rag.store_faiss import FAISSStore
 from mcp_tools.client import MCPTools
@@ -39,8 +42,18 @@ class OrchestrationRunner:
         self.quizmaster = QuizMasterAgent()
         self.grader = GraderAgent()
         self.tools = MCPTools()
+        self.context_budgeter = ContextBudgeter()
         # 保存本轮执行元信息，供 Replan 判定使用。
         self._last_run_meta: Dict[str, Any] = {}
+        self.logger = logging.getLogger("runner")
+
+    @staticmethod
+    def _trace_tag() -> str:
+        trace = get_active_trace()
+        if trace is None:
+            return ""
+        request_id = str((trace.meta or {}).get("request_id", "")).strip() or "unknown"
+        return f" request_id={request_id} trace_id={trace.trace_id}"
 
     """执行质量量化：长度、句子数和异常信号综合判断。"""
     @staticmethod
@@ -156,6 +169,25 @@ class OrchestrationRunner:
         store = FAISSStore()
         store.load(index_path)
         return Retriever(store)
+
+    @staticmethod
+    def _top_k_for_mode(mode: str) -> int:
+        m = (mode or "").strip().lower()
+        if m == "exam":
+            return int(os.getenv("RAG_TOPK_EXAM", "6"))
+        if m in {"learn", "practice"}:
+            return int(os.getenv("RAG_TOPK_LEARN_PRACTICE", "4"))
+        return int(os.getenv("TOP_K_RESULTS", "3"))
+
+    @staticmethod
+    def _trim_history_recent(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if not history:
+            return []
+        turns = int(os.getenv("CB_HISTORY_RECENT_TURNS", "6"))
+        keep = max(0, turns * 2)
+        if keep <= 0:
+            return []
+        return history[-keep:]
     
     def run_learn_mode(
         self,
@@ -167,6 +199,7 @@ class OrchestrationRunner:
         """执行学习模式（非流式）。"""
         if history is None:
             history = []
+        history = self._trim_history_recent(history)
         retrieval_empty = False
         # 关键步骤：按 plan 决定是否执行 RAG 检索并准备 citations。
         context = ""
@@ -175,7 +208,7 @@ class OrchestrationRunner:
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message)
+                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("learn"))
                 if chunks:
                     context = retriever.format_context(chunks)
                     citations = chunks
@@ -185,6 +218,24 @@ class OrchestrationRunner:
             else:
                 retrieval_empty = True
                 context = "（未找到相关教材，请先上传课程资料）"
+
+        memory_ctx = self._fetch_history_ctx(
+            query=user_message,
+            course_name=course_name,
+            mode="learn",
+            agent="tutor",
+            phase="answer",
+        )
+        packed = self.context_budgeter.build_context(
+            query=user_message,
+            history=history,
+            rag_text=context,
+            memory_text=memory_ctx,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+        )
+        self._log_context_budget("learn", packed)
+        context = packed["final_text"]
         
         # 关键步骤：组装 Tutor 入参并触发生成。
         workspace_path = self.get_workspace_path(course_name)
@@ -199,7 +250,7 @@ class OrchestrationRunner:
         )
         # 质量检查：若回答过短或包含错误信号，自动重试一次
         if not self._check_quality(result.content):
-            print("[QualityCheck] 回答质量不足，自动重试")
+            self.logger.info("[quality] retry_once=1 reason=low_quality%s", self._trace_tag())
             result = self.tutor.teach(
                 user_message, course_name, context,
                 allowed_tools=plan.allowed_tools,
@@ -232,6 +283,7 @@ class OrchestrationRunner:
         """对话式练习模式（非流式）：出题走 QuizMaster，交卷走 Grader。"""
         if history is None:
             history = []
+        history = self._trim_history_recent(history)
         retrieval_empty = False
 
         context = ""
@@ -239,7 +291,7 @@ class OrchestrationRunner:
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message)
+                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("practice"))
                 if chunks:
                     context = retriever.format_context(chunks)
                     citations = chunks
@@ -251,7 +303,24 @@ class OrchestrationRunner:
                 context = "（未找到相关教材，请先上传课程资料）"
 
         # 历史错题上下文
-        history_ctx = self._fetch_history_ctx(user_message, course_name)
+        history_ctx = self._fetch_history_ctx(
+            query=user_message,
+            course_name=course_name,
+            mode="practice",
+            agent="grader",
+            phase="grade",
+        )
+        packed = self.context_budgeter.build_context(
+            query=user_message,
+            history=history,
+            rag_text=context,
+            memory_text=history_ctx,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+        )
+        self._log_context_budget("practice", packed)
+        context = packed["final_text"]
+        history_ctx = packed["memory_text"]
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
@@ -261,7 +330,7 @@ class OrchestrationRunner:
         # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
         answer_submission = self._is_answer_submission(user_message, history)
         if answer_submission:
-            print("[Runner] 检测到答案提交，路由至 GraderAgent")
+            self.logger.info("[route] practice answer_submission=1 target=grader%s", self._trace_tag())
             quiz_content = self._extract_quiz_from_history(history)
             chunks = []
             for chunk in self.grader.grade_practice_stream(
@@ -313,6 +382,7 @@ class OrchestrationRunner:
         """对话式练习模式（流式）：交卷走 Grader 流式，出题走 QuizMaster。"""
         if history is None:
             history = []
+        history = self._trim_history_recent(history)
         retrieval_empty = False
 
         context = ""
@@ -320,7 +390,7 @@ class OrchestrationRunner:
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message)
+                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("practice"))
                 if chunks:
                     context = retriever.format_context(chunks)
                     citations_dicts = [c.model_dump() for c in chunks]
@@ -335,7 +405,24 @@ class OrchestrationRunner:
         if citations_dicts:
             yield {"__citations__": citations_dicts}
 
-        history_ctx = self._fetch_history_ctx(user_message, course_name)
+        history_ctx = self._fetch_history_ctx(
+            query=user_message,
+            course_name=course_name,
+            mode="practice",
+            agent="grader",
+            phase="grade",
+        )
+        packed = self.context_budgeter.build_context(
+            query=user_message,
+            history=history,
+            rag_text=context,
+            memory_text=history_ctx,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+        )
+        self._log_context_budget("practice", packed)
+        context = packed["final_text"]
+        history_ctx = packed["memory_text"]
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
@@ -344,7 +431,7 @@ class OrchestrationRunner:
         # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
         answer_submission = self._is_answer_submission(user_message, history)
         if answer_submission:
-            print("[Runner] 检测到答案提交，路由至 GraderAgent (stream)")
+            self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
             quiz_content = self._extract_quiz_from_history(history)
             collected = []
             for chunk in self.grader.grade_practice_stream(
@@ -391,12 +478,13 @@ class OrchestrationRunner:
         """对话式考试模式（非流式）：出卷走 QuizMaster，交卷评分讲解走 Grader。"""
         if history is None:
             history = []
+        history = self._trim_history_recent(history)
         retrieval_empty = False
 
         context = ""
         retriever = self.load_retriever(course_name)
         if retriever:
-            chunks = retriever.retrieve(user_message, top_k=12)
+            chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("exam"))
             if chunks:
                 context = retriever.format_context(chunks)
             else:
@@ -406,7 +494,24 @@ class OrchestrationRunner:
             retrieval_empty = True
             context = "（未找到相关教材，请先上传课程资料）"
 
-        history_ctx = self._fetch_history_ctx(user_message, course_name)
+        history_ctx = self._fetch_history_ctx(
+            query=user_message,
+            course_name=course_name,
+            mode="exam",
+            agent="grader",
+            phase="grade",
+        )
+        packed = self.context_budgeter.build_context(
+            query=user_message,
+            history=history,
+            rag_text=context,
+            memory_text=history_ctx,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+        )
+        self._log_context_budget("exam", packed)
+        context = packed["final_text"]
+        history_ctx = packed["memory_text"]
         answer_submission = self._is_exam_answer_submission(user_message, history)
         tool_calls = None
         if answer_submission:
@@ -462,13 +567,14 @@ class OrchestrationRunner:
         """对话式考试模式（流式）：交卷走 Grader 流式，出卷走 QuizMaster。"""
         if history is None:
             history = []
+        history = self._trim_history_recent(history)
         retrieval_empty = False
 
         context = ""
         citations_dicts = []
         retriever = self.load_retriever(course_name)
         if retriever:
-            chunks = retriever.retrieve(user_message, top_k=12)
+            chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("exam"))
             if chunks:
                 context = retriever.format_context(chunks)
                 citations_dicts = [c.model_dump() for c in chunks]
@@ -483,7 +589,24 @@ class OrchestrationRunner:
         if citations_dicts:
             yield {"__citations__": citations_dicts}
 
-        history_ctx = self._fetch_history_ctx(user_message, course_name)
+        history_ctx = self._fetch_history_ctx(
+            query=user_message,
+            course_name=course_name,
+            mode="exam",
+            agent="grader",
+            phase="grade",
+        )
+        packed = self.context_budgeter.build_context(
+            query=user_message,
+            history=history,
+            rag_text=context,
+            memory_text=history_ctx,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+        )
+        self._log_context_budget("exam", packed)
+        context = packed["final_text"]
+        history_ctx = packed["memory_text"]
         answer_submission = self._is_exam_answer_submission(user_message, history)
         if answer_submission:
             exam_paper = self._extract_exam_from_history(history)
@@ -562,13 +685,51 @@ class OrchestrationRunner:
         error_signals = ["Error calling LLM", "工具调用失败", "请重试", "API Error"]
         return not any(sig in content for sig in error_signals)
 
-    def _fetch_history_ctx(self, query: str, course_name: str) -> str:
+    def _fetch_history_ctx(
+        self,
+        query: str,
+        course_name: str,
+        mode: str = "",
+        agent: str = "",
+        phase: str = "",
+    ) -> str:
         """从记忆库预取历史错题片段，返回可追加到 system prompt 的字符串。"""
         try:
-            mem = MCPTools.call_tool("memory_search", query=query, course_name=course_name)
+            top_k = int(os.getenv("CB_MEMORY_TOPK", "2"))
+            item_max_chars = int(os.getenv("CB_MEMORY_ITEM_MAX_CHARS", "100"))
+            cache = getattr(self, "_tool_dedup_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._tool_dedup_cache = cache
+            key_payload = {
+                "tool": "memory_search",
+                "query": query,
+                "course_name": course_name,
+                "event_types": ["mistake", "practice", "exam", "qa"],
+                "mode": mode or None,
+                "agent": agent or None,
+                "phase": phase or None,
+                "top_k": top_k,
+            }
+            cache_key = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
+            if cache_key in cache:
+                mem = cache[cache_key]
+                self.logger.info("[tool_dedup] memory_search hit=1 reason=runner_cache%s", self._trace_tag())
+            else:
+                mem = MCPTools.call_tool(
+                    "memory_search",
+                    query=query,
+                    course_name=course_name,
+                    event_types=["mistake", "practice", "exam", "qa"],
+                    mode=mode or None,
+                    agent=agent or None,
+                    phase=phase or None,
+                    top_k=top_k,
+                )
+                cache[cache_key] = mem
             if mem.get("success") and mem.get("results"):
                 snippets = []
-                for r in mem["results"][:2]:
+                for r in mem["results"][: max(1, top_k)]:
                     text = ""
                     if isinstance(r, dict):
                         text = (
@@ -581,7 +742,7 @@ class OrchestrationRunner:
                         text = r
                     text = text.strip()
                     if text:
-                        snippets.append(text[:120])
+                        snippets.append(text[: max(20, item_max_chars)])
                 if snippets:
                     return (
                         "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n"
@@ -590,6 +751,23 @@ class OrchestrationRunner:
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _log_context_budget(mode: str, packed: Dict[str, Any]) -> None:
+        history_tokens = int(packed.get("history_tokens_est", 0) or 0)
+        rag_tokens = int(packed.get("rag_tokens_est", 0) or 0)
+        memory_tokens = int(packed.get("memory_tokens_est", 0) or 0)
+        final_tokens = int(packed.get("final_tokens_est", 0) or 0)
+        budget_tokens = int(packed.get("budget_tokens_est", 0) or 0)
+        logging.getLogger("runner").info(
+            "[context_budget] mode=%s history=%d rag=%d memory=%d final=%d budget=%d",
+            mode,
+            history_tokens,
+            rag_tokens,
+            memory_tokens,
+            final_tokens,
+            budget_tokens,
+        )
 
     """从用户出题请求中解析主题、难度、题量与题型（轻量规则，失败回退默认值）。"""
     @staticmethod
@@ -934,10 +1112,18 @@ class OrchestrationRunner:
                 concepts=signal.mistake_tags,
                 update_weak_points=signal.is_mistake,
                 increment_practice=True,
+                mode="practice",
+                agent="grader",
+                phase="grade",
             )
-            print(f"[Memory] 练习{'错题' if signal.is_mistake else '结果'}已记录，得分={signal.score:.0f}")
+            self.logger.info(
+                "[memory] practice_saved type=%s score=%.0f%s",
+                "mistake" if signal.is_mistake else "practice",
+                signal.score,
+                self._trace_tag(),
+            )
         except Exception as _e:
-            print(f"[Memory] 练习记忆写入失败（不影响评分）: {_e}")
+            self.logger.warning("[memory] practice_save_failed err=%s%s", str(_e), self._trace_tag())
 
     def _save_practice_record(self, course_name: str, user_message: str, history: list, response_text: str) -> str:
         """保存练习题记录（题目、用户答案、评分解析），返回相对路径。
@@ -1093,12 +1279,17 @@ class OrchestrationRunner:
                 score=score,
                 concepts=weak_points,
                 update_weak_points=bool(weak_points),
+                mode="exam",
+                agent="grader",
+                phase="grade",
             )
-            print(
-                f"[Memory] 考试记录已写入 memory.db（score={score if score is not None else 'N/A'}）"
+            self.logger.info(
+                "[memory] exam_saved score=%s%s",
+                score if score is not None else "N/A",
+                self._trace_tag(),
             )
         except Exception as _e:
-            print(f"[Memory] 考试记忆写入失败（不影响主流程）: {_e}")
+            self.logger.warning("[memory] exam_save_failed err=%s%s", str(_e), self._trace_tag())
 
     def run(
         self,
@@ -1111,6 +1302,7 @@ class OrchestrationRunner:
         """主编排入口（非流式）。"""
         if history is None:
             history = []
+        self._tool_dedup_cache = {}
         # 关键步骤：先由 Router 产出本轮执行计划（是否检索、允许工具等）。
         plan = self.router.plan(user_message, mode, course_name)
 
@@ -1121,7 +1313,7 @@ class OrchestrationRunner:
             reasons = self._collect_replan_reasons(mode, plan, response)
             if reasons:
                 reason_text = "；".join(reasons)
-                print(f"[Replan] trigger=1 mode={mode} reasons={reason_text}")
+                self.logger.info("[replan] trigger=1 mode=%s reasons=%s%s", mode, reason_text, self._trace_tag())
                 new_plan = self.router.replan(
                     user_message=user_message,
                     mode=mode,
@@ -1130,11 +1322,11 @@ class OrchestrationRunner:
                     reason=reason_text,
                 )
                 if new_plan.model_dump() != plan.model_dump():
-                    print("[Replan] plan_changed=1 rerun=1")
+                    self.logger.info("[replan] plan_changed=1 rerun=1%s", self._trace_tag())
                     plan = new_plan
                     response = self._run_mode_once(course_name, mode, user_message, plan, state, history)
                 else:
-                    print("[Replan] plan_changed=0 skip_rerun=1")
+                    self.logger.info("[replan] plan_changed=0 skip_rerun=1%s", self._trace_tag())
 
         return response, plan
 
@@ -1152,17 +1344,36 @@ class OrchestrationRunner:
         """
         if history is None:
             history = []
+        history = self._trim_history_recent(history)
 
         context = ""
         citations_dicts = []
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message)
+                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("learn"))
                 context = retriever.format_context(chunks)
                 citations_dicts = [c.model_dump() for c in chunks]
             else:
                 context = "（未找到相关教材，请先上传课程资料）"
+
+        memory_ctx = self._fetch_history_ctx(
+            query=user_message,
+            course_name=course_name,
+            mode="learn",
+            agent="tutor",
+            phase="answer",
+        )
+        packed = self.context_budgeter.build_context(
+            query=user_message,
+            history=history,
+            rag_text=context,
+            memory_text=memory_ctx,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+        )
+        self._log_context_budget("learn", packed)
+        context = packed["final_text"]
 
         # 先发送 citations 事件（前端按 __citations__ key 识别，不会渲染为文本）
         if citations_dicts:
@@ -1193,9 +1404,12 @@ class OrchestrationRunner:
                 importance=0.5,
                 metadata={"doc_ids": doc_ids},
                 increment_qa=True,
+                mode="learn",
+                agent="tutor",
+                phase="answer",
             )
         except Exception as _mem_err:
-            print(f"[Memory] 写入情景记忆失败（不影响输出）: {_mem_err}")
+            self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
 
     def run_stream(
         self,
@@ -1208,6 +1422,7 @@ class OrchestrationRunner:
         """主流式入口，learn 模式真正流式，其他模式一次性输出。"""
         if history is None:
             history = []
+        self._tool_dedup_cache = {}
         plan = self.router.plan(user_message, mode, course_name)
         enable_replan = os.getenv("ENABLE_ROUTER_REPLAN", "1") == "1"
         if enable_replan and plan.need_rag:
@@ -1222,7 +1437,7 @@ class OrchestrationRunner:
                     reason=reason,
                 )
                 if new_plan.model_dump() != plan.model_dump():
-                    print(f"[Replan] stream_precheck mode={mode} reason={reason}")
+                    self.logger.info("[replan] stream_precheck mode=%s reason=%s%s", mode, reason, self._trace_tag())
                     plan = new_plan
 
         if mode == "learn":

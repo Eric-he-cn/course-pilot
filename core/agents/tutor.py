@@ -11,6 +11,7 @@ from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import TUTOR_PROMPT
 from mcp_tools.client import get_tool_schemas
 from backend.schemas import TutorResult
+from core.metrics import add_event, estimate_text_tokens
 
 """
 TutorAgent：统一承载学习讲解、练习出题、考试对话等生成任务。
@@ -65,7 +66,9 @@ class TutorAgent:
                 f"4. 用户要求生成思维导图或知识点汇总，必须调用 mindmap_generator 工具。\n"
                 f"5. 如果该知识点用户之前问过或做错过，可以调用 memory_search 工具检索历史记录。\n"
                 f"6. 遇到询问当前日期、时间、星期几等时效性问题，必须调用 get_datetime 工具，不得凭记忆或训练数据回答。\n"
-                f"7. 禁止编造工具调用结果，必须等待工具真实返回后再回答。"
+                f"7. 禁止编造工具调用结果，必须等待工具真实返回后再回答。\n"
+                f"8. 工具调用中的中间轮仅输出简短状态或结论（1-2句），不要展开长篇正文；"
+                f"在确认不再需要工具后，再给出完整最终答案。"
             )
         else:
             system_prompt = "你是一位专业的大学课程导师。"
@@ -87,6 +90,14 @@ class TutorAgent:
                 if role in ("user", "assistant") and content:
                     messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": prompt})
+        add_event(
+            "prompt_budget",
+            system_tokens_est=estimate_text_tokens(system_prompt),
+            history_tokens_est=estimate_text_tokens("\n".join(str(m.get("content", "")) for m in messages if m.get("role") in ("user", "assistant"))),
+            context_tokens_est=estimate_text_tokens(context),
+            history_msg_count=max(0, len(messages) - 2),
+            stream_mode=stream_mode,
+        )
         return messages
 
     """根据 allowed_tools 解析工具 schema；返回 None 表示本轮不启用工具。"""

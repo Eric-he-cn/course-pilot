@@ -7,9 +7,12 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
+import re
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 from rag.lexical import BM25Index
 from backend.schemas import RetrievedChunk
+from core.metrics import add_event
 
 if TYPE_CHECKING:
     from rag.store_faiss import FAISSStore
@@ -59,6 +62,38 @@ class Retriever:
         query_embedding = self._get_embedding_model().embed_query(query)
         return self.store.search(query_embedding, top_k)
 
+    @staticmethod
+    def _keywords(query: str) -> List[str]:
+        q = (query or "").lower()
+        kws = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", q)
+        return list(dict.fromkeys(kws))[:12]
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        parts = re.split(r"(?<=[。！？!?\.])\s+|\n+", text or "")
+        return [p.strip() for p in parts if p.strip()]
+
+    def _compress_chunk_text(self, query: str, chunk_text: str) -> str:
+        sent_topn = self._env_int("CB_RAG_SENT_PER_CHUNK", 2)
+        sent_max_chars = self._env_int("CB_RAG_SENT_MAX_CHARS", 120)
+        sents = self._split_sentences(chunk_text)
+        if not sents:
+            return chunk_text
+        kws = self._keywords(query)
+        scored = []
+        for s in sents:
+            low = s.lower()
+            overlap = sum(1 for k in kws if k in low)
+            scored.append((overlap, len(s), s))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        selected = [x[2] for x in scored[: max(1, sent_topn)]]
+        if not any(selected):
+            selected = [sents[0]]
+        trimmed = [s[: max(30, sent_max_chars)] for s in selected if s]
+        if not trimmed:
+            return sents[0][: max(30, sent_max_chars)]
+        return " ".join(trimmed)
+
 
     """_fuse_with_rrf: 使用 Reciprocal Rank Fusion (RRF) 算法融合 dense 和 bm25 的检索结果。
     通过给每个结果根据其在两个列表中的排名分配权重，最终得到一个综合评分并排序。"""
@@ -100,6 +135,10 @@ class Retriever:
         top_k: int = None
     ) -> List[RetrievedChunk]:
         """根据查询召回相关文本片段。"""
+        t0 = perf_counter()
+        mode = "hybrid"
+        candidate_count = 0
+        success = True
         if top_k is None:
             top_k = self._env_int("TOP_K_RESULTS", 3)
         else:
@@ -109,29 +148,47 @@ class Retriever:
         if mode not in {"dense", "bm25", "hybrid"}:
             mode = "hybrid"
 
-        if mode == "dense":
-            results = self._dense_search(query, top_k)
-        elif mode == "bm25":
-            results = self.lexical_index.search(query, top_k)
-        else:
-            dense_multiplier = self._env_int("HYBRID_DENSE_CANDIDATES_MULTIPLIER", 3)
-            bm25_multiplier = self._env_int("HYBRID_BM25_CANDIDATES_MULTIPLIER", 3)
-            dense_k = max(top_k, top_k * dense_multiplier)
-            bm25_k = max(top_k, top_k * bm25_multiplier)
-            dense_results = self._dense_search(query, dense_k)
-            bm25_results = self.lexical_index.search(query, bm25_k)
-            results = self._fuse_with_rrf(dense_results, bm25_results, top_k)
+        try:
+            if mode == "dense":
+                results = self._dense_search(query, top_k)
+                candidate_count = len(results)
+            elif mode == "bm25":
+                results = self.lexical_index.search(query, top_k)
+                candidate_count = len(results)
+            else:
+                dense_multiplier = self._env_int("HYBRID_DENSE_CANDIDATES_MULTIPLIER", 3)
+                bm25_multiplier = self._env_int("HYBRID_BM25_CANDIDATES_MULTIPLIER", 3)
+                dense_k = max(top_k, top_k * dense_multiplier)
+                bm25_k = max(top_k, top_k * bm25_multiplier)
+                dense_results = self._dense_search(query, dense_k)
+                bm25_results = self.lexical_index.search(query, bm25_k)
+                candidate_count = len(dense_results) + len(bm25_results)
+                results = self._fuse_with_rrf(dense_results, bm25_results, top_k)
+        except Exception:
+            success = False
+            raise
         
         retrieved = []
         for chunk, score in results:
+            # 句级压缩：保留每个 chunk 的 top-N 相关句；失败时回退首句。
+            comp_text = self._compress_chunk_text(query=query, chunk_text=chunk["text"])
             retrieved.append(RetrievedChunk(
-                text=chunk["text"],
+                text=comp_text,
                 doc_id=chunk["doc_id"],
                 page=chunk.get("page"),
                 chunk_id=chunk.get("chunk_id"),
                 score=float(score)
             ))
-        
+
+        add_event(
+            "retrieval",
+            retrieval_ms=(perf_counter() - t0) * 1000.0,
+            mode=mode,
+            top_k=top_k,
+            candidate_count=candidate_count,
+            returned_count=len(retrieved),
+            success=success,
+        )
         return retrieved
     
     def format_context(self, chunks: List[RetrievedChunk]) -> str:
