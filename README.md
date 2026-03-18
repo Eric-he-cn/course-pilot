@@ -236,8 +236,8 @@ FastAPI (:8000)
 ```bash
 conda create -n study_agent python=3.11 -y
 conda activate study_agent
-git clone https://github.com/Eric-he-cn/your_AI_study_agent.git
-cd your_AI_study_agent
+git clone https://github.com/Eric-he-cn/course-pilot.git
+cd course-pilot
 pip install -r requirements.txt
 ```
 
@@ -252,9 +252,9 @@ DEFAULT_MODEL=deepseek-chat                   # 或 gpt-4o 等
 EMBEDDING_MODEL=BAAI/bge-base-zh-v1.5   # 中文优化嵌入模型
 EMBEDDING_DEVICE=auto                   # auto/cuda/cpu
 EMBEDDING_BATCH_SIZE=256                # GPU 推荐 128-512；CPU 推荐 32
-CHUNK_SIZE=600
-CHUNK_OVERLAP=120
-TOP_K_RESULTS=6
+CHUNK_SIZE=512
+CHUNK_OVERLAP=50
+TOP_K_RESULTS=3
 RAG_TOPK_LEARN_PRACTICE=4
 RAG_TOPK_EXAM=6
 RETRIEVAL_MODE=hybrid                     # dense / bm25 / hybrid
@@ -311,9 +311,9 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `EMBEDDING_MODEL` | — | `BAAI/bge-base-zh-v1.5` | 嵌入模型（HuggingFace Hub ID） |
 | `EMBEDDING_DEVICE` | — | `auto` | 计算设备：`auto` / `cuda` / `cpu` |
 | `EMBEDDING_BATCH_SIZE` | — | `256`（GPU）/ `32`（CPU） | encode batch 大小 |
-| `CHUNK_SIZE` | — | `600` | 文本分块大小（字符数） |
-| `CHUNK_OVERLAP` | — | `120` | 分块重叠大小（需 < CHUNK_SIZE，建议 20%） |
-| `TOP_K_RESULTS` | — | `6` | 默认检索返回块数（兜底值，优先使用分模式 top-k） |
+| `CHUNK_SIZE` | — | `512` | 文本分块大小（字符数） |
+| `CHUNK_OVERLAP` | — | `50` | 分块重叠大小（需 < CHUNK_SIZE） |
+| `TOP_K_RESULTS` | — | `3` | 默认检索返回块数（兜底值，优先使用分模式 top-k） |
 | `RETRIEVAL_MODE` | — | `hybrid` | 检索模式：`dense` / `bm25` / `hybrid` |
 | `BM25_K1` | — | `1.5` | BM25 参数 `k1` |
 | `BM25_B` | — | `0.75` | BM25 参数 `b` |
@@ -443,7 +443,7 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 ## 贡献与许可
 - 欢迎提交 Issue / PR，一起完善功能与安全性。
 - 许可证：MIT License
-- 作者：**Eric He** · 更新日期：2026-03-15
+- 作者：**Eric He** · 更新日期：2026-03-18
 
 ## V2 更新日志
 

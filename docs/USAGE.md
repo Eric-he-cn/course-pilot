@@ -530,7 +530,7 @@ cp data/memory/memory.db backup/memory.db
 
 ---
 
-> 如遇其他问题，请查看后端终端输出日志，或提交 [GitHub Issue](https://github.com/Eric-he-cn/your_AI_study_agent/issues)。
+> 如遇其他问题，请查看后端终端输出日志，或提交 [GitHub Issue](https://github.com/Eric-he-cn/course-pilot/issues)。
 
 ---
 
@@ -554,4 +554,4 @@ cp data/memory/memory.db backup/memory.db
 - 支持 checkpoint：中断后再次运行会自动跳过已完成样本。
 - 结果目录包含：`baseline_raw.jsonl`、`baseline_summary.json`、`baseline_summary.md`、`baseline_checkpoint.json`。
 
-更新日期：2026-03-15
+更新日期：2026-03-18
