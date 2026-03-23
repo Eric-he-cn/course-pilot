@@ -1,6 +1,6 @@
 以下是整个对话从头到尾所有调试过程的梳理，按时间顺序排列。
 
-> 当前状态说明（2026-03）：本文档包含若干历史阶段问题，部分条目对应旧架构（如 Tutor 兼任练习/考试主流程）。当前实现已调整为 `learn -> Tutor`、`practice/exam -> QuizMaster + Grader`。请以 `README.md` 与 `docs/ARCHITECTURE.md` 的“当前实现”描述为准。
+> 当前状态说明（2026-03）：本文档包含若干历史阶段问题，部分条目对应旧架构（如 Tutor 兼任练习/考试主流程）。当前实现已调整为 `learn -> Tutor`、`practice/exam -> Quizzer + Grader`。请以 `README.md` 与 `docs/ARCHITECTURE.md` 的“当前实现”描述为准。
 
 ## 1. ModuleNotFoundError — 模块找不到
 - 发现问题：直接运行 `python backend/api.py` 时找不到 `backend` 包。
@@ -152,3 +152,4 @@
   - 非 canonical perf 结果移动到 `data/perf_runs/_archive/20260315_v2_cleanup/`；
   - 两处均生成 `ARCHIVE_INDEX.md`。
 - 解决结果：主目录只保留 canonical baseline/after 和正式运行入口。
+

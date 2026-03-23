@@ -7,6 +7,7 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import re
+import html
 import streamlit as st
 import requests
 import json
@@ -232,6 +233,10 @@ if "workspaces" not in st.session_state:
     st.session_state.workspaces = []
 if "show_help" not in st.session_state:
     st.session_state.show_help = False
+if "latest_context_budget" not in st.session_state:
+    st.session_state.latest_context_budget = None
+if "_pending_context_budget" not in st.session_state:
+    st.session_state._pending_context_budget = None
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -334,6 +339,190 @@ def build_index(course_name: str):
     except Exception as e:
         st.error(f"构建索引失败: {e}")
     return False
+
+
+def _context_window_health(payload: dict) -> tuple[str, str]:
+    ratio = float(payload.get("context_pressure_ratio", 0.0) or 0.0)
+    hard_truncated = bool(payload.get("hard_truncated", False))
+    if hard_truncated:
+        return "error", "已触发硬截断：上下文超过预算，系统已强制裁剪。"
+    if ratio >= 0.9:
+        return "warning", "接近上下文上限：建议简化问题或减少单轮任务目标。"
+    if bool(payload.get("history_llm_compress_applied", False)):
+        return "info", "已触发历史压缩：上下文管理器正在工作。"
+    return "ok", "上下文预算正常。"
+
+
+def render_context_badge(payload: dict, placeholder=None) -> None:
+    has_payload = isinstance(payload, dict)
+    payload = payload if has_payload else {}
+    mode = str(payload.get("mode", "unknown"))
+    history_len = int(payload.get("history_len", 0) or 0)
+    history_tokens = int(payload.get("history_tokens_est", 0) or 0)
+    rag_tokens = int(payload.get("rag_tokens_est", 0) or 0)
+    memory_tokens = int(payload.get("memory_tokens_est", 0) or 0)
+    final_tokens = int(payload.get("final_tokens_est", 0) or 0)
+    budget_tokens = int(payload.get("budget_tokens_est", 0) or 0)
+    ratio = float(payload.get("context_pressure_ratio", 0.0) or 0.0)
+    summary_source = str(payload.get("history_summary_source", "none"))
+    llm_compress_applied = bool(payload.get("history_llm_compress_applied", False))
+    llm_compress_ms = payload.get("history_llm_compress_ms")
+    health_level, health_text = _context_window_health(payload) if has_payload else ("info", "等待上下文预算数据...")
+    pct = int(max(0, min(100, round(ratio * 100))))
+
+    if health_level == "error":
+        theme_bg = "#FDECEC"
+        theme_border = "#E57373"
+        theme_fg = "#8B0000"
+        bar_color = "#D64545"
+    elif health_level == "warning":
+        theme_bg = "#FFF8E1"
+        theme_border = "#F9A825"
+        theme_fg = "#7A5A00"
+        bar_color = "#F9A825"
+    elif health_level == "info":
+        theme_bg = "#E8F4FD"
+        theme_border = "#42A5F5"
+        theme_fg = "#0D47A1"
+        bar_color = "#42A5F5"
+    else:
+        theme_bg = "#E8F5E9"
+        theme_border = "#66BB6A"
+        theme_fg = "#1B5E20"
+        bar_color = "#43A047"
+
+    compress_line = "未触发"
+    if llm_compress_applied:
+        if isinstance(llm_compress_ms, (int, float)):
+            compress_line = f"已触发，{float(llm_compress_ms):.1f} ms"
+        else:
+            compress_line = "已触发"
+
+    html_block = f"""
+<style>
+.ctx-badge {{
+  position: fixed;
+  top: 6px;
+  right: 178px;
+  z-index: 1000000;
+  width: 98px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  border: 1px solid {theme_border};
+  background: color-mix(in srgb, {theme_bg} 88%, white 12%);
+  box-shadow: 0 1px 6px rgba(0,0,0,0.12);
+  font-size: 11px;
+  color: {theme_fg};
+}}
+.ctx-badge .ctx-head {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 700;
+  margin-bottom: 3px;
+}}
+.ctx-badge .ctx-bar {{
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.12);
+  overflow: hidden;
+}}
+.ctx-badge .ctx-fill {{
+  height: 100%;
+  width: {pct}%;
+  background: {bar_color};
+}}
+.ctx-badge .ctx-sub {{
+  margin-top: 3px;
+  font-size: 10px;
+  opacity: 0.85;
+}}
+.ctx-badge .ctx-tip {{
+  position: absolute;
+  left: -308px;
+  top: 2px;
+  width: 292px;
+  display: none;
+  background: #ffffff;
+  color: #1f2937;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.16);
+  line-height: 1.45;
+}}
+.ctx-badge:hover .ctx-tip {{
+  display: block;
+}}
+.ctx-badge .ctx-tip::after {{
+  content: "";
+  position: absolute;
+  top: 10px;
+  right: -8px;
+  width: 0;
+  height: 0;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+  border-left: 8px solid #d1d5db;
+}}
+.ctx-badge .ctx-tip::before {{
+  content: "";
+  position: absolute;
+  top: 10px;
+  right: -7px;
+  width: 0;
+  height: 0;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+  border-left: 8px solid #ffffff;
+  z-index: 1;
+}}
+.ctx-badge .ctx-tip b {{
+  color: #111827;
+}}
+@media (max-width: 980px) {{
+  .ctx-badge {{
+    top: 6px;
+    right: 12px;
+    width: 90px;
+  }}
+  .ctx-badge .ctx-tip {{
+    left: auto;
+    right: 0;
+    top: 34px;
+  }}
+  .ctx-badge .ctx-tip::after,
+  .ctx-badge .ctx-tip::before {{
+    right: 12px;
+    top: -8px;
+    border-left: 8px solid transparent;
+    border-right: 8px solid transparent;
+    border-bottom: 8px solid #d1d5db;
+    border-top: 0;
+  }}
+  .ctx-badge .ctx-tip::before {{
+    top: -7px;
+    border-bottom-color: #ffffff;
+  }}
+}}
+</style>
+<div class="ctx-badge" title="上下文预算状态">
+  <div class="ctx-head"><span>🧠 上下文</span><span>{pct}%</span></div>
+  <div class="ctx-bar"><div class="ctx-fill"></div></div>
+  <div class="ctx-sub">{html.escape(mode)} · h={history_len}</div>
+  <div class="ctx-tip">
+    <div><b>状态</b>: {html.escape(health_text)}</div>
+    <div><b>mode</b>: {html.escape(mode)} · <b>history_len</b>: {history_len}</div>
+    <div><b>history</b>: {history_tokens} · <b>rag</b>: {rag_tokens} · <b>memory</b>: {memory_tokens}</div>
+    <div><b>final/budget</b>: {final_tokens}/{budget_tokens} · <b>pressure</b>: {pct}%</div>
+    <div><b>summary_source</b>: {html.escape(summary_source)}</div>
+    <div><b>history_llm_compress</b>: {html.escape(compress_line)}</div>
+  </div>
+</div>
+"""
+    target = placeholder if placeholder is not None else st
+    target.markdown(html_block, unsafe_allow_html=True)
 
 
 def send_message(course_name: str, mode: str, message: str):
@@ -649,6 +838,11 @@ if st.session_state.current_course:
         f'<span style="font-weight:400;font-size:0.82rem;opacity:0.8;margin-left:8px">· {tip}</span></div>',
         unsafe_allow_html=True,
     )
+    context_badge_placeholder = st.empty()
+    render_context_badge(
+        st.session_state.get("latest_context_budget"),
+        placeholder=context_badge_placeholder,
+    )
 
     # 渲染历史消息：包含正文、引用、工具调用记录与导图。
     for msg in st.session_state.chat_history:
@@ -735,6 +929,18 @@ if st.session_state.current_course:
                         st.session_state._pending_tool_calls = chunk["__tool_calls__"] or []
                         continue
 
+                    # 上下文预算事件：显示“背景信息窗口”并记录最新预算状态
+                    if isinstance(chunk, dict) and "__context_budget__" in chunk:
+                        payload_ctx = chunk.get("__context_budget__") or {}
+                        if isinstance(payload_ctx, dict):
+                            st.session_state._pending_context_budget = payload_ctx
+                            st.session_state.latest_context_budget = payload_ctx
+                            render_context_badge(
+                                payload_ctx,
+                                placeholder=context_badge_placeholder,
+                            )
+                        continue
+
                     # 进度事件：显示当前正在执行的阶段，避免“卡死感”
                     if isinstance(chunk, dict) and "__status__" in chunk:
                         status_text = str(chunk.get("__status__", "")).strip()
@@ -754,6 +960,7 @@ if st.session_state.current_course:
             # 捕获流式过程中拦截到的 citations
             citations = st.session_state.pop("_pending_citations", None) or None
             tool_calls = st.session_state.pop("_pending_tool_calls", None) or None
+            context_budget = st.session_state.pop("_pending_context_budget", None) or None
 
             if full_response:
                 # 提取 mermaid 代码块，避免 markdown 渲染失败
@@ -794,6 +1001,7 @@ if st.session_state.current_course:
                     "content": fix_latex(cleaned_response),
                     "citations": citations,
                     "tool_calls": tool_calls,
+                    "context_budget": context_budget,
                     "mermaid_blocks": mermaid_blocks,
                 }
             elif saw_status_event[0]:
@@ -805,6 +1013,7 @@ if st.session_state.current_course:
                     "content": fallback,
                     "citations": citations,
                     "tool_calls": tool_calls,
+                    "context_budget": context_budget,
                     "mermaid_blocks": [],
                 }
 

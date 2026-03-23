@@ -52,7 +52,12 @@ class _TraceScope:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if self._token is not None:
-            _active_trace.reset(self._token)
+            try:
+                _active_trace.reset(self._token)
+            except ValueError:
+                # 流式生成器可能跨上下文恢复执行，token reset 可能跨 Context 失败。
+                # 兜底清理当前上下文，避免影响主流程输出。
+                _active_trace.set(None)
         return False
 
 

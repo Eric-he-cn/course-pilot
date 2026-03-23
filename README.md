@@ -14,6 +14,20 @@
 - ⚡ 体验：SSE 流式输出 + 执行进度提示（含心跳兜底），Mermaid 思维导图渲染与 PNG 导出
 - 🔒 安全：路径穿越防护、并发 chdir 加锁、编码回退、分块死循环保护
 
+## 界面预览
+
+### 启动界面
+![启动界面](docs/images/%E5%90%AF%E5%8A%A8%E7%95%8C%E9%9D%A2.png)
+
+### 上传文件与索引构建
+![上传文件与索引构建](docs/images/%E4%B8%8A%E4%BC%A0%E6%96%87%E4%BB%B6%E4%B8%8E%E7%B4%A2%E5%BC%95%E6%9E%84%E5%BB%BA.png)
+
+### 示例1
+![学习模式示例](docs/images/%E5%AD%A6%E4%B9%A0%E6%A8%A1%E5%BC%8F%E7%A4%BA%E4%BE%8B.png)
+
+### 示例2（引用来源）
+![学习模式示例2 引用来源](docs/images/%E5%AD%A6%E4%B9%A0%E6%A8%A1%E5%BC%8F%E7%A4%BA%E4%BE%8B2%20%E5%BC%95%E7%94%A8%E6%9D%A5%E6%BA%90.png)
+
 ---
 
 ## 模式与工具

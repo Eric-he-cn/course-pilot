@@ -30,13 +30,69 @@ class QuizMasterAgent:
     """从模型输出中提取 JSON 负载，兼容 ```json``` 代码块与纯 JSON 文本。"""
     @staticmethod
     def _extract_json_payload(response_text: str) -> dict:
-        if "```json" in response_text:
-            json_str = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            json_str = response_text.split("```")[1].split("```")[0].strip()
-        else:
-            json_str = response_text.strip()
-        return json.loads(json_str)
+        raw = str(response_text or "")
+        candidates = []
+        if "```json" in raw:
+            try:
+                candidates.append(raw.split("```json", 1)[1].split("```", 1)[0].strip())
+            except Exception:
+                pass
+        if "```" in raw and not candidates:
+            try:
+                candidates.append(raw.split("```", 1)[1].split("```", 1)[0].strip())
+            except Exception:
+                pass
+        candidates.append(raw.strip())
+        first = raw.find("{")
+        last = raw.rfind("}")
+        if first >= 0 and last > first:
+            candidates.append(raw[first:last + 1].strip())
+
+        seen = set()
+        for cand in candidates:
+            c = str(cand or "").strip()
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            try:
+                obj = json.loads(c)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+
+        raise ValueError("invalid_json_payload")
+
+    def _repair_json_via_llm(
+        self,
+        raw_text: str,
+        schema_hint: str,
+        max_tokens: int = 1200,
+    ) -> Dict[str, Any]:
+        """把不规范输出修复为严格 JSON；失败返回空 dict。"""
+        prompt = (
+            "请把下面内容修复为一个合法 JSON 对象，仅输出 JSON，不要任何解释。\n"
+            "要求：\n"
+            "1) 仅保留与目标 schema 相关字段；\n"
+            "2) 所有 key/value 使用双引号；\n"
+            "3) 换行写为 \\n；\n"
+            "4) 不要 markdown 代码块。\n\n"
+            f"目标 schema:\n{schema_hint}\n\n"
+            f"原始内容:\n{str(raw_text or '')[:9000]}"
+        )
+        try:
+            repaired = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": "你是 JSON 修复器，只输出合法 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            payload = self._extract_json_payload(repaired)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
 
     """解析失败时返回兜底题目，防止上层链路中断。"""
     @staticmethod
@@ -487,12 +543,22 @@ JSON 示例：
         
         # 4) 调用模型（默认不开启 function-calling，避免非必要工具循环）
         messages = [
-            {"role": "system", "content": "你是一位出题专家。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是一位出题专家。必须只输出一个合法 JSON 对象，"
+                    "不得输出解释、前后缀文本或 markdown。"
+                ),
+            },
             {"role": "user", "content": prompt}
         ]
-        response = self.llm.chat(messages, temperature=0.7, max_tokens=1200)
+        response = self.llm.chat(messages, temperature=0.4, max_tokens=1400)
         
         # 5) 解析模型输出
+        schema_hint = (
+            '{"question":"...","standard_answer":"...","rubric":"...",'
+            '"difficulty":"easy|medium|hard","chapter":"...","concept":"..."}'
+        )
         try:
             quiz_dict = self._extract_json_payload(response)
             quiz_dict["question"] = self._sanitize_text(quiz_dict.get("question", ""))
@@ -508,8 +574,28 @@ JSON 示例：
         except Exception as e:
             err = str(e).strip() or "unknown_parse_error"
             self.logger.warning("[quiz] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
+            repaired = self._repair_json_via_llm(response, schema_hint=schema_hint, max_tokens=1200)
+            if repaired:
+                try:
+                    repaired["question"] = self._sanitize_text(repaired.get("question", ""))
+                    repaired["standard_answer"] = self._sanitize_text(repaired.get("standard_answer", ""))
+                    repaired["rubric"] = self._sanitize_text(repaired.get("rubric", ""))
+                    repaired["chapter"] = self._sanitize_text(repaired.get("chapter", planned_topic))
+                    repaired["concept"] = self._sanitize_text(repaired.get("concept", ""))
+                    repaired["difficulty"] = self._normalize_difficulty(
+                        str(repaired.get("difficulty", planned_difficulty)),
+                        planned_difficulty,
+                    )
+                    self.logger.info("[quiz] parse_recovered=1")
+                    return Quiz(**repaired)
+                except Exception as rec_e:
+                    self.logger.warning("[quiz] recover_failed err=%s", str(rec_e))
             fallback = self._build_default_quiz(topic=planned_topic, difficulty=planned_difficulty)
-            fallback.question = f"生成题目时出错（解析失败：{err}），请重试。"
+            raw_view = self._sanitize_text(response)
+            if raw_view:
+                fallback.question = raw_view[:1800]
+            else:
+                fallback.question = f"生成题目时出错（解析失败：{err}），请重试。"
             return fallback
 
     """生成考试试卷主入口：Plan-Solve 生成结构化试卷并附隐藏答案。"""
@@ -561,17 +647,36 @@ JSON 示例：
         prompt += "\n\n工具使用约束：默认不使用外部工具，仅在请求明确需要最新信息时使用外部参考。"
 
         messages = [
-            {"role": "system", "content": "你是一位严谨的考试出题专家。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是一位严谨的考试出题专家。必须只输出一个合法 JSON 对象，"
+                    "不得输出解释、前后缀文本或 markdown。"
+                ),
+            },
             {"role": "user", "content": prompt},
         ]
-        response = self.llm.chat(messages, temperature=0.6, max_tokens=3000)
+        response = self.llm.chat(messages, temperature=0.4, max_tokens=3200)
 
+        schema_hint = (
+            '{"title":"...","instructions":"...",'
+            '"questions":[{"type":"...","question":"...","options":["..."],'
+            '"score":10,"standard_answer":"...","rubric":"...","chapter":"...","concept":"..."}]}'
+        )
         try:
             exam_json = self._extract_json_payload(response)
             return self._render_exam_paper(course_name=course_name, exam_json=exam_json)
         except Exception as e:
             err = str(e).strip() or "unknown_parse_error"
             self.logger.warning("[exam] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
+            repaired = self._repair_json_via_llm(response, schema_hint=schema_hint, max_tokens=2200)
+            if repaired:
+                try:
+                    paper = self._render_exam_paper(course_name=course_name, exam_json=repaired)
+                    self.logger.info("[exam] parse_recovered=1")
+                    return paper
+                except Exception as rec_e:
+                    self.logger.warning("[exam] recover_failed err=%s", str(rec_e))
             # 解析失败时退化为原始文本，至少保证可继续交互。
             return {
                 "content": (

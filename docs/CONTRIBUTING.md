@@ -1,6 +1,6 @@
 ﻿# 贡献指南
 
-感谢你对课程学习助手项目的关注！本文档将帮助你了解如何为项目做出贡献。
+感谢你对 CoursePilot 项目的关注！本文档将帮助你了解如何为项目做出贡献。
 
 ## 🎯 贡献方式
 
@@ -34,8 +34,8 @@
 1. **Fork 仓库**
    ```bash
    # Fork on GitHub, then clone
-   git clone https://github.com/YOUR_USERNAME/your_AI_study_agent.git
-   cd your_AI_study_agent
+   git clone https://github.com/YOUR_USERNAME/course-pilot.git
+   cd course-pilot
    ```
 
 2. **创建分支**

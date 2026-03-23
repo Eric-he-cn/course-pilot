@@ -6,6 +6,7 @@
 - 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
+import os
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import TUTOR_PROMPT
@@ -60,15 +61,15 @@ class TutorAgent:
                 f"你是一位专业的大学课程导师。"
                 f"你可以使用以下工具：{tool_desc}。"
                 f"规则：\n"
-                f"1. 遇到数学计算，必须调用 calculator 工具，不要自己心算。\n"
+                f"1. 工具调用采用 Plan/Act/Synthesize 三阶段：Act 仅做工具决策和短状态，Synthesize 再输出完整答案。\n"
+                f"2. 工具选择必须最小充分：只有当不用工具无法可靠回答时才调用，避免重复调用同一工具。\n"
+                f"3. 遇到需要外部时效信息（如当前日期时间、新闻）时必须调用对应工具，禁止臆造。\n"
+                f"4. 数值计算优先使用 calculator；若是纯概念性解释且无数值推导，可不调用计算器。\n"
                 f"{rule_2}\n"
-                f"3. 用户明确要求保存笔记，必须调用 filewriter 工具，文件名用中文，格式为 .md。\n"
-                f"4. 用户要求生成思维导图或知识点汇总，必须调用 mindmap_generator 工具。\n"
-                f"5. 如果该知识点用户之前问过或做错过，可以调用 memory_search 工具检索历史记录。\n"
-                f"6. 遇到询问当前日期、时间、星期几等时效性问题，必须调用 get_datetime 工具，不得凭记忆或训练数据回答。\n"
-                f"7. 禁止编造工具调用结果，必须等待工具真实返回后再回答。\n"
-                f"8. 工具调用中的中间轮仅输出简短状态或结论（1-2句），不要展开长篇正文；"
-                f"在确认不再需要工具后，再给出完整最终答案。"
+                f"6. 用户明确要求保存笔记时调用 filewriter（文件名中文，扩展名 .md）。\n"
+                f"7. 用户要求思维导图/结构化知识树时调用 mindmap_generator。\n"
+                f"8. memory_search 只在确实需要历史错题或学习轨迹时调用，且避免重复查询。\n"
+                f"9. 禁止编造工具结果；工具失败时应说明降级路径，再进入最终回答。"
             )
         else:
             system_prompt = "你是一位专业的大学课程导师。"
@@ -83,8 +84,14 @@ class TutorAgent:
             pass
 
         messages: List[dict] = [{"role": "system", "content": system_prompt}]
-        if history:
-            for msg in history[-history_limit:]:
+        include_raw_history = os.getenv("CB_INCLUDE_RAW_HISTORY_IN_MESSAGES", "0") == "1"
+        try:
+            recent_raw_turns = max(1, int(os.getenv("CB_RECENT_RAW_TURNS", "3")))
+        except Exception:
+            recent_raw_turns = 3
+        effective_limit = min(history_limit, recent_raw_turns * 2)
+        if history and include_raw_history:
+            for msg in history[-effective_limit:]:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if role in ("user", "assistant") and content:
@@ -96,6 +103,8 @@ class TutorAgent:
             history_tokens_est=estimate_text_tokens("\n".join(str(m.get("content", "")) for m in messages if m.get("role") in ("user", "assistant"))),
             context_tokens_est=estimate_text_tokens(context),
             history_msg_count=max(0, len(messages) - 2),
+            include_raw_history_in_messages=include_raw_history,
+            history_limit_applied=effective_limit if include_raw_history else 0,
             stream_mode=stream_mode,
         )
         return messages

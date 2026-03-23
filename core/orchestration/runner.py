@@ -346,6 +346,7 @@ class OrchestrationRunner:
             self._save_grading_to_memory(course_name, user_message, history, response_text)
             response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
+            yield {"__status__": "正在生成练习题..."}
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
             quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
@@ -530,6 +531,7 @@ class OrchestrationRunner:
             self._save_exam_to_memory(course_name, response_text)
             response_text += f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
         else:
+            yield {"__status__": "正在生成考试试卷..."}
             exam_payload = self.quizmaster.generate_exam_paper(
                 course_name=course_name,
                 user_request=user_message,
