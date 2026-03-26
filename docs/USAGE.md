@@ -116,7 +116,7 @@ curl -X DELETE http://localhost:8000/workspaces/线性代数
 可在项目根目录 `.env` 调整 RAG 检索行为：
 
 ```dotenv
-TOP_K_RESULTS=6
+TOP_K_RESULTS=3
 RETRIEVAL_MODE=hybrid                     # dense / bm25 / hybrid
 BM25_K1=1.5
 BM25_B=0.75
@@ -128,7 +128,7 @@ HYBRID_BM25_CANDIDATES_MULTIPLIER=3
 ```
 
 说明：
-- 学习/练习模式默认使用 `TOP_K_RESULTS`。
+- `TOP_K_RESULTS` 是兜底值，优先级低于分模式 top-k。
 - 分模式 top-k：学习/练习 `RAG_TOPK_LEARN_PRACTICE=4`，考试 `RAG_TOPK_EXAM=6`。
 
 ### 3.4 文件管理
@@ -547,6 +547,8 @@ cp data/memory/memory.db backup/memory.db
 - 系统默认启用统一预算器，不需要用户额外操作。
 - 压缩优先级：历史 > RAG > 记忆 > 硬截断。
 - 学习/练习默认 `top_k=4`，考试默认 `top_k=6`。
+- 前端右上角会显示“上下文预算角标”（hover 可见分段 token 与 pressure 百分比）。
+- 若接近预算上限或触发硬截断，角标会变色提示，可据此调整提问范围。
 
 ### 11.3 benchmark 与断点续跑
 
@@ -554,4 +556,4 @@ cp data/memory/memory.db backup/memory.db
 - 支持 checkpoint：中断后再次运行会自动跳过已完成样本。
 - 结果目录包含：`baseline_raw.jsonl`、`baseline_summary.json`、`baseline_summary.md`、`baseline_checkpoint.json`。
 
-更新日期：2026-03-18
+更新日期：2026-03-26

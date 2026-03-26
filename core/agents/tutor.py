@@ -9,7 +9,11 @@
 import os
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import TUTOR_PROMPT
+from core.orchestration.prompts import (
+    TUTOR_PROMPT,
+    TUTOR_DEFAULT_SYSTEM_PROMPT,
+    TUTOR_TOOL_SYSTEM_PROMPT,
+)
 from mcp_tools.client import get_tool_schemas
 from backend.schemas import TutorResult
 from core.metrics import add_event, estimate_text_tokens
@@ -24,12 +28,23 @@ class TutorAgent:
     def __init__(self):
         self.llm = get_llm_client()
 
+    @staticmethod
+    def _normalize_context_sections(context: str, context_sections: Optional[dict]) -> dict:
+        sections = dict(context_sections or {})
+        return {
+            "context": str(sections.get("context", context or "")),
+            "rag_context": str(sections.get("rag_context", "")),
+            "history_context": str(sections.get("history_context", "")),
+            "memory_context": str(sections.get("memory_context", "")),
+        }
+
     """统一组装消息列表（system + history + user），仅负责提示词与消息构造。"""
     def _build_messages(
         self,
         question: str,
         course_name: str,
         context: str,
+        context_sections: Optional[dict] = None,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,
@@ -37,13 +52,17 @@ class TutorAgent:
         history_limit: int = 20,
         stream_mode: bool = False,
     ) -> List[dict]:
+        sections = self._normalize_context_sections(context, context_sections)
         if user_content_override:
             prompt = user_content_override
         else:
             prompt = TUTOR_PROMPT.format(
                 course_name=course_name,
-                context=context,
-                question=question
+                context=sections["context"],
+                rag_context=sections["rag_context"],
+                history_context=sections["history_context"],
+                memory_context=sections["memory_context"],
+                question=question,
             )
 
         if system_prompt_override:
@@ -57,22 +76,12 @@ class TutorAgent:
                 )
             else:
                 rule_2 = "2. 优先从数据库中获取数据，遇到超出知识库的信息或者需要网络查询的信息，可以调用 websearch 工具。"
-            system_prompt = (
-                f"你是一位专业的大学课程导师。"
-                f"你可以使用以下工具：{tool_desc}。"
-                f"规则：\n"
-                f"1. 工具调用采用 Plan/Act/Synthesize 三阶段：Act 仅做工具决策和短状态，Synthesize 再输出完整答案。\n"
-                f"2. 工具选择必须最小充分：只有当不用工具无法可靠回答时才调用，避免重复调用同一工具。\n"
-                f"3. 遇到需要外部时效信息（如当前日期时间、新闻）时必须调用对应工具，禁止臆造。\n"
-                f"4. 数值计算优先使用 calculator；若是纯概念性解释且无数值推导，可不调用计算器。\n"
-                f"{rule_2}\n"
-                f"6. 用户明确要求保存笔记时调用 filewriter（文件名中文，扩展名 .md）。\n"
-                f"7. 用户要求思维导图/结构化知识树时调用 mindmap_generator。\n"
-                f"8. memory_search 只在确实需要历史错题或学习轨迹时调用，且避免重复查询。\n"
-                f"9. 禁止编造工具结果；工具失败时应说明降级路径，再进入最终回答。"
+            system_prompt = TUTOR_TOOL_SYSTEM_PROMPT.format(
+                tool_desc=tool_desc,
+                rule_2=rule_2,
             )
         else:
-            system_prompt = "你是一位专业的大学课程导师。"
+            system_prompt = TUTOR_DEFAULT_SYSTEM_PROMPT
 
         # 注入用户画像（薄弱知识点等），失败不影响主流程
         try:
@@ -101,7 +110,10 @@ class TutorAgent:
             "prompt_budget",
             system_tokens_est=estimate_text_tokens(system_prompt),
             history_tokens_est=estimate_text_tokens("\n".join(str(m.get("content", "")) for m in messages if m.get("role") in ("user", "assistant"))),
-            context_tokens_est=estimate_text_tokens(context),
+            context_tokens_est=estimate_text_tokens(sections["context"]),
+            rag_context_tokens_est=estimate_text_tokens(sections["rag_context"]),
+            history_context_tokens_est=estimate_text_tokens(sections["history_context"]),
+            memory_context_tokens_est=estimate_text_tokens(sections["memory_context"]),
             history_msg_count=max(0, len(messages) - 2),
             include_raw_history_in_messages=include_raw_history,
             history_limit_applied=effective_limit if include_raw_history else 0,
@@ -122,6 +134,7 @@ class TutorAgent:
         question: str,
         course_name: str,
         context: str,
+        context_sections: Optional[dict] = None,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,  # 练习/考试模式用此覆盖
@@ -135,6 +148,7 @@ class TutorAgent:
             question=question,
             course_name=course_name,
             context=context,
+            context_sections=context_sections,
             allowed_tools=allowed_tools,
             history=history,
             system_prompt_override=system_prompt_override,
@@ -158,6 +172,7 @@ class TutorAgent:
         question: str,
         course_name: str,
         context: str,
+        context_sections: Optional[dict] = None,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,
@@ -171,6 +186,7 @@ class TutorAgent:
             question=question,
             course_name=course_name,
             context=context,
+            context_sections=context_sections,
             allowed_tools=allowed_tools,
             history=history,
             system_prompt_override=system_prompt_override,

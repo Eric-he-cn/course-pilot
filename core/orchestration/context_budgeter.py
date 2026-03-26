@@ -9,6 +9,10 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.metrics import add_event, estimate_text_tokens
+from core.orchestration.prompts import (
+    CONTEXT_COMPRESSOR_SYSTEM_PROMPT,
+    CONTEXT_COMPRESSOR_USER_PROMPT,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -43,11 +47,12 @@ class ContextBudgeter:
     def __init__(self) -> None:
         self.ctx_total_tokens = _env_int("CTX_TOTAL_TOKENS", 8192)
         self.ctx_safety_margin = _env_int("CTX_SAFETY_MARGIN", 256)
-        self.history_recent_turns = _env_int("CB_HISTORY_RECENT_TURNS", 6)
-        self.recent_raw_turns = max(1, _env_int("CB_RECENT_RAW_TURNS", 3))
-        self.history_summary_max_tokens = _env_int("CB_HISTORY_SUMMARY_MAX_TOKENS", 700)
+        self.history_recent_turns = _env_int("CB_HISTORY_RECENT_TURNS", 10)
+        self.recent_raw_turns = max(1, _env_int("CB_RECENT_RAW_TURNS", 5))
+        self.history_summary_max_tokens = _env_int("CB_HISTORY_SUMMARY_MAX_TOKENS", 2000)
         self.rag_max_tokens = _env_int("CB_RAG_MAX_TOKENS", 1800)
         self.memory_max_tokens = _env_int("CB_MEMORY_MAX_TOKENS", 450)
+        self.rag_compress_owner = str(os.getenv("RAG_COMPRESS_OWNER", "retriever")).strip().lower() or "retriever"
 
         self.enable_llm_history_compress = _env_bool("CB_ENABLE_LLM_HISTORY_COMPRESS", True)
         self.llm_compress_trigger_tokens = max(120, _env_int("CB_LLM_COMPRESS_TRIGGER_TOKENS", 600))
@@ -201,18 +206,9 @@ class ContextBudgeter:
         ):
             return "", None, "skip"
 
-        prompt = (
-            "请将以下对话历史压缩为 JSON，保留任务连续性，不要编造事实。\n"
-            "仅输出 JSON，不要额外说明。\n"
-            "字段固定：facts/constraints/unresolved/next_steps。\n"
-            "每个字段最多 4 条，每条不超过 28 个汉字。\n"
-            f"\n历史内容：\n{source_text}"
-        )
+        prompt = CONTEXT_COMPRESSOR_USER_PROMPT.format(source_text=source_text)
         messages = [
-            {
-                "role": "system",
-                "content": "你是上下文压缩器。只能输出合法 JSON。",
-            },
+            {"role": "system", "content": CONTEXT_COMPRESSOR_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         timeout_s = max(0.4, self.llm_compress_timeout_ms / 1000.0)
@@ -361,12 +357,18 @@ class ContextBudgeter:
         history_budget = self.history_summary_max_tokens + max(120, recent_turns * 120)
         hist_text = self._trim_to_tokens(hist_text, history_budget)
 
-        rag_comp = self.compress_rag_text(
-            query=query,
-            rag_text=rag_text,
-            sent_per_chunk=rag_sent_per_chunk,
-            sent_max_chars=rag_sent_max_chars,
-        )
+        rag_budgeter_compress_applied = False
+        if self.rag_compress_owner == "budgeter":
+            rag_comp = self.compress_rag_text(
+                query=query,
+                rag_text=rag_text,
+                sent_per_chunk=rag_sent_per_chunk,
+                sent_max_chars=rag_sent_max_chars,
+            )
+            rag_budgeter_compress_applied = True
+        else:
+            # 默认由 Retriever 负责句级压缩；Budgeter 只做 token 预算裁切，避免重复压缩。
+            rag_comp = str(rag_text or "").strip()
         rag_comp = self._trim_to_tokens(rag_comp, self.rag_max_tokens)
 
         mem_comp = self._trim_to_tokens(memory_text, self.memory_max_tokens)
@@ -399,6 +401,8 @@ class ContextBudgeter:
             history_summary_source=summary_source,
             history_llm_compress_applied=llm_applied,
             history_llm_compress_ms=llm_compress_ms,
+            rag_compress_owner=self.rag_compress_owner,
+            rag_budgeter_compress_applied=rag_budgeter_compress_applied,
             rag_tokens_est=rag_tokens,
             memory_tokens_est=memory_tokens,
             final_tokens_before_hard_trim_est=final_before_hard_trim_tokens,
@@ -413,6 +417,8 @@ class ContextBudgeter:
             "history_summary_source": summary_source,
             "history_llm_compress_applied": llm_applied,
             "history_llm_compress_ms": llm_compress_ms,
+            "rag_compress_owner": self.rag_compress_owner,
+            "rag_budgeter_compress_applied": rag_budgeter_compress_applied,
             "rag_text": rag_comp,
             "memory_text": mem_comp,
             "final_text": final,

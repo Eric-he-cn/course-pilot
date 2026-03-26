@@ -8,11 +8,24 @@
 """
 import json
 import logging
+import os
 from typing import Dict, Any
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import QUIZMASTER_PROMPT, EXAM_GENERATOR_PROMPT
+from core.orchestration.prompts import (
+    QUIZMASTER_PROMPT,
+    EXAM_GENERATOR_PROMPT,
+    QUIZMASTER_JSON_REPAIR_SYSTEM_PROMPT,
+    QUIZMASTER_JSON_REPAIR_PROMPT,
+    QUIZMASTER_PLAN_SYSTEM_PROMPT,
+    QUIZMASTER_PLAN_PROMPT,
+    QUIZMASTER_EXAM_PLAN_SYSTEM_PROMPT,
+    QUIZMASTER_EXAM_PLAN_PROMPT,
+    QUIZMASTER_SOLVE_SYSTEM_PROMPT,
+    EXAM_SOLVE_SYSTEM_PROMPT,
+)
 from backend.schemas import Quiz
 from mcp_tools.client import MCPTools
+from core.metrics import add_event
 
 """
 QuizMasterAgent：按知识点与难度生成结构化题目。
@@ -70,20 +83,14 @@ class QuizMasterAgent:
         max_tokens: int = 1200,
     ) -> Dict[str, Any]:
         """把不规范输出修复为严格 JSON；失败返回空 dict。"""
-        prompt = (
-            "请把下面内容修复为一个合法 JSON 对象，仅输出 JSON，不要任何解释。\n"
-            "要求：\n"
-            "1) 仅保留与目标 schema 相关字段；\n"
-            "2) 所有 key/value 使用双引号；\n"
-            "3) 换行写为 \\n；\n"
-            "4) 不要 markdown 代码块。\n\n"
-            f"目标 schema:\n{schema_hint}\n\n"
-            f"原始内容:\n{str(raw_text or '')[:9000]}"
+        prompt = QUIZMASTER_JSON_REPAIR_PROMPT.format(
+            schema_hint=schema_hint,
+            raw_text=str(raw_text or "")[:9000],
         )
         try:
             repaired = self.llm.chat(
                 messages=[
-                    {"role": "system", "content": "你是 JSON 修复器，只输出合法 JSON。"},
+                    {"role": "system", "content": QUIZMASTER_JSON_REPAIR_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
@@ -92,6 +99,69 @@ class QuizMasterAgent:
             payload = self._extract_json_payload(repaired)
             return payload if isinstance(payload, dict) else {}
         except Exception:
+            return {}
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _structured_chat_json(
+        self,
+        *,
+        messages: list,
+        schema_name: str,
+        schema: Dict[str, Any],
+        temperature: float,
+        max_tokens: int,
+        flag_env: str,
+    ) -> Dict[str, Any]:
+        if not self._env_bool(flag_env, False):
+            return {}
+        try:
+            response = self.llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+            )
+            payload = self._extract_json_payload(response)
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=True,
+                    fallback=False,
+                )
+            except Exception:
+                pass
+            return payload if isinstance(payload, dict) else {}
+        except Exception as ex:
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=False,
+                    fallback=True,
+                    error=str(ex),
+                )
+            except Exception:
+                pass
+            self.logger.warning(
+                "[structured] failed schema=%s flag=%s err=%s",
+                schema_name,
+                flag_env,
+                str(ex),
+            )
             return {}
 
     """解析失败时返回兜底题目，防止上层链路中断。"""
@@ -199,23 +269,13 @@ class QuizMasterAgent:
         requested_question_type: str,
         memory_ctx: str,
     ) -> str:
-        return f"""你是练习命题规划器。请根据用户请求先生成“出题计划”。
-
-用户请求：{user_request}
-默认难度：{default_difficulty}
-期望题量：{requested_num_questions}
-期望题型：{requested_question_type}
-{memory_ctx}
-
-请只输出 JSON，字段如下：
-{{
-  "topic": "本次出题的核心知识点",
-  "num_questions": 题目数量（1-20）,
-  "difficulty": "easy|medium|hard",
-  "question_type": "选择题/判断题/填空题/简答题/论述题/计算题/综合题",
-  "focus_points": ["知识点1", "知识点2"]
-}}
-"""
+        return QUIZMASTER_PLAN_PROMPT.format(
+            user_request=user_request,
+            default_difficulty=default_difficulty,
+            requested_num_questions=requested_num_questions,
+            requested_question_type=requested_question_type,
+            memory_ctx=memory_ctx,
+        )
 
     """Plan 阶段：从用户请求中抽取主题、题量、题型与难度。"""
     def _plan_quiz(
@@ -227,7 +287,7 @@ class QuizMasterAgent:
         memory_ctx: str,
     ) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": "你是一个严谨的出题规划器，只输出 JSON。"},
+            {"role": "system", "content": QUIZMASTER_PLAN_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": self._build_plan_prompt(
@@ -239,9 +299,30 @@ class QuizMasterAgent:
                 ),
             },
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "num_questions": {"type": "integer"},
+                "difficulty": {"type": "string"},
+                "question_type": {"type": "string"},
+                "focus_points": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["topic", "num_questions", "difficulty", "question_type", "focus_points"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.2, max_tokens=600)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="quiz_plan",
+                schema=schema,
+                temperature=0.2,
+                max_tokens=600,
+                flag_env="ENABLE_STRUCTURED_OUTPUTS_QUIZ",
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.2, max_tokens=600)
+                plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
                 return {
                     "topic": user_request,
@@ -330,28 +411,10 @@ class QuizMasterAgent:
     """构建考试计划提示词（Plan 阶段）。"""
     @staticmethod
     def _build_exam_plan_prompt(user_request: str, memory_ctx: str) -> str:
-        return f"""你是考试命题规划器。请先生成一份考试出卷计划（JSON）。
-
-用户请求：
-{user_request}
-
-{memory_ctx}
-
-要求：
-1. 只输出 JSON，不要解释。
-2. 字段必须包含：
-   - scope: 考试范围描述
-   - num_questions: 题目总数（整数，建议 6~20）
-   - difficulty_ratio: 题目难度分配（easy/medium/hard 的题目数量）
-3. three 类题目数量之和必须等于 num_questions。
-
-JSON 示例：
-{{
-  "scope": "第五章 Transformer",
-  "num_questions": 10,
-  "difficulty_ratio": {{"easy": 3, "medium": 5, "hard": 2}}
-}}
-"""
+        return QUIZMASTER_EXAM_PLAN_PROMPT.format(
+            user_request=user_request,
+            memory_ctx=memory_ctx,
+        )
 
     """规范化考试计划，确保题量和难度分配合法。"""
     @staticmethod
@@ -404,12 +467,40 @@ JSON 示例：
     """Plan 阶段：解析考试请求并生成结构化配置。"""
     def _plan_exam(self, user_request: str, memory_ctx: str) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": "你是一个严谨的考试命题规划器，只输出 JSON。"},
+            {"role": "system", "content": QUIZMASTER_EXAM_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_exam_plan_prompt(user_request, memory_ctx)},
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string"},
+                "num_questions": {"type": "integer"},
+                "difficulty_ratio": {
+                    "type": "object",
+                    "properties": {
+                        "easy": {"type": "integer"},
+                        "medium": {"type": "integer"},
+                        "hard": {"type": "integer"},
+                    },
+                    "required": ["easy", "medium", "hard"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["scope", "num_questions", "difficulty_ratio"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.2, max_tokens=800)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="exam_plan",
+                schema=schema,
+                temperature=0.2,
+                max_tokens=800,
+                flag_env="ENABLE_STRUCTURED_OUTPUTS_EXAM",
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.2, max_tokens=800)
+                plan = self._extract_json_payload(response)
         except Exception:
             plan = {}
         return self._normalize_exam_plan(plan)
@@ -489,17 +580,22 @@ JSON 示例：
         topic: str,
         difficulty: str,
         context: str,
+        rag_context: str = "",
+        history_context: str = "",
+        memory_context: str = "",
+        prefetched_memory_ctx: str = "",
         num_questions: int = 1,
         question_type: str = "综合题",
     ) -> Quiz:
         # 1) 预查询历史错题，优先针对薄弱知识点出题
-        memory_ctx = ""
-        try:
-            from mcp_tools.client import MCPTools
-            mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
-            memory_ctx = self._build_memory_ctx(mem)
-        except Exception:
-            pass
+        memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
+        if not memory_ctx:
+            try:
+                from mcp_tools.client import MCPTools
+                mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
+                memory_ctx = self._build_memory_ctx(mem)
+            except Exception:
+                memory_ctx = ""
 
         # 1.5) 先做内部计划（Plan），再按计划生成题目（Solve）
         quiz_plan = self._plan_quiz(
@@ -526,6 +622,9 @@ JSON 示例：
             topic=planned_topic,
             difficulty=planned_difficulty,
             context=context,
+            rag_context=rag_context,
+            history_context=history_context,
+            memory_context=memory_ctx,
             memory_ctx=memory_ctx,
             num_questions=planned_num_questions,
             question_type=planned_question_type,
@@ -543,16 +642,33 @@ JSON 示例：
         
         # 4) 调用模型（默认不开启 function-calling，避免非必要工具循环）
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是一位出题专家。必须只输出一个合法 JSON 对象，"
-                    "不得输出解释、前后缀文本或 markdown。"
-                ),
-            },
+            {"role": "system", "content": QUIZMASTER_SOLVE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
-        response = self.llm.chat(messages, temperature=0.4, max_tokens=1400)
+        solve_schema = {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "standard_answer": {"type": "string"},
+                "rubric": {"type": "string"},
+                "difficulty": {"type": "string"},
+                "chapter": {"type": "string"},
+                "concept": {"type": "string"},
+            },
+            "required": ["question", "standard_answer", "rubric", "difficulty", "chapter", "concept"],
+            "additionalProperties": False,
+        }
+        solved_payload = self._structured_chat_json(
+            messages=messages,
+            schema_name="quiz_solve",
+            schema=solve_schema,
+            temperature=0.4,
+            max_tokens=1400,
+            flag_env="ENABLE_STRUCTURED_OUTPUTS_QUIZ",
+        )
+        response = ""
+        if not solved_payload:
+            response = self.llm.chat(messages, temperature=0.4, max_tokens=1400)
         
         # 5) 解析模型输出
         schema_hint = (
@@ -560,7 +676,7 @@ JSON 示例：
             '"difficulty":"easy|medium|hard","chapter":"...","concept":"..."}'
         )
         try:
-            quiz_dict = self._extract_json_payload(response)
+            quiz_dict = solved_payload if solved_payload else self._extract_json_payload(response)
             quiz_dict["question"] = self._sanitize_text(quiz_dict.get("question", ""))
             quiz_dict["standard_answer"] = self._sanitize_text(quiz_dict.get("standard_answer", ""))
             quiz_dict["rubric"] = self._sanitize_text(quiz_dict.get("rubric", ""))
@@ -604,14 +720,19 @@ JSON 示例：
         course_name: str,
         user_request: str,
         context: str,
+        rag_context: str = "",
+        history_context: str = "",
+        memory_context: str = "",
+        prefetched_memory_ctx: str = "",
     ) -> Dict[str, Any]:
-        memory_ctx = ""
-        try:
-            from mcp_tools.client import MCPTools
-            mem = MCPTools.call_tool("memory_search", query=user_request, course_name=course_name)
-            memory_ctx = self._build_memory_ctx(mem)
-        except Exception:
-            pass
+        memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
+        if not memory_ctx:
+            try:
+                from mcp_tools.client import MCPTools
+                mem = MCPTools.call_tool("memory_search", query=user_request, course_name=course_name)
+                memory_ctx = self._build_memory_ctx(mem)
+            except Exception:
+                memory_ctx = ""
 
         exam_plan = self._plan_exam(user_request=user_request, memory_ctx=memory_ctx)
         external_ctx = self._build_external_ctx(user_request)
@@ -620,6 +741,9 @@ JSON 示例：
             num_questions=exam_plan["num_questions"],
             difficulty_ratio=exam_plan["difficulty_ratio"],
             context=context,
+            rag_context=rag_context,
+            history_context=history_context,
+            memory_context=memory_ctx,
         )
         prompt += (
             "\n\n【内部考试计划（请执行但不要原样复述）】\n"
@@ -647,16 +771,56 @@ JSON 示例：
         prompt += "\n\n工具使用约束：默认不使用外部工具，仅在请求明确需要最新信息时使用外部参考。"
 
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是一位严谨的考试出题专家。必须只输出一个合法 JSON 对象，"
-                    "不得输出解释、前后缀文本或 markdown。"
-                ),
-            },
+            {"role": "system", "content": EXAM_SOLVE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        response = self.llm.chat(messages, temperature=0.4, max_tokens=3200)
+        solve_schema = {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "instructions": {"type": "string"},
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "question": {"type": "string"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "score": {"type": "integer"},
+                            "standard_answer": {"type": "string"},
+                            "rubric": {"type": "string"},
+                            "chapter": {"type": "string"},
+                            "concept": {"type": "string"},
+                        },
+                        "required": [
+                            "type",
+                            "question",
+                            "options",
+                            "score",
+                            "standard_answer",
+                            "rubric",
+                            "chapter",
+                            "concept",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["title", "instructions", "questions"],
+            "additionalProperties": False,
+        }
+        solved_payload = self._structured_chat_json(
+            messages=messages,
+            schema_name="exam_solve",
+            schema=solve_schema,
+            temperature=0.4,
+            max_tokens=3200,
+            flag_env="ENABLE_STRUCTURED_OUTPUTS_EXAM",
+        )
+        response = ""
+        if not solved_payload:
+            response = self.llm.chat(messages, temperature=0.4, max_tokens=3200)
 
         schema_hint = (
             '{"title":"...","instructions":"...",'
@@ -664,7 +828,7 @@ JSON 示例：
             '"score":10,"standard_answer":"...","rubric":"...","chapter":"...","concept":"..."}]}'
         )
         try:
-            exam_json = self._extract_json_payload(response)
+            exam_json = solved_payload if solved_payload else self._extract_json_payload(response)
             return self._render_exam_paper(course_name=course_name, exam_json=exam_json)
         except Exception as e:
             err = str(e).strip() or "unknown_parse_error"

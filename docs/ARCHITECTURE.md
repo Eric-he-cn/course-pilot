@@ -582,3 +582,13 @@ gunicorn backend.api:app -w 4 -k uvicorn.workers.UvicornWorker
 - 基准脚本：`scripts/perf/bench_runner.py`。
 - 数据集：`benchmarks/cases_v1.jsonl` + `benchmarks/rag_gold_v1.jsonl`。
 - 产物：`raw/summary/checkpoint`，支持断点续跑和 baseline/after 对比。
+
+### 5. 2026-03 Full Fix（任务 1-9）增量
+
+- 同步链路修复：`/chat` 的 practice/exam 非流式路径已移除生成器副作用，返回类型统一为 `ChatMessage`。
+- 上下文分区：Runner 传递 `history_context / rag_context / memory_context / context`，Agent 按分区消费，降低“混合上下文”污染风险。
+- 工具契约化：`ToolPolicy` 新增 `ToolCapability`（required_args / phase_allow / dedup_scope / retry_policy），统一 preflight 门控。
+- 结构化输出灰度：Quiz/Exam/Grader 支持 `ENABLE_STRUCTURED_OUTPUTS_*` 开关，失败自动回退旧解析链。
+- 记忆检索后端：`memory/store.py` 增加 `FTS5 -> LIKE` 双路径，`MEMORY_SEARCH_BACKEND` 控制优先级。
+- 可观测性补齐：MCP 工具侧增加 `tool_progress`（start/end）事件；流式状态链路更完整（检索/工具/继续推理/最终回答）。
+- 上下文预算可视化：流式链路增加 `__context_budget__` 事件，前端右上角角标可展示 pressure 与分段 token。

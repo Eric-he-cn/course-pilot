@@ -9,7 +9,12 @@
 import json
 from typing import Dict, Any
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import ROUTER_PROMPT
+from core.orchestration.prompts import (
+    ROUTER_PROMPT,
+    ROUTER_SYSTEM_PROMPT,
+    ROUTER_REPLAN_PROMPT,
+    ROUTER_REPLAN_SYSTEM_PROMPT,
+)
 from core.orchestration.policies import ToolPolicy
 from backend.schemas import Plan
 
@@ -86,7 +91,7 @@ class RouterAgent:
         
         # 3) 调用模型生成规划
         messages = [
-            {"role": "system", "content": "你是一个任务规划助手。"},
+            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
         response = self.llm.chat(messages, temperature=0.3)
@@ -109,30 +114,16 @@ class RouterAgent:
         reason: str,
     ) -> Plan:
         weak_points_ctx = self._build_weak_points_ctx(course_name)
-        prompt = f"""你是一个任务重规划助手，请基于失败原因修正执行计划。
-
-课程模式: {mode}
-课程名称: {course_name}
-用户问题: {user_message}
-失败原因: {reason}
-上一版计划(JSON): {json.dumps(previous_plan.model_dump(), ensure_ascii=False)}
-{weak_points_ctx}
-
-输出要求：
-1. 仅输出 JSON，不要额外解释。
-2. 字段必须包含: need_rag/style/output_format。
-3. allowed_tools 与 task_type 不需要你填写，系统会覆盖为安全值。
-4. 若失败原因是“检索为空/资料缺失”，请优先把 need_rag 设为 false，并给出更稳妥的 style。
-
-JSON 示例：
-{{
-  "need_rag": true,
-  "style": "step_by_step",
-  "output_format": "answer"
-}}
-"""
+        prompt = ROUTER_REPLAN_PROMPT.format(
+            mode=mode,
+            course_name=course_name,
+            user_message=user_message,
+            reason=reason,
+            previous_plan_json=json.dumps(previous_plan.model_dump(), ensure_ascii=False),
+            weak_points_ctx=weak_points_ctx,
+        )
         messages = [
-            {"role": "system", "content": "你是一个稳健的任务重规划助手。"},
+            {"role": "system", "content": ROUTER_REPLAN_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         try:

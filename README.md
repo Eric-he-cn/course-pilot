@@ -254,6 +254,7 @@ git clone https://github.com/Eric-he-cn/course-pilot.git
 cd course-pilot
 pip install -r requirements.txt
 ```
+> 依赖版本以 `requirements.txt` 为运行真源；`pyproject.toml` 仅用于 Poetry 元数据与版本对齐声明。
 
 2) 配置环境变量（项目根目录 `.env`）
 ```dotenv
@@ -348,6 +349,11 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `CTX_TOTAL_TOKENS` | `8192` | 上下文预算总 token |
 | `CTX_SAFETY_MARGIN` | `256` | 预算安全边界，避免贴边超限 |
 | `CB_*` | 见 `.env` 示例 | History/RAG/Memory 三段预算和压缩参数 |
+| `RAG_COMPRESS_OWNER` | `retriever` | RAG 压缩责任方：`retriever`（默认，避免工具轮重复压缩）或 `budgeter` |
+| `ENABLE_STRUCTURED_OUTPUTS_QUIZ` | `0` | Quiz 结构化输出灰度开关（strict json_schema） |
+| `ENABLE_STRUCTURED_OUTPUTS_EXAM` | `0` | Exam 结构化输出灰度开关（strict json_schema） |
+| `ENABLE_STRUCTURED_OUTPUTS_GRADER` | `0` | Grader 结构化输出灰度开关（strict json_schema） |
+| `MEMORY_SEARCH_BACKEND` | `fts5` | 记忆检索后端：`fts5` 优先，失败自动回退 `like` |
 
 ---
 
@@ -392,6 +398,7 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 流式中可能出现以下元事件：
 - `{"__citations__": [...]}`：当前轮引用元数据（文档名/页码/分数/原文片段）
 - `{"__status__": "..."}`：当前执行状态提示（检索/工具调用/答案整理）
+- `{"__context_budget__": {...}}`：上下文预算快照（history/rag/memory/final/budget/pressure）
 
 ---
 
@@ -429,6 +436,7 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 - API 层通过 `trace_scope` 注入 trace，上下游事件可按 `request_id + trace_id` 串联。
 - 流式 SSE 增加心跳状态：长时间无 chunk 时主动推送“后端仍在处理”。
 - 工具链新增状态闭环：`memory_search` 后会显式进入“工具调用完成，继续推理中”。
+- MCP 工具调用新增 `tool_progress` 事件（start/end），便于定位工具侧耗时。
 
 ---
 
@@ -457,7 +465,11 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 ## 贡献与许可
 - 欢迎提交 Issue / PR，一起完善功能与安全性。
 - 许可证：MIT License
-- 作者：**Eric He** · 更新日期：2026-03-18
+- 作者：**Eric He** · 更新日期：2026-03-26
+
+## 进展报告
+
+- 2026-03-26 Full Fix 分支审阅与性能报告：[`docs/PROGRESS_REPORT_2026-03-26_FULLFIX.md`](docs/PROGRESS_REPORT_2026-03-26_FULLFIX.md)
 
 ## V2 更新日志
 
@@ -469,4 +481,14 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 - 新增性能评测体系：metrics 采集、benchmark 用例、checkpoint 续跑、summary/delta 报告。
 - 流式链路改进：前端状态展示与后端心跳事件闭环，排查体验更稳定。
 - 请求级日志补齐：`/chat` 与 `/chat/stream` 可用 `request_id` 跨层追踪。
+
+## V2.5 更新日志
+
+- 修复 `/chat` 同步链路返回类型不一致问题（practice/exam 非流式路径稳定返回 `ChatMessage`）。
+- 完成上下文分区化注入（`history/rag/memory/final`），降低混合上下文污染风险。
+- 新增统一工具契约与 preflight 门控（参数校验、phase 限制、request 级去重签名）。
+- Quiz/Exam/Grader 接入 Structured Outputs 灰度开关，失败自动回退旧解析链。
+- 记忆检索升级为 `FTS5 -> LIKE` 双路径，`MEMORY_SEARCH_BACKEND` 可配置。
+- 增强流式可观测性：新增 `tool_progress` 事件与更完整的状态闭环。
+- 前端上下文预算角标修复：后端补发 `__context_budget__`，前端增加 ratio 兜底计算，不再固定 `0%`。
 

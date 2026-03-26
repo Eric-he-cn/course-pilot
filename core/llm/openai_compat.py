@@ -151,14 +151,26 @@ def _build_compact_user_content(
         return ""
     goal = _extract_user_goal(content)
     stop_markers = ["\n\n用户问题", "\n\n用户当前消息", "\n\n请按", "\n\n输出要求"]
-    rag_raw = _extract_section(content, ["【教材参考】", "教材参考资料"], stop_markers)
-    mem_raw = _extract_section(content, ["【该知识点历史错题参考", "【历史错题", "【用户学习档案】"], stop_markers)
+    rag_raw = _extract_section(content, ["【教材证据", "【教材参考】", "教材参考资料"], stop_markers)
+    mem_raw = _extract_section(
+        content,
+        ["【长期记忆片段", "【该知识点历史错题参考", "【历史错题", "【用户学习档案】"],
+        stop_markers,
+    )
 
-    rag_summary = _trim_by_tokens(rag_raw, rag_max_tokens) if rag_raw else ""
+    rag_owner = str(os.getenv("RAG_COMPRESS_OWNER", "retriever")).strip().lower() or "retriever"
+    rag_summary = ""
+    if rag_raw:
+        if rag_owner == "budgeter":
+            rag_summary = _trim_by_tokens(rag_raw, rag_max_tokens)
+        else:
+            # Retriever 已做句级压缩时，工具轮只做必要 token 裁切，避免重复摘要。
+            rag_summary = _trim_by_tokens(rag_raw, max(rag_max_tokens, 2000))
     mem_summary = _trim_by_tokens(mem_raw, memory_max_tokens) if mem_raw else ""
     out = [f"【任务目标】{goal or _trim_text(content, 220)}"]
     if rag_summary:
-        out.append("【必要证据摘要】\n" + rag_summary)
+        label = "【必要证据摘要】" if rag_owner == "budgeter" else "【必要证据】"
+        out.append(label + "\n" + rag_summary)
     if mem_summary:
         out.append("【近期记忆摘要】\n" + mem_summary)
     return "\n\n".join(out).strip()

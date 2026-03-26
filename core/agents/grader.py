@@ -7,15 +7,22 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
+import os
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import (
     GRADER_PROMPT,
+    GRADER_GRADE_SYSTEM_PROMPT,
+    GRADER_PRACTICE_PLAN_SYSTEM_PROMPT,
+    GRADER_EXAM_PLAN_SYSTEM_PROMPT,
+    GRADER_PRACTICE_PLAN_PROMPT,
+    GRADER_EXAM_INTERNAL_PLAN_PROMPT,
     GRADER_SYSTEM,
     GRADER_PRACTICE_PROMPT,
     GRADER_EXAM_PROMPT,
 )
 from backend.schemas import GradeReport
+from core.metrics import add_event
 
 
 """只暴露 calculator 给 Grader，不需要其他工具。"""
@@ -50,6 +57,63 @@ class GraderAgent:
     def __init__(self):
         self.llm = get_llm_client()
 
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _structured_chat_json(
+        self,
+        *,
+        messages: List[dict],
+        schema_name: str,
+        schema: dict,
+        temperature: float,
+        max_tokens: int,
+        flag_env: str = "ENABLE_STRUCTURED_OUTPUTS_GRADER",
+    ) -> dict:
+        if not self._env_bool(flag_env, False):
+            return {}
+        try:
+            response = self.llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+            )
+            payload = self._extract_json_payload(response)
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=True,
+                    fallback=False,
+                )
+            except Exception:
+                pass
+            return payload if isinstance(payload, dict) else {}
+        except Exception as ex:
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=False,
+                    fallback=True,
+                    error=str(ex),
+                )
+            except Exception:
+                pass
+            return {}
+
     """评分解析与消息组装辅助。"""
 
     """从模型输出中提取 JSON 负载。"""
@@ -76,11 +140,7 @@ class GraderAgent:
         return [
             {
                 "role": "system",
-                "content": (
-                    "你是一位公正的评分专家。"
-                    "计算总分时必须调用 calculator 工具，不得自行心算，"
-                    "调用完毕后再输出 JSON 结果。"
-                ),
+                "content": GRADER_GRADE_SYSTEM_PROMPT,
             },
             {"role": "user", "content": prompt},
         ]
@@ -88,35 +148,10 @@ class GraderAgent:
     """构建练习评分“内部计划”提示词（仅供模型内部规划，不向用户展示）。"""
     @staticmethod
     def _build_practice_plan_prompt(quiz_content: str, student_answer: str) -> str:
-        return f"""请为本次练习评卷生成一个“内部执行计划”，用于后续评分阶段。
-
-【题目（来自本次练习）】
-{quiz_content}
-
-【学生提交的答案】
-{student_answer}
-
-要求：
-1. 只输出 JSON，不要输出解释文字。
-2. JSON 字段包含：
-   - question_steps: 按题号顺序的逐题步骤（数组，每项含 question_no 和 action）
-   - final_step: 最后一步固定为“调用 calculator 汇总总分”
-   - score_formula: 计算总分的公式字符串模板（例如 sum([q1_score,q2_score,...])）
-   - key_mistakes: 可能的错误类型（数组）
-3. 不要输出最终分数与讲评正文。
-4. 必须保证：每道题恰好一个步骤；计算总分只能在最后一步执行。
-
-JSON 示例：
-{{
-  "question_steps": [
-    {{"question_no": 1, "action": "核对第1题标准答案与学生答案并给分"}},
-    {{"question_no": 2, "action": "核对第2题标准答案与学生答案并给分"}}
-  ],
-  "final_step": "调用 calculator 汇总总分",
-  "score_formula": "sum([q1_score,q2_score])",
-  "key_mistakes": ["概念性错误", "步骤缺失"]
-}}
-"""
+        return GRADER_PRACTICE_PLAN_PROMPT.format(
+            quiz_content=quiz_content,
+            student_answer=student_answer,
+        )
 
     """从题面文本中提取题号序列，供逐题计划兜底构建。"""
     @staticmethod
@@ -167,12 +202,43 @@ JSON 示例：
         default_plan = self._build_default_practice_plan(quiz_content)
         q_numbers = [item["question_no"] for item in default_plan["question_steps"]]
         messages = [
-            {"role": "system", "content": "你是一个严谨的评卷计划器，只输出 JSON。"},
+            {"role": "system", "content": GRADER_PRACTICE_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_practice_plan_prompt(quiz_content, student_answer)},
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "question_steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question_no": {"type": "integer"},
+                            "action": {"type": "string"},
+                        },
+                        "required": ["question_no", "action"],
+                        "additionalProperties": False,
+                    },
+                },
+                "final_step": {"type": "string"},
+                "score_formula": {"type": "string"},
+                "checks": {"type": "array", "items": {"type": "string"}},
+                "key_mistakes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["question_steps", "final_step", "score_formula", "checks", "key_mistakes"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.1, max_tokens=800)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="grader_practice_plan",
+                schema=schema,
+                temperature=0.1,
+                max_tokens=800,
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.1, max_tokens=800)
+                plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
                 return default_plan
 
@@ -222,38 +288,38 @@ JSON 示例：
     """构建考试评分“内部计划”提示词（仅内部使用）。"""
     @staticmethod
     def _build_exam_plan_prompt(exam_paper: str, student_answer: str) -> str:
-        return f"""你是考试评卷计划器。请输出本次评卷的内部计划（JSON）。
-
-【试卷】
-{exam_paper}
-
-【学生答案】
-{student_answer}
-
-要求：
-1. 只输出 JSON，不要输出解释。
-2. 字段必须包含：
-   - checks: 逐题核对步骤数组
-   - score_formula: 汇总总分的公式（用于 calculator）
-   - weak_points_hint: 可能的薄弱点数组
-
-JSON 示例：
-{{
-  "checks": ["核对第1题答案匹配", "核对第2题步骤完整性"],
-  "score_formula": "sum([10,8,0,15])",
-  "weak_points_hint": ["概念边界不清", "步骤缺失"]
-}}
-"""
+        return GRADER_EXAM_INTERNAL_PLAN_PROMPT.format(
+            exam_paper=exam_paper,
+            student_answer=student_answer,
+        )
 
     """生成考试评分内部计划。"""
     def _generate_exam_plan(self, exam_paper: str, student_answer: str) -> dict:
         messages = [
-            {"role": "system", "content": "你是一个严谨的考试评卷计划器，只输出 JSON。"},
+            {"role": "system", "content": GRADER_EXAM_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_exam_plan_prompt(exam_paper, student_answer)},
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "checks": {"type": "array", "items": {"type": "string"}},
+                "score_formula": {"type": "string"},
+                "weak_points_hint": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["checks", "score_formula", "weak_points_hint"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.1, max_tokens=900)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="grader_exam_plan",
+                schema=schema,
+                temperature=0.1,
+                max_tokens=900,
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.1, max_tokens=900)
+                plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
                 return {"checks": [], "score_formula": "", "weak_points_hint": []}
             return {
