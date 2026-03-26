@@ -12,6 +12,7 @@ import streamlit as st
 import requests
 import json
 import os
+import time
 from datetime import datetime
 
 
@@ -920,7 +921,12 @@ if st.session_state.current_course:
 
         with st.chat_message("assistant"):
             progress_placeholder = st.empty()
+            context_hint_placeholder = st.empty()
             saw_status_event = [False]
+            saw_context_budget_event = [False]
+            showed_context_hint = [False]
+            stream_started_at = time.time()
+            context_event_timeout_sec = float(os.getenv("CONTEXT_BUDGET_EVENT_TIMEOUT_SEC", "3.0"))
 
             def _collecting_stream():
                 for chunk in stream_chat(
@@ -942,12 +948,15 @@ if st.session_state.current_course:
                     if isinstance(chunk, dict) and "__context_budget__" in chunk:
                         payload_ctx = chunk.get("__context_budget__") or {}
                         if isinstance(payload_ctx, dict):
+                            saw_context_budget_event[0] = True
                             st.session_state._pending_context_budget = payload_ctx
                             st.session_state.latest_context_budget = payload_ctx
                             render_context_badge(
                                 payload_ctx,
                                 placeholder=context_badge_placeholder,
                             )
+                            if showed_context_hint[0]:
+                                context_hint_placeholder.empty()
                         continue
 
                     # 进度事件：显示当前正在执行的阶段，避免“卡死感”
@@ -956,6 +965,15 @@ if st.session_state.current_course:
                         if status_text:
                             saw_status_event[0] = True
                             progress_placeholder.caption(f"⏳ {status_text}")
+                            if (
+                                not saw_context_budget_event[0]
+                                and not showed_context_hint[0]
+                                and (time.time() - stream_started_at) >= context_event_timeout_sec
+                            ):
+                                context_hint_placeholder.caption(
+                                    "ℹ️ 暂未收到上下文预算事件，后端仍在处理中。"
+                                )
+                                showed_context_hint[0] = True
                         continue
 
                     if isinstance(chunk, str):
@@ -964,6 +982,7 @@ if st.session_state.current_course:
 
             st.write_stream(_collecting_stream())
             progress_placeholder.empty()
+            context_hint_placeholder.empty()
 
             full_response = "".join(collected_chunks)
             # 捕获流式过程中拦截到的 citations

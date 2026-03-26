@@ -249,6 +249,24 @@ class QuizMasterAgent:
         }
         return mapping.get(raw, raw if raw.endswith("题") else "综合题")
 
+    """判断题面是否具备选择题形态（至少包含 A/B 选项行）。"""
+    @staticmethod
+    def _looks_like_mcq(question_text: str) -> bool:
+        import re
+
+        q = str(question_text or "")
+        return len(re.findall(r"(?m)^\s*[A-D][\.\uFF0E\u3001\u3011\)]\s*", q)) >= 2
+
+    """判断标准答案是否为选择题答案格式（A 或 A,B 等）。"""
+    @staticmethod
+    def _looks_like_mcq_answer(answer_text: str) -> bool:
+        import re
+
+        raw = str(answer_text or "").strip().upper()
+        if not raw:
+            return False
+        return bool(re.match(r"^[A-D](?:\s*[,/\u3001\uFF0C]\s*[A-D])*$", raw))
+
     """清理模型输出中的隐藏注释和控制字符，避免污染前端题面。"""
     @staticmethod
     def _sanitize_text(value: Any) -> str:
@@ -534,6 +552,26 @@ class QuizMasterAgent:
                 }
             )
 
+        # 统一考试总分口径：有题目时将总分归一到 100。
+        total_score = sum(int(x.get("score", 0) or 0) for x in answer_sheet)
+        if answer_sheet:
+            if total_score <= 0:
+                base = 100 // len(answer_sheet)
+                rem = 100 - base * len(answer_sheet)
+                for i, row in enumerate(answer_sheet):
+                    row["score"] = base + (1 if i < rem else 0)
+            elif total_score != 100:
+                factor = 100.0 / float(total_score)
+                running = 0
+                for i, row in enumerate(answer_sheet):
+                    if i < len(answer_sheet) - 1:
+                        scaled = int(round(int(row.get("score", 0) or 0) * factor))
+                        row["score"] = max(0, scaled)
+                        running += row["score"]
+                    else:
+                        row["score"] = max(0, 100 - running)
+        score_by_id = {int(item["id"]): int(item.get("score", 0) or 0) for item in answer_sheet}
+
         lines = [
             f"# {title}",
             "",
@@ -546,11 +584,11 @@ class QuizMasterAgent:
         section_titles = ["第一部分", "第二部分", "第三部分", "第四部分", "第五部分"]
         for s_idx, (q_type, q_list) in enumerate(sections.items(), start=1):
             section_name = section_titles[s_idx - 1] if s_idx <= len(section_titles) else f"第{s_idx}部分"
-            sec_score = sum(int(item.get("score", 0) or 0) for _, item in q_list)
+            sec_score = sum(int(score_by_id.get(int(qid), 0)) for qid, _ in q_list)
             lines.append(f"## {section_name}　{q_type}（共{len(q_list)}题，共{sec_score}分）")
             lines.append("")
             for qid, q in q_list:
-                q_score = int(q.get("score", 0) or 0)
+                q_score = int(score_by_id.get(int(qid), 0))
                 lines.append(f"{qid}. {q.get('question', '')}（{q_score}分）")
                 options = q.get("options", [])
                 if isinstance(options, list) and options:
@@ -584,12 +622,13 @@ class QuizMasterAgent:
         history_context: str = "",
         memory_context: str = "",
         prefetched_memory_ctx: str = "",
+        prefetched_memory_checked: bool = False,
         num_questions: int = 1,
         question_type: str = "综合题",
     ) -> Quiz:
         # 1) 预查询历史错题，优先针对薄弱知识点出题
         memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
-        if not memory_ctx:
+        if not memory_ctx and not prefetched_memory_checked:
             try:
                 from mcp_tools.client import MCPTools
                 mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
@@ -608,10 +647,29 @@ class QuizMasterAgent:
         planned_topic = quiz_plan["topic"]
         planned_num_questions = self._normalize_num_questions(quiz_plan.get("num_questions", num_questions), num_questions)
         planned_difficulty = quiz_plan["difficulty"]
-        planned_question_type = self._normalize_question_type(
-            str(quiz_plan.get("question_type", question_type)),
-            question_type,
+        requested_question_type = self._normalize_question_type(question_type, "综合题")
+        planned_question_type_from_plan = self._normalize_question_type(
+            str(quiz_plan.get("question_type", requested_question_type)),
+            requested_question_type,
         )
+        if requested_question_type != "综合题":
+            planned_question_type = requested_question_type
+            if planned_question_type_from_plan != requested_question_type:
+                self.logger.info(
+                    "[quiz] question_type_locked requested=%s planned=%s",
+                    requested_question_type,
+                    planned_question_type_from_plan,
+                )
+                try:
+                    add_event(
+                        "quiz_question_type_locked",
+                        requested_type=requested_question_type,
+                        planned_type=planned_question_type_from_plan,
+                    )
+                except Exception:
+                    pass
+        else:
+            planned_question_type = planned_question_type_from_plan
 
         # 2) 必要时补充外部上下文（单次调用，避免工具风暴）
         external_ctx = self._build_external_ctx(planned_topic)
@@ -686,10 +744,56 @@ class QuizMasterAgent:
                 str(quiz_dict.get("difficulty", planned_difficulty)),
                 planned_difficulty,
             )
+            if planned_question_type == "选择题":
+                if (not self._looks_like_mcq(quiz_dict.get("question", ""))) or (
+                    not self._looks_like_mcq_answer(quiz_dict.get("standard_answer", ""))
+                ):
+                    self.logger.info("[quiz] mcq_shape_retry_triggered=1")
+                    try:
+                        add_event("quiz_mcq_retry", triggered=True)
+                    except Exception:
+                        pass
+                    retry_prompt = (
+                        prompt
+                        + "\n\n【强约束】你必须输出选择题格式："
+                        + "\n1) question 中必须包含至少 A/B/C/D 四个选项（每行一个选项）;"
+                        + "\n2) standard_answer 只能是选项字母（如 A 或 A,B）;"
+                        + "\n3) 仅输出合法 JSON，不要添加解释文字。"
+                    )
+                    retry_messages = [
+                        {"role": "system", "content": QUIZMASTER_SOLVE_SYSTEM_PROMPT},
+                        {"role": "user", "content": retry_prompt},
+                    ]
+                    retry_response = self.llm.chat(retry_messages, temperature=0.2, max_tokens=1400)
+                    retry_dict = self._extract_json_payload(retry_response)
+                    retry_dict["question"] = self._sanitize_text(retry_dict.get("question", ""))
+                    retry_dict["standard_answer"] = self._sanitize_text(retry_dict.get("standard_answer", ""))
+                    retry_dict["rubric"] = self._sanitize_text(retry_dict.get("rubric", ""))
+                    retry_dict["chapter"] = self._sanitize_text(retry_dict.get("chapter", planned_topic))
+                    retry_dict["concept"] = self._sanitize_text(retry_dict.get("concept", ""))
+                    retry_dict["difficulty"] = self._normalize_difficulty(
+                        str(retry_dict.get("difficulty", planned_difficulty)),
+                        planned_difficulty,
+                    )
+                    if (not self._looks_like_mcq(retry_dict.get("question", ""))) or (
+                        not self._looks_like_mcq_answer(retry_dict.get("standard_answer", ""))
+                    ):
+                        raise ValueError("mcq_shape_invalid_after_retry")
+                    self.logger.info("[quiz] mcq_shape_retry_success=1")
+                    try:
+                        add_event("quiz_mcq_retry", triggered=True, success=True)
+                    except Exception:
+                        pass
+                    quiz_dict = retry_dict
             return Quiz(**quiz_dict)
         except Exception as e:
             err = str(e).strip() or "unknown_parse_error"
             self.logger.warning("[quiz] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
+            if "mcq_shape_invalid_after_retry" in err:
+                try:
+                    add_event("quiz_mcq_retry", triggered=True, success=False, reason=err)
+                except Exception:
+                    pass
             repaired = self._repair_json_via_llm(response, schema_hint=schema_hint, max_tokens=1200)
             if repaired:
                 try:
@@ -724,9 +828,10 @@ class QuizMasterAgent:
         history_context: str = "",
         memory_context: str = "",
         prefetched_memory_ctx: str = "",
+        prefetched_memory_checked: bool = False,
     ) -> Dict[str, Any]:
         memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
-        if not memory_ctx:
+        if not memory_ctx and not prefetched_memory_checked:
             try:
                 from mcp_tools.client import MCPTools
                 mem = MCPTools.call_tool("memory_search", query=user_request, course_name=course_name)

@@ -235,7 +235,6 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("learn", packed)
-        yield {"__context_budget__": self._context_budget_payload("learn", len(history), packed)}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         
@@ -328,7 +327,6 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("practice", packed)
-        yield {"__context_budget__": self._context_budget_payload("practice", len(history), packed)}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
@@ -339,17 +337,30 @@ class OrchestrationRunner:
         tool_calls = None
 
         if answer_submission:
-            self.logger.info("[route] practice answer_submission=1 target=grader%s", self._trace_tag())
-            quiz_content = self._extract_quiz_from_history(history)
+            has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
             chunks = []
-            for chunk in self.grader.grade_practice_stream(
-                quiz_content=quiz_content,
-                student_answer=user_message,
-                course_name=course_name,
-                history_ctx=history_ctx,
-            ):
-                if isinstance(chunk, str):
-                    chunks.append(chunk)
+            if has_exam_meta:
+                self.logger.info("[route] practice answer_submission=1 target=grader_exam%s", self._trace_tag())
+                exam_paper = self._extract_exam_from_history(history)
+                for chunk in self.grader.grade_exam_stream(
+                    exam_paper=exam_paper,
+                    student_answer=user_message,
+                    course_name=course_name,
+                    history_ctx=history_ctx,
+                ):
+                    if isinstance(chunk, str):
+                        chunks.append(chunk)
+            else:
+                self.logger.info("[route] practice answer_submission=1 target=grader%s", self._trace_tag())
+                quiz_content = self._extract_quiz_from_history(history)
+                for chunk in self.grader.grade_practice_stream(
+                    quiz_content=quiz_content,
+                    student_answer=user_message,
+                    course_name=course_name,
+                    history_ctx=history_ctx,
+                ):
+                    if isinstance(chunk, str):
+                        chunks.append(chunk)
             response_text = "".join(chunks)
             saved_path = self._save_practice_record(course_name, user_message, history, response_text)
             self._save_grading_to_memory(course_name, user_message, history, response_text)
@@ -357,20 +368,48 @@ class OrchestrationRunner:
         else:
             self.logger.info("[status] practice generating_quiz%s", self._trace_tag())
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
-            quiz = self.quizmaster.generate_quiz(
-                course_name=course_name,
-                topic=topic,
-                difficulty=difficulty,
-                context=context,
-                rag_context=context_sections["rag_context"],
-                history_context=context_sections["history_context"],
-                memory_context=context_sections["memory_context"],
-                prefetched_memory_ctx=context_sections["memory_context"],
-                num_questions=num_questions,
-                question_type=question_type,
-            )
-            response_text = self._render_quiz_message(quiz)
-            tool_calls = self._build_quiz_meta_tool_call(quiz)
+            if num_questions > 1:
+                self.logger.info(
+                    "[route] practice multi_question=%d use_exam_generator=1%s",
+                    num_questions,
+                    self._trace_tag(),
+                )
+                practice_request = f"请生成{num_questions}道{question_type}练习题，主题：{topic}，难度：{difficulty}"
+                exam_payload = self.quizmaster.generate_exam_paper(
+                    course_name=course_name,
+                    user_request=practice_request,
+                    context=context,
+                    rag_context=context_sections["rag_context"],
+                    history_context=context_sections["history_context"],
+                    memory_context=context_sections["memory_context"],
+                    prefetched_memory_ctx=context_sections["memory_context"],
+                    prefetched_memory_checked=True,
+                )
+                if not isinstance(exam_payload, dict):
+                    exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
+                response_text = str(exam_payload.get("content", "")).strip()
+                if response_text.startswith("# "):
+                    response_text = response_text.replace("模拟考试试卷", "练习题（多题）", 1)
+                tool_calls = self._build_exam_meta_tool_call(
+                    exam_payload.get("answer_sheet", []),
+                    int(exam_payload.get("total_score", 0)),
+                )
+            else:
+                quiz = self.quizmaster.generate_quiz(
+                    course_name=course_name,
+                    topic=topic,
+                    difficulty=difficulty,
+                    context=context,
+                    rag_context=context_sections["rag_context"],
+                    history_context=context_sections["history_context"],
+                    memory_context=context_sections["memory_context"],
+                    prefetched_memory_ctx=context_sections["memory_context"],
+                    prefetched_memory_checked=True,
+                    num_questions=num_questions,
+                    question_type=question_type,
+                )
+                response_text = self._render_quiz_message(quiz)
+                tool_calls = self._build_quiz_meta_tool_call(quiz)
 
         self._last_run_meta = {
             "mode": "practice",
@@ -441,6 +480,13 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("practice", packed)
+        payload = self._context_budget_payload("practice", len(history), packed)
+        self.logger.info(
+            "[context_budget_emit] mode=practice ratio=%.3f%s",
+            float(payload.get("context_pressure_ratio", 0.0) or 0.0),
+            self._trace_tag(),
+        )
+        yield {"__context_budget__": payload}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
@@ -451,18 +497,32 @@ class OrchestrationRunner:
 
         if answer_submission:
             yield {"__status__": "正在批改练习答案..."}
-            self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
-            quiz_content = self._extract_quiz_from_history(history)
             collected = []
-            for chunk in self.grader.grade_practice_stream(
-                quiz_content=quiz_content,
-                student_answer=user_message,
-                course_name=course_name,
-                history_ctx=history_ctx,
-            ):
-                if isinstance(chunk, str):
-                    collected.append(chunk)
-                yield chunk
+            has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
+            if has_exam_meta:
+                self.logger.info("[route] practice_stream answer_submission=1 target=grader_exam%s", self._trace_tag())
+                exam_paper = self._extract_exam_from_history(history)
+                for chunk in self.grader.grade_exam_stream(
+                    exam_paper=exam_paper,
+                    student_answer=user_message,
+                    course_name=course_name,
+                    history_ctx=history_ctx,
+                ):
+                    if isinstance(chunk, str):
+                        collected.append(chunk)
+                    yield chunk
+            else:
+                self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
+                quiz_content = self._extract_quiz_from_history(history)
+                for chunk in self.grader.grade_practice_stream(
+                    quiz_content=quiz_content,
+                    student_answer=user_message,
+                    course_name=course_name,
+                    history_ctx=history_ctx,
+                ):
+                    if isinstance(chunk, str):
+                        collected.append(chunk)
+                    yield chunk
             full_response = "".join(collected)
             saved_path = self._save_practice_record(course_name, user_message, history, full_response)
             self._save_grading_to_memory(course_name, user_message, history, full_response)
@@ -470,20 +530,51 @@ class OrchestrationRunner:
         else:
             yield {"__status__": "正在生成练习题..."}
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
-            quiz = self.quizmaster.generate_quiz(
-                course_name=course_name,
-                topic=topic,
-                difficulty=difficulty,
-                context=context,
-                rag_context=context_sections["rag_context"],
-                history_context=context_sections["history_context"],
-                memory_context=context_sections["memory_context"],
-                prefetched_memory_ctx=context_sections["memory_context"],
-                num_questions=num_questions,
-                question_type=question_type,
-            )
-            yield {"__tool_calls__": self._build_quiz_meta_tool_call(quiz)}
-            yield self._render_quiz_message(quiz)
+            if num_questions > 1:
+                self.logger.info(
+                    "[route] practice_stream multi_question=%d use_exam_generator=1%s",
+                    num_questions,
+                    self._trace_tag(),
+                )
+                practice_request = f"请生成{num_questions}道{question_type}练习题，主题：{topic}，难度：{difficulty}"
+                exam_payload = self.quizmaster.generate_exam_paper(
+                    course_name=course_name,
+                    user_request=practice_request,
+                    context=context,
+                    rag_context=context_sections["rag_context"],
+                    history_context=context_sections["history_context"],
+                    memory_context=context_sections["memory_context"],
+                    prefetched_memory_ctx=context_sections["memory_context"],
+                    prefetched_memory_checked=True,
+                )
+                if not isinstance(exam_payload, dict):
+                    exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
+                yield {
+                    "__tool_calls__": self._build_exam_meta_tool_call(
+                        exam_payload.get("answer_sheet", []),
+                        int(exam_payload.get("total_score", 0)),
+                    )
+                }
+                content = str(exam_payload.get("content", "")).strip()
+                if content.startswith("# "):
+                    content = content.replace("模拟考试试卷", "练习题（多题）", 1)
+                yield content
+            else:
+                quiz = self.quizmaster.generate_quiz(
+                    course_name=course_name,
+                    topic=topic,
+                    difficulty=difficulty,
+                    context=context,
+                    rag_context=context_sections["rag_context"],
+                    history_context=context_sections["history_context"],
+                    memory_context=context_sections["memory_context"],
+                    prefetched_memory_ctx=context_sections["memory_context"],
+                    prefetched_memory_checked=True,
+                    num_questions=num_questions,
+                    question_type=question_type,
+                )
+                yield {"__tool_calls__": self._build_quiz_meta_tool_call(quiz)}
+                yield self._render_quiz_message(quiz)
 
         self._last_run_meta = {
             "mode": "practice",
@@ -539,7 +630,6 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("exam", packed)
-        yield {"__context_budget__": self._context_budget_payload("exam", len(history), packed)}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
@@ -569,6 +659,7 @@ class OrchestrationRunner:
                 history_context=context_sections["history_context"],
                 memory_context=context_sections["memory_context"],
                 prefetched_memory_ctx=context_sections["memory_context"],
+                prefetched_memory_checked=True,
             )
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
@@ -646,6 +737,13 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("exam", packed)
+        payload = self._context_budget_payload("exam", len(history), packed)
+        self.logger.info(
+            "[context_budget_emit] mode=exam ratio=%.3f%s",
+            float(payload.get("context_pressure_ratio", 0.0) or 0.0),
+            self._trace_tag(),
+        )
+        yield {"__context_budget__": payload}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
@@ -676,6 +774,7 @@ class OrchestrationRunner:
                 history_context=context_sections["history_context"],
                 memory_context=context_sections["memory_context"],
                 prefetched_memory_ctx=context_sections["memory_context"],
+                prefetched_memory_checked=True,
             )
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
@@ -1004,7 +1103,9 @@ class OrchestrationRunner:
             has_answer_marker = True
 
         # 最近 assistant 消息是否含题目结构
-        has_quiz_in_history = bool(self._extract_internal_meta(history, "quiz_meta"))
+        has_quiz_in_history = bool(self._extract_internal_meta(history, "quiz_meta")) or bool(
+            self._extract_internal_meta(history, "exam_meta")
+        )
         if not has_quiz_in_history:
             for msg in reversed(history[-12:]):
                 if msg.get("role") == "assistant":
@@ -1465,6 +1566,13 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("learn", packed)
+        payload = self._context_budget_payload("learn", len(history), packed)
+        self.logger.info(
+            "[context_budget_emit] mode=learn ratio=%.3f%s",
+            float(payload.get("context_pressure_ratio", 0.0) or 0.0),
+            self._trace_tag(),
+        )
+        yield {"__context_budget__": payload}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
 

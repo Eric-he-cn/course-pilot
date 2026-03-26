@@ -153,3 +153,20 @@
   - 两处均生成 `ARCHIVE_INDEX.md`。
 - 解决结果：主目录只保留 canonical baseline/after 和正式运行入口。
 
+## 25. 上下文预算角标长期显示 0%
+- 发现问题：前端预算角标偶发长期显示 `0%`，但后端实际已做预算裁剪。
+- 解决思路：明确“预算事件只在流式链路发出”，并确保 learn/practice/exam 三模式统一发事件；前端加超时提示兜底。
+- 解决步骤：
+  - `runner.py`：在三种 `run_*_mode_stream` 中统一发送 `__context_budget__`，非流式路径不再混入该事件；
+  - `streamlit_app.py`：增加“预算事件超时未到达”提示，避免用户误判卡死。
+- 解决结果：角标随请求更新，若事件延迟也有明确提示，不再固定 `0%`。
+
+## 26. 练习多题出题与评卷链路错配
+- 发现问题：练习请求多题时仍按单题 schema 解析，导致选择题形态漂移、解析失败、评卷错路由。
+- 解决思路：practice 多题统一走试卷生成链路，并依据元数据决定评卷入口。
+- 解决步骤：
+  - `runner.py`：`num_questions > 1` 时走 `QuizMaster.generate_exam_paper()`，写入 `exam_meta`；
+  - 练习提交答案时：若历史含 `exam_meta`，走 `Grader.grade_exam_stream()`，否则走 `grade_practice_stream()`；
+  - `quizmaster.py`：增加题型锁定、选择题形态校验+单次重试、答题卡总分归一到 100。
+- 解决结果：练习多题链路稳定性提升，题型漂移与评分口径错配显著减少。
+

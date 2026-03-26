@@ -35,11 +35,11 @@
 | 模式 | 适用场景 | 执行 Agent | 工具可用性（代码层） | 关键约束 | 自动记录 |
 |------|----------|-----------|---------------------|----------|----------|
 | **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | `ToolPolicy` 放行全部 6 个工具（运行时按 Agent 规则约束） | 优先 RAG 引用，按需 ReAct 调用工具 | 问答写入 `memory.db`（`qa` episode） |
-| **练习 (Practice)** | 出题、提交答案、评分讲评 | QuizMasterAgent（出题）+ GraderAgent（评分讲解） | 出题阶段：按需最小工具（主要 `websearch/get_datetime`）；评卷阶段：仅 `calculator` | `_is_answer_submission()` 命中后强制切到 Grader 评卷链路 | `practices/` Markdown 记录 + `memory.db` |
+| **练习 (Practice)** | 出题、提交答案、评分讲评 | QuizMasterAgent（出题）+ GraderAgent（评分讲解） | 出题阶段：按需最小工具（主要 `websearch/get_datetime`）；评卷阶段：仅 `calculator` | `_is_answer_submission()` 命中后切评卷链路；`quiz_meta` 走 practice 评卷，`exam_meta` 走 exam 评卷 | `practices/` Markdown 记录 + `memory.db` |
 | **考试 (Exam)** | 模拟考试、自测报告 | QuizMasterAgent（出卷）+ GraderAgent（批改讲解） | 出卷阶段：按需最小工具（主要 `websearch/get_datetime`）；批改阶段：仅 `calculator` | `_is_exam_answer_submission()` 命中后进入 Grader 评卷链路 | `exams/` Markdown 记录 + `memory.db` |
 
 - **学习模式**：基于上传教材 RAG 检索，支持引用来源展示、网页补充检索、思维导图生成与笔记落盘。
-- **练习模式**：QuizMaster 负责出题（Plan-Solve + 按需外部信息），提交答案后 Runner 自动路由至 Grader，按“逐题对照 → calculator 汇总 → 讲评”流程输出并落盘。
+- **练习模式**：QuizMaster 负责出题（Plan-Solve + 按需外部信息）；单题走 `generate_quiz`，多题走 `generate_exam_paper`。提交答案后 Runner 按内部元数据自动路由至对应 Grader 链路并落盘。
 - **考试模式**：QuizMaster 负责出卷（返回试卷正文 + 内部答案元数据），交卷后 Grader 负责批改与讲解；结束后自动保存考试记录并同步记忆。
 - **实现说明**：当前 `core/orchestration/policies.py` 中 `learn/practice/exam` 的 `allowed_tools` 均为 `ALL_TOOLS`。模式差异主要来自 Runner 路由和 Agent 内部实现约束，不是白名单本身。
 - **方法论标签**：Router=`Plan+Replan`，Tutor=`ReAct`，QuizMaster=`Plan-Solve`，Grader=`Plan + ReAct-Solve(calculator only)`。
@@ -75,7 +75,9 @@ OrchestrationRunner（Python 调度器）
    │      ↓
    │   QuizMaster Agent（Plan-Solve）
    │      ├─ 默认不走工具循环，仅按需调用 MCP（websearch/get_datetime）
-   │      └─ 输出题目/试卷 + 内部元数据（quiz_meta / exam_meta）
+   │      ├─ 练习单题：generate_quiz → quiz_meta
+   │      ├─ 练习多题/考试：generate_exam_paper → exam_meta
+   │      └─ 输出题目/试卷 + 内部元数据（不向用户展示）
    │
    └─ 练习/考试评卷（检测到答案提交）
           ↓
@@ -399,6 +401,7 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 - `{"__citations__": [...]}`：当前轮引用元数据（文档名/页码/分数/原文片段）
 - `{"__status__": "..."}`：当前执行状态提示（检索/工具调用/答案整理）
 - `{"__context_budget__": {...}}`：上下文预算快照（history/rag/memory/final/budget/pressure）
+- 若流式开始后短时间内未收到 `__context_budget__`，前端会提示“后端仍在处理中”，避免误判为卡死。
 
 ---
 
@@ -490,5 +493,8 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 - Quiz/Exam/Grader 接入 Structured Outputs 灰度开关，失败自动回退旧解析链。
 - 记忆检索升级为 `FTS5 -> LIKE` 双路径，`MEMORY_SEARCH_BACKEND` 可配置。
 - 增强流式可观测性：新增 `tool_progress` 事件与更完整的状态闭环。
-- 前端上下文预算角标修复：后端补发 `__context_budget__`，前端增加 ratio 兜底计算，不再固定 `0%`。
+- 前端上下文预算角标修复：后端在三种流式模式统一发送 `__context_budget__`，前端增加 ratio 兜底计算与超时提示，不再固定 `0%`。
+- 练习多题链路统一：`practice` 下 `num_questions > 1` 走试卷生成与 `exam_meta`，提交答案后自动走考试评卷链路，避免题型/评分错配。
+- QuizMaster 增强：显式题型锁定、选择题形态校验（失败单次重试）、考试答题卡总分归一为 100。
+- Prompt 契约修复：练习评卷时“标准答案”严格来自 `【标准答案】` 段并按题号逐题对齐。
 

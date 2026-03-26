@@ -126,13 +126,14 @@
 
 ---
 
-## 6. 文档一致性修正（本轮已同步）
+## 6. 文档一致性修正（含本次增量）
 
 已更新：
 
-1. README：补充新元事件、新增配置项口径、链接本报告。  
-2. ARCHITECTURE：补充上下文分区、工具契约、Structured Outputs、FTS5 双路径。  
-3. USAGE：修正检索默认参数口径，补充上下文预算角标说明。  
+1. README：补充 practice 多题链路（`num_questions > 1` 走 `generate_exam_paper`）、评卷分流（`quiz_meta/exam_meta`）、上下文预算超时提示语义。  
+2. ARCHITECTURE：更新 practice 出题/评卷主流程，明确 Runner 预取记忆与 request 级去重；补充题型锁定、选择题形态重试、考试总分归一。  
+3. USAGE：修正练习模式“单题”过时描述，改为“单题或多题”；补充预算事件未到达时的前端提示行为。  
+4. 进展报告：新增本节用于记录 Full Fix 后的增量热修口径，避免文档与代码脱节。  
 
 ---
 

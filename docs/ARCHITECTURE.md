@@ -274,25 +274,27 @@ Runner.run_learn_mode_stream()
 
 ```
 【出题阶段】
-用户: "给我出一道矩阵秩的题"
+用户: "给我出一道矩阵秩的题" 或 "出 10 道 Attention 选择题"
   ↓
 Runner.run_practice_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
   ↓
 [工具] Retriever.retrieve() → RAG 上下文
-[工具] memory_search()      → 历史错题片段（追加到 system prompt）
+[工具] memory_search()      → 历史错题片段（Runner 预取，request 级去重）
   ↓
 _is_answer_submission() → False（用户在请求出题）
   ↓
-[LLM #2] QuizMaster.generate_quiz()  ← Plan-Solve
-  plan:  _plan_quiz()（topic/difficulty/question_type/focus_points）
-  solve: 基于 QUIZMASTER_PROMPT 生成结构化题目 JSON
-  tools: 默认不循环；必要时直调 MCP（websearch/get_datetime）
-  │
-  ├─ 生成题目正文（可见）
-  ├─ 生成 `quiz_meta`（内部 tool_calls，不展示）
-  └─ 流式返回题目 + 元数据事件（`__tool_calls__`）
+if num_questions > 1:
+  [LLM #2] QuizMaster.generate_exam_paper() ← Plan-Solve
+    ├─ 生成练习多题正文（内部仍走试卷 schema）
+    └─ 生成 `exam_meta`（answer_sheet/total_score，内部 tool_calls）
+else:
+  [LLM #2] QuizMaster.generate_quiz() ← Plan-Solve
+    ├─ 生成单题正文
+    └─ 生成 `quiz_meta`（内部 tool_calls）
+  ↓
+流式返回题目 + 元数据事件（`__tool_calls__`）
 
 【评卷阶段】
 用户: "1.A  2.正确  3.B..."（提交答案）
@@ -300,20 +302,16 @@ _is_answer_submission() → False（用户在请求出题）
 Runner.run_practice_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
-[工具] memory_search() → 历史错题上下文
+[工具] memory_search() → 历史错题上下文（Runner 预取）
   ↓
 _is_answer_submission() → True（检测到答案格式）
-_extract_quiz_from_history() → 从对话历史中提取题目原文（纯 Python，无 LLM）
+if history has exam_meta:
+  [LLM #2~N] GraderAgent.grade_exam_stream() ← 考试评卷链路（按 answer_sheet）
+else:
+  _extract_quiz_from_history() → 从历史提取题目原文
+  [LLM #2~N] GraderAgent.grade_practice_stream() ← 练习评卷链路
   ↓
-[LLM #2] GraderAgent._generate_practice_plan()  ← 内部计划（不展示）
-[LLM #3~N] GraderAgent.grade_practice_stream()  ← ReAct-Solve
-  system: GRADER_SYSTEM（强制逐字引用原文规则）
-  user:   GRADER_PRACTICE_PROMPT（题目 + 学生答案）
-  tools:  仅 calculator，temperature=0.1
-  │
-  ├─ 轮1：逐题对照表（原文引用标准答案 vs 学生答案，判断对错）
-  ├─ 轮2：call calculator('sum([20, 15, 0, 15, 10])')
-  └─ 轮3：流式输出得分 + 各题讲评 + 易错提醒（必要时伴随 `__status__` 事件）
+两条链路都仅调用 calculator 汇总，最后流式输出评分+讲评
   ↓
 _save_practice_record()   → 写 practices/ Markdown 文件
 _save_grading_to_memory() → 写 SQLite（episodes + user_profiles）
@@ -592,3 +590,12 @@ gunicorn backend.api:app -w 4 -k uvicorn.workers.UvicornWorker
 - 记忆检索后端：`memory/store.py` 增加 `FTS5 -> LIKE` 双路径，`MEMORY_SEARCH_BACKEND` 控制优先级。
 - 可观测性补齐：MCP 工具侧增加 `tool_progress`（start/end）事件；流式状态链路更完整（检索/工具/继续推理/最终回答）。
 - 上下文预算可视化：流式链路增加 `__context_budget__` 事件，前端右上角角标可展示 pressure 与分段 token。
+
+### 6. 2026-03-26 增量修复（练习/评卷链路）
+
+- practice 多题请求（`num_questions > 1`）统一走 `QuizMaster.generate_exam_paper()`，并写入 `exam_meta`，避免“多题仍按单题 schema 解析”。
+- practice 提交答案时新增分流：历史含 `exam_meta` 走 `Grader.grade_exam_stream()`；否则走 `Grader.grade_practice_stream()`。
+- QuizMaster 新增题型锁定：用户显式指定题型（且非“综合题”）时，计划阶段不得覆盖题型。
+- QuizMaster 新增选择题形态校验与单次重试：题面缺少 A/B/C/D 或标准答案不合法时触发一次严格重试。
+- 试卷答题卡分值口径统一：渲染阶段将 `answer_sheet` 总分归一到 100，避免跨链路总分不一致。
+- 流式上下文预算事件补齐：learn/practice/exam 三模式统一发 `__context_budget__`；前端增加“未收到预算事件”超时提示。
