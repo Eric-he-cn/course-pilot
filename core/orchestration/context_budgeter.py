@@ -9,6 +9,10 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.metrics import add_event, estimate_text_tokens
+from core.orchestration.prompts import (
+    CONTEXT_COMPRESSOR_SYSTEM_PROMPT,
+    CONTEXT_COMPRESSOR_USER_PROMPT,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -43,9 +47,9 @@ class ContextBudgeter:
     def __init__(self) -> None:
         self.ctx_total_tokens = _env_int("CTX_TOTAL_TOKENS", 8192)
         self.ctx_safety_margin = _env_int("CTX_SAFETY_MARGIN", 256)
-        self.history_recent_turns = _env_int("CB_HISTORY_RECENT_TURNS", 6)
-        self.recent_raw_turns = max(1, _env_int("CB_RECENT_RAW_TURNS", 3))
-        self.history_summary_max_tokens = _env_int("CB_HISTORY_SUMMARY_MAX_TOKENS", 700)
+        self.history_recent_turns = _env_int("CB_HISTORY_RECENT_TURNS", 10)
+        self.recent_raw_turns = max(1, _env_int("CB_RECENT_RAW_TURNS", 5))
+        self.history_summary_max_tokens = _env_int("CB_HISTORY_SUMMARY_MAX_TOKENS", 2000)
         self.rag_max_tokens = _env_int("CB_RAG_MAX_TOKENS", 1800)
         self.memory_max_tokens = _env_int("CB_MEMORY_MAX_TOKENS", 450)
 
@@ -201,18 +205,9 @@ class ContextBudgeter:
         ):
             return "", None, "skip"
 
-        prompt = (
-            "请将以下对话历史压缩为 JSON，保留任务连续性，不要编造事实。\n"
-            "仅输出 JSON，不要额外说明。\n"
-            "字段固定：facts/constraints/unresolved/next_steps。\n"
-            "每个字段最多 4 条，每条不超过 28 个汉字。\n"
-            f"\n历史内容：\n{source_text}"
-        )
+        prompt = CONTEXT_COMPRESSOR_USER_PROMPT.format(source_text=source_text)
         messages = [
-            {
-                "role": "system",
-                "content": "你是上下文压缩器。只能输出合法 JSON。",
-            },
+            {"role": "system", "content": CONTEXT_COMPRESSOR_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         timeout_s = max(0.4, self.llm_compress_timeout_ms / 1000.0)

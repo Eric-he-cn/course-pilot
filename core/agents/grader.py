@@ -11,6 +11,11 @@ from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import (
     GRADER_PROMPT,
+    GRADER_GRADE_SYSTEM_PROMPT,
+    GRADER_PRACTICE_PLAN_SYSTEM_PROMPT,
+    GRADER_EXAM_PLAN_SYSTEM_PROMPT,
+    GRADER_PRACTICE_PLAN_PROMPT,
+    GRADER_EXAM_INTERNAL_PLAN_PROMPT,
     GRADER_SYSTEM,
     GRADER_PRACTICE_PROMPT,
     GRADER_EXAM_PROMPT,
@@ -76,11 +81,7 @@ class GraderAgent:
         return [
             {
                 "role": "system",
-                "content": (
-                    "你是一位公正的评分专家。"
-                    "计算总分时必须调用 calculator 工具，不得自行心算，"
-                    "调用完毕后再输出 JSON 结果。"
-                ),
+                "content": GRADER_GRADE_SYSTEM_PROMPT,
             },
             {"role": "user", "content": prompt},
         ]
@@ -88,35 +89,10 @@ class GraderAgent:
     """构建练习评分“内部计划”提示词（仅供模型内部规划，不向用户展示）。"""
     @staticmethod
     def _build_practice_plan_prompt(quiz_content: str, student_answer: str) -> str:
-        return f"""请为本次练习评卷生成一个“内部执行计划”，用于后续评分阶段。
-
-【题目（来自本次练习）】
-{quiz_content}
-
-【学生提交的答案】
-{student_answer}
-
-要求：
-1. 只输出 JSON，不要输出解释文字。
-2. JSON 字段包含：
-   - question_steps: 按题号顺序的逐题步骤（数组，每项含 question_no 和 action）
-   - final_step: 最后一步固定为“调用 calculator 汇总总分”
-   - score_formula: 计算总分的公式字符串模板（例如 sum([q1_score,q2_score,...])）
-   - key_mistakes: 可能的错误类型（数组）
-3. 不要输出最终分数与讲评正文。
-4. 必须保证：每道题恰好一个步骤；计算总分只能在最后一步执行。
-
-JSON 示例：
-{{
-  "question_steps": [
-    {{"question_no": 1, "action": "核对第1题标准答案与学生答案并给分"}},
-    {{"question_no": 2, "action": "核对第2题标准答案与学生答案并给分"}}
-  ],
-  "final_step": "调用 calculator 汇总总分",
-  "score_formula": "sum([q1_score,q2_score])",
-  "key_mistakes": ["概念性错误", "步骤缺失"]
-}}
-"""
+        return GRADER_PRACTICE_PLAN_PROMPT.format(
+            quiz_content=quiz_content,
+            student_answer=student_answer,
+        )
 
     """从题面文本中提取题号序列，供逐题计划兜底构建。"""
     @staticmethod
@@ -167,7 +143,7 @@ JSON 示例：
         default_plan = self._build_default_practice_plan(quiz_content)
         q_numbers = [item["question_no"] for item in default_plan["question_steps"]]
         messages = [
-            {"role": "system", "content": "你是一个严谨的评卷计划器，只输出 JSON。"},
+            {"role": "system", "content": GRADER_PRACTICE_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_practice_plan_prompt(quiz_content, student_answer)},
         ]
         try:
@@ -222,33 +198,15 @@ JSON 示例：
     """构建考试评分“内部计划”提示词（仅内部使用）。"""
     @staticmethod
     def _build_exam_plan_prompt(exam_paper: str, student_answer: str) -> str:
-        return f"""你是考试评卷计划器。请输出本次评卷的内部计划（JSON）。
-
-【试卷】
-{exam_paper}
-
-【学生答案】
-{student_answer}
-
-要求：
-1. 只输出 JSON，不要输出解释。
-2. 字段必须包含：
-   - checks: 逐题核对步骤数组
-   - score_formula: 汇总总分的公式（用于 calculator）
-   - weak_points_hint: 可能的薄弱点数组
-
-JSON 示例：
-{{
-  "checks": ["核对第1题答案匹配", "核对第2题步骤完整性"],
-  "score_formula": "sum([10,8,0,15])",
-  "weak_points_hint": ["概念边界不清", "步骤缺失"]
-}}
-"""
+        return GRADER_EXAM_INTERNAL_PLAN_PROMPT.format(
+            exam_paper=exam_paper,
+            student_answer=student_answer,
+        )
 
     """生成考试评分内部计划。"""
     def _generate_exam_plan(self, exam_paper: str, student_answer: str) -> dict:
         messages = [
-            {"role": "system", "content": "你是一个严谨的考试评卷计划器，只输出 JSON。"},
+            {"role": "system", "content": GRADER_EXAM_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_exam_plan_prompt(exam_paper, student_answer)},
         ]
         try:

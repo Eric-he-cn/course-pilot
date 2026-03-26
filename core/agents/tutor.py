@@ -9,7 +9,11 @@
 import os
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import TUTOR_PROMPT
+from core.orchestration.prompts import (
+    TUTOR_PROMPT,
+    TUTOR_DEFAULT_SYSTEM_PROMPT,
+    TUTOR_TOOL_SYSTEM_PROMPT,
+)
 from mcp_tools.client import get_tool_schemas
 from backend.schemas import TutorResult
 from core.metrics import add_event, estimate_text_tokens
@@ -57,22 +61,12 @@ class TutorAgent:
                 )
             else:
                 rule_2 = "2. 优先从数据库中获取数据，遇到超出知识库的信息或者需要网络查询的信息，可以调用 websearch 工具。"
-            system_prompt = (
-                f"你是一位专业的大学课程导师。"
-                f"你可以使用以下工具：{tool_desc}。"
-                f"规则：\n"
-                f"1. 工具调用采用 Plan/Act/Synthesize 三阶段：Act 仅做工具决策和短状态，Synthesize 再输出完整答案。\n"
-                f"2. 工具选择必须最小充分：只有当不用工具无法可靠回答时才调用，避免重复调用同一工具。\n"
-                f"3. 遇到需要外部时效信息（如当前日期时间、新闻）时必须调用对应工具，禁止臆造。\n"
-                f"4. 数值计算优先使用 calculator；若是纯概念性解释且无数值推导，可不调用计算器。\n"
-                f"{rule_2}\n"
-                f"6. 用户明确要求保存笔记时调用 filewriter（文件名中文，扩展名 .md）。\n"
-                f"7. 用户要求思维导图/结构化知识树时调用 mindmap_generator。\n"
-                f"8. memory_search 只在确实需要历史错题或学习轨迹时调用，且避免重复查询。\n"
-                f"9. 禁止编造工具结果；工具失败时应说明降级路径，再进入最终回答。"
+            system_prompt = TUTOR_TOOL_SYSTEM_PROMPT.format(
+                tool_desc=tool_desc,
+                rule_2=rule_2,
             )
         else:
-            system_prompt = "你是一位专业的大学课程导师。"
+            system_prompt = TUTOR_DEFAULT_SYSTEM_PROMPT
 
         # 注入用户画像（薄弱知识点等），失败不影响主流程
         try:

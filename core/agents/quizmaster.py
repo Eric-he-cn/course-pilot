@@ -10,7 +10,18 @@ import json
 import logging
 from typing import Dict, Any
 from core.llm.openai_compat import get_llm_client
-from core.orchestration.prompts import QUIZMASTER_PROMPT, EXAM_GENERATOR_PROMPT
+from core.orchestration.prompts import (
+    QUIZMASTER_PROMPT,
+    EXAM_GENERATOR_PROMPT,
+    QUIZMASTER_JSON_REPAIR_SYSTEM_PROMPT,
+    QUIZMASTER_JSON_REPAIR_PROMPT,
+    QUIZMASTER_PLAN_SYSTEM_PROMPT,
+    QUIZMASTER_PLAN_PROMPT,
+    QUIZMASTER_EXAM_PLAN_SYSTEM_PROMPT,
+    QUIZMASTER_EXAM_PLAN_PROMPT,
+    QUIZMASTER_SOLVE_SYSTEM_PROMPT,
+    EXAM_SOLVE_SYSTEM_PROMPT,
+)
 from backend.schemas import Quiz
 from mcp_tools.client import MCPTools
 
@@ -70,20 +81,14 @@ class QuizMasterAgent:
         max_tokens: int = 1200,
     ) -> Dict[str, Any]:
         """把不规范输出修复为严格 JSON；失败返回空 dict。"""
-        prompt = (
-            "请把下面内容修复为一个合法 JSON 对象，仅输出 JSON，不要任何解释。\n"
-            "要求：\n"
-            "1) 仅保留与目标 schema 相关字段；\n"
-            "2) 所有 key/value 使用双引号；\n"
-            "3) 换行写为 \\n；\n"
-            "4) 不要 markdown 代码块。\n\n"
-            f"目标 schema:\n{schema_hint}\n\n"
-            f"原始内容:\n{str(raw_text or '')[:9000]}"
+        prompt = QUIZMASTER_JSON_REPAIR_PROMPT.format(
+            schema_hint=schema_hint,
+            raw_text=str(raw_text or "")[:9000],
         )
         try:
             repaired = self.llm.chat(
                 messages=[
-                    {"role": "system", "content": "你是 JSON 修复器，只输出合法 JSON。"},
+                    {"role": "system", "content": QUIZMASTER_JSON_REPAIR_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
@@ -199,23 +204,13 @@ class QuizMasterAgent:
         requested_question_type: str,
         memory_ctx: str,
     ) -> str:
-        return f"""你是练习命题规划器。请根据用户请求先生成“出题计划”。
-
-用户请求：{user_request}
-默认难度：{default_difficulty}
-期望题量：{requested_num_questions}
-期望题型：{requested_question_type}
-{memory_ctx}
-
-请只输出 JSON，字段如下：
-{{
-  "topic": "本次出题的核心知识点",
-  "num_questions": 题目数量（1-20）,
-  "difficulty": "easy|medium|hard",
-  "question_type": "选择题/判断题/填空题/简答题/论述题/计算题/综合题",
-  "focus_points": ["知识点1", "知识点2"]
-}}
-"""
+        return QUIZMASTER_PLAN_PROMPT.format(
+            user_request=user_request,
+            default_difficulty=default_difficulty,
+            requested_num_questions=requested_num_questions,
+            requested_question_type=requested_question_type,
+            memory_ctx=memory_ctx,
+        )
 
     """Plan 阶段：从用户请求中抽取主题、题量、题型与难度。"""
     def _plan_quiz(
@@ -227,7 +222,7 @@ class QuizMasterAgent:
         memory_ctx: str,
     ) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": "你是一个严谨的出题规划器，只输出 JSON。"},
+            {"role": "system", "content": QUIZMASTER_PLAN_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": self._build_plan_prompt(
@@ -330,28 +325,10 @@ class QuizMasterAgent:
     """构建考试计划提示词（Plan 阶段）。"""
     @staticmethod
     def _build_exam_plan_prompt(user_request: str, memory_ctx: str) -> str:
-        return f"""你是考试命题规划器。请先生成一份考试出卷计划（JSON）。
-
-用户请求：
-{user_request}
-
-{memory_ctx}
-
-要求：
-1. 只输出 JSON，不要解释。
-2. 字段必须包含：
-   - scope: 考试范围描述
-   - num_questions: 题目总数（整数，建议 6~20）
-   - difficulty_ratio: 题目难度分配（easy/medium/hard 的题目数量）
-3. three 类题目数量之和必须等于 num_questions。
-
-JSON 示例：
-{{
-  "scope": "第五章 Transformer",
-  "num_questions": 10,
-  "difficulty_ratio": {{"easy": 3, "medium": 5, "hard": 2}}
-}}
-"""
+        return QUIZMASTER_EXAM_PLAN_PROMPT.format(
+            user_request=user_request,
+            memory_ctx=memory_ctx,
+        )
 
     """规范化考试计划，确保题量和难度分配合法。"""
     @staticmethod
@@ -404,7 +381,7 @@ JSON 示例：
     """Plan 阶段：解析考试请求并生成结构化配置。"""
     def _plan_exam(self, user_request: str, memory_ctx: str) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": "你是一个严谨的考试命题规划器，只输出 JSON。"},
+            {"role": "system", "content": QUIZMASTER_EXAM_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_exam_plan_prompt(user_request, memory_ctx)},
         ]
         try:
@@ -543,13 +520,7 @@ JSON 示例：
         
         # 4) 调用模型（默认不开启 function-calling，避免非必要工具循环）
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是一位出题专家。必须只输出一个合法 JSON 对象，"
-                    "不得输出解释、前后缀文本或 markdown。"
-                ),
-            },
+            {"role": "system", "content": QUIZMASTER_SOLVE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
         response = self.llm.chat(messages, temperature=0.4, max_tokens=1400)
@@ -647,13 +618,7 @@ JSON 示例：
         prompt += "\n\n工具使用约束：默认不使用外部工具，仅在请求明确需要最新信息时使用外部参考。"
 
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是一位严谨的考试出题专家。必须只输出一个合法 JSON 对象，"
-                    "不得输出解释、前后缀文本或 markdown。"
-                ),
-            },
+            {"role": "system", "content": EXAM_SOLVE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         response = self.llm.chat(messages, temperature=0.4, max_tokens=3200)
