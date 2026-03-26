@@ -7,6 +7,7 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
+import os
 from typing import List, Optional
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import (
@@ -21,6 +22,7 @@ from core.orchestration.prompts import (
     GRADER_EXAM_PROMPT,
 )
 from backend.schemas import GradeReport
+from core.metrics import add_event
 
 
 """只暴露 calculator 给 Grader，不需要其他工具。"""
@@ -54,6 +56,63 @@ class GraderAgent:
     """初始化 GraderAgent，复用全局 LLM 客户端。"""
     def __init__(self):
         self.llm = get_llm_client()
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _structured_chat_json(
+        self,
+        *,
+        messages: List[dict],
+        schema_name: str,
+        schema: dict,
+        temperature: float,
+        max_tokens: int,
+        flag_env: str = "ENABLE_STRUCTURED_OUTPUTS_GRADER",
+    ) -> dict:
+        if not self._env_bool(flag_env, False):
+            return {}
+        try:
+            response = self.llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+            )
+            payload = self._extract_json_payload(response)
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=True,
+                    fallback=False,
+                )
+            except Exception:
+                pass
+            return payload if isinstance(payload, dict) else {}
+        except Exception as ex:
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=False,
+                    fallback=True,
+                    error=str(ex),
+                )
+            except Exception:
+                pass
+            return {}
 
     """评分解析与消息组装辅助。"""
 
@@ -146,9 +205,40 @@ class GraderAgent:
             {"role": "system", "content": GRADER_PRACTICE_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_practice_plan_prompt(quiz_content, student_answer)},
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "question_steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question_no": {"type": "integer"},
+                            "action": {"type": "string"},
+                        },
+                        "required": ["question_no", "action"],
+                        "additionalProperties": False,
+                    },
+                },
+                "final_step": {"type": "string"},
+                "score_formula": {"type": "string"},
+                "checks": {"type": "array", "items": {"type": "string"}},
+                "key_mistakes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["question_steps", "final_step", "score_formula", "checks", "key_mistakes"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.1, max_tokens=800)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="grader_practice_plan",
+                schema=schema,
+                temperature=0.1,
+                max_tokens=800,
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.1, max_tokens=800)
+                plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
                 return default_plan
 
@@ -209,9 +299,27 @@ class GraderAgent:
             {"role": "system", "content": GRADER_EXAM_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_exam_plan_prompt(exam_paper, student_answer)},
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "checks": {"type": "array", "items": {"type": "string"}},
+                "score_formula": {"type": "string"},
+                "weak_points_hint": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["checks", "score_formula", "weak_points_hint"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.1, max_tokens=900)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="grader_exam_plan",
+                schema=schema,
+                temperature=0.1,
+                max_tokens=900,
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.1, max_tokens=900)
+                plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
                 return {"checks": [], "score_formula": "", "weak_points_hint": []}
             return {

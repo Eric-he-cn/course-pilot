@@ -349,6 +349,11 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 | `CTX_TOTAL_TOKENS` | `8192` | 上下文预算总 token |
 | `CTX_SAFETY_MARGIN` | `256` | 预算安全边界，避免贴边超限 |
 | `CB_*` | 见 `.env` 示例 | History/RAG/Memory 三段预算和压缩参数 |
+| `RAG_COMPRESS_OWNER` | `retriever` | RAG 压缩责任方：`retriever`（默认，避免工具轮重复压缩）或 `budgeter` |
+| `ENABLE_STRUCTURED_OUTPUTS_QUIZ` | `0` | Quiz 结构化输出灰度开关（strict json_schema） |
+| `ENABLE_STRUCTURED_OUTPUTS_EXAM` | `0` | Exam 结构化输出灰度开关（strict json_schema） |
+| `ENABLE_STRUCTURED_OUTPUTS_GRADER` | `0` | Grader 结构化输出灰度开关（strict json_schema） |
+| `MEMORY_SEARCH_BACKEND` | `fts5` | 记忆检索后端：`fts5` 优先，失败自动回退 `like` |
 
 ---
 

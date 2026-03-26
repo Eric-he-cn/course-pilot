@@ -22,6 +22,7 @@ class SQLiteMemoryStore:
             db_path = os.getenv("MEMORY_DB_PATH", "./data/memory/memory.db")
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self.db_path = db_path
+        self.search_backend = str(os.getenv("MEMORY_SEARCH_BACKEND", "fts5")).strip().lower() or "fts5"
         self._init_tables()
 
     # ── 内部工具 ──────────────────────────────────────────────────────────────
@@ -71,6 +72,48 @@ class SQLiteMemoryStore:
                 conn.execute(
                     "ALTER TABLE user_profiles ADD COLUMN concept_mastery TEXT DEFAULT '{}'"
                 )
+            self._init_fts(conn)
+
+    def _init_fts(self, conn: sqlite3.Connection) -> None:
+        """初始化 FTS5 虚表与触发器；SQLite 不支持 FTS5 时静默回退。"""
+        try:
+            conn.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+                    id UNINDEXED,
+                    user_id UNINDEXED,
+                    course_name UNINDEXED,
+                    event_type UNINDEXED,
+                    content
+                );
+
+                CREATE TRIGGER IF NOT EXISTS trg_episodes_ai AFTER INSERT ON episodes BEGIN
+                    INSERT INTO episodes_fts(id, user_id, course_name, event_type, content)
+                    VALUES (new.id, new.user_id, new.course_name, new.event_type, new.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_episodes_ad AFTER DELETE ON episodes BEGIN
+                    DELETE FROM episodes_fts WHERE id = old.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_episodes_au AFTER UPDATE ON episodes BEGIN
+                    DELETE FROM episodes_fts WHERE id = old.id;
+                    INSERT INTO episodes_fts(id, user_id, course_name, event_type, content)
+                    VALUES (new.id, new.user_id, new.course_name, new.event_type, new.content);
+                END;
+            """)
+            conn.execute(
+                """
+                INSERT INTO episodes_fts(id, user_id, course_name, event_type, content)
+                SELECT e.id, e.user_id, e.course_name, e.event_type, e.content
+                FROM episodes e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM episodes_fts f WHERE f.id = e.id
+                )
+                """
+            )
+        except Exception:
+            # 兼容不带 FTS5 的 SQLite 构建：保留 LIKE 路径。
+            pass
 
     # ── 情景记忆 CRUD ─────────────────────────────────────────────────────────
 
@@ -114,37 +157,37 @@ class SQLiteMemoryStore:
         基于关键词的情景记忆检索（Phase 1 简易版）。
         按 importance DESC, created_at DESC 排序后取 top_k。
         """
-        # 把查询拆成词——每个词单独 LIKE 搜索，OR 合并
-        terms = [t.strip() for t in query.split() if t.strip()]
-        if not terms:
-            terms = [query]
+        backend = str(os.getenv("MEMORY_SEARCH_BACKEND", self.search_backend)).strip().lower() or "fts5"
+        fetch_limit = max(top_k * 5, top_k)
 
-        like_clauses = " OR ".join(["content LIKE ?" for _ in terms])
-        params: List[Any] = [f"%{t}%" for t in terms]
-
-        # course / user 过滤
-        base_where = "user_id = ? AND course_name = ? AND importance >= ?"
-        params = [user_id, course_name, min_importance] + params
-
-        # event_type 过滤（可选）
-        type_clause = ""
-        if event_types:
-            placeholders = ",".join(["?" for _ in event_types])
-            type_clause = f" AND event_type IN ({placeholders})"
-            params += event_types
-
-        sql = f"""
-            SELECT * FROM episodes
-            WHERE {base_where}
-              AND ({like_clauses})
-              {type_clause}
-            ORDER BY importance DESC, created_at DESC
-            LIMIT ?
-        """
-        params.append(max(top_k * 5, top_k))
-
-        with self._conn() as conn:
-            rows = conn.execute(sql, params).fetchall()
+        rows: List[sqlite3.Row] = []
+        if backend == "like":
+            rows = self._search_rows_like(
+                query=query,
+                course_name=course_name,
+                user_id=user_id,
+                event_types=event_types,
+                min_importance=min_importance,
+                fetch_limit=fetch_limit,
+            )
+        else:
+            rows = self._search_rows_fts5(
+                query=query,
+                course_name=course_name,
+                user_id=user_id,
+                event_types=event_types,
+                min_importance=min_importance,
+                fetch_limit=fetch_limit,
+            )
+            if not rows:
+                rows = self._search_rows_like(
+                    query=query,
+                    course_name=course_name,
+                    user_id=user_id,
+                    event_types=event_types,
+                    min_importance=min_importance,
+                    fetch_limit=fetch_limit,
+                )
 
         results = []
         for row in rows:
@@ -164,6 +207,83 @@ class SQLiteMemoryStore:
             if len(results) >= top_k:
                 break
         return results
+
+    def _query_terms(self, query: str) -> List[str]:
+        terms = [t.strip() for t in str(query or "").split() if t.strip()]
+        if not terms:
+            terms = [str(query or "").strip()]
+        return [t for t in terms if t]
+
+    def _search_rows_like(
+        self,
+        query: str,
+        course_name: str,
+        user_id: str,
+        event_types: Optional[List[str]],
+        min_importance: float,
+        fetch_limit: int,
+    ) -> List[sqlite3.Row]:
+        terms = self._query_terms(query)
+        like_clauses = " OR ".join(["content LIKE ?" for _ in terms])
+        params: List[Any] = [user_id, course_name, min_importance] + [f"%{t}%" for t in terms]
+
+        type_clause = ""
+        if event_types:
+            placeholders = ",".join(["?" for _ in event_types])
+            type_clause = f" AND event_type IN ({placeholders})"
+            params += event_types
+
+        sql = f"""
+            SELECT * FROM episodes
+            WHERE user_id = ? AND course_name = ? AND importance >= ?
+              AND ({like_clauses})
+              {type_clause}
+            ORDER BY importance DESC, created_at DESC
+            LIMIT ?
+        """
+        params.append(fetch_limit)
+        with self._conn() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def _search_rows_fts5(
+        self,
+        query: str,
+        course_name: str,
+        user_id: str,
+        event_types: Optional[List[str]],
+        min_importance: float,
+        fetch_limit: int,
+    ) -> List[sqlite3.Row]:
+        terms = self._query_terms(query)
+        if not terms:
+            return []
+        fts_query = " OR ".join(terms)
+        params: List[Any] = [fts_query, user_id, course_name, min_importance]
+
+        type_clause = ""
+        if event_types:
+            placeholders = ",".join(["?" for _ in event_types])
+            type_clause = f" AND e.event_type IN ({placeholders})"
+            params += event_types
+        params.append(fetch_limit)
+
+        sql = f"""
+            SELECT e.*
+            FROM episodes_fts f
+            JOIN episodes e ON e.id = f.id
+            WHERE f.episodes_fts MATCH ?
+              AND e.user_id = ?
+              AND e.course_name = ?
+              AND e.importance >= ?
+              {type_clause}
+            ORDER BY e.importance DESC, e.created_at DESC
+            LIMIT ?
+        """
+        try:
+            with self._conn() as conn:
+                return conn.execute(sql, params).fetchall()
+        except Exception:
+            return []
 
     def get_recent_episodes(
         self,

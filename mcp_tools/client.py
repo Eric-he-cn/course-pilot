@@ -8,6 +8,7 @@
 """
 import atexit
 import json
+import logging
 import math
 import os
 import subprocess
@@ -914,6 +915,12 @@ class MCPTools:
         """按名称调用工具（严格经由 stdio MCP，不做本地回退）。"""
         t0 = time.perf_counter()
         payload = dict(kwargs)
+        logger = logging.getLogger("mcp.call")
+        try:
+            from core.metrics import add_event as _add_event
+            _add_event("tool_progress", tool_name=tool_name, stage="start")
+        except Exception:
+            pass
         # filewriter 的 notes_dir 由 runner 注入上下文；通过 MCP 参数透传给子进程。
         if tool_name == "filewriter" and "notes_dir" not in payload:
             payload["notes_dir"] = MCPTools._context.get("notes_dir", "./data/notes")
@@ -934,15 +941,24 @@ class MCPTools:
             }
             success = False
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info("[mcp] tool=%s success=%s elapsed_ms=%.1f", tool_name, success, elapsed_ms)
         try:
             from core.metrics import add_event as _add_event
 
             _add_event(
                 "tool_call",
                 tool_name=tool_name,
-                tool_ms=(time.perf_counter() - t0) * 1000.0,
+                tool_ms=elapsed_ms,
                 tool_success=success,
                 success=success,
+            )
+            _add_event(
+                "tool_progress",
+                tool_name=tool_name,
+                stage="end",
+                success=success,
+                elapsed_ms=elapsed_ms,
             )
         except Exception:
             pass

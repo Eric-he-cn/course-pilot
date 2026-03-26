@@ -400,6 +400,7 @@ class OrchestrationRunner:
         context = ""
         citations_dicts = []
         if plan.need_rag:
+            yield {"__status__": "正在检索教材证据..."}
             retriever = self.load_retriever(course_name)
             if retriever:
                 chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("practice"))
@@ -421,6 +422,7 @@ class OrchestrationRunner:
         mem_agent = "grader" if answer_submission else "quizzer"
         mem_phase = "grade" if answer_submission else "generate"
 
+        yield {"__status__": "正在检索历史记忆..."}
         history_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
@@ -446,6 +448,7 @@ class OrchestrationRunner:
         MCPTools._context = {"notes_dir": notes_dir}
 
         if answer_submission:
+            yield {"__status__": "正在批改练习答案..."}
             self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
             quiz_content = self._extract_quiz_from_history(history)
             collected = []
@@ -463,6 +466,7 @@ class OrchestrationRunner:
             self._save_grading_to_memory(course_name, user_message, history, full_response)
             yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
+            yield {"__status__": "正在生成练习题..."}
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
             quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
@@ -600,6 +604,7 @@ class OrchestrationRunner:
 
         context = ""
         citations_dicts = []
+        yield {"__status__": "正在检索教材证据..."}
         retriever = self.load_retriever(course_name)
         if retriever:
             chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("exam"))
@@ -621,6 +626,7 @@ class OrchestrationRunner:
         mem_agent = "grader" if answer_submission else "quizzer"
         mem_phase = "grade" if answer_submission else "generate"
 
+        yield {"__status__": "正在检索历史记忆..."}
         history_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
@@ -641,6 +647,7 @@ class OrchestrationRunner:
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
         if answer_submission:
+            yield {"__status__": "正在批改考试答案..."}
             exam_paper = self._extract_exam_from_history(history)
             collected = []
             for chunk in self.grader.grade_exam_stream(
@@ -657,6 +664,7 @@ class OrchestrationRunner:
             self._save_exam_to_memory(course_name, full_response)
             yield f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
         else:
+            yield {"__status__": "正在生成考试试卷..."}
             exam_payload = self.quizmaster.generate_exam_paper(
                 course_name=course_name,
                 user_request=user_message,
@@ -1403,6 +1411,7 @@ class OrchestrationRunner:
         context = ""
         citations_dicts = []
         if plan.need_rag:
+            yield {"__status__": "正在检索教材证据..."}
             retriever = self.load_retriever(course_name)
             if retriever:
                 chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("learn"))
@@ -1411,6 +1420,7 @@ class OrchestrationRunner:
             else:
                 context = "（未找到相关教材，请先上传课程资料）"
 
+        yield {"__status__": "正在检索历史记忆..."}
         memory_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
@@ -1438,6 +1448,7 @@ class OrchestrationRunner:
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
 
+        yield {"__status__": "正在生成最终回答..."}
         yield from self.tutor.teach_stream(
             user_message, course_name, context,
             context_sections=context_sections,

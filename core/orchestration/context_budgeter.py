@@ -52,6 +52,7 @@ class ContextBudgeter:
         self.history_summary_max_tokens = _env_int("CB_HISTORY_SUMMARY_MAX_TOKENS", 2000)
         self.rag_max_tokens = _env_int("CB_RAG_MAX_TOKENS", 1800)
         self.memory_max_tokens = _env_int("CB_MEMORY_MAX_TOKENS", 450)
+        self.rag_compress_owner = str(os.getenv("RAG_COMPRESS_OWNER", "retriever")).strip().lower() or "retriever"
 
         self.enable_llm_history_compress = _env_bool("CB_ENABLE_LLM_HISTORY_COMPRESS", True)
         self.llm_compress_trigger_tokens = max(120, _env_int("CB_LLM_COMPRESS_TRIGGER_TOKENS", 600))
@@ -356,12 +357,18 @@ class ContextBudgeter:
         history_budget = self.history_summary_max_tokens + max(120, recent_turns * 120)
         hist_text = self._trim_to_tokens(hist_text, history_budget)
 
-        rag_comp = self.compress_rag_text(
-            query=query,
-            rag_text=rag_text,
-            sent_per_chunk=rag_sent_per_chunk,
-            sent_max_chars=rag_sent_max_chars,
-        )
+        rag_budgeter_compress_applied = False
+        if self.rag_compress_owner == "budgeter":
+            rag_comp = self.compress_rag_text(
+                query=query,
+                rag_text=rag_text,
+                sent_per_chunk=rag_sent_per_chunk,
+                sent_max_chars=rag_sent_max_chars,
+            )
+            rag_budgeter_compress_applied = True
+        else:
+            # 默认由 Retriever 负责句级压缩；Budgeter 只做 token 预算裁切，避免重复压缩。
+            rag_comp = str(rag_text or "").strip()
         rag_comp = self._trim_to_tokens(rag_comp, self.rag_max_tokens)
 
         mem_comp = self._trim_to_tokens(memory_text, self.memory_max_tokens)
@@ -394,6 +401,8 @@ class ContextBudgeter:
             history_summary_source=summary_source,
             history_llm_compress_applied=llm_applied,
             history_llm_compress_ms=llm_compress_ms,
+            rag_compress_owner=self.rag_compress_owner,
+            rag_budgeter_compress_applied=rag_budgeter_compress_applied,
             rag_tokens_est=rag_tokens,
             memory_tokens_est=memory_tokens,
             final_tokens_before_hard_trim_est=final_before_hard_trim_tokens,
@@ -408,6 +417,8 @@ class ContextBudgeter:
             "history_summary_source": summary_source,
             "history_llm_compress_applied": llm_applied,
             "history_llm_compress_ms": llm_compress_ms,
+            "rag_compress_owner": self.rag_compress_owner,
+            "rag_budgeter_compress_applied": rag_budgeter_compress_applied,
             "rag_text": rag_comp,
             "memory_text": mem_comp,
             "final_text": final,

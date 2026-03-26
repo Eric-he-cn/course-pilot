@@ -8,6 +8,7 @@
 """
 import json
 import logging
+import os
 from typing import Dict, Any
 from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import (
@@ -24,6 +25,7 @@ from core.orchestration.prompts import (
 )
 from backend.schemas import Quiz
 from mcp_tools.client import MCPTools
+from core.metrics import add_event
 
 """
 QuizMasterAgent：按知识点与难度生成结构化题目。
@@ -97,6 +99,69 @@ class QuizMasterAgent:
             payload = self._extract_json_payload(repaired)
             return payload if isinstance(payload, dict) else {}
         except Exception:
+            return {}
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _structured_chat_json(
+        self,
+        *,
+        messages: list,
+        schema_name: str,
+        schema: Dict[str, Any],
+        temperature: float,
+        max_tokens: int,
+        flag_env: str,
+    ) -> Dict[str, Any]:
+        if not self._env_bool(flag_env, False):
+            return {}
+        try:
+            response = self.llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+            )
+            payload = self._extract_json_payload(response)
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=True,
+                    fallback=False,
+                )
+            except Exception:
+                pass
+            return payload if isinstance(payload, dict) else {}
+        except Exception as ex:
+            try:
+                add_event(
+                    "structured_output",
+                    target=schema_name,
+                    feature_flag=flag_env,
+                    success=False,
+                    fallback=True,
+                    error=str(ex),
+                )
+            except Exception:
+                pass
+            self.logger.warning(
+                "[structured] failed schema=%s flag=%s err=%s",
+                schema_name,
+                flag_env,
+                str(ex),
+            )
             return {}
 
     """解析失败时返回兜底题目，防止上层链路中断。"""
@@ -234,9 +299,30 @@ class QuizMasterAgent:
                 ),
             },
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "num_questions": {"type": "integer"},
+                "difficulty": {"type": "string"},
+                "question_type": {"type": "string"},
+                "focus_points": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["topic", "num_questions", "difficulty", "question_type", "focus_points"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.2, max_tokens=600)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="quiz_plan",
+                schema=schema,
+                temperature=0.2,
+                max_tokens=600,
+                flag_env="ENABLE_STRUCTURED_OUTPUTS_QUIZ",
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.2, max_tokens=600)
+                plan = self._extract_json_payload(response)
             if not isinstance(plan, dict):
                 return {
                     "topic": user_request,
@@ -384,9 +470,37 @@ class QuizMasterAgent:
             {"role": "system", "content": QUIZMASTER_EXAM_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_exam_plan_prompt(user_request, memory_ctx)},
         ]
+        schema = {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string"},
+                "num_questions": {"type": "integer"},
+                "difficulty_ratio": {
+                    "type": "object",
+                    "properties": {
+                        "easy": {"type": "integer"},
+                        "medium": {"type": "integer"},
+                        "hard": {"type": "integer"},
+                    },
+                    "required": ["easy", "medium", "hard"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["scope", "num_questions", "difficulty_ratio"],
+            "additionalProperties": False,
+        }
         try:
-            response = self.llm.chat(messages, temperature=0.2, max_tokens=800)
-            plan = self._extract_json_payload(response)
+            plan = self._structured_chat_json(
+                messages=messages,
+                schema_name="exam_plan",
+                schema=schema,
+                temperature=0.2,
+                max_tokens=800,
+                flag_env="ENABLE_STRUCTURED_OUTPUTS_EXAM",
+            )
+            if not plan:
+                response = self.llm.chat(messages, temperature=0.2, max_tokens=800)
+                plan = self._extract_json_payload(response)
         except Exception:
             plan = {}
         return self._normalize_exam_plan(plan)
@@ -531,7 +645,30 @@ class QuizMasterAgent:
             {"role": "system", "content": QUIZMASTER_SOLVE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
-        response = self.llm.chat(messages, temperature=0.4, max_tokens=1400)
+        solve_schema = {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "standard_answer": {"type": "string"},
+                "rubric": {"type": "string"},
+                "difficulty": {"type": "string"},
+                "chapter": {"type": "string"},
+                "concept": {"type": "string"},
+            },
+            "required": ["question", "standard_answer", "rubric", "difficulty", "chapter", "concept"],
+            "additionalProperties": False,
+        }
+        solved_payload = self._structured_chat_json(
+            messages=messages,
+            schema_name="quiz_solve",
+            schema=solve_schema,
+            temperature=0.4,
+            max_tokens=1400,
+            flag_env="ENABLE_STRUCTURED_OUTPUTS_QUIZ",
+        )
+        response = ""
+        if not solved_payload:
+            response = self.llm.chat(messages, temperature=0.4, max_tokens=1400)
         
         # 5) 解析模型输出
         schema_hint = (
@@ -539,7 +676,7 @@ class QuizMasterAgent:
             '"difficulty":"easy|medium|hard","chapter":"...","concept":"..."}'
         )
         try:
-            quiz_dict = self._extract_json_payload(response)
+            quiz_dict = solved_payload if solved_payload else self._extract_json_payload(response)
             quiz_dict["question"] = self._sanitize_text(quiz_dict.get("question", ""))
             quiz_dict["standard_answer"] = self._sanitize_text(quiz_dict.get("standard_answer", ""))
             quiz_dict["rubric"] = self._sanitize_text(quiz_dict.get("rubric", ""))
@@ -637,7 +774,53 @@ class QuizMasterAgent:
             {"role": "system", "content": EXAM_SOLVE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        response = self.llm.chat(messages, temperature=0.4, max_tokens=3200)
+        solve_schema = {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "instructions": {"type": "string"},
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "question": {"type": "string"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "score": {"type": "integer"},
+                            "standard_answer": {"type": "string"},
+                            "rubric": {"type": "string"},
+                            "chapter": {"type": "string"},
+                            "concept": {"type": "string"},
+                        },
+                        "required": [
+                            "type",
+                            "question",
+                            "options",
+                            "score",
+                            "standard_answer",
+                            "rubric",
+                            "chapter",
+                            "concept",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["title", "instructions", "questions"],
+            "additionalProperties": False,
+        }
+        solved_payload = self._structured_chat_json(
+            messages=messages,
+            schema_name="exam_solve",
+            schema=solve_schema,
+            temperature=0.4,
+            max_tokens=3200,
+            flag_env="ENABLE_STRUCTURED_OUTPUTS_EXAM",
+        )
+        response = ""
+        if not solved_payload:
+            response = self.llm.chat(messages, temperature=0.4, max_tokens=3200)
 
         schema_hint = (
             '{"title":"...","instructions":"...",'
@@ -645,7 +828,7 @@ class QuizMasterAgent:
             '"score":10,"standard_answer":"...","rubric":"...","chapter":"...","concept":"..."}]}'
         )
         try:
-            exam_json = self._extract_json_payload(response)
+            exam_json = solved_payload if solved_payload else self._extract_json_payload(response)
             return self._render_exam_paper(course_name=course_name, exam_json=exam_json)
         except Exception as e:
             err = str(e).strip() or "unknown_parse_error"
