@@ -342,7 +342,13 @@ def build_index(course_name: str):
 
 
 def _context_window_health(payload: dict) -> tuple[str, str]:
-    ratio = float(payload.get("context_pressure_ratio", 0.0) or 0.0)
+    ratio_raw = payload.get("context_pressure_ratio", None)
+    ratio = float(ratio_raw or 0.0)
+    if ratio <= 0.0:
+        final_tokens = int(payload.get("final_tokens_est", 0) or 0)
+        budget_tokens = int(payload.get("budget_tokens_est", 0) or 0)
+        if budget_tokens > 0 and final_tokens > 0:
+            ratio = max(0.0, min(1.0, float(final_tokens) / float(budget_tokens)))
     hard_truncated = bool(payload.get("hard_truncated", False))
     if hard_truncated:
         return "error", "已触发硬截断：上下文超过预算，系统已强制裁剪。"
@@ -363,7 +369,10 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
     memory_tokens = int(payload.get("memory_tokens_est", 0) or 0)
     final_tokens = int(payload.get("final_tokens_est", 0) or 0)
     budget_tokens = int(payload.get("budget_tokens_est", 0) or 0)
-    ratio = float(payload.get("context_pressure_ratio", 0.0) or 0.0)
+    ratio_raw = payload.get("context_pressure_ratio", None)
+    ratio = float(ratio_raw or 0.0)
+    if (ratio <= 0.0) and budget_tokens > 0 and final_tokens > 0:
+        ratio = max(0.0, min(1.0, float(final_tokens) / float(budget_tokens)))
     summary_source = str(payload.get("history_summary_source", "none"))
     llm_compress_applied = bool(payload.get("history_llm_compress_applied", False))
     llm_compress_ms = payload.get("history_llm_compress_ms")

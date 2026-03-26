@@ -235,6 +235,7 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("learn", packed)
+        yield {"__context_budget__": self._context_budget_payload("learn", len(history), packed)}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         
@@ -327,6 +328,7 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("practice", packed)
+        yield {"__context_budget__": self._context_budget_payload("practice", len(history), packed)}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
@@ -537,6 +539,7 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("exam", packed)
+        yield {"__context_budget__": self._context_budget_payload("exam", len(history), packed)}
         context_sections = self._context_sections_from_packed(packed)
         context = context_sections["context"]
         history_ctx = context_sections["memory_context"]
@@ -830,6 +833,31 @@ class OrchestrationRunner:
             final_tokens,
             budget_tokens,
         )
+
+    @staticmethod
+    def _context_budget_payload(mode: str, history_len: int, packed: Dict[str, Any]) -> Dict[str, Any]:
+        history_tokens = int(packed.get("history_tokens_est", 0) or 0)
+        rag_tokens = int(packed.get("rag_tokens_est", 0) or 0)
+        memory_tokens = int(packed.get("memory_tokens_est", 0) or 0)
+        final_tokens = int(packed.get("final_tokens_est", 0) or 0)
+        budget_tokens = int(packed.get("budget_tokens_est", 0) or 0)
+        ratio = 0.0
+        if budget_tokens > 0:
+            ratio = max(0.0, min(1.0, float(final_tokens) / float(budget_tokens)))
+        return {
+            "mode": mode,
+            "history_len": int(history_len or 0),
+            "history_tokens_est": history_tokens,
+            "rag_tokens_est": rag_tokens,
+            "memory_tokens_est": memory_tokens,
+            "final_tokens_est": final_tokens,
+            "budget_tokens_est": budget_tokens,
+            "context_pressure_ratio": ratio,
+            "history_summary_source": str(packed.get("history_summary_source", "none") or "none"),
+            "history_llm_compress_applied": bool(packed.get("history_llm_compress_applied", False)),
+            "history_llm_compress_ms": packed.get("history_llm_compress_ms"),
+            "hard_truncated": bool(packed.get("hard_truncated", False)),
+        }
 
     """从用户出题请求中解析主题、难度、题量与题型（轻量规则，失败回退默认值）。"""
     @staticmethod
