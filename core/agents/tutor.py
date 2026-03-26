@@ -28,12 +28,23 @@ class TutorAgent:
     def __init__(self):
         self.llm = get_llm_client()
 
+    @staticmethod
+    def _normalize_context_sections(context: str, context_sections: Optional[dict]) -> dict:
+        sections = dict(context_sections or {})
+        return {
+            "context": str(sections.get("context", context or "")),
+            "rag_context": str(sections.get("rag_context", "")),
+            "history_context": str(sections.get("history_context", "")),
+            "memory_context": str(sections.get("memory_context", "")),
+        }
+
     """统一组装消息列表（system + history + user），仅负责提示词与消息构造。"""
     def _build_messages(
         self,
         question: str,
         course_name: str,
         context: str,
+        context_sections: Optional[dict] = None,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,
@@ -41,13 +52,17 @@ class TutorAgent:
         history_limit: int = 20,
         stream_mode: bool = False,
     ) -> List[dict]:
+        sections = self._normalize_context_sections(context, context_sections)
         if user_content_override:
             prompt = user_content_override
         else:
             prompt = TUTOR_PROMPT.format(
                 course_name=course_name,
-                context=context,
-                question=question
+                context=sections["context"],
+                rag_context=sections["rag_context"],
+                history_context=sections["history_context"],
+                memory_context=sections["memory_context"],
+                question=question,
             )
 
         if system_prompt_override:
@@ -95,7 +110,10 @@ class TutorAgent:
             "prompt_budget",
             system_tokens_est=estimate_text_tokens(system_prompt),
             history_tokens_est=estimate_text_tokens("\n".join(str(m.get("content", "")) for m in messages if m.get("role") in ("user", "assistant"))),
-            context_tokens_est=estimate_text_tokens(context),
+            context_tokens_est=estimate_text_tokens(sections["context"]),
+            rag_context_tokens_est=estimate_text_tokens(sections["rag_context"]),
+            history_context_tokens_est=estimate_text_tokens(sections["history_context"]),
+            memory_context_tokens_est=estimate_text_tokens(sections["memory_context"]),
             history_msg_count=max(0, len(messages) - 2),
             include_raw_history_in_messages=include_raw_history,
             history_limit_applied=effective_limit if include_raw_history else 0,
@@ -116,6 +134,7 @@ class TutorAgent:
         question: str,
         course_name: str,
         context: str,
+        context_sections: Optional[dict] = None,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,  # 练习/考试模式用此覆盖
@@ -129,6 +148,7 @@ class TutorAgent:
             question=question,
             course_name=course_name,
             context=context,
+            context_sections=context_sections,
             allowed_tools=allowed_tools,
             history=history,
             system_prompt_override=system_prompt_override,
@@ -152,6 +172,7 @@ class TutorAgent:
         question: str,
         course_name: str,
         context: str,
+        context_sections: Optional[dict] = None,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,
@@ -165,6 +186,7 @@ class TutorAgent:
             question=question,
             course_name=course_name,
             context=context,
+            context_sections=context_sections,
             allowed_tools=allowed_tools,
             history=history,
             system_prompt_override=system_prompt_override,

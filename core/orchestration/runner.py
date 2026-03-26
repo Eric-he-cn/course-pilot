@@ -235,7 +235,8 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("learn", packed)
-        context = packed["final_text"]
+        context_sections = self._context_sections_from_packed(packed)
+        context = context_sections["context"]
         
         # 关键步骤：组装 Tutor 入参并触发生成。
         workspace_path = self.get_workspace_path(course_name)
@@ -245,6 +246,7 @@ class OrchestrationRunner:
         MCPTools._context = {"notes_dir": notes_dir}
         result: TutorResult = self.tutor.teach(
             user_message, course_name, context,
+            context_sections=context_sections,
             allowed_tools=plan.allowed_tools,
             history=history,
         )
@@ -253,6 +255,7 @@ class OrchestrationRunner:
             self.logger.info("[quality] retry_once=1 reason=low_quality%s", self._trace_tag())
             result = self.tutor.teach(
                 user_message, course_name, context,
+                context_sections=context_sections,
                 allowed_tools=plan.allowed_tools,
                 history=history,
             )
@@ -302,13 +305,18 @@ class OrchestrationRunner:
                 retrieval_empty = True
                 context = "（未找到相关教材，请先上传课程资料）"
 
-        # 历史错题上下文
+        # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
+        answer_submission = self._is_answer_submission(user_message, history)
+        mem_agent = "grader" if answer_submission else "quizzer"
+        mem_phase = "grade" if answer_submission else "generate"
+
+        # 历史错题上下文（Runner 统一预取，供后续链路共享）
         history_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
             mode="practice",
-            agent="grader",
-            phase="grade",
+            agent=mem_agent,
+            phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
             query=user_message,
@@ -319,16 +327,15 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("practice", packed)
-        context = packed["final_text"]
-        history_ctx = packed["memory_text"]
+        context_sections = self._context_sections_from_packed(packed)
+        context = context_sections["context"]
+        history_ctx = context_sections["memory_context"]
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
         tool_calls = None
 
-        # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
-        answer_submission = self._is_answer_submission(user_message, history)
         if answer_submission:
             self.logger.info("[route] practice answer_submission=1 target=grader%s", self._trace_tag())
             quiz_content = self._extract_quiz_from_history(history)
@@ -346,13 +353,17 @@ class OrchestrationRunner:
             self._save_grading_to_memory(course_name, user_message, history, response_text)
             response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
         else:
-            yield {"__status__": "正在生成练习题..."}
+            self.logger.info("[status] practice generating_quiz%s", self._trace_tag())
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
             quiz = self.quizmaster.generate_quiz(
                 course_name=course_name,
                 topic=topic,
                 difficulty=difficulty,
                 context=context,
+                rag_context=context_sections["rag_context"],
+                history_context=context_sections["history_context"],
+                memory_context=context_sections["memory_context"],
+                prefetched_memory_ctx=context_sections["memory_context"],
                 num_questions=num_questions,
                 question_type=question_type,
             )
@@ -406,12 +417,16 @@ class OrchestrationRunner:
         if citations_dicts:
             yield {"__citations__": citations_dicts}
 
+        answer_submission = self._is_answer_submission(user_message, history)
+        mem_agent = "grader" if answer_submission else "quizzer"
+        mem_phase = "grade" if answer_submission else "generate"
+
         history_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
             mode="practice",
-            agent="grader",
-            phase="grade",
+            agent=mem_agent,
+            phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
             query=user_message,
@@ -422,15 +437,14 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("practice", packed)
-        context = packed["final_text"]
-        history_ctx = packed["memory_text"]
+        context_sections = self._context_sections_from_packed(packed)
+        context = context_sections["context"]
+        history_ctx = context_sections["memory_context"]
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         MCPTools._context = {"notes_dir": notes_dir}
 
-        # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
-        answer_submission = self._is_answer_submission(user_message, history)
         if answer_submission:
             self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
             quiz_content = self._extract_quiz_from_history(history)
@@ -455,6 +469,10 @@ class OrchestrationRunner:
                 topic=topic,
                 difficulty=difficulty,
                 context=context,
+                rag_context=context_sections["rag_context"],
+                history_context=context_sections["history_context"],
+                memory_context=context_sections["memory_context"],
+                prefetched_memory_ctx=context_sections["memory_context"],
                 num_questions=num_questions,
                 question_type=question_type,
             )
@@ -495,12 +513,16 @@ class OrchestrationRunner:
             retrieval_empty = True
             context = "（未找到相关教材，请先上传课程资料）"
 
+        answer_submission = self._is_exam_answer_submission(user_message, history)
+        mem_agent = "grader" if answer_submission else "quizzer"
+        mem_phase = "grade" if answer_submission else "generate"
+
         history_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
             mode="exam",
-            agent="grader",
-            phase="grade",
+            agent=mem_agent,
+            phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
             query=user_message,
@@ -511,9 +533,9 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("exam", packed)
-        context = packed["final_text"]
-        history_ctx = packed["memory_text"]
-        answer_submission = self._is_exam_answer_submission(user_message, history)
+        context_sections = self._context_sections_from_packed(packed)
+        context = context_sections["context"]
+        history_ctx = context_sections["memory_context"]
         tool_calls = None
         if answer_submission:
             exam_paper = self._extract_exam_from_history(history)
@@ -531,11 +553,15 @@ class OrchestrationRunner:
             self._save_exam_to_memory(course_name, response_text)
             response_text += f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
         else:
-            yield {"__status__": "正在生成考试试卷..."}
+            self.logger.info("[status] exam generating_paper%s", self._trace_tag())
             exam_payload = self.quizmaster.generate_exam_paper(
                 course_name=course_name,
                 user_request=user_message,
                 context=context,
+                rag_context=context_sections["rag_context"],
+                history_context=context_sections["history_context"],
+                memory_context=context_sections["memory_context"],
+                prefetched_memory_ctx=context_sections["memory_context"],
             )
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
@@ -591,12 +617,16 @@ class OrchestrationRunner:
         if citations_dicts:
             yield {"__citations__": citations_dicts}
 
+        answer_submission = self._is_exam_answer_submission(user_message, history)
+        mem_agent = "grader" if answer_submission else "quizzer"
+        mem_phase = "grade" if answer_submission else "generate"
+
         history_ctx = self._fetch_history_ctx(
             query=user_message,
             course_name=course_name,
             mode="exam",
-            agent="grader",
-            phase="grade",
+            agent=mem_agent,
+            phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
             query=user_message,
@@ -607,9 +637,9 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("exam", packed)
-        context = packed["final_text"]
-        history_ctx = packed["memory_text"]
-        answer_submission = self._is_exam_answer_submission(user_message, history)
+        context_sections = self._context_sections_from_packed(packed)
+        context = context_sections["context"]
+        history_ctx = context_sections["memory_context"]
         if answer_submission:
             exam_paper = self._extract_exam_from_history(history)
             collected = []
@@ -631,6 +661,10 @@ class OrchestrationRunner:
                 course_name=course_name,
                 user_request=user_message,
                 context=context,
+                rag_context=context_sections["rag_context"],
+                history_context=context_sections["history_context"],
+                memory_context=context_sections["memory_context"],
+                prefetched_memory_ctx=context_sections["memory_context"],
             )
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
@@ -746,13 +780,31 @@ class OrchestrationRunner:
                     if text:
                         snippets.append(text[: max(20, item_max_chars)])
                 if snippets:
+                    title = "【该知识点历史错题参考】"
+                    if phase == "grade":
+                        title = "【该知识点历史错题参考（评分时请特别关注相同薄弱点）】"
+                    elif phase == "generate":
+                        title = "【该知识点历史错题参考（出题时请优先覆盖薄弱点）】"
                     return (
-                        "\n\n【该知识点历史错题参考（评分时请特别关注相同薄弱点）】\n"
+                        f"\n\n{title}\n"
                         + "\n".join(f"- {s}" for s in snippets)
                     )
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _context_sections_from_packed(packed: Dict[str, Any]) -> Dict[str, str]:
+        history_text = str(packed.get("history_text", "") or "").strip()
+        rag_text = str(packed.get("rag_text", "") or "").strip()
+        memory_text = str(packed.get("memory_text", "") or "").strip()
+        final_text = str(packed.get("final_text", "") or "").strip()
+        return {
+            "history_context": history_text,
+            "rag_context": rag_text,
+            "memory_context": memory_text,
+            "context": final_text,
+        }
 
     @staticmethod
     def _log_context_budget(mode: str, packed: Dict[str, Any]) -> None:
@@ -1375,7 +1427,8 @@ class OrchestrationRunner:
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
         )
         self._log_context_budget("learn", packed)
-        context = packed["final_text"]
+        context_sections = self._context_sections_from_packed(packed)
+        context = context_sections["context"]
 
         # 先发送 citations 事件（前端按 __citations__ key 识别，不会渲染为文本）
         if citations_dicts:
@@ -1387,6 +1440,7 @@ class OrchestrationRunner:
 
         yield from self.tutor.teach_stream(
             user_message, course_name, context,
+            context_sections=context_sections,
             allowed_tools=plan.allowed_tools,
             history=history
         )

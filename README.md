@@ -254,6 +254,7 @@ git clone https://github.com/Eric-he-cn/course-pilot.git
 cd course-pilot
 pip install -r requirements.txt
 ```
+> 依赖版本以 `requirements.txt` 为运行真源；`pyproject.toml` 仅用于 Poetry 元数据与版本对齐声明。
 
 2) 配置环境变量（项目根目录 `.env`）
 ```dotenv

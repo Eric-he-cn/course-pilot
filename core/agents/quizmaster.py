@@ -466,17 +466,22 @@ class QuizMasterAgent:
         topic: str,
         difficulty: str,
         context: str,
+        rag_context: str = "",
+        history_context: str = "",
+        memory_context: str = "",
+        prefetched_memory_ctx: str = "",
         num_questions: int = 1,
         question_type: str = "综合题",
     ) -> Quiz:
         # 1) 预查询历史错题，优先针对薄弱知识点出题
-        memory_ctx = ""
-        try:
-            from mcp_tools.client import MCPTools
-            mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
-            memory_ctx = self._build_memory_ctx(mem)
-        except Exception:
-            pass
+        memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
+        if not memory_ctx:
+            try:
+                from mcp_tools.client import MCPTools
+                mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
+                memory_ctx = self._build_memory_ctx(mem)
+            except Exception:
+                memory_ctx = ""
 
         # 1.5) 先做内部计划（Plan），再按计划生成题目（Solve）
         quiz_plan = self._plan_quiz(
@@ -503,6 +508,9 @@ class QuizMasterAgent:
             topic=planned_topic,
             difficulty=planned_difficulty,
             context=context,
+            rag_context=rag_context,
+            history_context=history_context,
+            memory_context=memory_ctx,
             memory_ctx=memory_ctx,
             num_questions=planned_num_questions,
             question_type=planned_question_type,
@@ -575,14 +583,19 @@ class QuizMasterAgent:
         course_name: str,
         user_request: str,
         context: str,
+        rag_context: str = "",
+        history_context: str = "",
+        memory_context: str = "",
+        prefetched_memory_ctx: str = "",
     ) -> Dict[str, Any]:
-        memory_ctx = ""
-        try:
-            from mcp_tools.client import MCPTools
-            mem = MCPTools.call_tool("memory_search", query=user_request, course_name=course_name)
-            memory_ctx = self._build_memory_ctx(mem)
-        except Exception:
-            pass
+        memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
+        if not memory_ctx:
+            try:
+                from mcp_tools.client import MCPTools
+                mem = MCPTools.call_tool("memory_search", query=user_request, course_name=course_name)
+                memory_ctx = self._build_memory_ctx(mem)
+            except Exception:
+                memory_ctx = ""
 
         exam_plan = self._plan_exam(user_request=user_request, memory_ctx=memory_ctx)
         external_ctx = self._build_external_ctx(user_request)
@@ -591,6 +604,9 @@ class QuizMasterAgent:
             num_questions=exam_plan["num_questions"],
             difficulty_ratio=exam_plan["difficulty_ratio"],
             context=context,
+            rag_context=rag_context,
+            history_context=history_context,
+            memory_context=memory_ctx,
         )
         prompt += (
             "\n\n【内部考试计划（请执行但不要原样复述）】\n"
