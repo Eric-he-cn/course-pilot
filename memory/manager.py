@@ -7,6 +7,8 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
+import json
+import threading
 from typing import List, Dict, Any, Optional
 from memory.store import SQLiteMemoryStore
 
@@ -30,6 +32,124 @@ class MemoryManager:
     def __init__(self, user_id: str = "default", store: Optional[SQLiteMemoryStore] = None):
         self.user_id = user_id
         self._store = store or _get_store()
+        self._qa_archive_lock = threading.Lock()
+
+    @staticmethod
+    def _format_qa_summary_card(fields: Dict[str, List[str]]) -> str:
+        sections = [
+            ("topics", "主题"),
+            ("weak_points", "薄弱点"),
+            ("preferences", "偏好"),
+            ("stable_facts", "稳定结论"),
+        ]
+        lines = ["历史学习问答摘要："]
+        for key, label in sections:
+            values = [str(x).strip() for x in (fields.get(key, []) or []) if str(x).strip()]
+            if not values:
+                continue
+            lines.append(f"{label}：")
+            lines.extend(f"- {v}" for v in values[:6])
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _parse_qa_summary_json(raw: str) -> Dict[str, List[str]]:
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        if "```" in text:
+            import re
+            m = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text, flags=re.IGNORECASE)
+            if m:
+                text = m.group(1).strip()
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return {}
+        if not isinstance(obj, dict):
+            return {}
+        out: Dict[str, List[str]] = {}
+        for key in ("topics", "weak_points", "preferences", "stable_facts"):
+            val = obj.get(key, [])
+            if isinstance(val, list):
+                out[key] = [str(x).strip() for x in val if str(x).strip()]
+            elif isinstance(val, str) and val.strip():
+                out[key] = [val.strip()]
+            else:
+                out[key] = []
+        return out
+
+    @staticmethod
+    def _fallback_qa_summary(rows: List[Dict[str, Any]]) -> str:
+        lines = []
+        for row in rows[:20]:
+            text = str(row.get("content", "") or "").strip()
+            if not text:
+                continue
+            first = next((ln.strip() for ln in text.splitlines() if ln.strip()), text)
+            first = first.replace("问题:", "").replace("用户要求记住:", "").strip()
+            if len(first) > 120:
+                first = first[:120].rstrip() + "..."
+            if first:
+                lines.append(f"- {first}")
+        if not lines:
+            return ""
+        return "历史学习问答摘要：\n" + "\n".join(lines)
+
+    def _summarize_qa_rows(self, rows: List[Dict[str, Any]]) -> tuple[str, Dict[str, Any]]:
+        target_tokens = max(120, int(os.getenv("MEMORY_QA_SUMMARY_TARGET_TOKENS", "220")))
+        max_tokens = max(target_tokens, int(os.getenv("MEMORY_QA_SUMMARY_MAX_TOKENS", "320")))
+        timeout_s = max(0.5, int(os.getenv("MEMORY_QA_SUMMARY_TIMEOUT_MS", "2000")) / 1000.0)
+        temperature = float(os.getenv("MEMORY_QA_SUMMARY_TEMPERATURE", "0.1"))
+        source_text_parts: List[str] = []
+        source_ids: List[str] = []
+        for idx, row in enumerate(rows, start=1):
+            source_ids.append(str(row.get("id", "")).strip())
+            source_text_parts.append(
+                f"[QA {idx}]\n{str(row.get('content', '') or '').strip()}\n"
+            )
+        source_text = "\n".join(source_text_parts).strip()
+        if not source_text:
+            return "", {"source": "empty", "source_ids": source_ids}
+
+        summary_text = ""
+        source = "fallback"
+        try:
+            from core.llm.openai_compat import get_llm_client
+            from core.orchestration.prompts import (
+                MEMORY_QA_SUMMARY_SYSTEM_PROMPT,
+                MEMORY_QA_SUMMARY_USER_PROMPT,
+            )
+
+            llm = get_llm_client()
+            model = str(os.getenv("MEMORY_QA_SUMMARY_MODEL", "")).strip() or llm.model
+            resp = llm.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": MEMORY_QA_SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": MEMORY_QA_SUMMARY_USER_PROMPT.format(source_text=source_text)},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout_s,
+            )
+            content = resp.choices[0].message.content or ""
+            parsed = self._parse_qa_summary_json(content)
+            if parsed:
+                summary_text = self._format_qa_summary_card(parsed)
+                source = "llm"
+        except Exception:
+            summary_text = ""
+
+        if not summary_text:
+            summary_text = self._fallback_qa_summary(rows)
+            source = "fallback"
+
+        return summary_text, {
+            "source": source,
+            "source_ids": source_ids,
+            "source_count": len(source_ids),
+            "target_tokens_est": target_tokens,
+        }
 
     # ── 情景记忆 ──────────────────────────────────────────────────────────────
 
@@ -105,7 +225,7 @@ class MemoryManager:
         lines = ["【相关历史记录】"]
         for ep in episodes:
             date_str = ep.get("created_at", "")[:10]
-            etype = {"qa": "问答", "mistake": "错题", "practice": "练习", "exam": "考试"}.get(
+            etype = {"qa": "问答", "qa_summary": "问答摘要", "mistake": "错题", "practice": "练习", "exam": "考试"}.get(
                 ep.get("event_type", ""), ep.get("event_type", "")
             )
             importance_flag = "⚠️" if ep.get("importance", 0) >= 0.8 else ""
@@ -261,7 +381,47 @@ class MemoryManager:
         if updates:
             self._store.upsert_profile(self.user_id, course_name, **updates)
 
+        if event_type == "qa":
+            self._maybe_archive_qa_async(course_name)
+
         return eid
+
+    def _maybe_archive_qa_async(self, course_name: str) -> None:
+        if str(os.getenv("MEMORY_QA_ARCHIVE_ENABLE", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        retain_recent = max(0, int(os.getenv("MEMORY_QA_RETAIN_RECENT", "50")))
+        batch_size = max(1, int(os.getenv("MEMORY_QA_ARCHIVE_BATCH", "20")))
+        max_importance = float(os.getenv("MEMORY_QA_ARCHIVE_MAX_IMPORTANCE", "0.55"))
+
+        def _worker() -> None:
+            if not self._qa_archive_lock.acquire(blocking=False):
+                return
+            try:
+                rows = self._store.get_old_qa_batch_for_archive(
+                    course_name=course_name,
+                    user_id=self.user_id,
+                    retain_recent=retain_recent,
+                    batch_size=batch_size,
+                    max_importance=max_importance,
+                )
+                if not rows:
+                    return
+                summary_text, meta = self._summarize_qa_rows(rows)
+                if not summary_text:
+                    return
+                self._store.archive_qa_batch(
+                    course_name=course_name,
+                    user_id=self.user_id,
+                    rows=rows,
+                    summary_content=summary_text,
+                    metadata=meta,
+                )
+            except Exception:
+                pass
+            finally:
+                self._qa_archive_lock.release()
+
+        threading.Thread(target=_worker, daemon=True, name="memory-qa-archive").start()
 
     def get_profile_context(self, course_name: str) -> str:
         """生成注入 prompt 用的用户画像摘要（一段话）。"""

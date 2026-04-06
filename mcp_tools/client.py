@@ -828,6 +828,10 @@ class MCPTools:
         """检索用户历史记忆（情景记忆）。"""
         try:
             from memory.manager import get_memory_manager
+            if not query:
+                query = str(MCPTools._context.get("memory_query", "")).strip()
+            if event_types is None:
+                event_types = ["mistake", "practice", "exam", "qa_summary"]
             mgr = get_memory_manager()
             episodes = mgr.search_episodes(
                 query=query,

@@ -39,6 +39,11 @@ class Plan(BaseModel):
     task_type: Literal["learn", "practice", "exam", "general"] = "learn"
     style: Literal["step_by_step", "hint_first", "direct"] = "step_by_step"
     output_format: Literal["answer", "quiz", "exam", "report"] = "answer"
+    question_raw: str = ""
+    user_intent: str = ""
+    retrieval_keywords: List[str] = Field(default_factory=list)
+    retrieval_query: str = ""
+    memory_query: str = ""
 
 
 class Quiz(BaseModel):

@@ -52,7 +52,7 @@
 - GPU 自动加速：有 NVIDIA GPU 时自动使用 CUDA，batch_size 256；无 GPU 退回 CPU
 - TXT/MD 文件自动检测编码（UTF-8 → GBK → Latin-1 回退）
 - 检索结果携带文档名、页码、相关度分数
-- 分模式 `top_k`：`learn/practice=4`，`exam=6`（可用环境变量覆盖）
+- 分模式 `top_k`：`learn/practice=4`，`exam=8`（可用环境变量覆盖）
 
 ### 多 Agent 编排
 
@@ -181,11 +181,11 @@ FastAPI (:8000)
 
 ├── README.md                 ← 本文档
 ├── docs/
-│   ├── USAGE.md              ← 使用手册（面向用户）
-│   ├── ARCHITECTURE.md       ← 架构设计与数据流
-│   ├── debug.md              ← 调试记录
-│   ├── CONTRIBUTING.md       ← 贡献指南
-│   └── SECURITY.md           ← 安全说明
+│   ├── guides/               ← 使用说明 / 架构 / 贡献 / 安全 / 配置总览
+│   ├── notes/                ← 调试记录 / Q&A / 上下文工程 / 进展记录
+│   ├── reviews/              ← 审阅报告与后续 backlog
+│   ├── changelog/            ← 版本与阶段更新日志
+│   └── images/               ← README 与文档图片资源
 ├── requirements.txt
 ├── pyproject.toml
 ├── .env                      ← 本地环境变量（不入库）
@@ -273,7 +273,7 @@ CHUNK_SIZE=512
 CHUNK_OVERLAP=50
 TOP_K_RESULTS=3
 RAG_TOPK_LEARN_PRACTICE=4
-RAG_TOPK_EXAM=6
+RAG_TOPK_EXAM=8
 RETRIEVAL_MODE=hybrid                     # dense / bm25 / hybrid
 CHUNK_STRATEGY=chapter_hybrid             # fixed / chapter_hybrid
 BM25_K1=1.5
@@ -287,7 +287,7 @@ HYBRID_BM25_CANDIDATES_MULTIPLIER=3
 # Context Budget（V2）
 CTX_TOTAL_TOKENS=8192
 CTX_SAFETY_MARGIN=256
-CB_HISTORY_RECENT_TURNS=6
+CB_HISTORY_RECENT_TURNS=5
 CB_HISTORY_SUMMARY_MAX_TOKENS=700
 CB_RAG_MAX_TOKENS=1800
 CB_MEMORY_MAX_TOKENS=450
@@ -347,7 +347,7 @@ streamlit run frontend/streamlit_app.py   # 端口 8501
 |------|--------|------|
 | `CHUNK_STRATEGY` | `chapter_hybrid` | 分块策略：`fixed` 或 `chapter_hybrid`（失败自动回退 `fixed`） |
 | `RAG_TOPK_LEARN_PRACTICE` | `4` | 学习/练习模式检索 top-k |
-| `RAG_TOPK_EXAM` | `6` | 考试模式检索 top-k |
+| `RAG_TOPK_EXAM` | `8` | 考试模式检索 top-k |
 | `CTX_TOTAL_TOKENS` | `8192` | 上下文预算总 token |
 | `CTX_SAFETY_MARGIN` | `256` | 预算安全边界，避免贴边超限 |
 | `CB_*` | 见 `.env` 示例 | History/RAG/Memory 三段预算和压缩参数 |
@@ -472,7 +472,9 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 
 ## 进展报告
 
-- 2026-03-26 Full Fix 分支审阅与性能报告：[`docs/PROGRESS_REPORT_2026-03-26_FULLFIX.md`](docs/PROGRESS_REPORT_2026-03-26_FULLFIX.md)
+- 2026-03-26 Full Fix 分支审阅与性能报告：[`docs/notes/progress-report-2026-03-26-fullfix.md`](docs/notes/progress-report-2026-03-26-fullfix.md)
+- 配置总览：[`docs/guides/config-overview.md`](docs/guides/config-overview.md)
+- 审阅与研究材料：[`docs/reviews/`](docs/reviews/)
 
 ## V2 更新日志
 
@@ -488,6 +490,23 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 ## V2.5 更新日志
 
 - 修复 `/chat` 同步链路返回类型不一致问题（practice/exam 非流式路径稳定返回 `ChatMessage`）。
+- 上下文压缩升级为滚动摘要：最近 5 轮原文保留，每新增满 5 轮旧历史生成一个 `summary block`。
+- learn 模式默认不再写普通 `qa` 情景记忆，仅显式“记住/提醒/偏好”请求写入长期记忆。
+- 情景记忆归档升级为异步批次压缩：低价值旧 `qa` 聚合为 `qa_summary`，减少噪声与检索负担。
+- Router 补充结构化 rewrite 字段，检索链路可区分 `question_raw / retrieval_query / memory_query`。
+- 前端上下文预算窗口修正为显示 message 窗口与滚动摘要状态，避免将 `history_len` 误解为真实对话轮数。
+
+## 文档导航
+
+- 使用说明：[`docs/guides/usage.md`](docs/guides/usage.md)
+- 架构设计：[`docs/guides/architecture.md`](docs/guides/architecture.md)
+- 贡献指南：[`docs/guides/contributing.md`](docs/guides/contributing.md)
+- 安全说明：[`docs/guides/security.md`](docs/guides/security.md)
+- 配置总览：[`docs/guides/config-overview.md`](docs/guides/config-overview.md)
+- 调试记录：[`docs/notes/debug.md`](docs/notes/debug.md)
+- 上下文工程笔记：[`docs/notes/context-engineering.md`](docs/notes/context-engineering.md)
+- 面试问答：[`docs/notes/qa.md`](docs/notes/qa.md)
+- 本次更新日志：[`docs/changelog/2026-04-06-repo-cleanup-and-context-refresh.md`](docs/changelog/2026-04-06-repo-cleanup-and-context-refresh.md)
 - 完成上下文分区化注入（`history/rag/memory/final`），降低混合上下文污染风险。
 - 新增统一工具契约与 preflight 门控（参数校验、phase 限制、request 级去重签名）。
 - Quiz/Exam/Grader 接入 Structured Outputs 灰度开关，失败自动回退旧解析链。

@@ -132,11 +132,13 @@ class Retriever:
     def retrieve(
         self,
         query: str,
-        top_k: int = None
+        top_k: int = None,
+        mode: str = "",
     ) -> List[RetrievedChunk]:
         """根据查询召回相关文本片段。"""
         t0 = perf_counter()
-        mode = "hybrid"
+        search_mode = "hybrid"
+        request_mode = str(mode or "").strip().lower()
         candidate_count = 0
         success = True
         if top_k is None:
@@ -144,22 +146,29 @@ class Retriever:
         else:
             top_k = max(1, int(top_k))
 
-        mode = os.getenv("RETRIEVAL_MODE", "hybrid").strip().lower()
-        if mode not in {"dense", "bm25", "hybrid"}:
-            mode = "hybrid"
+        search_mode = os.getenv("RETRIEVAL_MODE", "hybrid").strip().lower()
+        if search_mode not in {"dense", "bm25", "hybrid"}:
+            search_mode = "hybrid"
 
         try:
-            if mode == "dense":
+            if search_mode == "dense":
                 results = self._dense_search(query, top_k)
                 candidate_count = len(results)
-            elif mode == "bm25":
+            elif search_mode == "bm25":
                 results = self.lexical_index.search(query, top_k)
                 candidate_count = len(results)
             else:
-                dense_multiplier = self._env_int("HYBRID_DENSE_CANDIDATES_MULTIPLIER", 3)
-                bm25_multiplier = self._env_int("HYBRID_BM25_CANDIDATES_MULTIPLIER", 3)
-                dense_k = max(top_k, top_k * dense_multiplier)
-                bm25_k = max(top_k, top_k * bm25_multiplier)
+                if request_mode in {"learn", "practice"}:
+                    dense_k = max(top_k, 10)
+                    bm25_k = max(top_k, 10)
+                elif request_mode == "exam":
+                    dense_k = max(top_k, 16)
+                    bm25_k = max(top_k, 16)
+                else:
+                    dense_multiplier = self._env_int("HYBRID_DENSE_CANDIDATES_MULTIPLIER", 3)
+                    bm25_multiplier = self._env_int("HYBRID_BM25_CANDIDATES_MULTIPLIER", 3)
+                    dense_k = max(top_k, top_k * dense_multiplier)
+                    bm25_k = max(top_k, top_k * bm25_multiplier)
                 dense_results = self._dense_search(query, dense_k)
                 bm25_results = self.lexical_index.search(query, bm25_k)
                 candidate_count = len(dense_results) + len(bm25_results)
@@ -183,7 +192,8 @@ class Retriever:
         add_event(
             "retrieval",
             retrieval_ms=(perf_counter() - t0) * 1000.0,
-            mode=mode,
+            mode=search_mode,
+            request_mode=request_mode or None,
             top_k=top_k,
             candidate_count=candidate_count,
             returned_count=len(retrieved),

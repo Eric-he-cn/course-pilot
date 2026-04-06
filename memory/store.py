@@ -204,9 +204,11 @@ class SQLiteMemoryStore:
             if phase and str(meta.get("phase", "")).strip() != str(phase).strip():
                 continue
             results.append(d)
-            if len(results) >= top_k:
-                break
-        return results
+        priority = {"mistake": 0, "practice": 1, "exam": 2, "qa_summary": 3, "qa": 4}
+        results.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+        results.sort(key=lambda x: float(x.get("importance", 0.0) or 0.0), reverse=True)
+        results.sort(key=lambda x: priority.get(str(x.get("event_type", "")), 9))
+        return results[:top_k]
 
     def _query_terms(self, query: str) -> List[str]:
         terms = [t.strip() for t in str(query or "").split() if t.strip()]
@@ -319,6 +321,126 @@ class SQLiteMemoryStore:
                 d["metadata"] = {}
             results.append(d)
         return results
+
+    @staticmethod
+    def _qa_summary_line(content: str) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), text)
+        first_line = first_line.replace("问题:", "").replace("用户要求记住:", "").strip()
+        if len(first_line) > 120:
+            first_line = first_line[:120].rstrip() + "..."
+        return first_line
+
+    def get_old_qa_batch_for_archive(
+        self,
+        course_name: str,
+        user_id: str = "default",
+        retain_recent: int = 50,
+        batch_size: int = 20,
+        max_importance: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        retain_recent = max(0, int(retain_recent or 0))
+        batch_size = max(1, int(batch_size or 1))
+        if max_importance is None:
+            max_importance = float(os.getenv("MEMORY_QA_ARCHIVE_MAX_IMPORTANCE", "0.55"))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM episodes
+                WHERE user_id = ? AND course_name = ? AND event_type = 'qa' AND importance <= ?
+                ORDER BY created_at DESC
+                """,
+                (user_id, course_name, float(max_importance)),
+            ).fetchall()
+        if len(rows) <= retain_recent:
+            return []
+        older_rows = rows[retain_recent: retain_recent + batch_size]
+        results: List[Dict[str, Any]] = []
+        for row in reversed(older_rows):
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.get("metadata", "{}") or "{}")
+            except Exception:
+                item["metadata"] = {}
+            if item["metadata"].get("explicit_memory_request"):
+                continue
+            results.append(item)
+        return results
+
+    def archive_qa_batch(
+        self,
+        course_name: str,
+        rows: List[Dict[str, Any]],
+        summary_content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        user_id: str = "default",
+        importance: float = 0.45,
+    ) -> Dict[str, Any]:
+        source_ids = [str(r.get("id", "")).strip() for r in (rows or []) if str(r.get("id", "")).strip()]
+        summary_text = str(summary_content or "").strip()
+        if not source_ids or not summary_text:
+            return {"created": False, "source_count": 0}
+
+        meta = dict(metadata or {})
+        meta.setdefault("source_ids", source_ids)
+        meta.setdefault("source_count", len(source_ids))
+        meta.setdefault("archived_from", "qa")
+        eid = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO episodes
+                    (id, user_id, course_name, event_type, content, importance, created_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    eid,
+                    user_id,
+                    course_name,
+                    "qa_summary",
+                    summary_text,
+                    float(importance),
+                    now,
+                    json.dumps(meta, ensure_ascii=False),
+                ),
+            )
+            placeholders = ",".join(["?" for _ in source_ids])
+            conn.execute(f"DELETE FROM episodes WHERE id IN ({placeholders})", source_ids)
+        return {"created": True, "source_count": len(source_ids), "summary_id": eid}
+
+    def compact_old_qa(
+        self,
+        course_name: str,
+        user_id: str = "default",
+        retain_recent: int = 80,
+        batch_size: int = 20,
+    ) -> Dict[str, Any]:
+        """把较旧 qa 聚合为 qa_summary，减少主检索路径噪声。"""
+        rows = self.get_old_qa_batch_for_archive(
+            course_name=course_name,
+            user_id=user_id,
+            retain_recent=retain_recent,
+            batch_size=batch_size,
+        )
+        if not rows:
+            return {"created": False, "source_count": 0}
+        summary_lines = []
+        for row in rows:
+            line = self._qa_summary_line(row.get("content", ""))
+            if line:
+                summary_lines.append(f"- {line}")
+        if not summary_lines:
+            return {"created": False, "source_count": 0}
+        summary_content = "历史问答摘要：\n" + "\n".join(summary_lines[:batch_size])
+        return self.archive_qa_batch(
+            course_name=course_name,
+            user_id=user_id,
+            rows=rows,
+            summary_content=summary_content,
+        )
 
     # ── 用户画像 CRUD ─────────────────────────────────────────────────────────
 

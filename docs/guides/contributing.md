@@ -1,4 +1,4 @@
-﻿# 贡献指南
+# 贡献指南
 
 感谢你对 CoursePilot 项目的关注！本文档将帮助你了解如何为项目做出贡献。
 
@@ -311,8 +311,9 @@ def test_my_feature():
 如果你的更改影响用户使用方式，请更新：
 
 - `README.md`: 主要功能和快速开始
-- `docs/USAGE.md`: 详细使用示例
-- `docs/ARCHITECTURE.md`: 系统架构和设计
+- `docs/guides/usage.md`: 详细使用示例
+- `docs/guides/architecture.md`: 系统架构和设计
+- `docs/changelog/`: 版本更新说明与阶段性变更
 
 ### 文档风格
 
@@ -386,3 +387,4 @@ Closes #123
 ---
 
 **祝你编码愉快！** 🚀
+

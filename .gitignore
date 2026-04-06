@@ -39,6 +39,7 @@ venv.bak/
 *~
 
 # Data
+data/perf_runs/
 data/workspaces/
 data/memory/
 *.pdf
@@ -48,7 +49,7 @@ data/memory/
 
 # Documentation files should be included
 !README.md
-!docs/*.md
+!docs/**
 !tests/*.txt
 !tests/*.md
 # Logs
@@ -61,10 +62,13 @@ Thumbs.db
 
 # Testing
 .pytest_cache/
+pytest-cache-files-*/
 .coverage
 htmlcov/
+__pycache__/
 
 # Temporary files
 tmp/
 temp/
+tmp*/
 

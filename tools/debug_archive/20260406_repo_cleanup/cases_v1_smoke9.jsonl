@@ -1,0 +1,9 @@
+{"case_id": "learn_01", "mode": "learn", "course_name": "矩阵理论", "message": "矩阵的秩是什么？给出定义和一个简单例子。", "history": []}
+{"case_id": "learn_02", "mode": "learn", "course_name": "矩阵理论", "message": "行秩和列秩有什么关系？", "history": []}
+{"case_id": "learn_03", "mode": "learn", "course_name": "矩阵理论", "message": "为什么初等变换不改变矩阵的秩？", "history": []}
+{"case_id": "practice_01", "mode": "practice", "course_name": "矩阵理论", "message": "给我出一道关于矩阵秩的中等难度练习题。", "history": []}
+{"case_id": "practice_02", "mode": "practice", "course_name": "矩阵理论", "message": "出一道线性相关与线性无关判断题。", "history": []}
+{"case_id": "practice_03", "mode": "practice", "course_name": "矩阵理论", "message": "来一道特征值计算题，难度 easy。", "history": []}
+{"case_id": "exam_01", "mode": "exam", "course_name": "矩阵理论", "message": "生成一份覆盖矩阵秩与线性相关的模拟试卷。", "history": []}
+{"case_id": "exam_02", "mode": "exam", "course_name": "矩阵理论", "message": "出一套以特征值和特征向量为核心的考试卷。", "history": []}
+{"case_id": "exam_03", "mode": "exam", "course_name": "矩阵理论", "message": "请设计一份中等难度的矩阵理论章节测试。", "history": []}

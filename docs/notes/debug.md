@@ -1,6 +1,6 @@
 以下是整个对话从头到尾所有调试过程的梳理，按时间顺序排列。
 
-> 当前状态说明（2026-03）：本文档包含若干历史阶段问题，部分条目对应旧架构（如 Tutor 兼任练习/考试主流程）。当前实现已调整为 `learn -> Tutor`、`practice/exam -> Quizzer + Grader`。请以 `README.md` 与 `docs/ARCHITECTURE.md` 的“当前实现”描述为准。
+> 当前状态说明（2026-03）：本文档包含若干历史阶段问题，部分条目对应旧架构（如 Tutor 兼任练习/考试主流程）。当前实现已调整为 `learn -> Tutor`、`practice/exam -> Quizzer + Grader`。请以 `README.md` 与 `docs/guides/architecture.md` 的“当前实现”描述为准。
 
 ## 1. ModuleNotFoundError — 模块找不到
 - 发现问题：直接运行 `python backend/api.py` 时找不到 `backend` 包。
@@ -169,4 +169,5 @@
   - 练习提交答案时：若历史含 `exam_meta`，走 `Grader.grade_exam_stream()`，否则走 `grade_practice_stream()`；
   - `quizmaster.py`：增加题型锁定、选择题形态校验+单次重试、答题卡总分归一到 100。
 - 解决结果：练习多题链路稳定性提升，题型漂移与评分口径错配显著减少。
+
 

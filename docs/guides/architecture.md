@@ -86,7 +86,7 @@ flowchart LR
 - 融合层：Hybrid 使用 RRF（Reciprocal Rank Fusion）合并 dense 与 bm25 候选，兼顾语义召回与术语精确匹配。
 
 **A4. 性能与正确性权衡**
-- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升；V2 默认分模式配置：学习/练习 `top_k=4`，考试 `top_k=6`。
+- `Top-K` 越大，召回更全但 prompt 更长，延迟和费用上升；当前主干默认分模式配置：学习/练习 `top_k=4`，考试 `top_k=8`。
 - `chunk_size` 越大，上下文语义更完整但定位更粗；越小则相反。
 - `hybrid` 模式通常比纯向量召回更稳健，尤其在课程术语/缩写/公式关键词场景。
 
@@ -326,7 +326,7 @@ Runner.run_exam_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
   ↓
-[工具] Retriever.retrieve(top_k=6) → 大范围 RAG 上下文
+[工具] Retriever.retrieve(top_k=8) → 大范围 RAG 上下文
   ↓
 [LLM #2] QuizMaster.generate_exam_paper()  ← Plan-Solve
   plan:  _plan_exam()（scope/num_questions/difficulty_ratio）
@@ -436,7 +436,7 @@ batch_size = 256  # GPU；CPU 时降为 32
 **检索策略**:
 ```python
 retrieval_mode = "hybrid"   # dense / bm25 / hybrid
-top_k = 4                   # 学习/练习默认；考试模式在 Runner 中覆盖为 6
+top_k = 4                   # 学习/练习默认；考试模式在 Runner 中覆盖为 8
 hybrid_rrf_k = 60
 hybrid_dense_weight = 1.0
 hybrid_bm25_weight = 1.0

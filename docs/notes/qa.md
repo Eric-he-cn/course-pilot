@@ -22,7 +22,7 @@
 ### 1.4 多轮对话是怎么实现的？
 - 标准回答：前端会先裁剪最近历史并发送后端；后端在 Runner 先做 recent turns 截取，再由 `ContextBudgeter` 按 `history -> rag -> memory -> hard_truncate` 统一做 token 预算。Tutor 默认不重复注入原始历史（可配置开启）。
 - 详细补充：现在是“前端裁剪 + Runner 预算器 + Agent 可选原文注入”三层控制，不再是单纯 `history_limit` 拼接。
-- 参数速记：`CB_HISTORY_RECENT_TURNS=6`、`CB_RECENT_RAW_TURNS=3`、`CB_INCLUDE_RAW_HISTORY_IN_MESSAGES=0`（默认）。
+- 参数速记：`CB_HISTORY_RECENT_TURNS=5`、`CB_RECENT_RAW_TURNS=5`、`CB_INCLUDE_RAW_HISTORY_IN_MESSAGES=0`（默认）。
 - 代码锚点：`frontend/streamlit_app.py`，`backend/api.py`，`core/orchestration/runner.py`，`core/orchestration/context_budgeter.py`，`core/agents/tutor.py`
 
 ### 1.5 上下文过长如何处理？
@@ -97,7 +97,7 @@
 ### 1.19 参数配置是怎么治理的？如何避免“全靠改代码”？
 - 标准回答：通用参数优先走 `.env`（检索、切块、嵌入、上下文预算）；业务约束在代码层用“按模式参数”覆盖（如 learn/practice 与 exam 的不同 top-k），形成“默认可配置 + 场景可覆盖”的分层。
 - 详细补充：这种策略能兼顾可调试性和业务确定性，减少误配导致的线上行为漂移。
-- 参数速记：`TOP_K_RESULTS` 是兜底；分模式优先读 `RAG_TOPK_LEARN_PRACTICE`（默认 4）和 `RAG_TOPK_EXAM`（默认 6）。
+- 参数速记：`TOP_K_RESULTS` 是兜底；分模式优先读 `RAG_TOPK_LEARN_PRACTICE`（默认 4）和 `RAG_TOPK_EXAM`（默认 8）。
 - 代码锚点：`rag/retrieve.py`，`core/orchestration/runner.py`，`rag/chunk.py`
 
 ### 1.20 课程工作区是如何做隔离的？
@@ -192,9 +192,9 @@
 - 代码锚点：`rag/retrieve.py:65`，`rag/retrieve.py:71`，`rag/retrieve.py:72`，`rag/retrieve.py:73`
 
 ### 2.7 top-k 参数在三模式是否一致？
-- 标准回答：不一致。Runner 会按模式下发 top-k：学习/练习读 `RAG_TOPK_LEARN_PRACTICE`（默认 4），考试读 `RAG_TOPK_EXAM`（默认 6）；`TOP_K_RESULTS` 只作为兜底。
+- 标准回答：不一致。Runner 会按模式下发 top-k：学习/练习读 `RAG_TOPK_LEARN_PRACTICE`（默认 4），考试读 `RAG_TOPK_EXAM`（默认 8）；`TOP_K_RESULTS` 只作为兜底。
 - 详细补充：回答时明确“默认值来自 .env，但业务分支可显式覆盖”，这是参数优先级问题。
-- 参数速记：`RAG_TOPK_LEARN_PRACTICE=4`、`RAG_TOPK_EXAM=6`、`TOP_K_RESULTS`（fallback）。
+- 参数速记：`RAG_TOPK_LEARN_PRACTICE=4`、`RAG_TOPK_EXAM=8`、`TOP_K_RESULTS`（fallback）。
 - 代码锚点：`rag/retrieve.py`，`core/orchestration/runner.py`
 
 ### 2.8 引用是如何生成并展示的？
@@ -461,9 +461,9 @@
 - 面试高频反问：你如何做参数寻优而不是拍脑袋？
 
 ### 5.6 为什么考试模式 top_k 默认更高（当前是 6）？
-- 标准回答：考试场景需要更广的证据覆盖，Runner 会给 exam 使用更高的 top-k（默认 6，高于 learn/practice 的 4）；这是业务策略覆盖默认参数的例子。
+- 标准回答：考试场景需要更广的证据覆盖，Runner 会给 exam 使用更高的 top-k（默认 8，高于 learn/practice 的 4）；这是业务策略覆盖默认参数的例子。
 - 详细补充：可以解释为考试模式偏“覆盖率优先”，宁可上下文更长也要减少漏召回。
-- 参数速记：`RAG_TOPK_LEARN_PRACTICE=4`、`RAG_TOPK_EXAM=6`（均可通过环境变量调整）。
+- 参数速记：`RAG_TOPK_LEARN_PRACTICE=4`、`RAG_TOPK_EXAM=8`（均可通过环境变量调整）。
 - 代码锚点：`core/orchestration/runner.py`
 - 面试高频反问：top_k 过大带来的负面影响是什么？
 
@@ -626,7 +626,7 @@
 ### 5.36 聊天历史是如何传递到后端的？
 - 标准回答：前端先裁剪最近若干轮历史，再构造成 `role/content` 的轻量 payload 发送给后端。后端把 `ChatRequest.history` 传给 Runner，Runner 再交给 `ContextBudgeter` 做分段预算（history/rag/memory），Tutor 默认不重复注入原始历史消息。这个设计避免历史无限膨胀。
 - 详细补充：补充历史先以轻量结构跨层传递，再在 agent 层决定最终注入粒度。
-- 参数速记：历史链路关键值：前端裁剪 `20`；后端常用 `CB_HISTORY_RECENT_TURNS=6`、`CB_RECENT_RAW_TURNS=3`。
+- 参数速记：历史链路关键值：前端裁剪 `20`；后端常用 `CB_HISTORY_RECENT_TURNS=5`、`CB_RECENT_RAW_TURNS=5`，并按 `5` 轮一个 block 生成 rolling summary。
 - 代码锚点：`frontend/streamlit_app.py:343`，`frontend/streamlit_app.py:381`，`backend/api.py:346`
 
 ### 5.37 为什么这个前端“经常刷新”，有没有做优化？

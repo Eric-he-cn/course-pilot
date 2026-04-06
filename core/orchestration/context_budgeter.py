@@ -12,6 +12,8 @@ from core.metrics import add_event, estimate_text_tokens
 from core.orchestration.prompts import (
     CONTEXT_COMPRESSOR_SYSTEM_PROMPT,
     CONTEXT_COMPRESSOR_USER_PROMPT,
+    HISTORY_BLOCK_COMPRESSOR_SYSTEM_PROMPT,
+    HISTORY_BLOCK_COMPRESSOR_USER_PROMPT,
 )
 
 
@@ -47,9 +49,19 @@ class ContextBudgeter:
     def __init__(self) -> None:
         self.ctx_total_tokens = _env_int("CTX_TOTAL_TOKENS", 8192)
         self.ctx_safety_margin = _env_int("CTX_SAFETY_MARGIN", 256)
-        self.history_recent_turns = _env_int("CB_HISTORY_RECENT_TURNS", 10)
-        self.recent_raw_turns = max(1, _env_int("CB_RECENT_RAW_TURNS", 5))
+        self.history_recent_turns = max(1, _env_int("CB_HISTORY_RECENT_TURNS", 5))
+        self.recent_raw_turns = max(1, _env_int("CB_RECENT_RAW_TURNS", self.history_recent_turns))
         self.history_summary_max_tokens = _env_int("CB_HISTORY_SUMMARY_MAX_TOKENS", 2000)
+        self.history_block_turns = max(1, _env_int("CB_HISTORY_SUMMARY_BLOCK_TURNS", 5))
+        self.history_max_blocks = max(1, _env_int("CB_HISTORY_SUMMARY_MAX_BLOCKS", 10))
+        self.history_block_target_tokens = max(80, _env_int("CB_HISTORY_BLOCK_COMPRESS_TARGET_TOKENS", 160))
+        self.history_block_max_tokens = max(
+            self.history_block_target_tokens,
+            _env_int("CB_HISTORY_BLOCK_COMPRESS_MAX_TOKENS", 220),
+        )
+        self.history_block_timeout_ms = max(200, _env_int("CB_HISTORY_BLOCK_COMPRESS_TIMEOUT_MS", 1500))
+        self.history_block_model = str(os.getenv("CB_HISTORY_BLOCK_COMPRESS_MODEL", "")).strip()
+        self.history_block_temperature = _env_float("CB_HISTORY_BLOCK_COMPRESS_TEMPERATURE", 0.1)
         self.rag_max_tokens = _env_int("CB_RAG_MAX_TOKENS", 1800)
         self.memory_max_tokens = _env_int("CB_MEMORY_MAX_TOKENS", 450)
         self.rag_compress_owner = str(os.getenv("RAG_COMPRESS_OWNER", "retriever")).strip().lower() or "retriever"
@@ -118,7 +130,7 @@ class ContextBudgeter:
     @classmethod
     def _format_summary_card(cls, fields: Dict[str, List[str]]) -> str:
         parts = ["【历史摘要卡片】"]
-        for key in ("facts", "constraints", "unresolved", "next_steps"):
+        for key in ("facts", "constraints", "unresolved", "preferences", "next_steps"):
             vals = cls._dedup_keep_order(list(fields.get(key, []) or []), 4)
             parts.append(f"{key}:")
             if vals:
@@ -132,8 +144,10 @@ class ContextBudgeter:
         facts: List[str] = []
         constraints: List[str] = []
         unresolved: List[str] = []
+        preferences: List[str] = []
         constraint_keywords = ("必须", "不要", "不得", "仅", "要求", "格式", "限制", "截止", "必须要")
         unresolved_keywords = ("?", "？", "请", "希望", "需要", "怎么", "如何", "为什么")
+        preference_keywords = ("喜欢", "偏好", "先", "以后", "习惯", "更想", "优先")
 
         for role, content in lines:
             text = content.strip()
@@ -145,6 +159,8 @@ class ContextBudgeter:
                 constraints.append(_trim_by_chars(text, 120))
             if role == "user" and any(k in text for k in unresolved_keywords):
                 unresolved.append(_trim_by_chars(text, 120))
+            if role == "user" and any(k in text for k in preference_keywords):
+                preferences.append(_trim_by_chars(text, 120))
 
         next_steps: List[str] = []
         if unresolved:
@@ -161,6 +177,7 @@ class ContextBudgeter:
                 "facts": facts,
                 "constraints": constraints,
                 "unresolved": unresolved,
+                "preferences": preferences,
                 "next_steps": next_steps,
             }
         )
@@ -182,7 +199,7 @@ class ContextBudgeter:
             return {}
 
         out: Dict[str, List[str]] = {}
-        for key in ("facts", "constraints", "unresolved", "next_steps"):
+        for key in ("facts", "constraints", "unresolved", "preferences", "next_steps"):
             val = obj.get(key, [])
             if isinstance(val, list):
                 out[key] = [str(x).strip() for x in val if str(x).strip()]
@@ -195,6 +212,18 @@ class ContextBudgeter:
     @staticmethod
     def _history_lines_to_text(lines: List[Tuple[str, str]]) -> str:
         return "\n".join(f"[{r}] {c}" for r, c in lines if c).strip()
+
+    @staticmethod
+    def _history_messages_to_text(history: List[Dict[str, Any]]) -> str:
+        if not history:
+            return ""
+        lines = []
+        for msg in history:
+            role = str(msg.get("role", "user"))
+            content = str(msg.get("content", "")).strip()
+            if content:
+                lines.append(f"[{role}] {content}")
+        return "\n".join(lines).strip()
 
     def _llm_summary_card(self, lines: List[Tuple[str, str]]) -> Tuple[str, Optional[float], str]:
         source_text = self._history_lines_to_text(lines)
@@ -259,6 +288,83 @@ class ContextBudgeter:
             error=last_err or "llm_compress_failed",
         )
         return "", elapsed_ms, "llm_failed"
+
+    def compress_history_block(
+        self,
+        turns: List[List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        messages_flat: List[Dict[str, Any]] = []
+        for turn in turns:
+            for msg in turn:
+                if isinstance(msg, dict):
+                    messages_flat.append(msg)
+        source_text = self._history_messages_to_text(messages_flat)
+        source_tokens = estimate_text_tokens(source_text)
+        if not source_text:
+            return {
+                "summary_text": "",
+                "source": "none",
+                "tokens_est": 0,
+                "elapsed_ms": None,
+                "source_tokens_est": 0,
+            }
+
+        prompt = HISTORY_BLOCK_COMPRESSOR_USER_PROMPT.format(source_text=source_text)
+        messages = [
+            {"role": "system", "content": HISTORY_BLOCK_COMPRESSOR_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        timeout_s = max(0.4, self.history_block_timeout_ms / 1000.0)
+        max_tokens = max(120, min(600, self.history_block_max_tokens))
+        t0 = perf_counter()
+        source = "heuristic"
+        summary_text = ""
+        last_err = ""
+        try:
+            from core.llm.openai_compat import get_llm_client
+
+            llm = get_llm_client()
+            model = self.history_block_model or llm.model
+            resp = llm.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=self.history_block_temperature,
+                max_tokens=max_tokens,
+                timeout=timeout_s,
+            )
+            content = resp.choices[0].message.content or ""
+            fields = self._parse_summary_json(content)
+            if fields:
+                summary_text = self._format_summary_card(fields)
+                source = "llm"
+            else:
+                last_err = "invalid_json"
+        except Exception as ex:
+            last_err = str(ex)
+
+        if not summary_text:
+            history_lines = [(str(m.get("role", "user")), str(m.get("content", ""))) for m in messages_flat]
+            summary_text = self._heuristic_summary_card(history_lines)
+            source = "heuristic"
+
+        summary_text = self._trim_to_tokens(summary_text, self.history_block_target_tokens)
+        elapsed_ms = (perf_counter() - t0) * 1000.0
+        add_event(
+            "history_block_compress",
+            success=bool(summary_text),
+            source=source,
+            source_tokens_est=source_tokens,
+            target_tokens_est=self.history_block_target_tokens,
+            elapsed_ms=elapsed_ms,
+            error=last_err or None,
+        )
+        return {
+            "summary_text": summary_text,
+            "source": source,
+            "tokens_est": estimate_text_tokens(summary_text),
+            "elapsed_ms": elapsed_ms,
+            "source_tokens_est": source_tokens,
+        }
 
     @staticmethod
     def _keywords(query: str) -> List[str]:
@@ -332,29 +438,70 @@ class ContextBudgeter:
         memory_text: str,
         rag_sent_per_chunk: int,
         rag_sent_max_chars: int,
+        history_summary_state: Optional[Dict[str, Any]] = None,
+        pending_history: Optional[List[Dict[str, Any]]] = None,
+        recent_history: Optional[List[Dict[str, Any]]] = None,
+        history_state_metrics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        recent_turns = max(1, self.recent_raw_turns)
-        recent_text = self._history_recent_text(history, recent_turns)
-        older_lines = self._history_older_lines(history, recent_turns)
+        metrics = dict(history_state_metrics or {})
+        if history_summary_state is not None or pending_history is not None or recent_history is not None:
+            blocks = []
+            if isinstance(history_summary_state, dict):
+                blocks = history_summary_state.get("blocks", []) or []
+            block_texts: List[str] = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                turn_range = str(block.get("turn_range", "")).strip()
+                summary = str(block.get("summary_text", "") or "").strip()
+                if not summary:
+                    continue
+                if turn_range:
+                    block_texts.append(f"【历史摘要块 {turn_range}】\n{summary}")
+                else:
+                    block_texts.append(summary)
+            summary_text = "\n\n".join(block_texts).strip()
+            summary_source = "state" if summary_text else "none"
+            llm_compress_ms: Optional[float] = metrics.get("history_block_compress_ms")
+            pending_text = self._history_messages_to_text(pending_history or [])
+            if pending_text:
+                pending_text = "【待归档历史】\n" + pending_text
+            recent_text = self._history_messages_to_text(recent_history or [])
+            if recent_text:
+                recent_text = "【最近对话】\n" + recent_text
+            summary_text = self._trim_to_tokens(summary_text, self.history_summary_max_tokens)
+            history_sections = [x for x in [summary_text, pending_text, recent_text] if x]
+            history_summary_tokens = estimate_text_tokens(summary_text)
+            history_recent_tokens = estimate_text_tokens(recent_text)
+            history_pending_tokens = estimate_text_tokens(pending_text)
+        else:
+            recent_turns = max(1, min(self.history_recent_turns, self.recent_raw_turns))
+            recent_text = self._history_recent_text(history, recent_turns)
+            older_lines = self._history_older_lines(history, recent_turns)
 
-        summary_text = ""
-        summary_source = "none"
-        llm_compress_ms: Optional[float] = None
-        if older_lines:
-            summary_text, llm_compress_ms, summary_source = self._llm_summary_card(older_lines)
-            if not summary_text:
-                summary_text = self._heuristic_summary_card(older_lines)
-                summary_source = "heuristic"
+            summary_text = ""
+            summary_source = "none"
+            llm_compress_ms = None
+            if older_lines:
+                summary_text, llm_compress_ms, summary_source = self._llm_summary_card(older_lines)
+                if not summary_text:
+                    summary_text = self._heuristic_summary_card(older_lines)
+                    summary_source = "heuristic"
 
-        summary_budget = (
-            self.llm_compress_target_tokens
-            if summary_source == "llm"
-            else self.history_summary_max_tokens
-        )
-        summary_text = self._trim_to_tokens(summary_text, summary_budget)
-        history_sections = [x for x in [summary_text, recent_text] if x]
+            summary_budget = (
+                self.llm_compress_target_tokens
+                if summary_source == "llm"
+                else self.history_summary_max_tokens
+            )
+            summary_text = self._trim_to_tokens(summary_text, summary_budget)
+            history_sections = [x for x in [summary_text, recent_text] if x]
+            history_summary_tokens = estimate_text_tokens(summary_text)
+            history_recent_tokens = estimate_text_tokens(recent_text)
+            history_pending_tokens = 0
+
         hist_text = "\n\n".join(history_sections).strip()
-        history_budget = self.history_summary_max_tokens + max(120, recent_turns * 120)
+        recent_turns_for_budget = max(1, min(self.history_recent_turns, self.recent_raw_turns))
+        history_budget = self.history_summary_max_tokens + max(120, recent_turns_for_budget * 120) + max(0, history_pending_tokens)
         hist_text = self._trim_to_tokens(hist_text, history_budget)
 
         rag_budgeter_compress_applied = False
@@ -387,20 +534,24 @@ class ContextBudgeter:
         final = self._trim_to_tokens(final, hard_budget)
         hard_truncated = final_before_hard_trim_tokens > hard_budget
         history_tokens = estimate_text_tokens(hist_text)
-        history_recent_tokens = estimate_text_tokens(recent_text)
-        history_summary_tokens = estimate_text_tokens(summary_text)
         rag_tokens = estimate_text_tokens(rag_comp)
         memory_tokens = estimate_text_tokens(mem_comp)
         final_tokens = estimate_text_tokens(final)
         llm_applied = summary_source == "llm"
+        history_summary_block_count = int(metrics.get("history_summary_block_count", 0) or 0)
+        history_summary_state_hit = bool(metrics.get("history_summary_state_hit", False))
         add_event(
             "context_budget",
             history_tokens_est=history_tokens,
             history_recent_tokens_est=history_recent_tokens,
+            history_pending_tokens_est=history_pending_tokens,
             history_summary_tokens_est=history_summary_tokens,
             history_summary_source=summary_source,
             history_llm_compress_applied=llm_applied,
             history_llm_compress_ms=llm_compress_ms,
+            history_summary_block_count=history_summary_block_count,
+            history_summary_state_hit=history_summary_state_hit,
+            history_block_compress_ms=metrics.get("history_block_compress_ms"),
             rag_compress_owner=self.rag_compress_owner,
             rag_budgeter_compress_applied=rag_budgeter_compress_applied,
             rag_tokens_est=rag_tokens,
@@ -424,7 +575,10 @@ class ContextBudgeter:
             "final_text": final,
             "history_tokens_est": history_tokens,
             "history_recent_tokens_est": history_recent_tokens,
+            "history_pending_tokens_est": history_pending_tokens,
             "history_summary_tokens_est": history_summary_tokens,
+            "history_summary_block_count": history_summary_block_count,
+            "history_summary_state_hit": history_summary_state_hit,
             "rag_tokens_est": rag_tokens,
             "memory_tokens_est": memory_tokens,
             "final_tokens_before_hard_trim_est": final_before_hard_trim_tokens,

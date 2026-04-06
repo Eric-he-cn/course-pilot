@@ -365,6 +365,7 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
     payload = payload if has_payload else {}
     mode = str(payload.get("mode", "unknown"))
     history_len = int(payload.get("history_len", 0) or 0)
+    history_turns_est = int((history_len + 1) // 2) if history_len > 0 else 0
     history_tokens = int(payload.get("history_tokens_est", 0) or 0)
     rag_tokens = int(payload.get("rag_tokens_est", 0) or 0)
     memory_tokens = int(payload.get("memory_tokens_est", 0) or 0)
@@ -375,8 +376,11 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
     if (ratio <= 0.0) and budget_tokens > 0 and final_tokens > 0:
         ratio = max(0.0, min(1.0, float(final_tokens) / float(budget_tokens)))
     summary_source = str(payload.get("history_summary_source", "none"))
+    summary_block_count = int(payload.get("history_summary_block_count", 0) or 0)
+    summary_state_hit = bool(payload.get("history_summary_state_hit", False))
     llm_compress_applied = bool(payload.get("history_llm_compress_applied", False))
     llm_compress_ms = payload.get("history_llm_compress_ms")
+    history_block_compress_ms = payload.get("history_block_compress_ms")
     health_level, health_text = _context_window_health(payload) if has_payload else ("info", "等待上下文预算数据...")
     pct = int(max(0, min(100, round(ratio * 100))))
 
@@ -401,12 +405,24 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
         theme_fg = "#1B5E20"
         bar_color = "#43A047"
 
-    compress_line = "未触发"
-    if llm_compress_applied:
-        if isinstance(llm_compress_ms, (int, float)):
-            compress_line = f"已触发，{float(llm_compress_ms):.1f} ms"
+    if summary_source == "state" or summary_block_count > 0 or summary_state_hit:
+        if isinstance(history_block_compress_ms, (int, float)):
+            compress_line = f"rolling summary · {summary_block_count} blocks · {float(history_block_compress_ms):.1f} ms"
         else:
-            compress_line = "已触发"
+            compress_line = f"rolling summary · {summary_block_count} blocks"
+    elif llm_compress_applied:
+        if isinstance(llm_compress_ms, (int, float)):
+            compress_line = f"旧式即时摘要 · {float(llm_compress_ms):.1f} ms"
+        else:
+            compress_line = "旧式即时摘要 · 已触发"
+    else:
+        compress_line = "未触发"
+
+    history_line = f"{history_len} msgs"
+    if history_turns_est > 0:
+        history_line += f" (~{history_turns_est} turns)"
+    if history_len >= 20:
+        history_line += " · 前端发送窗口已封顶"
 
     html_block = f"""
 <style>
@@ -520,14 +536,14 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
 <div class="ctx-badge" title="上下文预算状态">
   <div class="ctx-head"><span>🧠 上下文</span><span>{pct}%</span></div>
   <div class="ctx-bar"><div class="ctx-fill"></div></div>
-  <div class="ctx-sub">{html.escape(mode)} · h={history_len}</div>
+  <div class="ctx-sub">{html.escape(mode)} · ~{history_turns_est}轮</div>
   <div class="ctx-tip">
     <div><b>状态</b>: {html.escape(health_text)}</div>
-    <div><b>mode</b>: {html.escape(mode)} · <b>history_len</b>: {history_len}</div>
+    <div><b>mode</b>: {html.escape(mode)} · <b>history</b>: {html.escape(history_line)}</div>
     <div><b>history</b>: {history_tokens} · <b>rag</b>: {rag_tokens} · <b>memory</b>: {memory_tokens}</div>
     <div><b>final/budget</b>: {final_tokens}/{budget_tokens} · <b>pressure</b>: {pct}%</div>
     <div><b>summary_source</b>: {html.escape(summary_source)}</div>
-    <div><b>history_llm_compress</b>: {html.escape(compress_line)}</div>
+    <div><b>rolling_summary</b>: {html.escape(compress_line)}</div>
   </div>
 </div>
 """

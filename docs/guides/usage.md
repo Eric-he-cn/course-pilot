@@ -1,6 +1,6 @@
 ﻿# 使用手册 — Your AI Study Agent
 
-> 本手册面向日常使用者，按操作流程逐步说明。如需开发/部署细节请参阅 [README.md](../README.md)。
+> 本手册面向日常使用者，按操作流程逐步说明。如需开发/部署细节请参阅 [README.md](../../README.md)。
 
 ---
 
@@ -109,7 +109,7 @@ curl -X DELETE http://localhost:8000/workspaces/线性代数
 > 如果有 NVIDIA GPU（驱动 ≥ 570），会自动切换 CUDA 加速，构建速度约快 5–8 倍。  
 > 每次新增或替换教材后，都需要重新点击构建索引。  
 > 批量重建所有课程可在项目根目录运行：`python rebuild_indexes.py`
-> 当前检索默认是 `hybrid`（Dense + BM25 融合）；分模式 top-k 默认为：学习/练习 `4`，考试 `6`。
+> 当前检索默认是 `hybrid`（Dense + BM25 融合）；分模式 top-k 默认为：学习/练习 `4`，考试 `8`。
 
 ### 3.6 检索参数（.env）
 
@@ -129,7 +129,7 @@ HYBRID_BM25_CANDIDATES_MULTIPLIER=3
 
 说明：
 - `TOP_K_RESULTS` 是兜底值，优先级低于分模式 top-k。
-- 分模式 top-k：学习/练习 `RAG_TOPK_LEARN_PRACTICE=4`，考试 `RAG_TOPK_EXAM=6`。
+- 分模式 top-k：学习/练习 `RAG_TOPK_LEARN_PRACTICE=4`，考试 `RAG_TOPK_EXAM=8`。
 
 ### 3.4 文件管理
 
@@ -548,7 +548,7 @@ cp data/memory/memory.db backup/memory.db
 
 - 系统默认启用统一预算器，不需要用户额外操作。
 - 压缩优先级：历史 > RAG > 记忆 > 硬截断。
-- 学习/练习默认 `top_k=4`，考试默认 `top_k=6`。
+- 学习/练习默认 `top_k=4`，考试默认 `top_k=8`。
 - 前端右上角会显示“上下文预算角标”（hover 可见分段 token 与 pressure 百分比）。
 - 若流式开始后短时间未收到预算事件，前端会提示“后端仍在处理中”（仅提示，不影响回答继续生成）。
 - 若接近预算上限或触发硬截断，角标会变色提示，可据此调整提问范围。

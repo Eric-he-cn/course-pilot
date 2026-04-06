@@ -174,20 +174,197 @@ class OrchestrationRunner:
     def _top_k_for_mode(mode: str) -> int:
         m = (mode or "").strip().lower()
         if m == "exam":
-            return int(os.getenv("RAG_TOPK_EXAM", "6"))
+            return int(os.getenv("RAG_TOPK_EXAM", "8"))
         if m in {"learn", "practice"}:
             return int(os.getenv("RAG_TOPK_LEARN_PRACTICE", "4"))
         return int(os.getenv("TOP_K_RESULTS", "3"))
 
+    # 兼容测试与旧调用方：当前主链路已改为 rolling summary，但最近历史裁剪口径仍统一为 5 轮。
     @staticmethod
     def _trim_history_recent(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if not history:
             return []
-        turns = int(os.getenv("CB_HISTORY_RECENT_TURNS", "6"))
+        turns = int(os.getenv("CB_HISTORY_RECENT_TURNS", "5"))
         keep = max(0, turns * 2)
         if keep <= 0:
             return []
         return history[-keep:]
+
+    @staticmethod
+    def _plan_question_raw(plan: Plan, user_message: str) -> str:
+        text = str(getattr(plan, "question_raw", "") or user_message or "").strip()
+        return text or str(user_message or "").strip()
+
+    @staticmethod
+    def _plan_retrieval_query(plan: Plan, user_message: str) -> str:
+        text = str(getattr(plan, "retrieval_query", "") or "").strip()
+        return text or OrchestrationRunner._plan_question_raw(plan, user_message)
+
+    @staticmethod
+    def _plan_memory_query(plan: Plan, user_message: str) -> str:
+        text = str(getattr(plan, "memory_query", "") or "").strip()
+        return text or OrchestrationRunner._plan_retrieval_query(plan, user_message)
+
+    @staticmethod
+    def _should_persist_learn_episode(user_message: str) -> bool:
+        text = str(user_message or "").strip()
+        if not text:
+            return False
+        explicit_patterns = [
+            "记住",
+            "帮我记住",
+            "请记住",
+            "下次提醒",
+            "以后提醒",
+            "以后按这个偏好",
+            "记下来",
+            "保存这个偏好",
+        ]
+        return any(p in text for p in explicit_patterns)
+
+    @staticmethod
+    def _empty_history_summary_state() -> Dict[str, Any]:
+        recent_raw_turns = max(1, int(os.getenv("CB_HISTORY_RECENT_RAW_TURNS", os.getenv("CB_HISTORY_RECENT_TURNS", "5"))))
+        block_turns = max(1, int(os.getenv("CB_HISTORY_SUMMARY_BLOCK_TURNS", "5")))
+        max_blocks = max(1, int(os.getenv("CB_HISTORY_SUMMARY_MAX_BLOCKS", "10")))
+        return {
+            "blocks": [],
+            "covered_turns": 0,
+            "recent_raw_turns": recent_raw_turns,
+            "block_turns": block_turns,
+            "max_blocks": max_blocks,
+        }
+
+    @classmethod
+    def _normalize_history_summary_state(cls, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        base = cls._empty_history_summary_state()
+        if not isinstance(state, dict):
+            return base
+        blocks = state.get("blocks", [])
+        if isinstance(blocks, list):
+            base["blocks"] = [dict(b) for b in blocks if isinstance(b, dict)]
+        try:
+            base["covered_turns"] = max(0, int(state.get("covered_turns", 0) or 0))
+        except Exception:
+            base["covered_turns"] = 0
+        for key in ("recent_raw_turns", "block_turns", "max_blocks"):
+            try:
+                base[key] = max(1, int(state.get(key, base[key]) or base[key]))
+            except Exception:
+                pass
+        return base
+
+    @staticmethod
+    def _history_to_turns(history: List[Dict[str, str]]) -> List[List[Dict[str, str]]]:
+        turns: List[List[Dict[str, str]]] = []
+        current_user: Optional[Dict[str, str]] = None
+        for msg in history or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "")).strip()
+            content = str(msg.get("content", "") or "").strip()
+            if role == "user":
+                current_user = dict(msg)
+            elif role == "assistant":
+                if current_user is None:
+                    continue
+                if not content and not msg.get("tool_calls"):
+                    continue
+                turns.append([current_user, dict(msg)])
+                current_user = None
+        return turns
+
+    @staticmethod
+    def _flatten_turns(turns: List[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        for turn in turns:
+            for msg in turn:
+                if isinstance(msg, dict):
+                    out.append(dict(msg))
+        return out
+
+    @classmethod
+    def _extract_history_summary_state(cls, history: list) -> Dict[str, Any]:
+        payload = cls._extract_internal_meta(history, "history_summary_state")
+        return cls._normalize_history_summary_state(payload)
+
+    @staticmethod
+    def _build_history_summary_tool_call(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        blocks = list((state or {}).get("blocks", []) or [])
+        covered_turns = int((state or {}).get("covered_turns", 0) or 0)
+        if not blocks and covered_turns <= 0:
+            return []
+        return [
+            {
+                "type": "internal_meta",
+                "name": "history_summary_state",
+                "payload": state,
+            }
+        ]
+
+    @staticmethod
+    def _merge_internal_tool_calls(*tool_call_groups: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        merged: List[Dict[str, Any]] = []
+        for group in tool_call_groups:
+            if not isinstance(group, list):
+                continue
+            for tc in group:
+                if isinstance(tc, dict):
+                    merged.append(tc)
+        return merged or None
+
+    def _prepare_history_summary_inputs(
+        self,
+        history: List[Dict[str, str]],
+    ) -> tuple[Dict[str, Any], List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
+        state = self._extract_history_summary_state(history)
+        turns = self._history_to_turns(history)
+        recent_raw_turns = max(1, int(state.get("recent_raw_turns", 5) or 5))
+        block_turns = max(1, int(state.get("block_turns", 5) or 5))
+        max_blocks = max(1, int(state.get("max_blocks", 10) or 10))
+
+        older_turn_limit = max(0, len(turns) - recent_raw_turns)
+        covered_turns = min(max(0, int(state.get("covered_turns", 0) or 0)), older_turn_limit)
+        blocks = [dict(b) for b in state.get("blocks", []) if isinstance(b, dict)]
+        state_hit = bool(blocks)
+        total_block_ms = 0.0
+
+        pending_turns = turns[covered_turns:older_turn_limit]
+        while len(pending_turns) >= block_turns:
+            batch = pending_turns[:block_turns]
+            compressed = self.context_budgeter.compress_history_block(batch)
+            turn_start = covered_turns + 1
+            covered_turns += block_turns
+            turn_end = covered_turns
+            blocks.append(
+                {
+                    "id": f"turns_{turn_start}_{turn_end}",
+                    "turn_range": f"{turn_start}-{turn_end}",
+                    "summary_text": str(compressed.get("summary_text", "") or "").strip(),
+                    "source": str(compressed.get("source", "heuristic") or "heuristic"),
+                    "tokens_est": int(compressed.get("tokens_est", 0) or 0),
+                    "created_at": datetime.now().isoformat(),
+                }
+            )
+            if len(blocks) > max_blocks:
+                blocks = blocks[-max_blocks:]
+            total_block_ms += float(compressed.get("elapsed_ms", 0.0) or 0.0)
+            pending_turns = pending_turns[block_turns:]
+
+        state = {
+            "blocks": blocks,
+            "covered_turns": covered_turns,
+            "recent_raw_turns": recent_raw_turns,
+            "block_turns": block_turns,
+            "max_blocks": max_blocks,
+        }
+        metrics = {
+            "history_summary_state_hit": state_hit,
+            "history_summary_block_count": len(blocks),
+            "history_block_compress_ms": round(total_block_ms, 3) if total_block_ms > 0 else None,
+        }
+        recent_turns = turns[older_turn_limit:]
+        return state, self._flatten_turns(pending_turns), self._flatten_turns(recent_turns), metrics
     
     def run_learn_mode(
         self,
@@ -199,8 +376,11 @@ class OrchestrationRunner:
         """执行学习模式（非流式）。"""
         if history is None:
             history = []
-        history = self._trim_history_recent(history)
         retrieval_empty = False
+        question_raw = self._plan_question_raw(plan, user_message)
+        retrieval_query = self._plan_retrieval_query(plan, user_message)
+        memory_query = self._plan_memory_query(plan, user_message)
+        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
         # 关键步骤：按 plan 决定是否执行 RAG 检索并准备 citations。
         context = ""
         citations = []
@@ -208,7 +388,7 @@ class OrchestrationRunner:
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("learn"))
+                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("learn"), mode="learn")
                 if chunks:
                     context = retriever.format_context(chunks)
                     citations = chunks
@@ -220,14 +400,14 @@ class OrchestrationRunner:
                 context = "（未找到相关教材，请先上传课程资料）"
 
         memory_ctx = self._fetch_history_ctx(
-            query=user_message,
+            query=memory_query,
             course_name=course_name,
             mode="learn",
             agent="tutor",
             phase="answer",
         )
         packed = self.context_budgeter.build_context(
-            query=user_message,
+            query=retrieval_query,
             history=history,
             rag_text=context,
             memory_text=memory_ctx,
@@ -243,7 +423,13 @@ class OrchestrationRunner:
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
         # 为 filewriter 工具注入当前课程的笔记目录
         from mcp_tools.client import MCPTools
-        MCPTools._context = {"notes_dir": notes_dir}
+        MCPTools._context = {
+            "notes_dir": notes_dir,
+            "memory_query": memory_query,
+            "retrieval_query": retrieval_query,
+            "question_raw": question_raw,
+            "course_name": course_name,
+        }
         result: TutorResult = self.tutor.teach(
             user_message, course_name, context,
             context_sections=context_sections,
@@ -262,6 +448,28 @@ class OrchestrationRunner:
 
         # 合并 RAG citations 和 Tutor 内部工具调用产生的 citations
         merged_citations = citations + result.citations if citations else result.citations
+        if self._should_persist_learn_episode(user_message):
+            try:
+                from memory.manager import get_memory_manager
+
+                mgr = get_memory_manager()
+                doc_ids = [c.doc_id for c in merged_citations] if merged_citations else []
+                content = f"用户要求记住: {question_raw}"
+                if doc_ids:
+                    content += f"\n参考来源: {', '.join(dict.fromkeys(doc_ids))}"
+                mgr.record_event(
+                    course_name=course_name,
+                    event_type="qa",
+                    content=content,
+                    importance=0.6,
+                    metadata={"doc_ids": doc_ids, "explicit_memory_request": True},
+                    increment_qa=True,
+                    mode="learn",
+                    agent="tutor",
+                    phase="answer",
+                )
+            except Exception as _mem_err:
+                self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
         self._last_run_meta = {
             "mode": "learn",
             "retrieval_empty": retrieval_empty,
@@ -272,7 +480,7 @@ class OrchestrationRunner:
             role="assistant",
             content=result.content,
             citations=merged_citations if merged_citations else None,
-            tool_calls=None,
+            tool_calls=self._build_history_summary_tool_call(history_summary_state),
         )
     
     def run_practice_mode(
@@ -286,15 +494,17 @@ class OrchestrationRunner:
         """对话式练习模式（非流式）：出题走 QuizMaster，交卷走 Grader。"""
         if history is None:
             history = []
-        history = self._trim_history_recent(history)
         retrieval_empty = False
+        retrieval_query = self._plan_retrieval_query(plan, user_message)
+        memory_query = self._plan_memory_query(plan, user_message)
+        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
 
         context = ""
         citations = []
         if plan.need_rag:
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("practice"))
+                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("practice"), mode="practice")
                 if chunks:
                     context = retriever.format_context(chunks)
                     citations = chunks
@@ -312,19 +522,23 @@ class OrchestrationRunner:
 
         # 历史错题上下文（Runner 统一预取，供后续链路共享）
         history_ctx = self._fetch_history_ctx(
-            query=user_message,
+            query=memory_query,
             course_name=course_name,
             mode="practice",
             agent=mem_agent,
             phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
-            query=user_message,
+            query=retrieval_query,
             history=history,
             rag_text=context,
             memory_text=history_ctx,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            history_summary_state=history_summary_state,
+            pending_history=pending_history,
+            recent_history=recent_history,
+            history_state_metrics=history_metrics,
         )
         self._log_context_budget("practice", packed)
         context_sections = self._context_sections_from_packed(packed)
@@ -333,7 +547,12 @@ class OrchestrationRunner:
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {"notes_dir": notes_dir}
+        MCPTools._context = {
+            "notes_dir": notes_dir,
+            "memory_query": memory_query,
+            "retrieval_query": retrieval_query,
+            "course_name": course_name,
+        }
         tool_calls = None
 
         if answer_submission:
@@ -365,6 +584,7 @@ class OrchestrationRunner:
             saved_path = self._save_practice_record(course_name, user_message, history, response_text)
             self._save_grading_to_memory(course_name, user_message, history, response_text)
             response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
+            tool_calls = self._build_history_summary_tool_call(history_summary_state)
         else:
             self.logger.info("[status] practice generating_quiz%s", self._trace_tag())
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
@@ -410,6 +630,10 @@ class OrchestrationRunner:
                 )
                 response_text = self._render_quiz_message(quiz)
                 tool_calls = self._build_quiz_meta_tool_call(quiz)
+            tool_calls = self._merge_internal_tool_calls(
+                tool_calls,
+                self._build_history_summary_tool_call(history_summary_state),
+            )
 
         self._last_run_meta = {
             "mode": "practice",
@@ -435,8 +659,10 @@ class OrchestrationRunner:
         """对话式练习模式（流式）：交卷走 Grader 流式，出题走 QuizMaster。"""
         if history is None:
             history = []
-        history = self._trim_history_recent(history)
         retrieval_empty = False
+        retrieval_query = self._plan_retrieval_query(plan, user_message)
+        memory_query = self._plan_memory_query(plan, user_message)
+        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
 
         context = ""
         citations_dicts = []
@@ -444,7 +670,7 @@ class OrchestrationRunner:
             yield {"__status__": "正在检索教材证据..."}
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("practice"))
+                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("practice"), mode="practice")
                 if chunks:
                     context = retriever.format_context(chunks)
                     citations_dicts = [c.model_dump() for c in chunks]
@@ -465,19 +691,23 @@ class OrchestrationRunner:
 
         yield {"__status__": "正在检索历史记忆..."}
         history_ctx = self._fetch_history_ctx(
-            query=user_message,
+            query=memory_query,
             course_name=course_name,
             mode="practice",
             agent=mem_agent,
             phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
-            query=user_message,
+            query=retrieval_query,
             history=history,
             rag_text=context,
             memory_text=history_ctx,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            history_summary_state=history_summary_state,
+            pending_history=pending_history,
+            recent_history=recent_history,
+            history_state_metrics=history_metrics,
         )
         self._log_context_budget("practice", packed)
         payload = self._context_budget_payload("practice", len(history), packed)
@@ -493,7 +723,12 @@ class OrchestrationRunner:
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {"notes_dir": notes_dir}
+        MCPTools._context = {
+            "notes_dir": notes_dir,
+            "memory_query": memory_query,
+            "retrieval_query": retrieval_query,
+            "course_name": course_name,
+        }
 
         if answer_submission:
             yield {"__status__": "正在批改练习答案..."}
@@ -527,6 +762,7 @@ class OrchestrationRunner:
             saved_path = self._save_practice_record(course_name, user_message, history, full_response)
             self._save_grading_to_memory(course_name, user_message, history, full_response)
             yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
+            yield {"__tool_calls__": self._build_history_summary_tool_call(history_summary_state)}
         else:
             yield {"__status__": "正在生成练习题..."}
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
@@ -550,9 +786,12 @@ class OrchestrationRunner:
                 if not isinstance(exam_payload, dict):
                     exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
                 yield {
-                    "__tool_calls__": self._build_exam_meta_tool_call(
-                        exam_payload.get("answer_sheet", []),
-                        int(exam_payload.get("total_score", 0)),
+                    "__tool_calls__": self._merge_internal_tool_calls(
+                        self._build_exam_meta_tool_call(
+                            exam_payload.get("answer_sheet", []),
+                            int(exam_payload.get("total_score", 0)),
+                        ),
+                        self._build_history_summary_tool_call(history_summary_state),
                     )
                 }
                 content = str(exam_payload.get("content", "")).strip()
@@ -573,7 +812,12 @@ class OrchestrationRunner:
                     num_questions=num_questions,
                     question_type=question_type,
                 )
-                yield {"__tool_calls__": self._build_quiz_meta_tool_call(quiz)}
+                yield {
+                    "__tool_calls__": self._merge_internal_tool_calls(
+                        self._build_quiz_meta_tool_call(quiz),
+                        self._build_history_summary_tool_call(history_summary_state),
+                    )
+                }
                 yield self._render_quiz_message(quiz)
 
         self._last_run_meta = {
@@ -594,13 +838,15 @@ class OrchestrationRunner:
         """对话式考试模式（非流式）：出卷走 QuizMaster，交卷评分讲解走 Grader。"""
         if history is None:
             history = []
-        history = self._trim_history_recent(history)
         retrieval_empty = False
+        retrieval_query = self._plan_retrieval_query(plan, user_message)
+        memory_query = self._plan_memory_query(plan, user_message)
+        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
 
         context = ""
         retriever = self.load_retriever(course_name)
         if retriever:
-            chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("exam"))
+            chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("exam"), mode="exam")
             if chunks:
                 context = retriever.format_context(chunks)
             else:
@@ -615,19 +861,23 @@ class OrchestrationRunner:
         mem_phase = "grade" if answer_submission else "generate"
 
         history_ctx = self._fetch_history_ctx(
-            query=user_message,
+            query=memory_query,
             course_name=course_name,
             mode="exam",
             agent=mem_agent,
             phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
-            query=user_message,
+            query=retrieval_query,
             history=history,
             rag_text=context,
             memory_text=history_ctx,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            history_summary_state=history_summary_state,
+            pending_history=pending_history,
+            recent_history=recent_history,
+            history_state_metrics=history_metrics,
         )
         self._log_context_budget("exam", packed)
         context_sections = self._context_sections_from_packed(packed)
@@ -649,6 +899,7 @@ class OrchestrationRunner:
             saved_path = self._save_exam_record(course_name, user_message, history, response_text)
             self._save_exam_to_memory(course_name, response_text)
             response_text += f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
+            tool_calls = self._build_history_summary_tool_call(history_summary_state)
         else:
             self.logger.info("[status] exam generating_paper%s", self._trace_tag())
             exam_payload = self.quizmaster.generate_exam_paper(
@@ -667,6 +918,10 @@ class OrchestrationRunner:
             tool_calls = self._build_exam_meta_tool_call(
                 exam_payload.get("answer_sheet", []),
                 int(exam_payload.get("total_score", 0)),
+            )
+            tool_calls = self._merge_internal_tool_calls(
+                tool_calls,
+                self._build_history_summary_tool_call(history_summary_state),
             )
 
         self._last_run_meta = {
@@ -693,15 +948,17 @@ class OrchestrationRunner:
         """对话式考试模式（流式）：交卷走 Grader 流式，出卷走 QuizMaster。"""
         if history is None:
             history = []
-        history = self._trim_history_recent(history)
         retrieval_empty = False
+        retrieval_query = self._plan_retrieval_query(plan, user_message)
+        memory_query = self._plan_memory_query(plan, user_message)
+        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
 
         context = ""
         citations_dicts = []
         yield {"__status__": "正在检索教材证据..."}
         retriever = self.load_retriever(course_name)
         if retriever:
-            chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("exam"))
+            chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("exam"), mode="exam")
             if chunks:
                 context = retriever.format_context(chunks)
                 citations_dicts = [c.model_dump() for c in chunks]
@@ -722,19 +979,23 @@ class OrchestrationRunner:
 
         yield {"__status__": "正在检索历史记忆..."}
         history_ctx = self._fetch_history_ctx(
-            query=user_message,
+            query=memory_query,
             course_name=course_name,
             mode="exam",
             agent=mem_agent,
             phase=mem_phase,
         )
         packed = self.context_budgeter.build_context(
-            query=user_message,
+            query=retrieval_query,
             history=history,
             rag_text=context,
             memory_text=history_ctx,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            history_summary_state=history_summary_state,
+            pending_history=pending_history,
+            recent_history=recent_history,
+            history_state_metrics=history_metrics,
         )
         self._log_context_budget("exam", packed)
         payload = self._context_budget_payload("exam", len(history), packed)
@@ -764,6 +1025,7 @@ class OrchestrationRunner:
             saved_path = self._save_exam_record(course_name, user_message, history, full_response)
             self._save_exam_to_memory(course_name, full_response)
             yield f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
+            yield {"__tool_calls__": self._build_history_summary_tool_call(history_summary_state)}
         else:
             yield {"__status__": "正在生成考试试卷..."}
             exam_payload = self.quizmaster.generate_exam_paper(
@@ -779,9 +1041,12 @@ class OrchestrationRunner:
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
             yield {
-                "__tool_calls__": self._build_exam_meta_tool_call(
-                    exam_payload.get("answer_sheet", []),
-                    int(exam_payload.get("total_score", 0)),
+                "__tool_calls__": self._merge_internal_tool_calls(
+                    self._build_exam_meta_tool_call(
+                        exam_payload.get("answer_sheet", []),
+                        int(exam_payload.get("total_score", 0)),
+                    ),
+                    self._build_history_summary_tool_call(history_summary_state),
                 )
             }
             yield str(exam_payload.get("content", "")).strip()
@@ -851,7 +1116,7 @@ class OrchestrationRunner:
                 "tool": "memory_search",
                 "query": query,
                 "course_name": course_name,
-                "event_types": ["mistake", "practice", "exam", "qa"],
+                "event_types": ["mistake", "practice", "exam", "qa_summary"],
                 "mode": mode or None,
                 "agent": agent or None,
                 "phase": phase or None,
@@ -866,7 +1131,7 @@ class OrchestrationRunner:
                     "memory_search",
                     query=query,
                     course_name=course_name,
-                    event_types=["mistake", "practice", "exam", "qa"],
+                    event_types=["mistake", "practice", "exam", "qa_summary"],
                     mode=mode or None,
                     agent=agent or None,
                     phase=phase or None,
@@ -953,6 +1218,8 @@ class OrchestrationRunner:
             "budget_tokens_est": budget_tokens,
             "context_pressure_ratio": ratio,
             "history_summary_source": str(packed.get("history_summary_source", "none") or "none"),
+            "history_summary_block_count": int(packed.get("history_summary_block_count", 0) or 0),
+            "history_summary_state_hit": bool(packed.get("history_summary_state_hit", False)),
             "history_llm_compress_applied": bool(packed.get("history_llm_compress_applied", False)),
             "history_llm_compress_ms": packed.get("history_llm_compress_ms"),
             "hard_truncated": bool(packed.get("hard_truncated", False)),
@@ -1535,7 +1802,10 @@ class OrchestrationRunner:
         """
         if history is None:
             history = []
-        history = self._trim_history_recent(history)
+        question_raw = self._plan_question_raw(plan, user_message)
+        retrieval_query = self._plan_retrieval_query(plan, user_message)
+        memory_query = self._plan_memory_query(plan, user_message)
+        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
 
         context = ""
         citations_dicts = []
@@ -1543,7 +1813,7 @@ class OrchestrationRunner:
             yield {"__status__": "正在检索教材证据..."}
             retriever = self.load_retriever(course_name)
             if retriever:
-                chunks = retriever.retrieve(user_message, top_k=self._top_k_for_mode("learn"))
+                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("learn"), mode="learn")
                 context = retriever.format_context(chunks)
                 citations_dicts = [c.model_dump() for c in chunks]
             else:
@@ -1551,19 +1821,23 @@ class OrchestrationRunner:
 
         yield {"__status__": "正在检索历史记忆..."}
         memory_ctx = self._fetch_history_ctx(
-            query=user_message,
+            query=memory_query,
             course_name=course_name,
             mode="learn",
             agent="tutor",
             phase="answer",
         )
         packed = self.context_budgeter.build_context(
-            query=user_message,
+            query=retrieval_query,
             history=history,
             rag_text=context,
             memory_text=memory_ctx,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            history_summary_state=history_summary_state,
+            pending_history=pending_history,
+            recent_history=recent_history,
+            history_state_metrics=history_metrics,
         )
         self._log_context_budget("learn", packed)
         payload = self._context_budget_payload("learn", len(history), packed)
@@ -1582,7 +1856,13 @@ class OrchestrationRunner:
 
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {"notes_dir": notes_dir}
+        MCPTools._context = {
+            "notes_dir": notes_dir,
+            "memory_query": memory_query,
+            "retrieval_query": retrieval_query,
+            "question_raw": question_raw,
+            "course_name": course_name,
+        }
 
         yield {"__status__": "正在生成最终回答..."}
         yield from self.tutor.teach_stream(
@@ -1591,28 +1871,31 @@ class OrchestrationRunner:
             allowed_tools=plan.allowed_tools,
             history=history
         )
+        yield {"__tool_calls__": self._build_history_summary_tool_call(history_summary_state)}
 
-        # 流式输出完成后写入情景记忆（异步失败不影响主流程）
-        try:
-            from memory.manager import get_memory_manager
-            mgr = get_memory_manager()
-            doc_ids = [c["doc_id"] for c in citations_dicts] if citations_dicts else []
-            content = f"问题: {user_message}"
-            if doc_ids:
-                content += f"\n参考来源: {', '.join(dict.fromkeys(doc_ids))}"
-            mgr.record_event(
-                course_name=course_name,
-                event_type="qa",
-                content=content,
-                importance=0.5,
-                metadata={"doc_ids": doc_ids},
-                increment_qa=True,
-                mode="learn",
-                agent="tutor",
-                phase="answer",
-            )
-        except Exception as _mem_err:
-            self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
+        if self._should_persist_learn_episode(user_message):
+            # 流式输出完成后仅在用户显式要求“记住”时写入情景记忆。
+            try:
+                from memory.manager import get_memory_manager
+
+                mgr = get_memory_manager()
+                doc_ids = [c["doc_id"] for c in citations_dicts] if citations_dicts else []
+                content = f"用户要求记住: {question_raw}"
+                if doc_ids:
+                    content += f"\n参考来源: {', '.join(dict.fromkeys(doc_ids))}"
+                mgr.record_event(
+                    course_name=course_name,
+                    event_type="qa",
+                    content=content,
+                    importance=0.6,
+                    metadata={"doc_ids": doc_ids, "explicit_memory_request": True},
+                    increment_qa=True,
+                    mode="learn",
+                    agent="tutor",
+                    phase="answer",
+                )
+            except Exception as _mem_err:
+                self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
 
     def run_stream(
         self,

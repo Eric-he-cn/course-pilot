@@ -403,6 +403,28 @@ def _memory_search_intent_from_user_goal(user_content: str) -> bool:
     return any(sig in text for sig in signals)
 
 
+def _rewrite_memory_search_args(tool_name: str, tool_args: Dict[str, Any], original_user_content: str) -> Dict[str, Any]:
+    if tool_name != "memory_search":
+        return dict(tool_args or {})
+    args = dict(tool_args or {})
+    try:
+        from mcp_tools.client import MCPTools
+
+        preferred_query = str(MCPTools._context.get("memory_query", "")).strip()
+        preferred_course = str(MCPTools._context.get("course_name", "")).strip()
+    except Exception:
+        preferred_query = ""
+        preferred_course = ""
+
+    current_query = str(args.get("query", "") or "").strip()
+    user_goal = _extract_user_goal(original_user_content).strip()
+    if preferred_query and (not current_query or current_query == user_goal or len(current_query) < 4):
+        args["query"] = preferred_query
+    if preferred_course and not str(args.get("course_name", "") or "").strip():
+        args["course_name"] = preferred_course
+    return args
+
+
 def _tool_call_preflight(
     *,
     tool_name: str,
@@ -604,6 +626,7 @@ class LLMClient:
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
+                    tool_args = _rewrite_memory_search_args(tool_name, tool_args, original_user_content)
 
                     allowed, gate_reason, capability, cache_key = _tool_call_preflight(
                         tool_name=tool_name,
@@ -989,6 +1012,7 @@ class LLMClient:
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
+                    tool_args = _rewrite_memory_search_args(tool_name, tool_args, original_user_content)
 
                     allowed, gate_reason, capability, cache_key = _tool_call_preflight(
                         tool_name=tool_name,

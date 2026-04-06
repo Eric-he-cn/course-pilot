@@ -63,12 +63,44 @@ class RouterAgent:
             output_format="answer",
         )
 
+    @staticmethod
+    def _fallback_keywords(user_message: str) -> list[str]:
+        import re
+
+        text = str(user_message or "").lower()
+        terms = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", text)
+        out = []
+        seen = set()
+        for term in terms:
+            if term not in seen:
+                out.append(term)
+                seen.add(term)
+            if len(out) >= 12:
+                break
+        return out
+
     """规范化并修正重规划结果，确保工具权限和任务类型不会越权。"""
     @staticmethod
-    def _normalize_plan(plan_dict: Dict[str, Any], mode: str) -> Plan:
+    def _normalize_plan(plan_dict: Dict[str, Any], mode: str, user_message: str) -> Plan:
         plan_dict = dict(plan_dict or {})
         plan_dict["allowed_tools"] = ToolPolicy.get_allowed_tools(mode)
         plan_dict["task_type"] = mode
+        question_raw = str(plan_dict.get("question_raw", "") or user_message or "").strip()
+        user_intent = str(plan_dict.get("user_intent", "") or question_raw).strip()
+        retrieval_query = str(plan_dict.get("retrieval_query", "") or question_raw).strip()
+        memory_query = str(plan_dict.get("memory_query", "") or retrieval_query or question_raw).strip()
+        keywords = plan_dict.get("retrieval_keywords")
+        if isinstance(keywords, list):
+            retrieval_keywords = [str(x).strip() for x in keywords if str(x).strip()][:12]
+        else:
+            retrieval_keywords = []
+        if not retrieval_keywords:
+            retrieval_keywords = RouterAgent._fallback_keywords(retrieval_query or question_raw)
+        plan_dict["question_raw"] = question_raw
+        plan_dict["user_intent"] = user_intent
+        plan_dict["retrieval_query"] = retrieval_query
+        plan_dict["memory_query"] = memory_query
+        plan_dict["retrieval_keywords"] = retrieval_keywords
         return Plan(**plan_dict)
     
     """生成 Router 执行计划：注入用户画像、调用模型、解析计划、失败兜底。"""
@@ -99,10 +131,10 @@ class RouterAgent:
         # 4) 解析模型输出并规范化字段
         try:
             plan_dict = self._extract_json_payload(response)
-            return self._normalize_plan(plan_dict, mode)
+            return self._normalize_plan(plan_dict, mode, user_message)
         except Exception as e:
             print(f"Error parsing plan: {e}, using defaults")
-            return self._build_default_plan(mode)
+            return self._normalize_plan(self._build_default_plan(mode).model_dump(), mode, user_message)
 
     """重规划入口：当执行阶段发现质量/工具/检索异常时，基于失败原因生成一次替代计划。"""
     def replan(
@@ -129,7 +161,7 @@ class RouterAgent:
         try:
             response = self.llm.chat(messages, temperature=0.2)
             plan_dict = self._extract_json_payload(response)
-            return self._normalize_plan(plan_dict, mode)
+            return self._normalize_plan(plan_dict, mode, user_message)
         except Exception as e:
             print(f"Error replanning: {e}, fallback to previous plan")
             return previous_plan

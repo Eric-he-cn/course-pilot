@@ -95,9 +95,9 @@ class TutorAgent:
         messages: List[dict] = [{"role": "system", "content": system_prompt}]
         include_raw_history = os.getenv("CB_INCLUDE_RAW_HISTORY_IN_MESSAGES", "0") == "1"
         try:
-            recent_raw_turns = max(1, int(os.getenv("CB_RECENT_RAW_TURNS", "3")))
+            recent_raw_turns = max(1, int(os.getenv("CB_RECENT_RAW_TURNS", "5")))
         except Exception:
-            recent_raw_turns = 3
+            recent_raw_turns = 5
         effective_limit = min(history_limit, recent_raw_turns * 2)
         if history and include_raw_history:
             for msg in history[-effective_limit:]:
