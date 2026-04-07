@@ -995,6 +995,28 @@ flowchart LR
 
 这套评测体系适合当前系统的原因是：它不是只看“模型调用快不快”，而是能同时观察 **RAG、上下文、工具、编排、最终输出** 五个层面的变化。
 
+#### 9.9.2 当前基线结果（full30）
+
+下面这组数字来自当前仓库中的最新 full30 评测产物：`data/perf_runs/fullfix_full30_20260326/baseline_summary.json`。它反映的是当前版本在 30 条样本上的整体表现。
+
+| 指标 | 当前结果 |
+|---|---:|
+| `avg_prompt_tokens` | 2524.63 |
+| `llm_call_count_avg` | 3.20 |
+| `avg_llm_ms` | 19176.75 |
+| `p50_first_token_latency_ms` | 42957.90 |
+| `p95_first_token_latency_ms` | 106809.79 |
+| `p50_e2e_latency_ms` | 46714.34 |
+| `p95_e2e_latency_ms` | 106810.37 |
+| `avg_retrieval_ms` | 88.08 |
+| `p95_retrieval_ms` | 275.81 |
+| `hit_at_k` | 1.00 |
+| `top1_acc` | 1.00 |
+| `precision_at_k` | 1.00 |
+| `tool_success_rate` | 1.00 |
+| `error_rate` | 0.00 |
+| `duplicate_tool_call_rate` | 0.00 |
+
 ## 10 数据存储结构
 
 这一章不只列“存在哪”，还强调三件事：
