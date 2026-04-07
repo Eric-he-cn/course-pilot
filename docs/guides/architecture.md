@@ -230,20 +230,104 @@ flowchart LR
 2. 各 Agent 的内部实现与提示词规则（尤其是 QuizMaster 的最小外部调用、Grader 的 `calculator` 专线）。
 - 练习/考试评卷阶段额外收紧：由 GraderAgent 专线处理，工具仅 `calculator`。
 
-#### D. 记忆系统 (memory/)
+#### D. 上下文工程与记忆系统
+
+当前实现把“短期上下文管理”和“长期记忆管理”分开设计，但由 Runner 统一编排。  
+一句话概括：
+
+- 短期上下文负责“这次回答用什么信息”
+- 长期记忆负责“下次更懂用户和课程薄弱点”
+
+**D1. 上下文工程（短期记忆）**
+
+上下文不是把 `history + rag + memory` 全量拼进 prompt，而是由 `ContextBudgeter` 做分段预算：
+
+1. `history`
+2. `rag`
+3. `memory`
+4. `hard truncate`
+
+当前的历史段已经升级为 **rolling summary + recent raw turns**：
+
+- 最近 `5` 轮原文始终保留
+- 每累计 `5` 轮旧历史，就压成一个新的 `summary block`
+- `summary block` 通过内部 `history_summary_state` meta 挂在对话历史里
+- 最多保留 `10` 个 block；超出后淘汰最老 block
+
+这意味着当前主路径不再是“每次请求重算全部 old history 摘要”，而是：
+
+- `history_summary_state.blocks`
+- `pending_history`
+- `recent_history`
+
+由 `ContextBudgeter` 统一消费。只有在缺少 `history_summary_state` 时，才会走旧的 older-history fallback 摘要逻辑。
+
+**D2. Router 结构化计划如何参与上下文构建**
+
+Router 当前不只输出 `need_rag/style`，还会产出检索相关字段：
+
+- `question_raw`: 用户原始问题，保持原意
+- `user_intent`: 归纳后的用户真实需求
+- `retrieval_query`: 给 RAG 用的检索查询
+- `memory_query`: 给长期记忆检索用的查询
+
+这几个字段的边界是：
+
+- 回答链路仍以 `question_raw` 为准，不改写用户真实问题
+- `retrieval_query` 只服务教材检索
+- `memory_query` 只服务记忆检索
+
+所以，当前系统已经不是“用户原话直接同时喂给 RAG 和 memory”，而是 Router 先做结构化拆分，再由 Runner 分别下发到检索链路。
+
+**D3. 长期记忆（memory.db）**
 
 **存储**: SQLite，路径 `data/memory/memory.db`
 
 **表结构**:
-- `episodes`: 每次练习/考试/错题的详细记录（timestamp、course、type、content、score）
-- `user_profiles`: 每门课程的薄弱知识点聚合（weak_points、practice_count、avg_score）
+- `episodes`: 长期情景记忆，当前事件类型包含 `qa / qa_summary / mistake / practice / exam`
+- `user_profiles`: 每门课程的聚合画像，如 `weak_points / concept_mastery / avg_score`
 
-**写入时机**:
-- 练习评分完成 → `_save_grading_to_memory()` → 写 `practice`/`mistake` episode
-- 考试批改完成 → `_save_exam_to_memory()` → 写 `exam` episode
-- 每次写入自动调用 `update_weak_points()` + `record_practice_result()` 更新用户画像
+**检索后端**:
+- 优先走 `FTS5`
+- 不可用时回退到 `LIKE`
 
-**用户画像注入**: Tutor/QuizMaster 在 system prompt 中自动附加弱点列表，优先针对薄弱知识点讲解和出题。
+**检索优先级**:
+- `mistake`
+- `practice`
+- `exam`
+- `qa_summary`
+- `qa`
+
+也就是说，当前主检索路径优先看高价值事件和摘要化问答，而不是优先扫全部原始 `qa`。
+
+**D4. 长期记忆写入与归档**
+
+当前写入策略已经不是“learn 模式每轮都记一条 `qa`”。
+
+- learn 模式：
+  - 默认不写普通 `qa`
+  - 仅用户显式表达“记住 / 下次提醒 / 以后按这个偏好”等长期记忆意图时才写入
+  - 这一步当前是规则匹配，不是 LLM 分类
+- practice 模式：
+  - 评分完成后写 `practice` 或 `mistake`
+- exam 模式：
+  - 批改完成后写 `exam`
+
+另外，低价值旧 `qa` 会异步归档为 `qa_summary`：
+
+- 最近 `50` 条原始 `qa` 保留
+- 每批 `20` 条旧 `qa` 归档成 1 条 `qa_summary`
+- `importance > 0.55` 或 `explicit_memory_request=True` 的 `qa` 不参与归档
+- 归档优先走 LLM 摘要，失败时回退到规则摘要
+
+**D5. 用户画像如何使用**
+
+用户画像仍由 `user_profiles` 承载，主要来源是 practice/exam 的评分结果和概念掌握度更新。  
+在模型侧，画像不会全量原始注入，而是以压缩后的 profile context 进入提示词，用来：
+
+- 强化薄弱点讲解
+- 影响练习/考试命题侧重点
+- 在记忆检索结果不足时提供稳定的长期偏好与弱项背景
 
 ### 3. 数据流详解
 
@@ -256,9 +340,12 @@ FastAPI (/chat/stream) → SSE 流式响应
   ↓
 Runner.run_learn_mode_stream()
   ↓
-[LLM #1] RouterAgent.plan() → Plan(need_rag=True, style="step_by_step")
+[LLM #1] RouterAgent.plan() → Plan(need_rag/style + question_raw/user_intent/retrieval_query/memory_query)
   ↓
-[工具] Retriever.retrieve("矩阵的秩") → [教材片段1, 片段2, ...]（含页码）
+[工具] Retriever.retrieve(retrieval_query, top_k=4) → [教材片段1, 片段2, ...]
+[工具] memory_search(memory_query, event_types=[mistake/practice/exam/qa_summary]) → 近期高价值记忆
+  ↓
+[工具] ContextBudgeter.build_context(history_summary_state + recent_history + rag + memory)
   ↓
 [LLM #2~N] TutorAgent.teach_stream()  ← ReAct 循环
   system: TUTOR_PROMPT + 用户学习档案（薄弱知识点）
@@ -268,6 +355,8 @@ Runner.run_learn_mode_stream()
   ├─ 流式元事件：`__status__`（模型分析/工具调用/整理答案）
   ├─ 流式元事件：`__citations__`（当前轮引用）
   └─ 流式输出：核心答案 + 详细解释 + [来源N] 引用（仅当前轮）
+  ↓
+若用户显式要求“记住/提醒/偏好” → 写入 learn `qa`
 ```
 
 #### 练习模式流程
@@ -280,8 +369,8 @@ Runner.run_practice_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
   ↓
-[工具] Retriever.retrieve() → RAG 上下文
-[工具] memory_search()      → 历史错题片段（Runner 预取，request 级去重）
+[工具] Retriever.retrieve(retrieval_query, top_k=4) → RAG 上下文
+[工具] memory_search(memory_query) → `mistake/practice/exam/qa_summary`（Runner 预取，request 级去重）
   ↓
 _is_answer_submission() → False（用户在请求出题）
   ↓
@@ -302,7 +391,7 @@ else:
 Runner.run_practice_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
-[工具] memory_search() → 历史错题上下文（Runner 预取）
+[工具] memory_search(memory_query) → 历史错题与问答摘要（Runner 预取）
   ↓
 _is_answer_submission() → True（检测到答案格式）
 if history has exam_meta:
@@ -326,7 +415,8 @@ Runner.run_exam_mode_stream()
   ↓
 [LLM #1] RouterAgent.plan()
   ↓
-[工具] Retriever.retrieve(top_k=8) → 大范围 RAG 上下文
+[工具] Retriever.retrieve(retrieval_query, top_k=8) → 大范围 RAG 上下文
+[工具] memory_search(memory_query) → `mistake/practice/exam/qa_summary`
   ↓
 [LLM #2] QuizMaster.generate_exam_paper()  ← Plan-Solve
   plan:  _plan_exam()（scope/num_questions/difficulty_ratio）
@@ -559,8 +649,13 @@ gunicorn backend.api:app -w 4 -k uvicorn.workers.UvicornWorker
 ### 1. 统一上下文预算器（ContextBudgeter）
 
 - 接入点：`OrchestrationRunner` 在进入 Agent 前统一裁剪。
-- 顺序固定：`历史（最近轮+摘要） -> RAG（句级压缩） -> Memory（短片段） -> 硬截断`。
-- 目标：在不改外部 API 的前提下，降低中间轮 prompt 膨胀，稳定延迟。
+- 顺序固定：`history -> rag -> memory -> hard truncate`。
+- 当前 history 主路径已升级为 rolling summary：
+  - 最近 `5` 轮原文保留
+  - 每 `5` 轮旧历史压成 1 个 `summary block`
+  - 通过 `history_summary_state` 在内部 meta 中传递
+  - 最多保留 `10` 个 block
+- 目标：在不改外部 API 的前提下，降低中间轮 prompt 膨胀，稳定长对话时延。
 
 ### 2. RAG V2（分层切分 + 句级压缩）
 
@@ -599,3 +694,17 @@ gunicorn backend.api:app -w 4 -k uvicorn.workers.UvicornWorker
 - QuizMaster 新增选择题形态校验与单次重试：题面缺少 A/B/C/D 或标准答案不合法时触发一次严格重试。
 - 试卷答题卡分值口径统一：渲染阶段将 `answer_sheet` 总分归一到 100，避免跨链路总分不一致。
 - 流式上下文预算事件补齐：learn/practice/exam 三模式统一发 `__context_budget__`；前端增加“未收到预算事件”超时提示。
+
+### 7. 2026-04 上下文与记忆刷新
+
+- Router 计划结果新增：
+  - `question_raw`
+  - `user_intent`
+  - `retrieval_query`
+  - `memory_query`
+- learn 模式默认不再写普通 `qa`；仅显式长期记忆请求才写入。
+- `qa` 长期记忆新增异步归档：
+  - 最近 `50` 条原始 `qa` 保留
+  - 每批 `20` 条旧 `qa` 归档为 `qa_summary`
+  - `qa_summary` 在检索优先级中高于原始 `qa`
+- rolling summary 正式替代“每次请求重算 old history 摘要”的主路径；前端上下文窗口也改为区分 message 窗口与 rolling summary 状态。

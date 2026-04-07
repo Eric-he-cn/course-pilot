@@ -20,15 +20,15 @@
 - 代码锚点：`core/agents/router.py`，`core/agents/tutor.py`，`core/agents/grader.py`，`core/agents/quizmaster.py`
 
 ### 1.4 多轮对话是怎么实现的？
-- 标准回答：前端会先裁剪最近历史并发送后端；后端在 Runner 先做 recent turns 截取，再由 `ContextBudgeter` 按 `history -> rag -> memory -> hard_truncate` 统一做 token 预算。Tutor 默认不重复注入原始历史（可配置开启）。
-- 详细补充：现在是“前端裁剪 + Runner 预算器 + Agent 可选原文注入”三层控制，不再是单纯 `history_limit` 拼接。
-- 参数速记：`CB_HISTORY_RECENT_TURNS=5`、`CB_RECENT_RAW_TURNS=5`、`CB_INCLUDE_RAW_HISTORY_IN_MESSAGES=0`（默认）。
+- 标准回答：前端先发送最近 `20` 条 message 窗口，后端再由 Runner 做短期上下文重组。当前主路径不是“每轮重算全部旧历史摘要”，而是“最近 `5` 轮原文 + rolling summary blocks + RAG + memory”的组合，再交给 `ContextBudgeter` 做统一预算。
+- 详细补充：rolling summary 通过内部 `history_summary_state` meta 传递，每累计 `5` 轮旧历史就生成一个新的 `summary block`，最多保留 `10` 个 block；Tutor 默认不重复注入原始历史消息。
+- 参数速记：`CB_HISTORY_RECENT_TURNS=5`、`CB_RECENT_RAW_TURNS=5`、`CB_HISTORY_SUMMARY_BLOCK_TURNS=5`、`CB_HISTORY_SUMMARY_MAX_BLOCKS=10`、`CB_INCLUDE_RAW_HISTORY_IN_MESSAGES=0`（默认）。
 - 代码锚点：`frontend/streamlit_app.py`，`backend/api.py`，`core/orchestration/runner.py`，`core/orchestration/context_budgeter.py`，`core/agents/tutor.py`
 
 ### 1.5 上下文过长如何处理？
-- 标准回答：当前已启用 token 级 `ContextBudgeter`。会先压历史（含滚动摘要与可选 LLM 压缩）、再压 RAG（句级压缩）、再压 memory，最后做 hard truncate，避免超预算。
-- 详细补充：相比早期“只按轮次截断”，现在是分段预算 + 条件触发压缩，长对话与工具链路更稳。
-- 参数速记：`CTX_TOTAL_TOKENS=8192`、`CTX_SAFETY_MARGIN=256`、`CB_HISTORY_SUMMARY_MAX_TOKENS=700`、`CB_LLM_COMPRESS_TRIGGER_TOKENS=600`、`CB_LLM_COMPRESS_TARGET_TOKENS=260`。
+- 标准回答：当前已启用 token 级 `ContextBudgeter`。主顺序是 `history -> rag -> memory -> hard_truncate`：history 优先用 rolling summary，RAG 做句级压缩，memory 只注入短片段；只有缺少 rolling summary state 时，older history 才会走一次性的 LLM/heuristic fallback 摘要。
+- 详细补充：现在不是简单按轮次截断，而是“分段预算 + rolling summary + 条件压缩”。工具轮还会进一步瘦身，避免把全量上下文重复灌回模型。
+- 参数速记：`CTX_TOTAL_TOKENS=8192`、`CTX_SAFETY_MARGIN=256`、`CB_HISTORY_SUMMARY_MAX_TOKENS=700`、`CB_HISTORY_SUMMARY_BLOCK_TURNS=5`、`CB_HISTORY_SUMMARY_MAX_BLOCKS=10`、`CB_LLM_COMPRESS_TRIGGER_TOKENS=600`、`CB_LLM_COMPRESS_TARGET_TOKENS=260`。
 - 代码锚点：`core/orchestration/context_budgeter.py`，`core/orchestration/runner.py`
 
 ### 1.6 后端存在的核心价值是什么？
@@ -69,8 +69,8 @@
 - 代码锚点：`backend/api.py:334`，`backend/api.py:356`，`frontend/streamlit_app.py:378`
 
 ### 1.14 Router 规划结果解析失败时，系统怎么保证不中断？
-- 标准回答：Router 对模型输出做 JSON 解析，失败时直接回退默认 Plan（need_rag=true、按模式取 allowed_tools），让主链路继续执行，不把解析失败扩大为整次请求失败。
-- 详细补充：这体现了“模型不可信、编排要兜底”的工程原则，避免把可恢复错误变成致命错误。
+- 标准回答：Router 对模型输出做 JSON 解析，失败时会回退到默认 Plan，并补齐检索相关字段：`question_raw=user_message`、`user_intent=user_message`、`retrieval_query=user_message`、`memory_query=user_message`、`retrieval_keywords=[]`。这样主链路仍可继续，不把解析失败扩大为整次请求失败。
+- 详细补充：这体现了“模型不可信、编排要兜底”的工程原则；rewrite 失败时也只会回退到原问题，不会阻断主链路。
 - 代码锚点：`core/agents/router.py:41`，`core/agents/router.py:53`，`core/agents/router.py:92`
 
 ### 1.15 模式差异是靠提示词硬控，还是靠流程分支硬控？
@@ -147,14 +147,19 @@
 - 代码锚点：`core/agents/router.py`，`core/agents/tutor.py`，`core/agents/quizmaster.py`，`core/agents/grader.py`
 
 ### 1.29 Router / Tutor / QuizMaster / Grader 各自负责什么？状态怎么传递？
-- 标准回答：Router 产计划（need_rag/style/allowed_tools）；Tutor 负责学习回答；QuizMaster 负责练习出题与考试出卷；Grader 负责评卷讲解。状态通过 Runner 显式传递（mode/history/context），并通过内部元数据 `quiz_meta/exam_meta` 串联出题到评卷。
-- 详细补充：强调“不是 Agent 互相聊天”，而是 Runner 统一调度与状态收敛。
+- 标准回答：Router 产计划（`need_rag/style/allowed_tools/question_raw/user_intent/retrieval_query/memory_query`）；Tutor 负责学习回答；QuizMaster 负责练习出题与考试出卷；Grader 负责评卷讲解。状态通过 Runner 显式传递，并通过内部元数据 `quiz_meta/exam_meta/history_summary_state` 串联出题、评卷和滚动摘要。
+- 详细补充：强调“不是 Agent 互相聊天”，而是 Runner 统一调度与状态收敛；其中 `retrieval_query/memory_query` 只服务检索，不改写用户真实问题。
 - 代码锚点：`core/orchestration/runner.py`，`backend/schemas.py`
 
 ### 1.30 多 Agent 的收益是什么？有没有带来额外复杂性？
 - 标准回答：收益是可维护性、可观测性、可回归性更好；复杂性是编排分支和状态管理成本增加。当前通过统一 Runner、统一工具契约、统一指标埋点来控制复杂性。
 - 详细补充：可给 trade-off 结论：`用编排复杂度换业务可控性`。
 - 代码锚点：`core/orchestration/runner.py`，`core/orchestration/policies.py`，`core/metrics/`
+
+### 1.31 Router rewrite 会不会改写用户真实问题？
+- 标准回答：不会。当前 Router 只把用户输入拆成 `question_raw / user_intent / retrieval_query / memory_query` 四类信息，其中回答链路仍以 `question_raw` 为准；`retrieval_query` 和 `memory_query` 只服务检索。
+- 详细补充：这属于“结构化 query planning”，不是把用户原问题改写后再直接拿去回答。
+- 代码锚点：`core/agents/router.py`，`core/orchestration/runner.py`，`core/orchestration/prompts.py`
 
 ## 2. RAG（解析/切块/索引/混合检索/引用）
 
@@ -339,16 +344,16 @@
 ## 4. 记忆系统（情景记忆/用户画像/触发条件/检索注入）
 
 ### 4.1 情景记忆分几种事件类型？
-- 标准回答：`episodes.event_type` 设计为 `qa / mistake / practice / exam`。
-- 详细补充：回答时把四类事件映射到业务场景：学习问答、练习错题、练习正常、考试记录。
-- 参数速记：事件类型固定 `4` 类：`qa`、`mistake`、`practice`、`exam`。
-- 代码锚点：`memory/store.py:41`
+- 标准回答：当前 `episodes.event_type` 已包含 `qa / qa_summary / mistake / practice / exam` 五类。`qa_summary` 是把较旧、低价值 `qa` 异步归档后的摘要事件。
+- 详细补充：回答时建议区分“原始问答事件”和“归档摘要事件”，因为当前主检索路径已经优先看 `qa_summary`，不是优先看所有 `qa`。
+- 参数速记：事件类型固定 `5` 类：`qa`、`qa_summary`、`mistake`、`practice`、`exam`。
+- 代码锚点：`memory/store.py`，`memory/manager.py`
 
 ### 4.2 学习模式问答什么时候写入记忆？
-- 标准回答：当前在 `run_learn_mode_stream` 完成后写入 `qa`，并记录 `doc_ids` 到 metadata，同时通过统一入口 `record_event` 完成 `total_qa + 1`。
-- 详细补充：补充学习模式写入时会带 doc_ids，后续检索能回到学习材料上下文。
-- 参数速记：学习模式记忆写入参数：`event_type=qa`、`importance=0.5`、`increment_qa=True`，`doc_ids` 去重后写入 metadata。
-- 代码锚点：`core/orchestration/runner.py:723`，`core/orchestration/runner.py:771`，`memory/manager.py:191`
+- 标准回答：当前 learn 模式默认**不**写普通 `qa`。只有用户显式表达“记住 / 下次提醒 / 以后按这个偏好”等长期记忆意图时，才会写一条 `qa`。
+- 详细补充：这一步当前是**规则匹配**，不是 LLM 分类；写入时会带 `doc_ids` 和 `explicit_memory_request=True`，importance 也会更高，避免后续被低价值归档吞掉。
+- 参数速记：显式 learn 记忆默认 `event_type=qa`、`importance=0.6`、`explicit_memory_request=True`；普通 learn 问答默认不入库。
+- 代码锚点：`core/orchestration/runner.py`，`memory/manager.py`
 
 ### 4.3 练习模式什么时候写入记忆？
 - 标准回答：先通过 `_is_answer_submission` 判断用户是否在提交答案，进入评分后调用 `_save_grading_to_memory`，再统一走 `record_event` 写入。
@@ -369,7 +374,7 @@
 - 代码锚点：`core/orchestration/runner.py:300`，`core/orchestration/runner.py:359`，`core/orchestration/runner.py:627`，`core/orchestration/runner.py:676`
 
 ### 4.6 情景记忆存储结构是什么？
-- 标准回答：SQLite `episodes` 表，字段含 `content`（自然语言摘要）、`importance`、`created_at`、`metadata(JSON)`，支持按课程和类型过滤索引。
+- 标准回答：SQLite `episodes` 表，字段含 `content`（自然语言或摘要卡片）、`importance`、`created_at`、`metadata(JSON)`，支持按课程、事件类型和关键词检索。
 - 详细补充：回答时突出 content 与 metadata 分离：前者便于检索展示，后者便于结构化扩展。
 - 代码锚点：`memory/store.py:37`，`memory/store.py:45`，`memory/store.py:52`
 
@@ -379,16 +384,16 @@
 - 代码锚点：`memory/store.py:42`，`core/orchestration/runner.py:492`，`core/orchestration/runner.py:506`，`core/orchestration/runner.py:769`
 
 ### 4.8 情景记忆如何检索？
-- 标准回答：`search_episodes` 采用关键词 LIKE（分词 OR）、可选事件类型过滤、按 `importance DESC + created_at DESC` 排序，取 `top_k`。
-- 详细补充：说明当前检索是关键词 LIKE 方案，优点是简单稳定，缺点是语义能力有限。
-- 参数速记：记忆检索默认 `top_k=5`（`memory_search` 工具层），再按重要度和时间排序。
-- 代码锚点：`memory/store.py:93`，`memory/store.py:111`，`memory/store.py:120`，`memory/store.py:130`
+- 标准回答：当前记忆检索优先走 `FTS5`，不可用时回退到 `LIKE`。结果会按事件优先级、重要度和时间综合排序：`mistake > practice > exam > qa_summary > qa`。
+- 详细补充：这意味着当前检索不再是“简单按时间查最近问答”，而是优先高价值学习事件，其次才是问答摘要和原始问答。
+- 参数速记：记忆检索默认 `top_k=5`（工具层默认值）；当前后端支持 `MEMORY_SEARCH_BACKEND=fts5|like`。
+- 代码锚点：`memory/store.py`，`memory/manager.py`
 
 ### 4.9 什么情况下会触发检索？会不会把整条记录全塞模型？
-- 标准回答：练习/考试路径会通过 `_fetch_history_ctx -> memory_search` 预取历史；注入时只取前 2 条、每条截断 120 字，不会把全库全量注入。
-- 详细补充：建议强调检索结果进入模型前再次压缩，防止记忆上下文反客为主。
-- 参数速记：注入模型前再压缩：只取前 `2` 条历史，每条最多 `120` 字；避免长上下文污染。
-- 代码锚点：`core/orchestration/runner.py:142`，`core/orchestration/runner.py:400`，`core/orchestration/runner.py:406`，`core/orchestration/runner.py:419`
+- 标准回答：当前 learn/practice/exam 都可能通过 Runner 预取记忆，但默认事件类型是 `mistake / practice / exam / qa_summary`，**不含原始 `qa`**。进入模型前还会再压缩，只保留少量短片段，不会把整库全量注入。
+- 详细补充：建议强调“Runner 预取 + Budgeter 再裁剪”是两层控制；memory 现在更像高价值补充，而不是主上下文。
+- 参数速记：注入模型前通常只取前 `2` 条、每条最多 `100~120` 字；预取默认事件类型不含原始 `qa`。
+- 代码锚点：`core/orchestration/runner.py`，`core/orchestration/context_budgeter.py`
 
 ### 4.10 用户画像存储结构是什么？
 - 标准回答：`user_profiles` 以 `(user_id, course_name)` 为主键，字段含 `weak_points(JSON list)`、`concept_mastery(JSON dict)`、`pref_style`、`total_qa`、`total_practice`、`avg_score`。
@@ -403,13 +408,13 @@
 - 代码锚点：`memory/manager.py:136`，`memory/manager.py:191`，`memory/manager.py:239`，`core/orchestration/runner.py:511`
 
 ### 4.12 用户画像在模型侧怎么使用？
-- 标准回答：Router/Tutor/Grader 都会读取 `get_profile_context` 注入提示词；注入内容是摘要句，不是整行原始画像。
-- 详细补充：可强调画像主要用于提示词增强，不直接参与评分逻辑，职责上与 grader 分离。
+- 标准回答：当前画像主要在 Tutor/QuizMaster/Grader 的提示词构造里使用，以 profile context 形式提供，不会把整行原始表记录直接塞进 prompt。
+- 详细补充：可强调画像主要用于提示词增强和任务偏好，不直接替代评分逻辑或检索逻辑。
 - 参数速记：注入时 `weak_points` 仅展示前 `8` 个；`concept_mastery` 仅展示“尝试次数 >=2 且掌握度最低”的前 `3` 个知识点。
 - 代码锚点：`memory/manager.py:251`，`memory/manager.py:256`，`memory/manager.py:266`，`core/agents/tutor.py:76`
 
 ### 4.13 短期记忆和长期记忆分别存什么？
-- 标准回答：短期记忆是当前请求/会话的工作上下文（最近历史、RAG证据、最近工具结果、当前任务状态）；长期记忆是持久化在 `memory.db` 的学习事件（qa/practice/mistake/exam）和用户画像聚合。
+- 标准回答：短期记忆是当前请求/会话的工作上下文（recent history、rolling summary、RAG 证据、最近工具结果、当前任务状态）；长期记忆是持久化在 `memory.db` 的学习事件（`qa/qa_summary/practice/mistake/exam`）和用户画像聚合。
 - 详细补充：一句话：短期保证“这次答好”，长期保证“下次更懂你”。
 - 代码锚点：`core/orchestration/context_budgeter.py`，`memory/store.py`，`memory/manager.py`
 
@@ -419,20 +424,30 @@
 - 代码锚点：`memory/store.py`，`memory/manager.py`
 
 ### 4.15 用户画像和情景记忆是怎么设计的？什么时候注入上下文？
-- 标准回答：情景记忆按事件写入（qa/practice/mistake/exam），用户画像由事件增量更新。注入时机由 Runner 按 mode/agent/phase 决定：学习偏讲解注入，练习/考试偏出题与评卷注入。
-- 详细补充：注入是“按需检索+限长”，不是全量回灌。
+- 标准回答：情景记忆按事件写入（`qa/qa_summary/practice/mistake/exam`），用户画像由事件增量更新。注入时机由 Runner 按 mode/phase 决定：先用 `memory_query` 做预取，再按上下文预算决定是否注入以及注入多少。
+- 详细补充：注入是“按需检索 + 限长 + 事件优先级过滤”，不是全量回灌。
 - 代码锚点：`core/orchestration/runner.py`，`memory/manager.py`
 
 ### 4.16 如果 memory 太长，全部塞给模型会有什么问题？你怎么压缩？
-- 标准回答：全量注入会导致 token 膨胀、相关性稀释、推理时延上升。当前通过 event_type 过滤、top_k 限制、单条截断、预算器统一裁剪来控制。
-- 详细补充：原则是“高价值短片段优先”，而不是“越多越好”。
-- 参数速记：`CB_MEMORY_MAX_TOKENS`、`CB_MEMORY_TOPK`、`CB_MEMORY_ITEM_MAX_CHARS`。
+- 标准回答：全量注入会导致 token 膨胀、相关性稀释、推理时延上升。当前通过 event_type 过滤、`qa_summary` 替代旧 `qa`、top_k 限制、单条截断和预算器统一裁剪来控制。
+- 详细补充：现在的原则是“优先注入高价值短片段，旧 qa 先异步归档成摘要”，而不是“越多越好”。
+- 参数速记：`CB_MEMORY_MAX_TOKENS`、`CB_MEMORY_TOPK`、`CB_MEMORY_ITEM_MAX_CHARS`、`MEMORY_QA_RETAIN_RECENT=50`、`MEMORY_QA_ARCHIVE_BATCH=20`、`MEMORY_QA_ARCHIVE_MAX_IMPORTANCE=0.55`。
 - 代码锚点：`core/orchestration/context_budgeter.py`，`core/orchestration/runner.py`
 
 ### 4.17 你的上下文策略是什么？不同 agent 的上下文为什么要差异化？
-- 标准回答：统一框架是 `history -> rag -> memory -> hard_truncate`，但按 Agent 目标差异化注入：Tutor 重讲解证据，QuizMaster 重出题约束与范围，Grader 重题面/标准答案/学生答案对齐。
-- 详细补充：差异化的本质是“同预算下最大化任务相关信息密度”。
+- 标准回答：统一框架是 `history -> rag -> memory -> hard_truncate`，其中 history 当前主路径是 `rolling summary blocks + recent raw turns`。但按 Agent 目标差异化注入：Tutor 重讲解证据与用户画像，QuizMaster 重出题范围与题型约束，Grader 重题面/标准答案/学生答案对齐。
+- 详细补充：差异化的本质是“同预算下最大化任务相关信息密度”，而不是所有 Agent 吃同一份上下文。
 - 代码锚点：`core/orchestration/runner.py`，`core/orchestration/context_budgeter.py`，`core/agents/tutor.py`，`core/agents/quizmaster.py`，`core/agents/grader.py`
+
+### 4.18 `qa_summary` 与原始 `qa` 的区别是什么？
+- 标准回答：`qa` 是单次问答事件，`qa_summary` 是把较旧、低价值 `qa` 按批压缩后的长期摘要。前者保留单次问答痕迹，后者更适合长期检索与控制噪声。
+- 详细补充：当前系统已经把 `qa_summary` 放在原始 `qa` 之前检索，说明它的定位不是“备份”，而是“主检索路径上的摘要化长期记忆”。
+- 代码锚点：`memory/manager.py`，`memory/store.py`
+
+### 4.19 `retrieval_query` 和 `memory_query` 为什么分开？
+- 标准回答：因为教材检索和长期记忆检索关注点不同。`retrieval_query` 更偏课程术语和教材命中，`memory_query` 更偏薄弱点、历史错题和用户长期偏好。
+- 详细补充：回答链路仍以 `question_raw` 为准，拆分两个 query 是为了让检索更稳定，而不是为了改写用户诉求。
+- 代码锚点：`core/agents/router.py`，`core/orchestration/runner.py`，`core/orchestration/prompts.py`
 
 ## 5. 延伸追问（按上面四类补充）
 

@@ -34,7 +34,7 @@
 
 | 模式 | 适用场景 | 执行 Agent | 工具可用性（代码层） | 关键约束 | 自动记录 |
 |------|----------|-----------|---------------------|----------|----------|
-| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | `ToolPolicy` 放行全部 6 个工具（运行时按 Agent 规则约束） | 优先 RAG 引用，按需 ReAct 调用工具 | 问答写入 `memory.db`（`qa` episode） |
+| **学习 (Learn)** | 概念讲解、知识梳理 | TutorAgent | `ToolPolicy` 放行全部 6 个工具（运行时按 Agent 规则约束） | 优先 RAG 引用，按需 ReAct 调用工具 | 默认不写普通 `qa`；仅显式“记住/提醒/偏好”类请求写入 `memory.db` |
 | **练习 (Practice)** | 出题、提交答案、评分讲评 | QuizMasterAgent（出题）+ GraderAgent（评分讲解） | 出题阶段：按需最小工具（主要 `websearch/get_datetime`）；评卷阶段：仅 `calculator` | `_is_answer_submission()` 命中后切评卷链路；`quiz_meta` 走 practice 评卷，`exam_meta` 走 exam 评卷 | `practices/` Markdown 记录 + `memory.db` |
 | **考试 (Exam)** | 模拟考试、自测报告 | QuizMasterAgent（出卷）+ GraderAgent（批改讲解） | 出卷阶段：按需最小工具（主要 `websearch/get_datetime`）；批改阶段：仅 `calculator` | `_is_exam_answer_submission()` 命中后进入 Grader 评卷链路 | `exams/` Markdown 记录 + `memory.db` |
 
@@ -60,9 +60,9 @@
 用户请求
    ↓
 OrchestrationRunner（Python 调度器）
-   ├─ [LLM] Router Agent  ← 制定 Plan（need_rag / style）并在失败时 Replan 一次
+   ├─ [LLM] Router Agent  ← 制定 Plan（need_rag / style / question_raw / user_intent / retrieval_query / memory_query）并在失败时 Replan 一次
    ├─ [工具] RAG Retriever ← Hybrid 检索（FAISS + BM25）
-   ├─ [工具] memory_search ← 预取历史错题上下文
+   ├─ [工具] memory_search ← 预取高价值长期记忆（mistake / practice / exam / qa_summary）
    │
    ├─ 学习模式
    │      ↓
@@ -168,7 +168,7 @@ FastAPI (:8000)
 ### Agent 职责
 | Agent | 调用时机 | 输入 | 输出 |
 |-------|---------|------|------|
-| Router | 每次请求首先调用；必要时触发一次重规划 | 用户消息 + 模式 + 失败原因（重规划时） | `Plan`（need_rag、style、output_format） |
+| Router | 每次请求首先调用；必要时触发一次重规划 | 用户消息 + 模式 + 失败原因（重规划时） | `Plan`（need_rag、style、question_raw、user_intent、retrieval_query、memory_query、output_format） |
 | Tutor | 学习模式主执行 | 问题 + RAG 上下文 + 历史 | 教学内容（可含引用/工具结果） |
 | QuizMaster | 练习出题 / 考试出卷 | 请求 + RAG 上下文 + 历史错题上下文 | 题目/试卷正文 + 内部元数据 |
 | Grader | 练习/考试检测到答案提交 | 题目或试卷原文 + 学生答案 + 历史错题上下文 | 逐题对照 + 得分 + 讲评 |
@@ -435,7 +435,7 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 
 ## 日志与可观测性（V2）
 
-- `backend/api.py` 为 `/chat`、`/chat/stream` 增加请求级日志：`request_id`、`history_len`、首包耗时、总耗时、异常摘要。
+- `backend/api.py` 为 `/chat`、`/chat/stream` 增加请求级日志：`request_id`、`history_len`（当前 message 窗口长度，不等于真实对话轮数）、首包耗时、总耗时、异常摘要。
 - API 层通过 `trace_scope` 注入 trace，上下游事件可按 `request_id + trace_id` 串联。
 - 流式 SSE 增加心跳状态：长时间无 chunk 时主动推送“后端仍在处理”。
 - 工具链新增状态闭环：`memory_search` 后会显式进入“工具调用完成，继续推理中”。

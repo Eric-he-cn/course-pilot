@@ -1,6 +1,6 @@
 以下是整个对话从头到尾所有调试过程的梳理，按时间顺序排列。
 
-> 当前状态说明（2026-03）：本文档包含若干历史阶段问题，部分条目对应旧架构（如 Tutor 兼任练习/考试主流程）。当前实现已调整为 `learn -> Tutor`、`practice/exam -> Quizzer + Grader`。请以 `README.md` 与 `docs/guides/architecture.md` 的“当前实现”描述为准。
+> 当前状态说明（2026-04）：本文档仍以“历史问题档案”为主，部分条目对应旧架构或旧口径。当前实现请以 `README.md` 与 `docs/guides/architecture.md` 为准。最近阶段已经完成的关键变化包括：rolling summary、`history_summary_state`、Router query rewrite、learn 模式默认不写普通 `qa`、`qa_summary` 异步归档。
 
 ## 1. ModuleNotFoundError — 模块找不到
 - 发现问题：直接运行 `python backend/api.py` 时找不到 `backend` 包。
@@ -169,5 +169,41 @@
   - 练习提交答案时：若历史含 `exam_meta`，走 `Grader.grade_exam_stream()`，否则走 `grade_practice_stream()`；
   - `quizmaster.py`：增加题型锁定、选择题形态校验+单次重试、答题卡总分归一到 100。
 - 解决结果：练习多题链路稳定性提升，题型漂移与评分口径错配显著减少。
+
+## 27. rolling summary 上线后 `history_len` 被误读成“轮数”
+- 发现问题：前端预算窗口里的 `history_len` 实际是“当前发送给后端的 message 窗口大小”，不是 `user + assistant` 对话轮数；rolling summary 生效后，这个数字封顶在 `20`，容易被误判为“摘要没触发”。
+- 解决思路：明确区分 `message window` 与 `turns`，并在预算窗口显示 rolling summary 状态，而不是继续沿用旧字段语义。
+- 解决步骤：
+  - 前端上下文窗口改为显示 `X msgs (~Y turns)`；
+  - 当窗口达到前端发送上限时，显式提示“前端发送窗口已封顶”；
+  - 预算卡片增加 rolling summary 指标，避免继续用旧 `history_llm_compress` 字段描述新机制。
+- 解决结果：长对话时可以正确判断 rolling summary 是否生效，不再把 `history_len=20` 误读为“只有 20 轮”。
+
+## 28. 预算窗口继续显示旧 `history_llm_compress`，与 rolling summary 不一致
+- 发现问题：历史压缩主路径已经从“每次请求重算 old history 摘要”切到 rolling summary block，但前端预算窗口仍显示旧字段 `history_llm_compress`，造成“明明已经 summary_source=state，界面却显示未触发压缩”的错觉。
+- 解决思路：把展示字段切换到 rolling summary 相关指标，保留旧字段仅作 fallback 兼容。
+- 解决步骤：
+  - 前端预算窗口改为优先展示 `summary_source=state`、`history_summary_block_count`、`history_block_compress_ms`；
+  - 旧 `history_llm_compress` 字段仅在 fallback 路径下显示。
+- 解决结果：预算窗口展示和当前代码路径对齐，能够正确反映 block-based summary 的实际状态。
+
+## 29. learn 模式普通问答写入过多 `qa`，长期记忆噪声累积
+- 发现问题：早期 learn 模式普通问答默认写入 `qa`，随着聊天轮次增加，长期记忆里会堆积大量低价值问答，影响 `memory_search` 相关性，也增加后续归档成本。
+- 解决思路：把 learn 记忆写入收敛成“显式长期记忆请求才写”，普通问答默认不入库。
+- 解决步骤：
+  - `runner.py` 增加 `_should_persist_learn_episode()`；
+  - 当前通过规则匹配识别“记住/下次提醒/以后按这个偏好”等表达；
+  - 命中时写入 `qa`，并打上 `explicit_memory_request=True`。
+- 解决结果：learn 主链路不再自动堆积低价值 `qa`，长期记忆噪声显著下降。
+
+## 30. 旧 `qa` 只做首行拼接归档，摘要质量不足
+- 发现问题：早期 `qa` 归档只是抽首行做规则拼接，虽然便宜，但表达能力有限，难以保留用户偏好、薄弱点和稳定事实。
+- 解决思路：把旧 `qa` 归档升级为“异步 LLM 摘要优先，规则摘要回退”。
+- 解决步骤：
+  - `memory/manager.py` 新增 LLM 版 `qa_summary` 生成逻辑；
+  - 最近 `50` 条原始 `qa` 保留，每批 `20` 条低价值旧 `qa` 归档成一条 `qa_summary`；
+  - 仅 `importance <= 0.55` 且非 `explicit_memory_request` 的 `qa` 参与归档；
+  - LLM 失败时回退到规则摘要，保证归档链路不中断。
+- 解决结果：长期记忆检索优先命中更稳定、可读性更好的 `qa_summary`，同时保留异步和低侵入特性。
 
 
