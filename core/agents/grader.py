@@ -9,7 +9,8 @@
 import json
 import os
 from typing import List, Optional
-from core.llm.openai_compat import get_llm_client
+from backend.schemas import SessionStateV1
+from core.agents.base import BaseAgent
 from core.orchestration.prompts import (
     GRADER_PROMPT,
     GRADER_GRADE_SYSTEM_PROMPT,
@@ -50,12 +51,22 @@ _CALCULATOR_TOOL = [
 ]
 
 """GraderAgent：负责对答案评分、讲评，并按需写入记忆系统。"""
-class GraderAgent:
+class GraderAgent(BaseAgent):
     """评分 Agent 主体。"""
 
     """初始化 GraderAgent，复用全局 LLM 客户端。"""
     def __init__(self):
-        self.llm = get_llm_client()
+        super().__init__(agent_name="grader")
+
+    def build_context(self, session_state: SessionStateV1, **kwargs) -> dict:
+        return {
+            "task_summary": session_state.task_summary,
+            "current_stage": session_state.current_stage,
+            "selected_memory": session_state.selected_memory,
+            "last_quiz": session_state.last_quiz,
+            "last_exam": session_state.last_exam,
+            **kwargs,
+        }
 
     @staticmethod
     def _env_bool(name: str, default: bool = False) -> bool:

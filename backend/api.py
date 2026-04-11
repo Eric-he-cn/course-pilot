@@ -102,6 +102,17 @@ class MessageRequest(BaseModel):
     message: str
 
 
+def _extract_session_state_payload(tool_calls: Optional[list]) -> dict:
+    for tool_call in reversed(tool_calls or []):
+        if not isinstance(tool_call, dict):
+            continue
+        if tool_call.get("type") == "internal_meta" and tool_call.get("name") == "session_state":
+            payload = tool_call.get("payload")
+            if isinstance(payload, dict):
+                return payload
+    return {}
+
+
 @app.get("/")
 async def root():
     """健康检查入口。"""
@@ -375,7 +386,7 @@ async def chat(request: ChatRequest):
                 course_name=request.course_name,
                 mode=request.mode,
                 user_message=request.message,
-                state={},
+                state={"session_id": request.session_id} if request.session_id else {},
                 history=history,
             )
             elapsed_ms = (perf_counter() - t0) * 1000.0
@@ -402,9 +413,13 @@ async def chat(request: ChatRequest):
         )
         raise
     
+    session_state_payload = _extract_session_state_payload(response_message.tool_calls)
     return ChatResponse(
         message=response_message,
-        plan=plan
+        plan=plan,
+        session_id=session_state_payload.get("session_id"),
+        resolved_mode=getattr(plan, "resolved_mode", None),
+        current_stage=session_state_payload.get("current_stage"),
     )
 
 
@@ -445,7 +460,7 @@ async def chat_stream(request: ChatRequest):
                     course_name=request.course_name,
                     mode=request.mode,
                     user_message=request.message,
-                    state={},
+                    state={"session_id": request.session_id} if request.session_id else {},
                     history=history,
                 ):
                     q.put(("chunk", chunk))

@@ -8,7 +8,8 @@
 """
 import json
 from typing import Dict, Any
-from core.llm.openai_compat import get_llm_client
+from backend.schemas import Plan, PlanPlusV1, SessionStateV1
+from core.agents.base import BaseAgent
 from core.orchestration.prompts import (
     ROUTER_PROMPT,
     ROUTER_SYSTEM_PROMPT,
@@ -16,17 +17,16 @@ from core.orchestration.prompts import (
     ROUTER_REPLAN_SYSTEM_PROMPT,
 )
 from core.orchestration.policies import ToolPolicy
-from backend.schemas import Plan
 
 """
 RouterAgent：把自然语言请求映射为可执行 Plan。
 职责：聚合用户画像、调用路由提示词、解析模型输出并产出结构化计划。
 """
-class RouterAgent:
+class RouterAgent(BaseAgent):
     
     """初始化 RouterAgent，复用全局 LLM 客户端。"""
     def __init__(self):
-        self.llm = get_llm_client()
+        super().__init__(agent_name="router")
 
     """提示词与解析辅助。"""
 
@@ -79,12 +79,72 @@ class RouterAgent:
                 break
         return out
 
+    @staticmethod
+    def _normalize_mode(value: Any, default: str = "learn") -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"learn", "practice", "exam"}:
+            return raw
+        return default
+
+    @classmethod
+    def _infer_resolved_mode(cls, plan_dict: Dict[str, Any], mode: str, user_message: str) -> str:
+        explicit = cls._normalize_mode(plan_dict.get("resolved_mode"), "")
+        if explicit:
+            return explicit
+        task_type = cls._normalize_mode(plan_dict.get("task_type"), "")
+        if task_type:
+            return task_type
+
+        text = str(user_message or "").strip().lower()
+        exam_keywords = ("考试", "试卷", "出卷", "模拟考", "模拟考试", "交卷", "阅卷")
+        practice_keywords = (
+            "练习", "刷题", "出题", "出一道题", "出几道题",
+            "选择题", "判断题", "填空题", "简答题", "计算题",
+        )
+        learn_keywords = ("讲解", "解释", "学习", "总结", "知识点", "思维导图", "是什么", "为什么")
+
+        if any(k in text for k in exam_keywords):
+            return "exam"
+        if any(k in text for k in practice_keywords):
+            return "practice"
+        if any(k in text for k in learn_keywords):
+            return "learn"
+        return cls._normalize_mode(mode, "learn")
+
+    @staticmethod
+    def _default_mode_reason(mode_hint: str, resolved_mode: str) -> str:
+        if resolved_mode == mode_hint:
+            return "沿用用户当前选择的模式"
+        return f"根据任务意图从 {mode_hint} 调整为 {resolved_mode}"
+
+    @staticmethod
+    def _normalize_risk_level(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"low", "medium", "high"}:
+            return raw
+        return "medium"
+
+    @staticmethod
+    def _normalize_permission_mode(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"safe", "standard", "elevated"}:
+            return raw
+        return "standard"
+
+    @staticmethod
+    def _normalize_replan_policy(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"never", "once_on_failure"}:
+            return raw
+        return "once_on_failure"
+
     """规范化并修正重规划结果，确保工具权限和任务类型不会越权。"""
     @staticmethod
-    def _normalize_plan(plan_dict: Dict[str, Any], mode: str, user_message: str) -> Plan:
+    def _normalize_plan(plan_dict: Dict[str, Any], mode: str, user_message: str) -> PlanPlusV1:
         plan_dict = dict(plan_dict or {})
-        plan_dict["allowed_tools"] = ToolPolicy.get_allowed_tools(mode)
-        plan_dict["task_type"] = mode
+        resolved_mode = RouterAgent._infer_resolved_mode(plan_dict, mode, user_message)
+        plan_dict["allowed_tools"] = ToolPolicy.get_allowed_tools(resolved_mode)
+        plan_dict["task_type"] = resolved_mode
         question_raw = str(plan_dict.get("question_raw", "") or user_message or "").strip()
         user_intent = str(plan_dict.get("user_intent", "") or question_raw).strip()
         retrieval_query = str(plan_dict.get("retrieval_query", "") or question_raw).strip()
@@ -101,24 +161,80 @@ class RouterAgent:
         plan_dict["retrieval_query"] = retrieval_query
         plan_dict["memory_query"] = memory_query
         plan_dict["retrieval_keywords"] = retrieval_keywords
-        return Plan(**plan_dict)
+        plan_dict["resolved_mode"] = resolved_mode
+        plan_dict["mode_reason"] = str(plan_dict.get("mode_reason", "") or RouterAgent._default_mode_reason(mode, resolved_mode)).strip()
+        plan_dict["need_memory"] = bool(plan_dict.get("need_memory", True))
+        capabilities = plan_dict.get("capabilities")
+        if isinstance(capabilities, list):
+            normalized_capabilities = [str(x).strip() for x in capabilities if str(x).strip()]
+        else:
+            normalized_capabilities = []
+        if plan_dict.get("need_rag", True):
+            normalized_capabilities.append("rag")
+        if plan_dict["need_memory"]:
+            normalized_capabilities.append("memory")
+        normalized_capabilities.extend(plan_dict["allowed_tools"])
+        plan_dict["capabilities"] = list(dict.fromkeys(normalized_capabilities))
+        plan_dict["risk_level"] = RouterAgent._normalize_risk_level(plan_dict.get("risk_level"))
+        plan_dict["permission_mode"] = RouterAgent._normalize_permission_mode(plan_dict.get("permission_mode"))
+        plan_dict["replan_policy"] = RouterAgent._normalize_replan_policy(plan_dict.get("replan_policy"))
+        return PlanPlusV1(**plan_dict)
+
+    def build_context(
+        self,
+        session_state: SessionStateV1,
+        *,
+        course_name: str,
+        user_message: str,
+        mode_hint: str,
+    ) -> Dict[str, Any]:
+        weak_points_ctx = self._build_weak_points_ctx(course_name)
+        session_summary = str(session_state.task_summary or "").strip()
+        session_stage = str(session_state.current_stage or "").strip()
+        session_ctx = ""
+        if session_summary or session_stage:
+            session_ctx = (
+                "\n\n【当前会话状态】\n"
+                f"- 当前阶段: {session_stage or 'router_planned'}\n"
+                f"- 任务摘要: {session_summary or user_message[:120]}\n"
+                f"- 模式提示: {mode_hint}"
+            )
+        return {
+            "weak_points_ctx": weak_points_ctx,
+            "session_ctx": session_ctx,
+        }
     
     """生成 Router 执行计划：注入用户画像、调用模型、解析计划、失败兜底。"""
     def plan(
         self,
         user_message: str,
         mode: str,
-        course_name: str
-    ) -> Plan:
+        course_name: str,
+        session_state: SessionStateV1 = None,
+    ) -> PlanPlusV1:
+        if session_state is None:
+            session_state = SessionStateV1(
+                session_id="bootstrap",
+                course_name=course_name,
+                requested_mode_hint=self._normalize_mode(mode, "learn"),  # type: ignore[arg-type]
+                resolved_mode=self._normalize_mode(mode, "learn"),  # type: ignore[arg-type]
+                task_full_text=user_message,
+                task_summary=user_message[:120],
+            )
         # 1) 准备提示词上下文（含用户画像）
-        weak_points_ctx = self._build_weak_points_ctx(course_name)
+        ctx = self.build_context(
+            session_state,
+            course_name=course_name,
+            user_message=user_message,
+            mode_hint=mode,
+        )
 
         # 2) 组装 Router 提示词
         prompt = ROUTER_PROMPT.format(
             mode=mode,
             course_name=course_name,
             user_message=user_message,
-            weak_points_ctx=weak_points_ctx,
+            weak_points_ctx=f"{ctx['weak_points_ctx']}{ctx['session_ctx']}",
         )
         
         # 3) 调用模型生成规划
@@ -126,7 +242,7 @@ class RouterAgent:
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
-        response = self.llm.chat(messages, temperature=0.3)
+        response = self.invoke_llm(messages, temperature=0.3)
         
         # 4) 解析模型输出并规范化字段
         try:
@@ -159,7 +275,7 @@ class RouterAgent:
             {"role": "user", "content": prompt},
         ]
         try:
-            response = self.llm.chat(messages, temperature=0.2)
+            response = self.invoke_llm(messages, temperature=0.2)
             plan_dict = self._extract_json_payload(response)
             return self._normalize_plan(plan_dict, mode, user_message)
         except Exception as e:

@@ -10,7 +10,6 @@ import json
 import logging
 import os
 from typing import Dict, Any
-from core.llm.openai_compat import get_llm_client
 from core.orchestration.prompts import (
     QUIZMASTER_PROMPT,
     EXAM_GENERATOR_PROMPT,
@@ -24,6 +23,8 @@ from core.orchestration.prompts import (
     EXAM_SOLVE_SYSTEM_PROMPT,
 )
 from backend.schemas import Quiz
+from backend.schemas import SessionStateV1
+from core.agents.base import BaseAgent
 from mcp_tools.client import MCPTools
 from core.metrics import add_event
 
@@ -31,12 +32,22 @@ from core.metrics import add_event
 QuizMasterAgent：按知识点与难度生成结构化题目。
 职责：融合历史错题上下文、调用出题提示词、解析 JSON 题目输出。
 """
-class QuizMasterAgent:
+class QuizMasterAgent(BaseAgent):
     
     """初始化 QuizMasterAgent，复用全局 LLM 客户端。"""
     def __init__(self):
-        self.llm = get_llm_client()
+        super().__init__(agent_name="quizmaster")
         self.logger = logging.getLogger("agent.quizmaster")
+
+    def build_context(self, session_state: SessionStateV1, **kwargs) -> Dict[str, Any]:
+        return {
+            "task_summary": session_state.task_summary,
+            "current_stage": session_state.current_stage,
+            "selected_memory": session_state.selected_memory,
+            "last_quiz": session_state.last_quiz,
+            "last_exam": session_state.last_exam,
+            **kwargs,
+        }
 
     """提示词与解析辅助。"""
 

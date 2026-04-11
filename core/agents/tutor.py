@@ -8,7 +8,8 @@
 """
 import os
 from typing import List, Optional
-from core.llm.openai_compat import get_llm_client
+from backend.schemas import SessionStateV1
+from core.agents.base import BaseAgent
 from core.orchestration.prompts import (
     TUTOR_PROMPT,
     TUTOR_DEFAULT_SYSTEM_PROMPT,
@@ -22,11 +23,21 @@ from core.metrics import add_event, estimate_text_tokens
 TutorAgent：统一承载学习讲解、练习出题、考试对话等生成任务。
 职责：组装消息、注入工具与用户画像规则、调用 LLM 返回文本。
 """
-class TutorAgent:
+class TutorAgent(BaseAgent):
     
     """初始化 TutorAgent，复用全局 LLM 客户端。"""
     def __init__(self):
-        self.llm = get_llm_client()
+        super().__init__(agent_name="tutor")
+
+    def build_context(self, session_state: SessionStateV1, **kwargs) -> dict:
+        return {
+            "task_summary": session_state.task_summary,
+            "current_stage": session_state.current_stage,
+            "selected_memory": session_state.selected_memory,
+            "last_quiz": session_state.last_quiz,
+            "last_exam": session_state.last_exam,
+            **kwargs,
+        }
 
     @staticmethod
     def _normalize_context_sections(context: str, context_sections: Optional[dict]) -> dict:

@@ -13,10 +13,11 @@ import shutil
 import time
 import unittest
 
-from backend.schemas import Plan
+from backend.schemas import ChatMessage, Plan, PlanPlusV1, SessionStateV1
 from core.agents.quizmaster import QuizMasterAgent
 from core.agents.router import RouterAgent
 from core.orchestration.runner import OrchestrationRunner
+from core.runtime.executor import ExecutionRuntime
 from memory.manager import MemoryManager
 from memory.store import SQLiteMemoryStore
 
@@ -244,6 +245,134 @@ class ContractFixTests(unittest.TestCase):
         self.assertEqual("解释一下 attention 的作用", plan.retrieval_query)
         self.assertEqual("解释一下 attention 的作用", plan.memory_query)
         self.assertTrue(isinstance(plan.retrieval_keywords, list) and len(plan.retrieval_keywords) > 0)
+
+    def test_router_can_resolve_mode_from_user_intent(self):
+        plan = RouterAgent._normalize_plan(
+            {
+                "need_rag": True,
+                "style": "step_by_step",
+                "output_format": "exam",
+            },
+            "learn",
+            "请帮我出一套模拟考试试卷",
+        )
+        self.assertEqual("exam", plan.resolved_mode)
+        self.assertEqual("exam", plan.task_type)
+        self.assertIn("调整", plan.mode_reason)
+
+    def test_learn_mode_emits_session_state_meta(self):
+        from backend.schemas import TutorResult
+
+        runner = OrchestrationRunner()
+        runner.load_retriever = lambda _course: None
+        runner._fetch_history_ctx = lambda **_kwargs: ""
+        runner.tutor.teach = lambda *_args, **_kwargs: TutorResult(content="好的，这里是讲解。")
+
+        resp = runner.run_learn_mode(
+            course_name="course",
+            user_message="解释一下 Attention",
+            plan=self._plan("learn"),
+            history=[],
+            state={"session_id": "sess-learn-1"},
+        )
+
+        session_payload = None
+        for tool_call in resp.tool_calls or []:
+            if tool_call.get("name") == "session_state":
+                session_payload = tool_call.get("payload")
+                break
+        self.assertIsNotNone(session_payload)
+        self.assertEqual("sess-learn-1", session_payload["session_id"])
+        self.assertEqual("learn_completed", session_payload["current_stage"])
+
+    def test_runtime_compiles_taskgraph_for_practice_multi_question(self):
+        runner = OrchestrationRunner()
+        runtime = ExecutionRuntime(runner)
+        session_state = SessionStateV1(
+            session_id="sess-graph-1",
+            course_name="course",
+            requested_mode_hint="practice",
+            resolved_mode="practice",
+            task_full_text="出10道Attention相关的选择题",
+            task_summary="出10道Attention相关的选择题",
+        )
+        plan = PlanPlusV1(
+            need_rag=True,
+            need_memory=True,
+            allowed_tools=[],
+            task_type="practice",
+            resolved_mode="practice",
+            style="step_by_step",
+            output_format="answer",
+            question_raw="出10道Attention相关的选择题",
+            user_intent="练习出题",
+            retrieval_query="Attention 选择题",
+            memory_query="Attention 选择题",
+            capabilities=["rag", "memory"],
+        )
+
+        graph = runtime.compile_taskgraph(
+            course_name="course",
+            mode_hint="practice",
+            user_message="出10道Attention相关的选择题",
+            history=[],
+            plan=plan,
+            session_state=session_state,
+            stream=False,
+        )
+
+        self.assertEqual("run_exam", graph.route)
+        self.assertIn("detect_submission", graph.step_names())
+        self.assertIn("run_exam", graph.step_names())
+        self.assertIn("persist_session_state", graph.step_names())
+        self.assertTrue(graph.metadata.get("digest"))
+
+    def test_runner_run_uses_runtime_resolved_mode(self):
+        runner = OrchestrationRunner()
+        old_replan = os.getenv("ENABLE_ROUTER_REPLAN")
+        os.environ["ENABLE_ROUTER_REPLAN"] = "0"
+        try:
+            runner.router.plan = lambda *_args, **_kwargs: PlanPlusV1(
+                need_rag=False,
+                need_memory=True,
+                allowed_tools=[],
+                task_type="exam",
+                resolved_mode="exam",
+                style="step_by_step",
+                output_format="answer",
+                question_raw="请出一套模拟考试试卷",
+                user_intent="考试出卷",
+                retrieval_query="模拟考试试卷",
+                memory_query="模拟考试试卷",
+                capabilities=["memory"],
+            )
+            runner.run_learn_mode = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("learn_should_not_run")
+            )
+            runner.run_practice_mode = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("practice_should_not_run")
+            )
+            runner.run_exam_mode = lambda *_args, **_kwargs: ChatMessage(
+                role="assistant",
+                content="exam route selected",
+                citations=None,
+                tool_calls=None,
+            )
+
+            response, plan = runner.run(
+                course_name="course",
+                mode="learn",
+                user_message="请出一套模拟考试试卷",
+                state={"session_id": "sess-runtime-1"},
+                history=[],
+            )
+            self.assertEqual("exam", plan.resolved_mode)
+            self.assertEqual("exam route selected", response.content)
+        finally:
+            if old_replan is None:
+                os.environ.pop("ENABLE_ROUTER_REPLAN", None)
+            else:
+                os.environ["ENABLE_ROUTER_REPLAN"] = old_replan
 
     def test_history_recent_trim_defaults_to_five_turns(self):
         history = []
