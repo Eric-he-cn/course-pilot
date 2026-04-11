@@ -22,10 +22,10 @@ def test_imports():
         from core.agents.tutor import TutorAgent
         from rag.chunk import chunk_documents
         from rag.store_faiss import FAISSStore
-        print("✅ All modules imported successfully")
+        print("[PASS] All modules imported successfully")
         return True
     except ImportError as e:
-        print(f"❌ Import error: {e}")
+        print(f"[FAIL] Import error: {e}")
         return False
 
 
@@ -54,10 +54,10 @@ def test_schemas():
         )
         assert quiz.difficulty == "medium"
         
-        print("✅ Schema tests passed")
+        print("[PASS] Schema tests passed")
         return True
     except Exception as e:
-        print(f"❌ Schema test error: {e}")
+        print(f"[FAIL] Schema test error: {e}")
         return False
 
 
@@ -81,10 +81,10 @@ def test_rag_components():
         assert len(hits) == 1
         assert hits[0][0]["doc_id"] == "a.md"
         
-        print(f"✅ RAG test passed - generated {len(chunks)} chunks")
+        print(f"[PASS] RAG test passed - generated {len(chunks)} chunks")
         return True
     except Exception as e:
-        print(f"❌ RAG test error: {e}")
+        print(f"[FAIL] RAG test error: {e}")
         return False
 
 
@@ -101,10 +101,10 @@ def test_tool_policy():
         assert "calculator" in exam_tools
         assert "websearch" in exam_tools  # 根据最新策略，考试模式也不再屏蔽任何工具
         
-        print("✅ Tool policy tests passed")
+        print("[PASS] Tool policy tests passed")
         return True
     except Exception as e:
-        print(f"❌ Tool policy test error: {e}")
+        print(f"[FAIL] Tool policy test error: {e}")
         return False
 
 
@@ -122,10 +122,10 @@ def test_mcp_tools():
         result = MCPTools.websearch("test query")
         assert result["success"] == True
         
-        print("✅ MCP tools tests passed")
+        print("[PASS] MCP tools tests passed")
         return True
     except Exception as e:
-        print(f"❌ MCP tools test error: {e}")
+        print(f"[FAIL] MCP tools test error: {e}")
         return False
 
 
@@ -160,7 +160,7 @@ def run_all_tests():
     total = len(results)
     
     for name, success in results:
-        status = "✅ PASS" if success else "❌ FAIL"
+        status = "[PASS]" if success else "[FAIL]"
         print(f"{status} - {name}")
     
     print()

@@ -12,12 +12,15 @@ import os
 import shutil
 import time
 import unittest
+from unittest import mock
 
-from backend.schemas import ChatMessage, Plan, PlanPlusV1, SessionStateV1
+from backend.schemas import AgentContextV1, ChatMessage, Plan, PlanPlusV1, SessionStateV1
 from core.agents.quizmaster import QuizMasterAgent
 from core.agents.router import RouterAgent
 from core.orchestration.runner import OrchestrationRunner
 from core.runtime.executor import ExecutionRuntime
+from core.services.event_bus import EventBus
+from core.services.tool_hub import ToolHub
 from memory.manager import MemoryManager
 from memory.store import SQLiteMemoryStore
 
@@ -260,6 +263,25 @@ class ContractFixTests(unittest.TestCase):
         self.assertEqual("exam", plan.task_type)
         self.assertIn("调整", plan.mode_reason)
 
+    def test_agent_build_context_returns_agent_context_v1(self):
+        session_state = SessionStateV1(
+            session_id="sess-agent-ctx",
+            course_name="course",
+            requested_mode_hint="learn",
+            resolved_mode="learn",
+            task_full_text="解释 Attention",
+            task_summary="解释 Attention",
+        )
+        ctx = RouterAgent().build_context(
+            session_state,
+            course_name="course",
+            user_message="解释 Attention",
+            mode_hint="learn",
+        )
+        self.assertIsInstance(ctx, AgentContextV1)
+        self.assertEqual("sess-agent-ctx", ctx.session_snapshot.session_id)
+        self.assertIn("mode_hint", ctx.constraints)
+
     def test_learn_mode_emits_session_state_meta(self):
         from backend.schemas import TutorResult
 
@@ -326,6 +348,112 @@ class ContractFixTests(unittest.TestCase):
         self.assertIn("run_exam", graph.step_names())
         self.assertIn("persist_session_state", graph.step_names())
         self.assertTrue(graph.metadata.get("digest"))
+
+    def test_session_state_restores_from_workspace_json(self):
+        runner = OrchestrationRunner()
+        course_name = "course_restore_case"
+        session_id = "sess-restore-1"
+        workspace_path = runner.get_workspace_path(course_name)
+        shutil.rmtree(workspace_path, ignore_errors=True)
+        session_state = SessionStateV1(
+            session_id=session_id,
+            course_name=course_name,
+            requested_mode_hint="practice",
+            resolved_mode="practice",
+            task_full_text="旧任务",
+            task_summary="旧任务",
+            current_stage="practice_generated",
+        )
+        runner.workspace_store.save_session_state(session_state)
+        restored = runner._extract_session_state(
+            history=[],
+            course_name=course_name,
+            mode_hint="practice",
+            user_message="继续这个会话",
+            state={"session_id": session_id},
+        )
+        self.assertEqual(session_id, restored.session_id)
+        self.assertEqual("practice_generated", restored.current_stage)
+        self.assertEqual("继续这个会话", restored.task_full_text)
+        shutil.rmtree(workspace_path, ignore_errors=True)
+
+    def test_strict_new_runtime_raises_without_fallback(self):
+        runner = OrchestrationRunner()
+        old_strict = os.getenv("STRICT_NEW_RUNTIME")
+        old_replan = os.getenv("ENABLE_ROUTER_REPLAN")
+        os.environ["STRICT_NEW_RUNTIME"] = "1"
+        os.environ["ENABLE_ROUTER_REPLAN"] = "0"
+        try:
+            runner.router.plan = lambda *_args, **_kwargs: PlanPlusV1(
+                need_rag=False,
+                need_memory=False,
+                allowed_tools=[],
+                task_type="learn",
+                resolved_mode="learn",
+                style="step_by_step",
+                output_format="answer",
+                question_raw="解释 Attention",
+                user_intent="学习讲解",
+                retrieval_query="Attention",
+                memory_query="Attention",
+            )
+            runner.runtime._build_agent_context = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+            with self.assertRaises(RuntimeError):
+                runner.run(
+                    course_name="course",
+                    mode="learn",
+                    user_message="解释 Attention",
+                    state={"session_id": "sess-strict-1"},
+                    history=[],
+                )
+        finally:
+            if old_strict is None:
+                os.environ.pop("STRICT_NEW_RUNTIME", None)
+            else:
+                os.environ["STRICT_NEW_RUNTIME"] = old_strict
+            if old_replan is None:
+                os.environ.pop("ENABLE_ROUTER_REPLAN", None)
+            else:
+                os.environ["ENABLE_ROUTER_REPLAN"] = old_replan
+
+    def test_tool_hub_permission_and_idempotency(self):
+        hub = ToolHub()
+        with mock.patch("core.services.tool_hub.MCPTools.call_tool", return_value={"success": True, "result": 4, "via": "mcp_stdio"}):
+            with self.assertRaises(Exception):
+                hub.invoke(
+                    tool_name="filewriter",
+                    tool_args={"filename": "a.md", "content": "x"},
+                    mode="learn",
+                    phase="act",
+                    permission_mode="standard",
+                    original_user_content="写笔记",
+                    tool_cache={},
+                    last_exec_ms={},
+                    tool_retry_max=0,
+                    tool_round=1,
+                )
+            decision, result = hub.invoke(
+                tool_name="calculator",
+                tool_args={"expression": "2+2"},
+                mode="learn",
+                phase="act",
+                permission_mode="safe",
+                original_user_content="算一下",
+                tool_cache={},
+                last_exec_ms={},
+                tool_retry_max=0,
+                tool_round=1,
+            )
+            self.assertTrue(decision.allowed)
+            self.assertTrue(decision.idempotency_key.startswith("calculator:"))
+            self.assertTrue(result["success"])
+
+    def test_event_bus_hidden_event_shapes_are_compatible(self):
+        bus = EventBus()
+        self.assertEqual({"__status__": "x"}, bus.status("x"))
+        self.assertEqual({"__citations__": [{"doc_id": "d"}]}, bus.citations([{"doc_id": "d"}]))
+        self.assertEqual({"__context_budget__": {"mode": "learn"}}, bus.context_budget({"mode": "learn"}))
+        self.assertEqual({"__tool_calls__": [{"name": "session_state"}]}, bus.tool_calls([{"name": "session_state"}]))
 
     def test_runner_run_uses_runtime_resolved_mode(self):
         runner = OrchestrationRunner()
