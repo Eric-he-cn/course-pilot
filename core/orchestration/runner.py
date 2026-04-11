@@ -15,8 +15,16 @@ from datetime import datetime
 from core.metrics import get_active_trace
 
 from backend.schemas import (
-    Plan, PlanPlusV1, SessionStateV1, ChatMessage, RetrievedChunk, Quiz, GradeReport,
-    TutorResult, PracticeGradeSignal
+    AgentContextV1,
+    Plan,
+    PlanPlusV1,
+    SessionStateV1,
+    ChatMessage,
+    RetrievedChunk,
+    Quiz,
+    GradeReport,
+    TutorResult,
+    PracticeGradeSignal,
 )
 from core.agents.router import RouterAgent
 from core.agents.tutor import TutorAgent
@@ -24,8 +32,15 @@ from core.agents.quizmaster import QuizMasterAgent
 from core.agents.grader import GraderAgent
 from core.orchestration.context_budgeter import ContextBudgeter
 from core.runtime import ExecutionRuntime
+from core.services import (
+    MemoryService,
+    RAGService,
+    TelemetryService,
+    WorkspaceStore,
+    get_default_event_bus,
+    get_default_tool_hub,
+)
 from rag.retrieve import Retriever
-from rag.store_faiss import FAISSStore
 from mcp_tools.client import MCPTools
 # 说明：练习/考试的出题与评分已拆分到 QuizMaster/Grader，Runner 只负责编排与持久化。
 
@@ -37,12 +52,24 @@ class OrchestrationRunner:
         if data_dir is None:
             data_dir = os.getenv("DATA_DIR", "./data/workspaces")
         self.data_dir = data_dir
+        self.workspace_store = WorkspaceStore(self.data_dir)
+        self.rag_service = RAGService(self.workspace_store)
+        self.memory_service = MemoryService()
+        self.telemetry_service = TelemetryService()
+        self.event_bus = get_default_event_bus()
+        self.tool_hub = get_default_tool_hub()
         
         # 初始化各 Agent
-        self.router = RouterAgent()
-        self.tutor = TutorAgent()
-        self.quizmaster = QuizMasterAgent()
-        self.grader = GraderAgent()
+        agent_services = {
+            "memory_service": self.memory_service,
+            "telemetry_service": self.telemetry_service,
+            "tool_hub": self.tool_hub,
+            "event_bus": self.event_bus,
+        }
+        self.router = RouterAgent(**agent_services)
+        self.tutor = TutorAgent(**agent_services)
+        self.quizmaster = QuizMasterAgent(**agent_services)
+        self.grader = GraderAgent(**agent_services)
         self.tools = MCPTools()
         self.context_budgeter = ContextBudgeter()
         self.runtime = ExecutionRuntime(self)
@@ -156,23 +183,11 @@ class OrchestrationRunner:
     
     def get_workspace_path(self, course_name: str) -> str:
         """获取课程工作目录（包含路径穿越防护）。"""
-        # 只取最后一个路径组件，防止 ../../../etc 等穿越攻击
-        safe_name = os.path.basename(course_name.strip())
-        if not safe_name or safe_name in (".", ".."):
-            raise ValueError(f"无效的课程名称: {course_name!r}")
-        return os.path.join(self.data_dir, safe_name)
+        return self.workspace_store.get_workspace_path(course_name)
     
     def load_retriever(self, course_name: str) -> Optional[Retriever]:
         """按课程加载检索器（未构建索引时返回 None）。"""
-        workspace_path = self.get_workspace_path(course_name)
-        index_path = os.path.abspath(os.path.join(workspace_path, "index", "faiss_index"))
-        
-        if not os.path.exists(f"{index_path}.faiss"):
-            return None
-        
-        store = FAISSStore()
-        store.load(index_path)
-        return Retriever(store)
+        return self.rag_service.load_retriever(course_name)
 
     @staticmethod
     def _top_k_for_mode(mode: str) -> int:
@@ -334,8 +349,22 @@ class OrchestrationRunner:
             }
         ]
 
+    def _final_internal_tool_calls(
+        self,
+        *,
+        session_state: SessionStateV1,
+        history_summary_state: Dict[str, Any],
+        extra_tool_calls: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        return self._merge_internal_tool_calls(
+            extra_tool_calls,
+            self._build_history_summary_tool_call(history_summary_state),
+            self._build_session_state_tool_call(session_state),
+        )
+
     def _persist_session_state(self, session_state: SessionStateV1) -> SessionStateV1:
         self._session_state_store[session_state.session_id] = session_state
+        self.workspace_store.save_session_state(session_state)
         return session_state
 
     def _extract_session_state(
@@ -373,14 +402,32 @@ class OrchestrationRunner:
         session_id = str((state or {}).get("session_id", "") or "").strip()
         if session_id and session_id in self._session_state_store:
             stored = self._session_state_store[session_id]
+            self.telemetry_service.add_event("session_store_lookup", source="memory", hit=True)
             return stored.model_copy(
                 update={
                     "course_name": course_name,
                     "requested_mode_hint": mode_hint,
-                    "task_full_text": user_message or stored.task_full_text,
-                    "task_summary": self._summarize_task_text(user_message or stored.task_full_text),
-                }
-            )
+                        "task_full_text": user_message or stored.task_full_text,
+                        "task_summary": self._summarize_task_text(user_message or stored.task_full_text),
+                    }
+                )
+        if session_id:
+            try:
+                stored = self.workspace_store.load_session_state(course_name, session_id)
+            except Exception:
+                stored = None
+            if stored is not None:
+                self._session_state_store[session_id] = stored
+                self.telemetry_service.add_event("session_store_lookup", source="workspace", hit=True)
+                return stored.model_copy(
+                    update={
+                        "course_name": course_name,
+                        "requested_mode_hint": mode_hint,
+                        "task_full_text": user_message or stored.task_full_text,
+                        "task_summary": self._summarize_task_text(user_message or stored.task_full_text),
+                    }
+                )
+            self.telemetry_service.add_event("session_store_lookup", source="workspace", hit=False)
 
         payload = self._extract_internal_meta(history or [], "session_state")
         if isinstance(payload, dict):
@@ -409,6 +456,10 @@ class OrchestrationRunner:
             resolved_mode=mode_hint,  # type: ignore[arg-type]
             task_full_text=user_message,
             task_summary=self._summarize_task_text(user_message),
+            question_raw=user_message,
+            user_intent=user_message,
+            retrieval_query=user_message,
+            memory_query=user_message,
             current_stage="router_planned",
             current_step_index=0,
             history_summary_state=legacy_history_summary_state,
@@ -419,6 +470,132 @@ class OrchestrationRunner:
     @staticmethod
     def _update_session_state(session_state: SessionStateV1, **updates: Any) -> SessionStateV1:
         return session_state.model_copy(update=updates)
+
+    @staticmethod
+    def _coerce_agent_context(value: Any) -> Optional[AgentContextV1]:
+        if isinstance(value, AgentContextV1):
+            return value
+        if isinstance(value, dict):
+            try:
+                return AgentContextV1.model_validate(value)
+            except Exception:
+                return None
+        return None
+
+    def _init_tool_runtime_context(
+        self,
+        *,
+        course_name: str,
+        session_state: SessionStateV1,
+        retrieval_query: str,
+        memory_query: str,
+        question_raw: str,
+        permission_mode: str,
+        taskgraph_step: str = "",
+    ) -> None:
+        workspace_path = self.get_workspace_path(course_name)
+        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
+        MCPTools._context = {
+            "notes_dir": notes_dir,
+            "memory_query": memory_query,
+            "retrieval_query": retrieval_query,
+            "question_raw": question_raw,
+            "course_name": course_name,
+            "session_id": session_state.session_id,
+            "permission_mode": permission_mode,
+            "taskgraph_step": str(taskgraph_step or "").strip(),
+            "runtime_route": str(taskgraph_step or "").strip(),
+            "strict_new_runtime": os.getenv("STRICT_NEW_RUNTIME", "0") == "1",
+            "tool_audit": [],
+        }
+
+    @staticmethod
+    def _extract_tool_audit_refs() -> List[str]:
+        ctx = getattr(MCPTools, "_context", None)
+        if not isinstance(ctx, dict):
+            return []
+        audit = ctx.get("tool_audit", [])
+        if not isinstance(audit, list):
+            return []
+        refs: List[str] = []
+        for item in audit:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("idempotency_key", "") or item.get("signature", "") or item.get("tool_name", "")).strip()
+            if key:
+                refs.append(key)
+        return refs
+
+    @staticmethod
+    def _runtime_managed(state: Optional[Dict[str, Any]]) -> bool:
+        return bool((state or {}).get("_runtime_managed"))
+
+    @staticmethod
+    def _runtime_route_override(state: Optional[Dict[str, Any]]) -> str:
+        return str((state or {}).get("_runtime_route", "") or "").strip()
+
+    @staticmethod
+    def _runtime_effects(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if state is None:
+            return {}
+        effects = state.get("_runtime_effects")
+        if not isinstance(effects, dict):
+            effects = {}
+            state["_runtime_effects"] = effects
+        return effects
+
+    @staticmethod
+    def _runtime_update_state_ref(state: Optional[Dict[str, Any]], session_state: SessionStateV1) -> SessionStateV1:
+        if isinstance(state, dict):
+            state["session_state"] = session_state
+        return session_state
+
+    def _build_agent_context(
+        self,
+        *,
+        session_state: SessionStateV1,
+        history: List[Dict[str, Any]],
+        retrieval_query: str,
+        rag_text: str,
+        memory_text: str,
+        citations: List[RetrievedChunk],
+        mode: str,
+        history_summary_state: Optional[Dict[str, Any]] = None,
+        pending_history: Optional[List[Dict[str, str]]] = None,
+        recent_history: Optional[List[Dict[str, str]]] = None,
+        history_metrics: Optional[Dict[str, Any]] = None,
+    ) -> tuple[AgentContextV1, Dict[str, Any], Dict[str, str]]:
+        packed = self.context_budgeter.build_context(
+            query=retrieval_query,
+            history=history,
+            rag_text=rag_text,
+            memory_text=memory_text,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            history_summary_state=history_summary_state,
+            pending_history=pending_history,
+            recent_history=recent_history,
+            history_state_metrics=history_metrics,
+        )
+        self._log_context_budget(mode, packed)
+        sections = self._context_sections_from_packed(packed)
+        agent_context = AgentContextV1(
+            session_snapshot=session_state,
+            history_context=sections["history_context"],
+            rag_context=sections["rag_context"],
+            memory_context=sections["memory_context"],
+            merged_context=sections["context"],
+            citations=list(citations or []),
+            constraints={"mode": mode},
+            tool_scope={
+                "permission_mode": session_state.permission_mode,
+                "allowed_tools": [],
+            },
+            metadata={
+                "context_budget": self._context_budget_payload(mode, len(history), packed),
+            },
+        )
+        return agent_context, packed, sections
 
     def _prepare_history_summary_inputs(
         self,
@@ -484,74 +661,87 @@ class OrchestrationRunner:
         """执行学习模式（非流式）。"""
         if history is None:
             history = []
+        state = state or {}
+        runtime_managed = self._runtime_managed(state)
         retrieval_empty = False
         question_raw = self._plan_question_raw(plan, user_message)
         retrieval_query = self._plan_retrieval_query(plan, user_message)
         memory_query = self._plan_memory_query(plan, user_message)
-        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
-        session_state = self._extract_session_state(
-            history=history,
-            course_name=course_name,
-            mode_hint="learn",
-            user_message=user_message,
-            state=state,
-        )
+        agent_context = self._coerce_agent_context(state.get("agent_context"))
+        if agent_context is not None:
+            session_state = agent_context.session_snapshot
+            history_summary_state = dict(session_state.history_summary_state or {})
+        else:
+            history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
+            session_state = self._extract_session_state(
+                history=history,
+                course_name=course_name,
+                mode_hint="learn",
+                user_message=user_message,
+                state=state,
+            )
         session_state = self._update_session_state(
             session_state,
             resolved_mode=str(getattr(plan, "resolved_mode", "") or "learn"),
+            question_raw=question_raw,
+            user_intent=str(getattr(plan, "user_intent", "") or question_raw),
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="learn_running",
             current_step_index=1,
             history_summary_state=history_summary_state,
         )
+        self._runtime_update_state_ref(state, session_state)
         # 关键步骤：按 plan 决定是否执行 RAG 检索并准备 citations。
-        context = ""
-        citations = []
-        
-        if plan.need_rag:
-            retriever = self.load_retriever(course_name)
-            if retriever:
-                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("learn"), mode="learn")
-                if chunks:
-                    context = retriever.format_context(chunks)
-                    citations = chunks
-                else:
-                    retrieval_empty = True
-                    context = "（检索未命中有效教材片段，本轮将基于通用知识和已有上下文回答）"
-            else:
-                retrieval_empty = True
-                context = "（未找到相关教材，请先上传课程资料）"
+        if agent_context is not None:
+            citations = list(agent_context.citations or [])
+            context_sections = {
+                "history_context": agent_context.history_context,
+                "rag_context": agent_context.rag_context,
+                "memory_context": agent_context.memory_context,
+                "context": agent_context.merged_context,
+            }
+            context = agent_context.merged_context
+            retrieval_empty = bool(agent_context.metadata.get("retrieval_empty", False))
+        else:
+            rag_text, citations, retrieval_empty = self.rag_service.retrieve(
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                mode="learn",
+                need_rag=plan.need_rag,
+                missing_index_message="（未找到相关教材，请先上传课程资料）",
+                empty_message="（检索未命中有效教材片段，本轮将基于通用知识和已有上下文回答）",
+            )
+            memory_ctx = self._fetch_history_ctx(
+                query=memory_query,
+                course_name=course_name,
+                mode="learn",
+                agent="tutor",
+                phase="answer",
+            )
+            agent_context, packed, context_sections = self._build_agent_context(
+                session_state=session_state,
+                history=history,
+                retrieval_query=retrieval_query,
+                rag_text=rag_text,
+                memory_text=memory_ctx,
+                citations=citations,
+                mode="learn",
+            )
+            agent_context.metadata["retrieval_empty"] = retrieval_empty
+            context = agent_context.merged_context
 
-        memory_ctx = self._fetch_history_ctx(
-            query=memory_query,
-            course_name=course_name,
-            mode="learn",
-            agent="tutor",
-            phase="answer",
-        )
-        packed = self.context_budgeter.build_context(
-            query=retrieval_query,
-            history=history,
-            rag_text=context,
-            memory_text=memory_ctx,
-            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
-            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
-        )
-        self._log_context_budget("learn", packed)
-        context_sections = self._context_sections_from_packed(packed)
-        context = context_sections["context"]
-        
         # 关键步骤：组装 Tutor 入参并触发生成。
-        workspace_path = self.get_workspace_path(course_name)
-        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        # 为 filewriter 工具注入当前课程的笔记目录
-        from mcp_tools.client import MCPTools
-        MCPTools._context = {
-            "notes_dir": notes_dir,
-            "memory_query": memory_query,
-            "retrieval_query": retrieval_query,
-            "question_raw": question_raw,
-            "course_name": course_name,
-        }
+        self._init_tool_runtime_context(
+            course_name=course_name,
+            session_state=session_state,
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            question_raw=question_raw,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
+            taskgraph_step=self._runtime_route_override(state) or "run_tutor",
+        )
         result: TutorResult = self.tutor.teach(
             user_message, course_name, context,
             context_sections=context_sections,
@@ -571,27 +761,20 @@ class OrchestrationRunner:
         # 合并 RAG citations 和 Tutor 内部工具调用产生的 citations
         merged_citations = citations + result.citations if citations else result.citations
         if self._should_persist_learn_episode(user_message):
-            try:
-                from memory.manager import get_memory_manager
-
-                mgr = get_memory_manager()
-                doc_ids = [c.doc_id for c in merged_citations] if merged_citations else []
-                content = f"用户要求记住: {question_raw}"
-                if doc_ids:
-                    content += f"\n参考来源: {', '.join(dict.fromkeys(doc_ids))}"
-                mgr.record_event(
-                    course_name=course_name,
-                    event_type="qa",
-                    content=content,
-                    importance=0.6,
-                    metadata={"doc_ids": doc_ids, "explicit_memory_request": True},
-                    increment_qa=True,
-                    mode="learn",
-                    agent="tutor",
-                    phase="answer",
-                )
-            except Exception as _mem_err:
-                self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
+            doc_ids = [c.doc_id for c in merged_citations] if merged_citations else []
+            if runtime_managed:
+                effects = self._runtime_effects(state)
+                effects["persist_memory"] = {
+                    "kind": "learn_episode",
+                    "course_name": course_name,
+                    "question_raw": question_raw,
+                    "doc_ids": doc_ids,
+                }
+            else:
+                try:
+                    self.memory_service.save_learn_episode(course_name, question_raw, doc_ids)
+                except Exception as _mem_err:
+                    self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
         self._last_run_meta = {
             "mode": "learn",
             "retrieval_empty": retrieval_empty,
@@ -605,16 +788,19 @@ class OrchestrationRunner:
             current_step_index=3,
             selected_memory=context_sections.get("memory_context", ""),
             history_summary_state=history_summary_state,
+            tool_audit_refs=self._extract_tool_audit_refs(),
         )
-        self._persist_session_state(session_state)
+        self._runtime_update_state_ref(state, session_state)
+        if not runtime_managed:
+            self._persist_session_state(session_state)
 
         return ChatMessage(
             role="assistant",
             content=result.content,
             citations=merged_citations if merged_citations else None,
-            tool_calls=self._merge_internal_tool_calls(
-                self._build_history_summary_tool_call(history_summary_state),
-                self._build_session_state_tool_call(session_state),
+            tool_calls=self._final_internal_tool_calls(
+                session_state=session_state,
+                history_summary_state=history_summary_state,
             ),
         )
     
@@ -629,79 +815,94 @@ class OrchestrationRunner:
         """对话式练习模式（非流式）：出题走 QuizMaster，交卷走 Grader。"""
         if history is None:
             history = []
+        state = state or {}
+        runtime_managed = self._runtime_managed(state)
+        route_override = self._runtime_route_override(state)
         retrieval_empty = False
         retrieval_query = self._plan_retrieval_query(plan, user_message)
         memory_query = self._plan_memory_query(plan, user_message)
-        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
-        session_state = self._extract_session_state(
-            history=history,
-            course_name=course_name,
-            mode_hint="practice",
-            user_message=user_message,
-            state=state,
+        agent_context = self._coerce_agent_context(state.get("agent_context"))
+        if agent_context is not None:
+            session_state = agent_context.session_snapshot
+            history_summary_state = dict(session_state.history_summary_state or {})
+            citations = list(agent_context.citations or [])
+            context_sections = {
+                "history_context": agent_context.history_context,
+                "rag_context": agent_context.rag_context,
+                "memory_context": agent_context.memory_context,
+                "context": agent_context.merged_context,
+            }
+            context = agent_context.merged_context
+            retrieval_empty = bool(agent_context.metadata.get("retrieval_empty", False))
+        else:
+            history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
+            session_state = self._extract_session_state(
+                history=history,
+                course_name=course_name,
+                mode_hint="practice",
+                user_message=user_message,
+                state=state,
+            )
+            rag_text, citations, retrieval_empty = self.rag_service.retrieve(
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                mode="practice",
+                need_rag=plan.need_rag,
+                missing_index_message="（未找到相关教材，请先上传课程资料）",
+                empty_message="（检索未命中有效教材片段，本轮将基于已有上下文出题）",
+            )
+
+        answer_submission = route_override == "run_grade" or (
+            not route_override and self._is_answer_submission(user_message, history)
         )
-
-        context = ""
-        citations = []
-        if plan.need_rag:
-            retriever = self.load_retriever(course_name)
-            if retriever:
-                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("practice"), mode="practice")
-                if chunks:
-                    context = retriever.format_context(chunks)
-                    citations = chunks
-                else:
-                    retrieval_empty = True
-                    context = "（检索未命中有效教材片段，本轮将基于已有上下文出题）"
-            else:
-                retrieval_empty = True
-                context = "（未找到相关教材，请先上传课程资料）"
-
-        # ── 路由判断：答案提交 → GraderAgent；出题请求 → QuizMaster ──
-        answer_submission = self._is_answer_submission(user_message, history)
         session_state = self._update_session_state(
             session_state,
             resolved_mode=str(getattr(plan, "resolved_mode", "") or "practice"),
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            user_intent=str(getattr(plan, "user_intent", "") or user_message),
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="practice_grading" if answer_submission else "practice_generating",
             current_step_index=2 if answer_submission else 1,
             history_summary_state=history_summary_state,
         )
+        self._runtime_update_state_ref(state, session_state)
         mem_agent = "grader" if answer_submission else "quizzer"
         mem_phase = "grade" if answer_submission else "generate"
-
-        # 历史错题上下文（Runner 统一预取，供后续链路共享）
-        history_ctx = self._fetch_history_ctx(
-            query=memory_query,
-            course_name=course_name,
-            mode="practice",
-            agent=mem_agent,
-            phase=mem_phase,
-        )
-        packed = self.context_budgeter.build_context(
-            query=retrieval_query,
-            history=history,
-            rag_text=context,
-            memory_text=history_ctx,
-            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
-            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
-            history_summary_state=history_summary_state,
-            pending_history=pending_history,
-            recent_history=recent_history,
-            history_state_metrics=history_metrics,
-        )
-        self._log_context_budget("practice", packed)
-        context_sections = self._context_sections_from_packed(packed)
-        context = context_sections["context"]
+        if agent_context is None:
+            history_ctx = self._fetch_history_ctx(
+                query=memory_query,
+                course_name=course_name,
+                mode="practice",
+                agent=mem_agent,
+                phase=mem_phase,
+            )
+            agent_context, packed, context_sections = self._build_agent_context(
+                session_state=session_state,
+                history=history,
+                retrieval_query=retrieval_query,
+                rag_text=rag_text,
+                memory_text=history_ctx,
+                citations=citations,
+                mode="practice",
+                history_summary_state=history_summary_state,
+                pending_history=pending_history,
+                recent_history=recent_history,
+                history_metrics=history_metrics,
+            )
+            agent_context.metadata["retrieval_empty"] = retrieval_empty
+            context = agent_context.merged_context
         history_ctx = context_sections["memory_context"]
-
-        workspace_path = self.get_workspace_path(course_name)
-        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {
-            "notes_dir": notes_dir,
-            "memory_query": memory_query,
-            "retrieval_query": retrieval_query,
-            "course_name": course_name,
-        }
+        self._init_tool_runtime_context(
+            course_name=course_name,
+            session_state=session_state,
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
+            taskgraph_step=route_override or ("run_grade" if answer_submission else "run_quiz"),
+        )
         tool_calls = None
 
         if answer_submission:
@@ -730,21 +931,41 @@ class OrchestrationRunner:
                     if isinstance(chunk, str):
                         chunks.append(chunk)
             response_text = "".join(chunks)
-            saved_path = self._save_practice_record(course_name, user_message, history, response_text)
-            self._save_grading_to_memory(course_name, user_message, history, response_text)
-            response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
+            if runtime_managed:
+                effects = self._runtime_effects(state)
+                effects["persist_records"] = {
+                    "kind": "practice_record",
+                    "course_name": course_name,
+                    "user_message": user_message,
+                    "history": list(history),
+                    "response_text": response_text,
+                }
+                effects["persist_memory"] = {
+                    "kind": "practice_grade",
+                    "course_name": course_name,
+                    "user_answer": user_message,
+                    "history": list(history),
+                    "response_text": response_text,
+                }
+                effects["record_notice"] = "practice"
+            else:
+                saved_path = self._save_practice_record(course_name, user_message, history, response_text)
+                self._save_grading_to_memory(course_name, user_message, history, response_text)
+                response_text += f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
             session_state = self._update_session_state(
                 session_state,
                 current_stage="practice_graded",
                 current_step_index=3,
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
+                tool_audit_refs=self._extract_tool_audit_refs(),
             )
-            tool_calls = self._build_history_summary_tool_call(history_summary_state)
+            self._runtime_update_state_ref(state, session_state)
+            tool_calls = None
         else:
             self.logger.info("[status] practice generating_quiz%s", self._trace_tag())
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
-            if num_questions > 1:
+            if route_override == "run_exam" or num_questions > 1:
                 self.logger.info(
                     "[route] practice multi_question=%d use_exam_generator=1%s",
                     num_questions,
@@ -777,7 +998,9 @@ class OrchestrationRunner:
                     current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
                     history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
                 )
+                self._runtime_update_state_ref(state, session_state)
                 tool_calls = self._build_exam_meta_tool_call(
                     exam_payload.get("answer_sheet", []),
                     int(exam_payload.get("total_score", 0)),
@@ -804,12 +1027,11 @@ class OrchestrationRunner:
                     current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
                     history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
                 )
+                self._runtime_update_state_ref(state, session_state)
                 tool_calls = self._build_quiz_meta_tool_call(quiz)
-            tool_calls = self._merge_internal_tool_calls(
-                tool_calls,
-                self._build_history_summary_tool_call(history_summary_state),
-            )
+            tool_calls = self._merge_internal_tool_calls(tool_calls, self._build_history_summary_tool_call(history_summary_state))
 
         self._last_run_meta = {
             "mode": "practice",
@@ -817,15 +1039,18 @@ class OrchestrationRunner:
             "answer_submission": answer_submission,
             "has_side_effect": answer_submission,
         }
-        self._persist_session_state(session_state)
+        self._runtime_update_state_ref(state, session_state)
+        if not runtime_managed:
+            self._persist_session_state(session_state)
 
         return ChatMessage(
             role="assistant",
             content=response_text,
             citations=citations if citations else None,
-            tool_calls=self._merge_internal_tool_calls(
-                tool_calls,
-                self._build_session_state_tool_call(session_state),
+            tool_calls=self._final_internal_tool_calls(
+                session_state=session_state,
+                history_summary_state=history_summary_state,
+                extra_tool_calls=tool_calls,
             ),
         )
 
@@ -840,93 +1065,111 @@ class OrchestrationRunner:
         """对话式练习模式（流式）：交卷走 Grader 流式，出题走 QuizMaster。"""
         if history is None:
             history = []
+        state = state or {}
+        runtime_managed = self._runtime_managed(state)
+        route_override = self._runtime_route_override(state)
         retrieval_empty = False
         retrieval_query = self._plan_retrieval_query(plan, user_message)
         memory_query = self._plan_memory_query(plan, user_message)
-        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
-        session_state = self._extract_session_state(
-            history=history,
-            course_name=course_name,
-            mode_hint="practice",
-            user_message=user_message,
-            state=state,
-        )
+        agent_context = self._coerce_agent_context(state.get("agent_context"))
+        if agent_context is not None:
+            session_state = agent_context.session_snapshot
+            history_summary_state = dict(session_state.history_summary_state or {})
+            context_sections = {
+                "history_context": agent_context.history_context,
+                "rag_context": agent_context.rag_context,
+                "memory_context": agent_context.memory_context,
+                "context": agent_context.merged_context,
+            }
+            context = agent_context.merged_context
+            citations_dicts = [c.model_dump() for c in agent_context.citations]
+            payload = dict(agent_context.metadata.get("context_budget", {}) or {})
+            retrieval_empty = bool(agent_context.metadata.get("retrieval_empty", False))
+        else:
+            history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
+            session_state = self._extract_session_state(
+                history=history,
+                course_name=course_name,
+                mode_hint="practice",
+                user_message=user_message,
+                state=state,
+            )
+            yield self.event_bus.status("正在检索教材证据...")
+            rag_text, citations, retrieval_empty = self.rag_service.retrieve(
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                mode="practice",
+                need_rag=plan.need_rag,
+                missing_index_message="（未找到相关教材，请先上传课程资料）",
+                empty_message="（检索未命中有效教材片段，本轮将基于已有上下文出题）",
+            )
+            citations_dicts = [c.model_dump() for c in citations]
 
-        context = ""
-        citations_dicts = []
-        if plan.need_rag:
-            yield {"__status__": "正在检索教材证据..."}
-            retriever = self.load_retriever(course_name)
-            if retriever:
-                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("practice"), mode="practice")
-                if chunks:
-                    context = retriever.format_context(chunks)
-                    citations_dicts = [c.model_dump() for c in chunks]
-                else:
-                    retrieval_empty = True
-                    context = "（检索未命中有效教材片段，本轮将基于已有上下文出题）"
-            else:
-                retrieval_empty = True
-                context = "（未找到相关教材，请先上传课程资料）"
-
-        # 与 learn 模式保持一致：先发送 citations 事件给前端缓存
         if citations_dicts:
-            yield {"__citations__": citations_dicts}
+            yield self.event_bus.citations(citations_dicts)
 
-        answer_submission = self._is_answer_submission(user_message, history)
+        answer_submission = route_override == "run_grade" or (
+            not route_override and self._is_answer_submission(user_message, history)
+        )
         session_state = self._update_session_state(
             session_state,
             resolved_mode=str(getattr(plan, "resolved_mode", "") or "practice"),
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            user_intent=str(getattr(plan, "user_intent", "") or user_message),
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="practice_grading" if answer_submission else "practice_generating",
             current_step_index=2 if answer_submission else 1,
             history_summary_state=history_summary_state,
         )
+        self._runtime_update_state_ref(state, session_state)
         mem_agent = "grader" if answer_submission else "quizzer"
         mem_phase = "grade" if answer_submission else "generate"
-
-        yield {"__status__": "正在检索历史记忆..."}
-        history_ctx = self._fetch_history_ctx(
-            query=memory_query,
-            course_name=course_name,
-            mode="practice",
-            agent=mem_agent,
-            phase=mem_phase,
-        )
-        packed = self.context_budgeter.build_context(
-            query=retrieval_query,
-            history=history,
-            rag_text=context,
-            memory_text=history_ctx,
-            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
-            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
-            history_summary_state=history_summary_state,
-            pending_history=pending_history,
-            recent_history=recent_history,
-            history_state_metrics=history_metrics,
-        )
-        self._log_context_budget("practice", packed)
-        payload = self._context_budget_payload("practice", len(history), packed)
+        if agent_context is None:
+            yield self.event_bus.status("正在检索历史记忆...")
+            history_ctx = self._fetch_history_ctx(
+                query=memory_query,
+                course_name=course_name,
+                mode="practice",
+                agent=mem_agent,
+                phase=mem_phase,
+            )
+            agent_context, packed, context_sections = self._build_agent_context(
+                session_state=session_state,
+                history=history,
+                retrieval_query=retrieval_query,
+                rag_text=rag_text,
+                memory_text=history_ctx,
+                citations=citations,
+                mode="practice",
+                history_summary_state=history_summary_state,
+                pending_history=pending_history,
+                recent_history=recent_history,
+                history_metrics=history_metrics,
+            )
+            agent_context.metadata["retrieval_empty"] = retrieval_empty
+            payload = self._context_budget_payload("practice", len(history), packed)
+            context = agent_context.merged_context
         self.logger.info(
             "[context_budget_emit] mode=practice ratio=%.3f%s",
             float(payload.get("context_pressure_ratio", 0.0) or 0.0),
             self._trace_tag(),
         )
-        yield {"__context_budget__": payload}
-        context_sections = self._context_sections_from_packed(packed)
-        context = context_sections["context"]
+        yield self.event_bus.context_budget(payload)
         history_ctx = context_sections["memory_context"]
-
-        workspace_path = self.get_workspace_path(course_name)
-        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {
-            "notes_dir": notes_dir,
-            "memory_query": memory_query,
-            "retrieval_query": retrieval_query,
-            "course_name": course_name,
-        }
+        self._init_tool_runtime_context(
+            course_name=course_name,
+            session_state=session_state,
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
+            taskgraph_step=route_override or ("run_grade" if answer_submission else "run_quiz"),
+        )
 
         if answer_submission:
-            yield {"__status__": "正在批改练习答案..."}
+            yield self.event_bus.status("正在批改练习答案...")
             collected = []
             has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
             if has_exam_meta:
@@ -954,27 +1197,48 @@ class OrchestrationRunner:
                         collected.append(chunk)
                     yield chunk
             full_response = "".join(collected)
-            saved_path = self._save_practice_record(course_name, user_message, history, full_response)
-            self._save_grading_to_memory(course_name, user_message, history, full_response)
-            yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
+            if runtime_managed:
+                effects = self._runtime_effects(state)
+                effects["persist_records"] = {
+                    "kind": "practice_record",
+                    "course_name": course_name,
+                    "user_message": user_message,
+                    "history": list(history),
+                    "response_text": full_response,
+                }
+                effects["persist_memory"] = {
+                    "kind": "practice_grade",
+                    "course_name": course_name,
+                    "user_answer": user_message,
+                    "history": list(history),
+                    "response_text": full_response,
+                }
+                effects["record_notice"] = "practice"
+            else:
+                saved_path = self._save_practice_record(course_name, user_message, history, full_response)
+                self._save_grading_to_memory(course_name, user_message, history, full_response)
+                yield f"\n\n---\n📁 **本题记录已保存至**：`{saved_path}`"
             session_state = self._update_session_state(
                 session_state,
                 current_stage="practice_graded",
                 current_step_index=3,
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
+                tool_audit_refs=self._extract_tool_audit_refs(),
             )
-            self._persist_session_state(session_state)
-            yield {
-                "__tool_calls__": self._merge_internal_tool_calls(
-                    self._build_history_summary_tool_call(history_summary_state),
-                    self._build_session_state_tool_call(session_state),
+            self._runtime_update_state_ref(state, session_state)
+            if not runtime_managed:
+                self._persist_session_state(session_state)
+                yield self.event_bus.tool_calls(
+                    self._final_internal_tool_calls(
+                        session_state=session_state,
+                        history_summary_state=history_summary_state,
+                    )
                 )
-            }
         else:
-            yield {"__status__": "正在生成练习题..."}
+            yield self.event_bus.status("正在生成练习题...")
             topic, difficulty, num_questions, question_type = self._resolve_quiz_request(user_message)
-            if num_questions > 1:
+            if route_override == "run_exam" or num_questions > 1:
                 self.logger.info(
                     "[route] practice_stream multi_question=%d use_exam_generator=1%s",
                     num_questions,
@@ -1004,18 +1268,26 @@ class OrchestrationRunner:
                     current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
                     history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
                 )
-                self._persist_session_state(session_state)
-                yield {
-                    "__tool_calls__": self._merge_internal_tool_calls(
-                        self._build_exam_meta_tool_call(
-                            exam_payload.get("answer_sheet", []),
-                            int(exam_payload.get("total_score", 0)),
-                        ),
-                        self._build_history_summary_tool_call(history_summary_state),
-                        self._build_session_state_tool_call(session_state),
+                self._runtime_update_state_ref(state, session_state)
+                if not runtime_managed:
+                    self._persist_session_state(session_state)
+                    yield self.event_bus.tool_calls(
+                        self._final_internal_tool_calls(
+                            session_state=session_state,
+                            history_summary_state=history_summary_state,
+                            extra_tool_calls=self._build_exam_meta_tool_call(
+                                exam_payload.get("answer_sheet", []),
+                                int(exam_payload.get("total_score", 0)),
+                            ),
+                        )
                     )
-                }
+                else:
+                    self._runtime_effects(state)["final_tool_calls"] = self._build_exam_meta_tool_call(
+                        exam_payload.get("answer_sheet", []),
+                        int(exam_payload.get("total_score", 0)),
+                    )
                 content = str(exam_payload.get("content", "")).strip()
                 if content.startswith("# "):
                     content = content.replace("模拟考试试卷", "练习题（多题）", 1)
@@ -1041,15 +1313,20 @@ class OrchestrationRunner:
                     current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
                     history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
                 )
-                self._persist_session_state(session_state)
-                yield {
-                    "__tool_calls__": self._merge_internal_tool_calls(
-                        self._build_quiz_meta_tool_call(quiz),
-                        self._build_history_summary_tool_call(history_summary_state),
-                        self._build_session_state_tool_call(session_state),
+                self._runtime_update_state_ref(state, session_state)
+                if not runtime_managed:
+                    self._persist_session_state(session_state)
+                    yield self.event_bus.tool_calls(
+                        self._final_internal_tool_calls(
+                            session_state=session_state,
+                            history_summary_state=history_summary_state,
+                            extra_tool_calls=self._build_quiz_meta_tool_call(quiz),
+                        )
                     )
-                }
+                else:
+                    self._runtime_effects(state)["final_tool_calls"] = self._build_quiz_meta_tool_call(quiz)
                 yield self._render_quiz_message(quiz)
 
         self._last_run_meta = {
@@ -1071,65 +1348,94 @@ class OrchestrationRunner:
         """对话式考试模式（非流式）：出卷走 QuizMaster，交卷评分讲解走 Grader。"""
         if history is None:
             history = []
+        state = state or {}
+        runtime_managed = self._runtime_managed(state)
+        route_override = self._runtime_route_override(state)
         retrieval_empty = False
         retrieval_query = self._plan_retrieval_query(plan, user_message)
         memory_query = self._plan_memory_query(plan, user_message)
-        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
-        session_state = self._extract_session_state(
-            history=history,
-            course_name=course_name,
-            mode_hint="exam",
-            user_message=user_message,
-            state=state,
-        )
-
-        context = ""
-        retriever = self.load_retriever(course_name)
-        if retriever:
-            chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("exam"), mode="exam")
-            if chunks:
-                context = retriever.format_context(chunks)
-            else:
-                retrieval_empty = True
-                context = "（检索未命中有效教材片段，本轮将基于已有上下文生成试卷/评分）"
+        agent_context = self._coerce_agent_context(state.get("agent_context"))
+        if agent_context is not None:
+            session_state = agent_context.session_snapshot
+            history_summary_state = dict(session_state.history_summary_state or {})
+            citations = list(agent_context.citations or [])
+            context_sections = {
+                "history_context": agent_context.history_context,
+                "rag_context": agent_context.rag_context,
+                "memory_context": agent_context.memory_context,
+                "context": agent_context.merged_context,
+            }
+            context = agent_context.merged_context
+            retrieval_empty = bool(agent_context.metadata.get("retrieval_empty", False))
         else:
-            retrieval_empty = True
-            context = "（未找到相关教材，请先上传课程资料）"
+            history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
+            session_state = self._extract_session_state(
+                history=history,
+                course_name=course_name,
+                mode_hint="exam",
+                user_message=user_message,
+                state=state,
+            )
+            rag_text, citations, retrieval_empty = self.rag_service.retrieve(
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                mode="exam",
+                need_rag=True,
+                missing_index_message="（未找到相关教材，请先上传课程资料）",
+                empty_message="（检索未命中有效教材片段，本轮将基于已有上下文生成试卷/评分）",
+            )
 
-        answer_submission = self._is_exam_answer_submission(user_message, history)
+        answer_submission = route_override == "run_grade" or (
+            not route_override and self._is_exam_answer_submission(user_message, history)
+        )
         session_state = self._update_session_state(
             session_state,
             resolved_mode=str(getattr(plan, "resolved_mode", "") or "exam"),
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            user_intent=str(getattr(plan, "user_intent", "") or user_message),
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="exam_grading" if answer_submission else "exam_generating",
             current_step_index=2 if answer_submission else 1,
             history_summary_state=history_summary_state,
         )
+        self._runtime_update_state_ref(state, session_state)
         mem_agent = "grader" if answer_submission else "quizzer"
         mem_phase = "grade" if answer_submission else "generate"
-
-        history_ctx = self._fetch_history_ctx(
-            query=memory_query,
-            course_name=course_name,
-            mode="exam",
-            agent=mem_agent,
-            phase=mem_phase,
-        )
-        packed = self.context_budgeter.build_context(
-            query=retrieval_query,
-            history=history,
-            rag_text=context,
-            memory_text=history_ctx,
-            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
-            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
-            history_summary_state=history_summary_state,
-            pending_history=pending_history,
-            recent_history=recent_history,
-            history_state_metrics=history_metrics,
-        )
-        self._log_context_budget("exam", packed)
-        context_sections = self._context_sections_from_packed(packed)
-        context = context_sections["context"]
+        if agent_context is None:
+            history_ctx = self._fetch_history_ctx(
+                query=memory_query,
+                course_name=course_name,
+                mode="exam",
+                agent=mem_agent,
+                phase=mem_phase,
+            )
+            agent_context, packed, context_sections = self._build_agent_context(
+                session_state=session_state,
+                history=history,
+                retrieval_query=retrieval_query,
+                rag_text=rag_text,
+                memory_text=history_ctx,
+                citations=citations,
+                mode="exam",
+                history_summary_state=history_summary_state,
+                pending_history=pending_history,
+                recent_history=recent_history,
+                history_metrics=history_metrics,
+            )
+            agent_context.metadata["retrieval_empty"] = retrieval_empty
+            context = agent_context.merged_context
         history_ctx = context_sections["memory_context"]
+        self._init_tool_runtime_context(
+            course_name=course_name,
+            session_state=session_state,
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
+            taskgraph_step=route_override or ("run_grade" if answer_submission else "run_exam"),
+        )
         tool_calls = None
         if answer_submission:
             exam_paper = self._extract_exam_from_history(history)
@@ -1143,17 +1449,35 @@ class OrchestrationRunner:
                 if isinstance(chunk, str):
                     chunks.append(chunk)
             response_text = "".join(chunks)
-            saved_path = self._save_exam_record(course_name, user_message, history, response_text)
-            self._save_exam_to_memory(course_name, response_text)
-            response_text += f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
+            if runtime_managed:
+                effects = self._runtime_effects(state)
+                effects["persist_records"] = {
+                    "kind": "exam_record",
+                    "course_name": course_name,
+                    "user_message": user_message,
+                    "history": list(history),
+                    "response_text": response_text,
+                }
+                effects["persist_memory"] = {
+                    "kind": "exam_grade",
+                    "course_name": course_name,
+                    "response_text": response_text,
+                }
+                effects["record_notice"] = "exam"
+            else:
+                saved_path = self._save_exam_record(course_name, user_message, history, response_text)
+                self._save_exam_to_memory(course_name, response_text)
+                response_text += f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
             session_state = self._update_session_state(
                 session_state,
                 current_stage="exam_graded",
                 current_step_index=3,
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
+                tool_audit_refs=self._extract_tool_audit_refs(),
             )
-            tool_calls = self._build_history_summary_tool_call(history_summary_state)
+            self._runtime_update_state_ref(state, session_state)
+            tool_calls = None
         else:
             self.logger.info("[status] exam generating_paper%s", self._trace_tag())
             exam_payload = self.quizmaster.generate_exam_paper(
@@ -1180,7 +1504,9 @@ class OrchestrationRunner:
                 current_step_index=3,
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
+                tool_audit_refs=self._extract_tool_audit_refs(),
             )
+            self._runtime_update_state_ref(state, session_state)
             tool_calls = self._build_exam_meta_tool_call(
                 exam_payload.get("answer_sheet", []),
                 int(exam_payload.get("total_score", 0)),
@@ -1196,15 +1522,18 @@ class OrchestrationRunner:
             "exam_grading": answer_submission,
             "has_side_effect": answer_submission,
         }
-        self._persist_session_state(session_state)
+        self._runtime_update_state_ref(state, session_state)
+        if not runtime_managed:
+            self._persist_session_state(session_state)
 
         return ChatMessage(
             role="assistant",
             content=response_text,
-            citations=None,
-            tool_calls=self._merge_internal_tool_calls(
-                tool_calls,
-                self._build_session_state_tool_call(session_state),
+            citations=citations if citations else None,
+            tool_calls=self._final_internal_tool_calls(
+                session_state=session_state,
+                history_summary_state=history_summary_state,
+                extra_tool_calls=tool_calls,
             ),
         )
 
@@ -1219,82 +1548,110 @@ class OrchestrationRunner:
         """对话式考试模式（流式）：交卷走 Grader 流式，出卷走 QuizMaster。"""
         if history is None:
             history = []
+        state = state or {}
+        runtime_managed = self._runtime_managed(state)
+        route_override = self._runtime_route_override(state)
         retrieval_empty = False
         retrieval_query = self._plan_retrieval_query(plan, user_message)
         memory_query = self._plan_memory_query(plan, user_message)
-        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
-        session_state = self._extract_session_state(
-            history=history,
-            course_name=course_name,
-            mode_hint="exam",
-            user_message=user_message,
-            state=state,
-        )
-
-        context = ""
-        citations_dicts = []
-        yield {"__status__": "正在检索教材证据..."}
-        retriever = self.load_retriever(course_name)
-        if retriever:
-            chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("exam"), mode="exam")
-            if chunks:
-                context = retriever.format_context(chunks)
-                citations_dicts = [c.model_dump() for c in chunks]
-            else:
-                retrieval_empty = True
-                context = "（检索未命中有效教材片段，本轮将基于已有上下文生成试卷/评分）"
+        agent_context = self._coerce_agent_context(state.get("agent_context"))
+        if agent_context is not None:
+            session_state = agent_context.session_snapshot
+            history_summary_state = dict(session_state.history_summary_state or {})
+            context_sections = {
+                "history_context": agent_context.history_context,
+                "rag_context": agent_context.rag_context,
+                "memory_context": agent_context.memory_context,
+                "context": agent_context.merged_context,
+            }
+            context = agent_context.merged_context
+            citations_dicts = [c.model_dump() for c in agent_context.citations]
+            payload = dict(agent_context.metadata.get("context_budget", {}) or {})
+            retrieval_empty = bool(agent_context.metadata.get("retrieval_empty", False))
         else:
-            retrieval_empty = True
-            context = "（未找到相关教材，请先上传课程资料）"
+            history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
+            session_state = self._extract_session_state(
+                history=history,
+                course_name=course_name,
+                mode_hint="exam",
+                user_message=user_message,
+                state=state,
+            )
+            yield self.event_bus.status("正在检索教材证据...")
+            rag_text, citations, retrieval_empty = self.rag_service.retrieve(
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                mode="exam",
+                need_rag=True,
+                missing_index_message="（未找到相关教材，请先上传课程资料）",
+                empty_message="（检索未命中有效教材片段，本轮将基于已有上下文生成试卷/评分）",
+            )
+            citations_dicts = [c.model_dump() for c in citations]
 
-        # 与 learn 模式保持一致：先发送 citations 事件给前端缓存
         if citations_dicts:
-            yield {"__citations__": citations_dicts}
+            yield self.event_bus.citations(citations_dicts)
 
-        answer_submission = self._is_exam_answer_submission(user_message, history)
+        answer_submission = route_override == "run_grade" or (
+            not route_override and self._is_exam_answer_submission(user_message, history)
+        )
         session_state = self._update_session_state(
             session_state,
             resolved_mode=str(getattr(plan, "resolved_mode", "") or "exam"),
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            user_intent=str(getattr(plan, "user_intent", "") or user_message),
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="exam_grading" if answer_submission else "exam_generating",
             current_step_index=2 if answer_submission else 1,
             history_summary_state=history_summary_state,
         )
+        self._runtime_update_state_ref(state, session_state)
         mem_agent = "grader" if answer_submission else "quizzer"
         mem_phase = "grade" if answer_submission else "generate"
-
-        yield {"__status__": "正在检索历史记忆..."}
-        history_ctx = self._fetch_history_ctx(
-            query=memory_query,
-            course_name=course_name,
-            mode="exam",
-            agent=mem_agent,
-            phase=mem_phase,
-        )
-        packed = self.context_budgeter.build_context(
-            query=retrieval_query,
-            history=history,
-            rag_text=context,
-            memory_text=history_ctx,
-            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
-            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
-            history_summary_state=history_summary_state,
-            pending_history=pending_history,
-            recent_history=recent_history,
-            history_state_metrics=history_metrics,
-        )
-        self._log_context_budget("exam", packed)
-        payload = self._context_budget_payload("exam", len(history), packed)
+        if agent_context is None:
+            yield self.event_bus.status("正在检索历史记忆...")
+            history_ctx = self._fetch_history_ctx(
+                query=memory_query,
+                course_name=course_name,
+                mode="exam",
+                agent=mem_agent,
+                phase=mem_phase,
+            )
+            agent_context, packed, context_sections = self._build_agent_context(
+                session_state=session_state,
+                history=history,
+                retrieval_query=retrieval_query,
+                rag_text=rag_text,
+                memory_text=history_ctx,
+                citations=citations,
+                mode="exam",
+                history_summary_state=history_summary_state,
+                pending_history=pending_history,
+                recent_history=recent_history,
+                history_metrics=history_metrics,
+            )
+            agent_context.metadata["retrieval_empty"] = retrieval_empty
+            payload = self._context_budget_payload("exam", len(history), packed)
+            context = agent_context.merged_context
         self.logger.info(
             "[context_budget_emit] mode=exam ratio=%.3f%s",
             float(payload.get("context_pressure_ratio", 0.0) or 0.0),
             self._trace_tag(),
         )
-        yield {"__context_budget__": payload}
-        context_sections = self._context_sections_from_packed(packed)
-        context = context_sections["context"]
+        yield self.event_bus.context_budget(payload)
         history_ctx = context_sections["memory_context"]
+        self._init_tool_runtime_context(
+            course_name=course_name,
+            session_state=session_state,
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            question_raw=str(getattr(plan, "question_raw", "") or user_message),
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
+            taskgraph_step=route_override or ("run_grade" if answer_submission else "run_exam"),
+        )
         if answer_submission:
-            yield {"__status__": "正在批改考试答案..."}
+            yield self.event_bus.status("正在批改考试答案...")
             exam_paper = self._extract_exam_from_history(history)
             collected = []
             for chunk in self.grader.grade_exam_stream(
@@ -1307,25 +1664,44 @@ class OrchestrationRunner:
                     collected.append(chunk)
                 yield chunk
             full_response = "".join(collected)
-            saved_path = self._save_exam_record(course_name, user_message, history, full_response)
-            self._save_exam_to_memory(course_name, full_response)
-            yield f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
+            if runtime_managed:
+                effects = self._runtime_effects(state)
+                effects["persist_records"] = {
+                    "kind": "exam_record",
+                    "course_name": course_name,
+                    "user_message": user_message,
+                    "history": list(history),
+                    "response_text": full_response,
+                }
+                effects["persist_memory"] = {
+                    "kind": "exam_grade",
+                    "course_name": course_name,
+                    "response_text": full_response,
+                }
+                effects["record_notice"] = "exam"
+            else:
+                saved_path = self._save_exam_record(course_name, user_message, history, full_response)
+                self._save_exam_to_memory(course_name, full_response)
+                yield f"\n\n---\n📁 **本次考试记录已保存至**：`{saved_path}`"
             session_state = self._update_session_state(
                 session_state,
                 current_stage="exam_graded",
                 current_step_index=3,
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
+                tool_audit_refs=self._extract_tool_audit_refs(),
             )
-            self._persist_session_state(session_state)
-            yield {
-                "__tool_calls__": self._merge_internal_tool_calls(
-                    self._build_history_summary_tool_call(history_summary_state),
-                    self._build_session_state_tool_call(session_state),
+            self._runtime_update_state_ref(state, session_state)
+            if not runtime_managed:
+                self._persist_session_state(session_state)
+                yield self.event_bus.tool_calls(
+                    self._final_internal_tool_calls(
+                        session_state=session_state,
+                        history_summary_state=history_summary_state,
+                    )
                 )
-            }
         else:
-            yield {"__status__": "正在生成考试试卷..."}
+            yield self.event_bus.status("正在生成考试试卷...")
             exam_payload = self.quizmaster.generate_exam_paper(
                 course_name=course_name,
                 user_request=user_message,
@@ -1347,20 +1723,28 @@ class OrchestrationRunner:
                 },
                 current_stage="exam_generated",
                 current_step_index=3,
-                selected_memory=context_sections.get("memory_context", ""),
-                history_summary_state=history_summary_state,
-            )
-            self._persist_session_state(session_state)
-            yield {
-                "__tool_calls__": self._merge_internal_tool_calls(
-                    self._build_exam_meta_tool_call(
-                        exam_payload.get("answer_sheet", []),
-                        int(exam_payload.get("total_score", 0)),
-                    ),
-                    self._build_history_summary_tool_call(history_summary_state),
-                    self._build_session_state_tool_call(session_state),
+                    selected_memory=context_sections.get("memory_context", ""),
+                    history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
                 )
-            }
+            self._runtime_update_state_ref(state, session_state)
+            if not runtime_managed:
+                self._persist_session_state(session_state)
+                yield self.event_bus.tool_calls(
+                    self._final_internal_tool_calls(
+                        session_state=session_state,
+                        history_summary_state=history_summary_state,
+                        extra_tool_calls=self._build_exam_meta_tool_call(
+                            exam_payload.get("answer_sheet", []),
+                            int(exam_payload.get("total_score", 0)),
+                        ),
+                    )
+                )
+            else:
+                self._runtime_effects(state)["final_tool_calls"] = self._build_exam_meta_tool_call(
+                    exam_payload.get("answer_sheet", []),
+                    int(exam_payload.get("total_score", 0)),
+                )
             yield str(exam_payload.get("content", "")).strip()
 
         self._last_run_meta = {
@@ -1378,24 +1762,7 @@ class OrchestrationRunner:
         grade_report: GradeReport
     ):
         """Save mistake to log."""
-        workspace_path = self.get_workspace_path(course_name)
-        mistakes_dir = os.path.join(workspace_path, "mistakes")
-        os.makedirs(mistakes_dir, exist_ok=True)
-        
-        mistake_file = os.path.join(mistakes_dir, "mistakes.jsonl")
-        
-        mistake_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "question": quiz.question,
-            "student_answer": student_answer,
-            "standard_answer": quiz.standard_answer,
-            "score": grade_report.score,
-            "feedback": grade_report.feedback,
-            "mistake_tags": grade_report.mistake_tags
-        }
-        
-        with open(mistake_file, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(mistake_entry, ensure_ascii=False) + '\n')
+        self.workspace_store.save_mistake(course_name, quiz, student_answer, grade_report)
 
     # ------------------------------------------------------------------ #
     #  记录检测 & 自动保存辅助方法
@@ -1417,68 +1784,13 @@ class OrchestrationRunner:
         phase: str = "",
     ) -> str:
         """从记忆库预取历史错题片段，返回可追加到 system prompt 的字符串。"""
-        try:
-            top_k = int(os.getenv("CB_MEMORY_TOPK", "2"))
-            item_max_chars = int(os.getenv("CB_MEMORY_ITEM_MAX_CHARS", "100"))
-            cache = getattr(self, "_tool_dedup_cache", None)
-            if not isinstance(cache, dict):
-                cache = {}
-                self._tool_dedup_cache = cache
-            key_payload = {
-                "tool": "memory_search",
-                "query": query,
-                "course_name": course_name,
-                "event_types": ["mistake", "practice", "exam", "qa_summary"],
-                "mode": mode or None,
-                "agent": agent or None,
-                "phase": phase or None,
-                "top_k": top_k,
-            }
-            cache_key = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
-            if cache_key in cache:
-                mem = cache[cache_key]
-                self.logger.info("[tool_dedup] memory_search hit=1 reason=runner_cache%s", self._trace_tag())
-            else:
-                mem = MCPTools.call_tool(
-                    "memory_search",
-                    query=query,
-                    course_name=course_name,
-                    event_types=["mistake", "practice", "exam", "qa_summary"],
-                    mode=mode or None,
-                    agent=agent or None,
-                    phase=phase or None,
-                    top_k=top_k,
-                )
-                cache[cache_key] = mem
-            if mem.get("success") and mem.get("results"):
-                snippets = []
-                for r in mem["results"][: max(1, top_k)]:
-                    text = ""
-                    if isinstance(r, dict):
-                        text = (
-                            r.get("content")
-                            or r.get("summary")
-                            or r.get("text")
-                            or ""
-                        )
-                    elif isinstance(r, str):
-                        text = r
-                    text = text.strip()
-                    if text:
-                        snippets.append(text[: max(20, item_max_chars)])
-                if snippets:
-                    title = "【该知识点历史错题参考】"
-                    if phase == "grade":
-                        title = "【该知识点历史错题参考（评分时请特别关注相同薄弱点）】"
-                    elif phase == "generate":
-                        title = "【该知识点历史错题参考（出题时请优先覆盖薄弱点）】"
-                    return (
-                        f"\n\n{title}\n"
-                        + "\n".join(f"- {s}" for s in snippets)
-                    )
-        except Exception:
-            pass
-        return ""
+        return self.memory_service.prefetch_history_ctx(
+            query=query,
+            course_name=course_name,
+            mode=mode,
+            agent=agent,
+            phase=phase,
+        )
 
     @staticmethod
     def _context_sections_from_packed(packed: Dict[str, Any]) -> Dict[str, str]:
@@ -1847,51 +2159,7 @@ class OrchestrationRunner:
     ) -> None:
         """将练习评分结果写入情景记忆，使用 PracticeGradeSignal 提取结构化信息。"""
         try:
-            from memory.manager import get_memory_manager
-
-            # 提取题目（历史中最近一条 assistant 消息）
-            question_summary = "（未能提取题目）"
-            for msg in reversed(history[-20:]):
-                if msg.get("role") == "assistant":
-                    question_summary = msg.get("content", "")[:300]
-                    break
-
-            # 用结构化方法解析评分和错误标签，替代原内联 regex
-            signal = PracticeGradeSignal.from_text(
-                response_text=response_text,
-                student_answer=user_answer,
-                question_summary=question_summary,
-            )
-
-            content = (
-                f"题目: {signal.question_summary}\n"
-                f"学生答案: {signal.student_answer}\n"
-                f"得分: {signal.score:.0f}"
-            )
-            if signal.mistake_tags:
-                content += f"\n错误类型: {', '.join(signal.mistake_tags)}"
-
-            mgr = get_memory_manager()
-            mgr.record_event(
-                course_name=course_name,
-                event_type="mistake" if signal.is_mistake else "practice",
-                content=content,
-                importance=0.9 if signal.is_mistake else 0.4,
-                metadata={"score": signal.score, "tags": signal.mistake_tags},
-                score=signal.score,
-                concepts=signal.mistake_tags,
-                update_weak_points=signal.is_mistake,
-                increment_practice=True,
-                mode="practice",
-                agent="grader",
-                phase="grade",
-            )
-            self.logger.info(
-                "[memory] practice_saved type=%s score=%.0f%s",
-                "mistake" if signal.is_mistake else "practice",
-                signal.score,
-                self._trace_tag(),
-            )
+            self.memory_service.save_practice_grade(course_name, user_answer, history, response_text)
         except Exception as _e:
             self.logger.warning("[memory] practice_save_failed err=%s%s", str(_e), self._trace_tag())
 
@@ -1900,164 +2168,19 @@ class OrchestrationRunner:
         user_message: 当前用户提交的答案（直接传入，不从 history 提取）
         history: 当前消息之前的历史（用于提取题目内容）
         """
-        workspace_path = self.get_workspace_path(course_name)
-        practices_dir = os.path.join(workspace_path, "practices")
-        os.makedirs(practices_dir, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"练习记录_{timestamp}.md"
-        filepath = os.path.join(practices_dir, filename)
-
-        # 从历史中提取最近一条 assistant 消息作为题目内容
-        quiz_content = None
-        for msg in reversed(history[-20:]):
-            if msg.get("role") == "assistant":
-                quiz_content = msg.get("content", "")
-                break
-
-        md = f"""# 练习记录
-
-**时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-**课程**：{course_name}
-
----
-
-## 题目
-
-{quiz_content or '（未能提取题目内容）'}
-
----
-
-## 我的答案
-
-{user_message}
-
----
-
-## 评分与详细解析
-
-{response_text}
-"""
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(md)
-        return f"practices/{filename}"
+        return self.workspace_store.save_practice_record(course_name, user_message, history, response_text)
 
     def _save_exam_record(self, course_name: str, user_message: str, history: list, response_text: str) -> str:
         """保存考试完整记录（试卷、用户答案、批改报告），返回相对路径。
         user_message: 用户提交的全部答案（直接传入）
         history: 当前消息之前的历史（用于提取试卷内容）
         """
-        workspace_path = self.get_workspace_path(course_name)
-        exams_dir = os.path.join(workspace_path, "exams")
-        os.makedirs(exams_dir, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"考试记录_{timestamp}.md"
-        filepath = os.path.join(exams_dir, filename)
-
-        # 从历史中提取包含试卷内容的最近 assistant 消息
-        exam_paper = None
-        for msg in reversed(history[-30:]):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                if any(kw in content for kw in ["模拟考试试卷", "第一部分", "第二部分"]):
-                    exam_paper = content
-                    break
-
-        md = f"""# 考试记录
-
-**时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-**课程**：{course_name}
-
----
-
-## 试卷
-
-{exam_paper or '（未能提取试卷内容）'}
-
----
-
-## 我的答案
-
-{user_message}
-
----
-
-## 批改报告
-
-{response_text}
-"""
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(md)
-        return f"exams/{filename}"
+        return self.workspace_store.save_exam_record(course_name, user_message, history, response_text)
 
     def _save_exam_to_memory(self, course_name: str, response_text: str) -> None:
         """将考试批改结果写入情景记忆，并同步薄弱知识点到用户画像。"""
         try:
-            import re
-            from memory.manager import get_memory_manager
-
-            # 提取总分（兼容“总得分：88 / 100”、“总分: 72分”等写法）
-            score = None
-            score_patterns = [
-                r"(?:总得分|总分)[：:\s]*([0-9]+(?:\.[0-9]+)?)\s*/\s*100",
-                r"(?:总得分|总分)[：:\s]*([0-9]+(?:\.[0-9]+)?)\s*分",
-            ]
-            for pattern in score_patterns:
-                m = re.search(pattern, response_text)
-                if m:
-                    score = float(m.group(1))
-                    break
-
-            # 提取薄弱知识点（兼容“薄弱知识点：A、B”与项目符号列表）
-            weak_points: List[str] = []
-            block = re.search(
-                r"薄弱知识点[：:\s]*([\s\S]{0,300})(?:\n## |\n---|\Z)",
-                response_text,
-            )
-            if block:
-                section = block.group(1)
-                bullet_items = re.findall(r"(?:^|\n)\s*[-*•]\s*([^\n]{1,40})", section)
-                if bullet_items:
-                    weak_points = [x.strip() for x in bullet_items if x.strip()]
-                else:
-                    inline = re.sub(r"[\r\n]+", " ", section).strip()
-                    weak_points = [
-                        x.strip()
-                        for x in re.split(r"[,，、；;]", inline)
-                        if x.strip()
-                    ]
-            weak_points = weak_points[:8]
-
-            # 生成可检索摘要，避免把完整长文原样入库
-            excerpt = response_text.strip().replace("\r", "")
-            excerpt = re.sub(r"\n{3,}", "\n\n", excerpt)[:900]
-            content = "考试批改摘要：\n" + excerpt
-            if score is not None:
-                content = f"考试总分: {score:.0f}/100\n" + content
-            if weak_points:
-                content += f"\n薄弱知识点: {', '.join(weak_points)}"
-
-            mgr = get_memory_manager()
-            importance = 0.9 if (score is not None and score < 60) else 0.6
-            mgr.record_event(
-                course_name=course_name,
-                event_type="exam",
-                content=content,
-                importance=importance,
-                metadata={"score": score, "weak_points": weak_points},
-                score=score,
-                concepts=weak_points,
-                update_weak_points=bool(weak_points),
-                mode="exam",
-                agent="grader",
-                phase="grade",
-            )
-            self.logger.info(
-                "[memory] exam_saved score=%s%s",
-                score if score is not None else "N/A",
-                self._trace_tag(),
-            )
+            self.memory_service.save_exam_grade(course_name, response_text)
         except Exception as _e:
             self.logger.warning("[memory] exam_save_failed err=%s%s", str(_e), self._trace_tag())
 
@@ -2095,83 +2218,105 @@ class OrchestrationRunner:
         """
         if history is None:
             history = []
+        state = state or {}
+        runtime_managed = self._runtime_managed(state)
         question_raw = self._plan_question_raw(plan, user_message)
         retrieval_query = self._plan_retrieval_query(plan, user_message)
         memory_query = self._plan_memory_query(plan, user_message)
-        history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
-        session_state = self._extract_session_state(
-            history=history,
-            course_name=course_name,
-            mode_hint="learn",
-            user_message=user_message,
-            state=state,
-        )
+        agent_context = self._coerce_agent_context(state.get("agent_context"))
+        if agent_context is not None:
+            session_state = agent_context.session_snapshot
+            history_summary_state = dict(session_state.history_summary_state or {})
+        else:
+            history_summary_state, pending_history, recent_history, history_metrics = self._prepare_history_summary_inputs(history)
+            session_state = self._extract_session_state(
+                history=history,
+                course_name=course_name,
+                mode_hint="learn",
+                user_message=user_message,
+                state=state,
+            )
         session_state = self._update_session_state(
             session_state,
             resolved_mode=str(getattr(plan, "resolved_mode", "") or "learn"),
+            question_raw=question_raw,
+            user_intent=str(getattr(plan, "user_intent", "") or question_raw),
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="learn_running",
             current_step_index=1,
             history_summary_state=history_summary_state,
         )
+        self._runtime_update_state_ref(state, session_state)
 
-        context = ""
-        citations_dicts = []
-        if plan.need_rag:
-            yield {"__status__": "正在检索教材证据..."}
-            retriever = self.load_retriever(course_name)
-            if retriever:
-                chunks = retriever.retrieve(retrieval_query, top_k=self._top_k_for_mode("learn"), mode="learn")
-                context = retriever.format_context(chunks)
-                citations_dicts = [c.model_dump() for c in chunks]
-            else:
-                context = "（未找到相关教材，请先上传课程资料）"
+        if agent_context is not None:
+            citations_dicts = [c.model_dump() for c in agent_context.citations]
+            context_sections = {
+                "history_context": agent_context.history_context,
+                "rag_context": agent_context.rag_context,
+                "memory_context": agent_context.memory_context,
+                "context": agent_context.merged_context,
+            }
+            context = agent_context.merged_context
+            payload = dict(agent_context.metadata.get("context_budget", {}) or {})
+        else:
+            yield self.event_bus.status("正在检索教材证据...")
+            rag_text, citations, retrieval_empty = self.rag_service.retrieve(
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                mode="learn",
+                need_rag=plan.need_rag,
+                missing_index_message="（未找到相关教材，请先上传课程资料）",
+                empty_message="（检索未命中有效教材片段，本轮将基于通用知识和已有上下文回答）",
+            )
+            citations_dicts = [c.model_dump() for c in citations]
+            yield self.event_bus.status("正在检索历史记忆...")
+            memory_ctx = self._fetch_history_ctx(
+                query=memory_query,
+                course_name=course_name,
+                mode="learn",
+                agent="tutor",
+                phase="answer",
+            )
+            agent_context, packed, context_sections = self._build_agent_context(
+                session_state=session_state,
+                history=history,
+                retrieval_query=retrieval_query,
+                rag_text=rag_text,
+                memory_text=memory_ctx,
+                citations=citations,
+                mode="learn",
+                history_summary_state=history_summary_state,
+                pending_history=pending_history,
+                recent_history=recent_history,
+                history_metrics=history_metrics,
+            )
+            agent_context.metadata["retrieval_empty"] = retrieval_empty
+            payload = self._context_budget_payload("learn", len(history), packed)
+            context = agent_context.merged_context
 
-        yield {"__status__": "正在检索历史记忆..."}
-        memory_ctx = self._fetch_history_ctx(
-            query=memory_query,
-            course_name=course_name,
-            mode="learn",
-            agent="tutor",
-            phase="answer",
-        )
-        packed = self.context_budgeter.build_context(
-            query=retrieval_query,
-            history=history,
-            rag_text=context,
-            memory_text=memory_ctx,
-            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
-            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
-            history_summary_state=history_summary_state,
-            pending_history=pending_history,
-            recent_history=recent_history,
-            history_state_metrics=history_metrics,
-        )
-        self._log_context_budget("learn", packed)
-        payload = self._context_budget_payload("learn", len(history), packed)
+        # 先发送 citations 事件（前端按 __citations__ key 识别，不会渲染为文本）
+        if citations_dicts:
+            yield self.event_bus.citations(citations_dicts)
+
         self.logger.info(
             "[context_budget_emit] mode=learn ratio=%.3f%s",
             float(payload.get("context_pressure_ratio", 0.0) or 0.0),
             self._trace_tag(),
         )
-        yield {"__context_budget__": payload}
-        context_sections = self._context_sections_from_packed(packed)
-        context = context_sections["context"]
+        yield self.event_bus.context_budget(payload)
+        self._init_tool_runtime_context(
+            course_name=course_name,
+            session_state=session_state,
+            retrieval_query=retrieval_query,
+            memory_query=memory_query,
+            question_raw=question_raw,
+            permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
+            taskgraph_step=self._runtime_route_override(state) or "run_tutor",
+        )
 
-        # 先发送 citations 事件（前端按 __citations__ key 识别，不会渲染为文本）
-        if citations_dicts:
-            yield {"__citations__": citations_dicts}
-
-        workspace_path = self.get_workspace_path(course_name)
-        notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {
-            "notes_dir": notes_dir,
-            "memory_query": memory_query,
-            "retrieval_query": retrieval_query,
-            "question_raw": question_raw,
-            "course_name": course_name,
-        }
-
-        yield {"__status__": "正在生成最终回答..."}
+        yield self.event_bus.status("正在生成最终回答...")
         yield from self.tutor.teach_stream(
             user_message, course_name, context,
             context_sections=context_sections,
@@ -2186,38 +2331,34 @@ class OrchestrationRunner:
             current_step_index=3,
             selected_memory=context_sections.get("memory_context", ""),
             history_summary_state=history_summary_state,
+            tool_audit_refs=self._extract_tool_audit_refs(),
         )
-        self._persist_session_state(session_state)
-        yield {
-            "__tool_calls__": self._merge_internal_tool_calls(
-                self._build_history_summary_tool_call(history_summary_state),
-                self._build_session_state_tool_call(session_state),
+        self._runtime_update_state_ref(state, session_state)
+        if not runtime_managed:
+            self._persist_session_state(session_state)
+            yield self.event_bus.tool_calls(
+                self._final_internal_tool_calls(
+                    session_state=session_state,
+                    history_summary_state=history_summary_state,
+                )
             )
-        }
 
         if self._should_persist_learn_episode(user_message):
-            # 流式输出完成后仅在用户显式要求“记住”时写入情景记忆。
-            try:
-                from memory.manager import get_memory_manager
-
-                mgr = get_memory_manager()
-                doc_ids = [c["doc_id"] for c in citations_dicts] if citations_dicts else []
-                content = f"用户要求记住: {question_raw}"
-                if doc_ids:
-                    content += f"\n参考来源: {', '.join(dict.fromkeys(doc_ids))}"
-                mgr.record_event(
-                    course_name=course_name,
-                    event_type="qa",
-                    content=content,
-                    importance=0.6,
-                    metadata={"doc_ids": doc_ids, "explicit_memory_request": True},
-                    increment_qa=True,
-                    mode="learn",
-                    agent="tutor",
-                    phase="answer",
-                )
-            except Exception as _mem_err:
-                self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
+            doc_ids = [c["doc_id"] for c in citations_dicts] if citations_dicts else []
+            if runtime_managed:
+                effects = self._runtime_effects(state)
+                effects["persist_memory"] = {
+                    "kind": "learn_episode",
+                    "course_name": course_name,
+                    "question_raw": question_raw,
+                    "doc_ids": doc_ids,
+                }
+            else:
+                # 流式输出完成后仅在用户显式要求“记住”时写入情景记忆。
+                try:
+                    self.memory_service.save_learn_episode(course_name, question_raw, doc_ids)
+                except Exception as _mem_err:
+                    self.logger.warning("[memory] learn_qa_save_failed err=%s%s", str(_mem_err), self._trace_tag())
 
     def run_stream(
         self,
