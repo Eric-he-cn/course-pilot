@@ -103,6 +103,9 @@ def _metric_block(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     replan_vals = [1.0 if r.get("replan_triggered") else 0.0 for r in rows]
     regen_final_vals = [1.0 if r.get("regen_final") else 0.0 for r in rows]
     duplicate_tool_call_rate_vals = [float(r.get("duplicate_tool_call_rate_case", 0.0) or 0.0) for r in rows]
+    fallback_rate_vals = [float(r.get("fallback_rate_case", 0.0) or 0.0) for r in rows]
+    mode_override_vals = [float(r.get("resolved_mode_override_count", 0.0) or 0.0) for r in rows]
+    session_store_hit_vals = [float(r.get("session_store_hit_rate_case", 0.0) or 0.0) for r in rows]
 
     tool_calls_total = _sum_key(rows, "tool_call_count")
     tool_success_total = _sum_key(rows, "tool_success_count")
@@ -130,6 +133,9 @@ def _metric_block(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         "replan_trigger_rate": _mean(replan_vals),
         "regen_final_rate": _mean(regen_final_vals),
         "duplicate_tool_call_rate": _mean(duplicate_tool_call_rate_vals),
+        "fallback_rate": _mean(fallback_rate_vals),
+        "resolved_mode_override_count": _mean(mode_override_vals),
+        "session_store_hit_rate": _mean(session_store_hit_vals),
     }
 
 
@@ -165,6 +171,9 @@ def _write_summary_markdown(path: Path, profile: str, summary: Dict[str, Any]) -
         "replan_trigger_rate",
         "regen_final_rate",
         "duplicate_tool_call_rate",
+        "fallback_rate",
+        "resolved_mode_override_count",
+        "session_store_hit_rate",
     ]
     for key in keys:
         lines.append(f"| `{key}` | {fmt(summary.get(key, 0.0))} |")
@@ -252,6 +261,10 @@ def _run_case_once(
     retrieval_events = [e for e in events if e.get("type") == "retrieval"]
     tool_events = [e for e in events if e.get("type") == "tool_call"]
     tool_dedup_events = [e for e in events if e.get("type") == "tool_dedup"]
+    fallback_events = [e for e in events if e.get("type") == "runtime_fallback"]
+    mode_override_events = [e for e in events if e.get("type") == "mode_override"]
+    taskgraph_events = [e for e in events if e.get("type") == "taskgraph_compiled"]
+    session_store_events = [e for e in events if e.get("type") == "session_store_lookup"]
 
     llm_ms_values = [float(e["llm_ms"]) for e in llm_events if isinstance(e.get("llm_ms"), (int, float))]
     retrieval_ms_values = [
@@ -292,6 +305,16 @@ def _run_case_once(
         if isinstance(src, str) and src:
             final_output_source = src
     replan_triggered = replan_counter["n"] > 0
+    fallback_rate_case = 1.0 if fallback_events else 0.0
+    resolved_mode_override_count = len(mode_override_events)
+    taskgraph_route = ""
+    if taskgraph_events:
+        taskgraph_route = str(taskgraph_events[-1].get("route", "") or "")
+    session_store_hit_rate_case = (
+        float(sum(1 for e in session_store_events if bool(e.get("hit")))) / float(len(session_store_events))
+        if session_store_events
+        else 0.0
+    )
 
     doc_ids = _extract_doc_ids(citations)
     gold_doc_ids = gold_map.get(case_id, [])
@@ -337,6 +360,10 @@ def _run_case_once(
         "tool_dedup_event_count": dedup_total_count,
         "tool_dedup_hit_count": dedup_hit_count,
         "duplicate_tool_call_rate_case": duplicate_tool_call_rate_case,
+        "fallback_rate_case": fallback_rate_case,
+        "resolved_mode_override_count": resolved_mode_override_count,
+        "taskgraph_route": taskgraph_route,
+        "session_store_hit_rate_case": session_store_hit_rate_case,
         "regen_final": regen_final,
         "final_output_source": final_output_source,
         "replan_triggered": replan_triggered,

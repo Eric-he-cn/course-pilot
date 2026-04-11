@@ -13,6 +13,7 @@
 | `API_HOST` | `0.0.0.0` | FastAPI 监听地址 |
 | `API_PORT` | `8000` | FastAPI 端口 |
 | `API_BASE` | `http://localhost:8000` | Streamlit 前端请求后端地址 |
+| `DATA_DIR` | `./data/workspaces` | 课程工作区与 `SessionState` 文件根目录 |
 | `SSE_HEARTBEAT_SEC` | `8` | `/chat/stream` 心跳状态推送间隔 |
 | `CONTEXT_BUDGET_EVENT_TIMEOUT_SEC` | `3.0` | 前端预算事件超时提示阈值 |
 
@@ -41,6 +42,7 @@
 | `ALWAYS_FINAL_STREAM` | `1` | 是否始终保留最终单独流式回答轮 |
 | `TOOL_RETRY_MAX` | `1` | 工具重试上限（仅支持一次重试策略） |
 | `TOOL_DEDUP_MIN_INTERVAL_MS` | `1500` | 重复工具调用最小间隔判定 |
+| `STRICT_NEW_RUNTIME` | `0` | 开启后禁止 Runtime fallback，任何兼容回退都视为失败 |
 | `TOOL_ROUND_FULL_CONTEXT_ROUNDS` | `1` | 前几轮保留全量上下文 |
 | `TOOL_ROUND_KEEP_LAST_TOOL_MSGS` | `2` | 工具轮保留最近 tool 消息数 |
 | `TOOL_ROUND_RAG_SUMMARY_MAX_TOKENS` | `400` | 工具轮 RAG 摘要预算 |
@@ -156,9 +158,10 @@
 | `SERPAPI_API_KEY` | 无 | `websearch` 工具密钥 |
 
 关键机制：
-- 工具链路固定：`OpenAI tool_call -> MCPTools.call_tool -> stdio MCP -> server_stdio`。
+- 工具链路固定：`OpenAI tool_call -> ToolHub -> MCPTools.call_tool -> stdio MCP -> server_stdio`。
 - MCP 客户端超时默认 `20s`，失败自动重启重试一次。
 - 不做本地直调 fallback（协议一致性优先）。
+- 权限模式固定为 `safe / standard / elevated`。
 
 ---
 
@@ -193,6 +196,10 @@
 | `REPLAN_MIN_CHARS` | `160` | 低质量判定阈值（字符） |
 | `REPLAN_MIN_SENTENCES` | `2` | 低质量判定阈值（句数） |
 
+补充：
+- Replan 最多发生一次。
+- 只允许发生在任何 `persist_*` 副作用步骤之前。
+
 ---
 
 ## 10. Structured Outputs 灰度
@@ -222,6 +229,7 @@
 支持：
 - checkpoint 断点续跑（按 `case_id#repeat` 去重）。
 - 输出 `raw/summary/md/checkpoint`。
+- v3 指标补充：`fallback_rate`、`resolved_mode_override_count`、`taskgraph_route`、`session_store_hit_rate`。
 
 ---
 
