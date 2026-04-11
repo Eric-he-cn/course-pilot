@@ -8,7 +8,7 @@
 """
 import json
 from typing import Dict, Any
-from backend.schemas import Plan, PlanPlusV1, SessionStateV1
+from backend.schemas import AgentContextV1, Plan, PlanPlusV1, SessionStateV1
 from core.agents.base import BaseAgent
 from core.orchestration.prompts import (
     ROUTER_PROMPT,
@@ -25,20 +25,16 @@ RouterAgent：把自然语言请求映射为可执行 Plan。
 class RouterAgent(BaseAgent):
     
     """初始化 RouterAgent，复用全局 LLM 客户端。"""
-    def __init__(self):
-        super().__init__(agent_name="router")
+    def __init__(self, **services: Any):
+        super().__init__(agent_name="router", **services)
 
     """提示词与解析辅助。"""
 
     """构建用户薄弱点上下文（供 Router 提示词注入）。失败时返回空字符串，不影响主流程。"""
     def _build_weak_points_ctx(self, course_name: str) -> str:
-        try:
-            from memory.manager import get_memory_manager
-            profile = get_memory_manager().get_profile_context(course_name)
-            if profile:
-                return f"\n\n【用户学习档案（供规划参考）】\n{profile}"
-        except Exception:
-            pass
+        profile = self.memory_service.get_profile_context(course_name)
+        if profile:
+            return f"\n\n【用户学习档案（供规划参考）】\n{profile}"
         return ""
 
     """从模型输出中提取 JSON 对象，兼容 ```json```、`````` 和纯 JSON 形态。"""
@@ -187,7 +183,7 @@ class RouterAgent(BaseAgent):
         course_name: str,
         user_message: str,
         mode_hint: str,
-    ) -> Dict[str, Any]:
+    ) -> AgentContextV1:
         weak_points_ctx = self._build_weak_points_ctx(course_name)
         session_summary = str(session_state.task_summary or "").strip()
         session_stage = str(session_state.current_stage or "").strip()
@@ -199,10 +195,16 @@ class RouterAgent(BaseAgent):
                 f"- 任务摘要: {session_summary or user_message[:120]}\n"
                 f"- 模式提示: {mode_hint}"
             )
-        return {
-            "weak_points_ctx": weak_points_ctx,
-            "session_ctx": session_ctx,
-        }
+        return AgentContextV1(
+            session_snapshot=session_state,
+            merged_context=f"{weak_points_ctx}{session_ctx}",
+            constraints={"mode_hint": mode_hint, "course_name": course_name},
+            tool_scope={"permission_mode": session_state.permission_mode},
+            metadata={
+                "weak_points_ctx": weak_points_ctx,
+                "session_ctx": session_ctx,
+            },
+        )
     
     """生成 Router 执行计划：注入用户画像、调用模型、解析计划、失败兜底。"""
     def plan(
@@ -234,7 +236,7 @@ class RouterAgent(BaseAgent):
             mode=mode,
             course_name=course_name,
             user_message=user_message,
-            weak_points_ctx=f"{ctx['weak_points_ctx']}{ctx['session_ctx']}",
+            weak_points_ctx=ctx.merged_context,
         )
         
         # 3) 调用模型生成规划

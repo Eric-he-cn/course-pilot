@@ -22,10 +22,8 @@ from core.orchestration.prompts import (
     QUIZMASTER_SOLVE_SYSTEM_PROMPT,
     EXAM_SOLVE_SYSTEM_PROMPT,
 )
-from backend.schemas import Quiz
-from backend.schemas import SessionStateV1
+from backend.schemas import AgentContextV1, Quiz, SessionStateV1
 from core.agents.base import BaseAgent
-from mcp_tools.client import MCPTools
 from core.metrics import add_event
 
 """
@@ -35,19 +33,21 @@ QuizMasterAgent：按知识点与难度生成结构化题目。
 class QuizMasterAgent(BaseAgent):
     
     """初始化 QuizMasterAgent，复用全局 LLM 客户端。"""
-    def __init__(self):
-        super().__init__(agent_name="quizmaster")
+    def __init__(self, **services):
+        super().__init__(agent_name="quizmaster", **services)
         self.logger = logging.getLogger("agent.quizmaster")
 
-    def build_context(self, session_state: SessionStateV1, **kwargs) -> Dict[str, Any]:
-        return {
-            "task_summary": session_state.task_summary,
-            "current_stage": session_state.current_stage,
-            "selected_memory": session_state.selected_memory,
-            "last_quiz": session_state.last_quiz,
-            "last_exam": session_state.last_exam,
-            **kwargs,
-        }
+    def build_context(self, session_state: SessionStateV1, **kwargs) -> AgentContextV1:
+        return AgentContextV1(
+            session_snapshot=session_state,
+            history_context=str(kwargs.get("history_context", "") or ""),
+            rag_context=str(kwargs.get("rag_context", "") or ""),
+            memory_context=str(kwargs.get("memory_context", "") or session_state.selected_memory or ""),
+            merged_context=str(kwargs.get("context", "") or kwargs.get("merged_context", "") or ""),
+            citations=list(kwargs.get("citations", []) or []),
+            constraints={"agent": "quizmaster"},
+            tool_scope={"permission_mode": session_state.permission_mode},
+        )
 
     """提示词与解析辅助。"""
 
@@ -409,7 +409,14 @@ class QuizMasterAgent(BaseAgent):
         parts = []
         if self._need_datetime(query):
             try:
-                dt = MCPTools.call_tool("get_datetime")
+                dt = self.call_tool(
+                    "get_datetime",
+                    tool_args={},
+                    mode="practice",
+                    phase="act",
+                    permission_mode="safe",
+                    original_user_content=query,
+                )
                 if dt.get("success"):
                     value = (
                         dt.get("datetime")
@@ -424,7 +431,14 @@ class QuizMasterAgent(BaseAgent):
 
         if self._need_recent_web_info(query):
             try:
-                ws = MCPTools.call_tool("websearch", query=query)
+                ws = self.call_tool(
+                    "websearch",
+                    tool_args={"query": query},
+                    mode="practice",
+                    phase="act",
+                    permission_mode="standard",
+                    original_user_content=query,
+                )
                 if ws.get("success"):
                     data = ws.get("data", {}) if isinstance(ws.get("data"), dict) else {}
                     snippets = data.get("snippets", [])
@@ -641,8 +655,14 @@ class QuizMasterAgent(BaseAgent):
         memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
         if not memory_ctx and not prefetched_memory_checked:
             try:
-                from mcp_tools.client import MCPTools
-                mem = MCPTools.call_tool("memory_search", query=topic, course_name=course_name)
+                mem = self.call_tool(
+                    "memory_search",
+                    tool_args={"query": topic, "course_name": course_name},
+                    mode="practice",
+                    phase="act",
+                    permission_mode="safe",
+                    original_user_content=topic,
+                )
                 memory_ctx = self._build_memory_ctx(mem)
             except Exception:
                 memory_ctx = ""
@@ -844,8 +864,14 @@ class QuizMasterAgent(BaseAgent):
         memory_ctx = (prefetched_memory_ctx or memory_context or "").strip()
         if not memory_ctx and not prefetched_memory_checked:
             try:
-                from mcp_tools.client import MCPTools
-                mem = MCPTools.call_tool("memory_search", query=user_request, course_name=course_name)
+                mem = self.call_tool(
+                    "memory_search",
+                    tool_args={"query": user_request, "course_name": course_name},
+                    mode="exam",
+                    phase="act",
+                    permission_mode="safe",
+                    original_user_content=user_request,
+                )
                 memory_ctx = self._build_memory_ctx(mem)
             except Exception:
                 memory_ctx = ""

@@ -156,6 +156,10 @@ class SessionStateV1(BaseModel):
     resolved_mode: Literal["learn", "practice", "exam"] = "learn"
     task_full_text: str = ""
     task_summary: str = ""
+    question_raw: str = ""
+    user_intent: str = ""
+    retrieval_query: str = ""
+    memory_query: str = ""
     current_stage: str = "router_planned"
     current_step_index: int = 0
     history_summary_state: Dict[str, Any] = Field(default_factory=dict)
@@ -165,6 +169,7 @@ class SessionStateV1(BaseModel):
     permission_mode: Literal["safe", "standard", "elevated"] = "standard"
     fallback_flags: List[str] = Field(default_factory=list)
     idempotency_keys: List[str] = Field(default_factory=list)
+    tool_audit_refs: List[str] = Field(default_factory=list)
     last_taskgraph_digest: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -177,6 +182,52 @@ class AgentResultV1(BaseModel):
     citations: List[RetrievedChunk] = Field(default_factory=list)
     tool_calls_log: List[ToolCallLog] = Field(default_factory=list)
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentContextV1(BaseModel):
+    """Specialist Agent 的只读上下文快照。"""
+
+    version: Literal["v1"] = "v1"
+    session_snapshot: SessionStateV1
+    history_context: str = ""
+    rag_context: str = ""
+    memory_context: str = ""
+    merged_context: str = ""
+    citations: List[RetrievedChunk] = Field(default_factory=list)
+    constraints: Dict[str, Any] = Field(default_factory=dict)
+    tool_scope: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolDecision(BaseModel):
+    """ToolHub 的统一门控结果。"""
+
+    tool_name: str
+    allowed: bool
+    reason: str
+    signature: str
+    permission_mode: Literal["safe", "standard", "elevated"] = "standard"
+    idempotency_key: str = ""
+    dedup_hit: bool = False
+    dedup_reason: str = ""
+
+
+class ToolAuditRecord(BaseModel):
+    """工具调用审计记录。"""
+
+    tool_name: str
+    signature: str
+    permission_mode: Literal["safe", "standard", "elevated"] = "standard"
+    allowed: bool = True
+    reason: str = "allowed"
+    success: bool = False
+    dedup_hit: bool = False
+    dedup_reason: str = ""
+    idempotency_key: str = ""
+    failure_class: str = ""
+    via: str = ""
+    elapsed_ms: float = 0.0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PracticeGradeSignal(BaseModel):
