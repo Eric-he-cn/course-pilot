@@ -9,7 +9,7 @@
 import json
 import logging
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 from core.orchestration.prompts import (
     QUIZMASTER_PROMPT,
     EXAM_GENERATOR_PROMPT,
@@ -38,15 +38,33 @@ class QuizMasterAgent(BaseAgent):
         self.logger = logging.getLogger("agent.quizmaster")
 
     def build_context(self, session_state: SessionStateV1, **kwargs) -> AgentContextV1:
+        history_context = str(kwargs.get("history_context", "") or "")
+        rag_context = str(kwargs.get("rag_context", "") or "")
+        memory_context = str(kwargs.get("memory_context", "") or session_state.selected_memory or "")
+        merged_context = "\n\n".join(
+            part
+            for part in [
+                f"【出题依据】\n{rag_context}" if rag_context else "",
+                f"【会话摘要】\n{history_context}" if history_context else "",
+                f"【薄弱点参考】\n{memory_context}" if memory_context else "",
+            ]
+            if part
+        ).strip() or str(kwargs.get("context", "") or kwargs.get("merged_context", "") or "")
         return AgentContextV1(
             session_snapshot=session_state,
-            history_context=str(kwargs.get("history_context", "") or ""),
-            rag_context=str(kwargs.get("rag_context", "") or ""),
-            memory_context=str(kwargs.get("memory_context", "") or session_state.selected_memory or ""),
-            merged_context=str(kwargs.get("context", "") or kwargs.get("merged_context", "") or ""),
+            history_context=history_context,
+            rag_context=rag_context,
+            memory_context=memory_context,
+            merged_context=merged_context,
             citations=list(kwargs.get("citations", []) or []),
-            constraints={"agent": "quizmaster"},
-            tool_scope={"permission_mode": session_state.permission_mode},
+            constraints={
+                "agent": "quizmaster",
+                **dict(kwargs.get("constraints", {}) or {}),
+            },
+            tool_scope={
+                "permission_mode": session_state.permission_mode,
+                **dict(kwargs.get("tool_scope", {}) or {}),
+            },
         )
 
     """提示词与解析辅助。"""
@@ -186,6 +204,33 @@ class QuizMasterAgent(BaseAgent):
             chapter=topic,
         )
 
+    @staticmethod
+    def _build_safe_retry_quiz(topic: str, difficulty: str, question_type: str = "综合题") -> Quiz:
+        topic_text = str(topic or "当前知识点").strip() or "当前知识点"
+        if question_type == "选择题":
+            return Quiz(
+                question=(
+                    f"关于「{topic_text}」，下列哪一项最符合教材中的核心概念？\n"
+                    "A. 对该知识点的关键定义与作用进行准确概括\n"
+                    "B. 完全忽略该知识点的主要用途\n"
+                    "C. 将该知识点等同于不相关概念\n"
+                    "D. 只描述细节而不涉及核心定义"
+                ),
+                standard_answer="A",
+                rubric="选择 A 得满分；若能补充一句原因可酌情给分。",
+                difficulty=difficulty,
+                chapter=topic_text,
+                concept=topic_text,
+            )
+        return Quiz(
+            question=f"请简要说明「{topic_text}」的核心概念，并给出一个典型应用场景。",
+            standard_answer=f"应说明「{topic_text}」的核心定义，并给出一个合理应用场景。",
+            rubric="答出核心定义和一个合理应用场景即可得分。",
+            difficulty=difficulty,
+            chapter=topic_text,
+            concept=topic_text,
+        )
+
     """把 memory_search 结果转换为出题参考上下文，仅保留最多 3 条精简片段。"""
     @staticmethod
     def _build_memory_ctx(mem_result: dict) -> str:
@@ -288,6 +333,89 @@ class QuizMasterAgent(BaseAgent):
         text = re.sub(r"\[INTERNAL_[^\]]*\][\s\S]*", "", text)
         text = text.replace("\ufeff", "").replace("\u200b", "")
         return text.strip()
+
+    def _validate_quiz_payload(
+        self,
+        quiz_dict: Dict[str, Any],
+        *,
+        planned_topic: str,
+        planned_difficulty: str,
+        planned_question_type: str,
+    ) -> Dict[str, Any]:
+        sanitized = {
+            "question": self._sanitize_text(quiz_dict.get("question", "")),
+            "standard_answer": self._sanitize_text(quiz_dict.get("standard_answer", "")),
+            "rubric": self._sanitize_text(quiz_dict.get("rubric", "")),
+            "difficulty": self._normalize_difficulty(
+                str(quiz_dict.get("difficulty", planned_difficulty)),
+                planned_difficulty,
+            ),
+            "chapter": self._sanitize_text(quiz_dict.get("chapter", planned_topic)) or planned_topic,
+            "concept": self._sanitize_text(quiz_dict.get("concept", "")) or planned_topic,
+        }
+        missing = [key for key in ("question", "standard_answer", "rubric") if not sanitized[key]]
+        if missing:
+            raise ValueError(f"quiz_missing_fields:{','.join(missing)}")
+        if planned_question_type == "选择题":
+            if not self._looks_like_mcq(sanitized["question"]):
+                raise ValueError("quiz_invalid_mcq_shape")
+            if not self._looks_like_mcq_answer(sanitized["standard_answer"]):
+                raise ValueError("quiz_invalid_mcq_answer")
+        return sanitized
+
+    def _normalize_exam_json(self, course_name: str, exam_json: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(exam_json, dict):
+            raise ValueError("exam_not_object")
+        title = self._sanitize_text(exam_json.get("title", "")) or f"《{course_name}》模拟考试试卷"
+        instructions = self._sanitize_text(exam_json.get("instructions", "")) or "请独立作答，完成后一次性提交全部答案。"
+        raw_questions = exam_json.get("questions", [])
+        if not isinstance(raw_questions, list):
+            raise ValueError("exam_questions_not_list")
+
+        questions: List[Dict[str, Any]] = []
+        for item in raw_questions:
+            if not isinstance(item, dict):
+                continue
+            q_type = self._sanitize_text(item.get("type", "")) or "综合题"
+            question = self._sanitize_text(item.get("question", ""))
+            standard_answer = self._sanitize_text(item.get("standard_answer", ""))
+            rubric = self._sanitize_text(item.get("rubric", ""))
+            chapter = self._sanitize_text(item.get("chapter", "")) or "综合复习"
+            concept = self._sanitize_text(item.get("concept", "")) or chapter
+            try:
+                score = int(item.get("score", 0) or 0)
+            except Exception:
+                score = 0
+            options = [
+                self._sanitize_text(opt)
+                for opt in list(item.get("options", []) or [])
+                if self._sanitize_text(opt)
+            ]
+            if not question or not standard_answer or not rubric:
+                continue
+            if score <= 0:
+                score = 10
+            if q_type == "选择题" and not options and not self._looks_like_mcq(question):
+                continue
+            questions.append(
+                {
+                    "type": q_type,
+                    "question": question,
+                    "options": options,
+                    "score": score,
+                    "standard_answer": standard_answer,
+                    "rubric": rubric,
+                    "chapter": chapter,
+                    "concept": concept,
+                }
+            )
+        if not questions:
+            raise ValueError("exam_questions_empty")
+        return {
+            "title": title,
+            "instructions": instructions,
+            "questions": questions,
+        }
 
     """构建“出题计划”提示词（Plan 阶段）。"""
     @staticmethod
@@ -766,87 +894,74 @@ class QuizMasterAgent(BaseAgent):
         )
         try:
             quiz_dict = solved_payload if solved_payload else self._extract_json_payload(response)
-            quiz_dict["question"] = self._sanitize_text(quiz_dict.get("question", ""))
-            quiz_dict["standard_answer"] = self._sanitize_text(quiz_dict.get("standard_answer", ""))
-            quiz_dict["rubric"] = self._sanitize_text(quiz_dict.get("rubric", ""))
-            quiz_dict["chapter"] = self._sanitize_text(quiz_dict.get("chapter", planned_topic))
-            quiz_dict["concept"] = self._sanitize_text(quiz_dict.get("concept", ""))
-            quiz_dict["difficulty"] = self._normalize_difficulty(
-                str(quiz_dict.get("difficulty", planned_difficulty)),
-                planned_difficulty,
+            quiz_dict = self._validate_quiz_payload(
+                quiz_dict,
+                planned_topic=planned_topic,
+                planned_difficulty=planned_difficulty,
+                planned_question_type=planned_question_type,
             )
-            if planned_question_type == "选择题":
-                if (not self._looks_like_mcq(quiz_dict.get("question", ""))) or (
-                    not self._looks_like_mcq_answer(quiz_dict.get("standard_answer", ""))
-                ):
-                    self.logger.info("[quiz] mcq_shape_retry_triggered=1")
-                    try:
-                        add_event("quiz_mcq_retry", triggered=True)
-                    except Exception:
-                        pass
-                    retry_prompt = (
-                        prompt
-                        + "\n\n【强约束】你必须输出选择题格式："
-                        + "\n1) question 中必须包含至少 A/B/C/D 四个选项（每行一个选项）;"
-                        + "\n2) standard_answer 只能是选项字母（如 A 或 A,B）;"
-                        + "\n3) 仅输出合法 JSON，不要添加解释文字。"
-                    )
-                    retry_messages = [
-                        {"role": "system", "content": QUIZMASTER_SOLVE_SYSTEM_PROMPT},
-                        {"role": "user", "content": retry_prompt},
-                    ]
+            return Quiz(**quiz_dict)
+        except Exception as e:
+            err = str(e).strip() or "unknown_parse_error"
+            self.logger.warning("[quiz] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
+            needs_shape_retry = planned_question_type == "选择题" and ("mcq" in err or "quiz_missing_fields" in err)
+            if needs_shape_retry:
+                self.logger.info("[quiz] mcq_shape_retry_triggered=1")
+                try:
+                    add_event("quiz_mcq_retry", triggered=True)
+                except Exception:
+                    pass
+                retry_prompt = (
+                    prompt
+                    + "\n\n【强约束】你必须输出选择题格式："
+                    + "\n1) question 中必须包含至少 A/B/C/D 四个选项（每行一个选项）;"
+                    + "\n2) standard_answer 只能是选项字母（如 A 或 A,B）;"
+                    + "\n3) rubric 必须明确说明按标准答案判分;"
+                    + "\n4) 仅输出合法 JSON，不要添加解释文字。"
+                )
+                retry_messages = [
+                    {"role": "system", "content": QUIZMASTER_SOLVE_SYSTEM_PROMPT},
+                    {"role": "user", "content": retry_prompt},
+                ]
+                try:
                     retry_response = self.llm.chat(retry_messages, temperature=0.2, max_tokens=1400)
-                    retry_dict = self._extract_json_payload(retry_response)
-                    retry_dict["question"] = self._sanitize_text(retry_dict.get("question", ""))
-                    retry_dict["standard_answer"] = self._sanitize_text(retry_dict.get("standard_answer", ""))
-                    retry_dict["rubric"] = self._sanitize_text(retry_dict.get("rubric", ""))
-                    retry_dict["chapter"] = self._sanitize_text(retry_dict.get("chapter", planned_topic))
-                    retry_dict["concept"] = self._sanitize_text(retry_dict.get("concept", ""))
-                    retry_dict["difficulty"] = self._normalize_difficulty(
-                        str(retry_dict.get("difficulty", planned_difficulty)),
-                        planned_difficulty,
+                    retry_dict = self._validate_quiz_payload(
+                        self._extract_json_payload(retry_response),
+                        planned_topic=planned_topic,
+                        planned_difficulty=planned_difficulty,
+                        planned_question_type=planned_question_type,
                     )
-                    if (not self._looks_like_mcq(retry_dict.get("question", ""))) or (
-                        not self._looks_like_mcq_answer(retry_dict.get("standard_answer", ""))
-                    ):
-                        raise ValueError("mcq_shape_invalid_after_retry")
                     self.logger.info("[quiz] mcq_shape_retry_success=1")
                     try:
                         add_event("quiz_mcq_retry", triggered=True, success=True)
                     except Exception:
                         pass
-                    quiz_dict = retry_dict
-            return Quiz(**quiz_dict)
-        except Exception as e:
-            err = str(e).strip() or "unknown_parse_error"
-            self.logger.warning("[quiz] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
-            if "mcq_shape_invalid_after_retry" in err:
-                try:
-                    add_event("quiz_mcq_retry", triggered=True, success=False, reason=err)
-                except Exception:
-                    pass
+                    return Quiz(**retry_dict)
+                except Exception as retry_exc:
+                    self.logger.warning("[quiz] mcq_retry_failed err=%s", str(retry_exc))
+                    try:
+                        add_event("quiz_mcq_retry", triggered=True, success=False, reason=str(retry_exc))
+                    except Exception:
+                        pass
             repaired = self._repair_json_via_llm(response, schema_hint=schema_hint, max_tokens=1200)
             if repaired:
                 try:
-                    repaired["question"] = self._sanitize_text(repaired.get("question", ""))
-                    repaired["standard_answer"] = self._sanitize_text(repaired.get("standard_answer", ""))
-                    repaired["rubric"] = self._sanitize_text(repaired.get("rubric", ""))
-                    repaired["chapter"] = self._sanitize_text(repaired.get("chapter", planned_topic))
-                    repaired["concept"] = self._sanitize_text(repaired.get("concept", ""))
-                    repaired["difficulty"] = self._normalize_difficulty(
-                        str(repaired.get("difficulty", planned_difficulty)),
-                        planned_difficulty,
+                    repaired = self._validate_quiz_payload(
+                        repaired,
+                        planned_topic=planned_topic,
+                        planned_difficulty=planned_difficulty,
+                        planned_question_type=planned_question_type,
                     )
                     self.logger.info("[quiz] parse_recovered=1")
                     return Quiz(**repaired)
                 except Exception as rec_e:
                     self.logger.warning("[quiz] recover_failed err=%s", str(rec_e))
-            fallback = self._build_default_quiz(topic=planned_topic, difficulty=planned_difficulty)
-            raw_view = self._sanitize_text(response)
-            if raw_view:
-                fallback.question = raw_view[:1800]
-            else:
-                fallback.question = f"生成题目时出错（解析失败：{err}），请重试。"
+            fallback = self._build_safe_retry_quiz(
+                topic=planned_topic,
+                difficulty=planned_difficulty,
+                question_type=planned_question_type,
+            )
+            fallback.rubric = f"{fallback.rubric}（系统已使用安全回退题面；如需更贴合教材的题目，请重试。）"
             return fallback
 
     """生成考试试卷主入口：Plan-Solve 生成结构化试卷并附隐藏答案。"""
@@ -923,6 +1038,7 @@ class QuizMasterAgent(BaseAgent):
                 "instructions": {"type": "string"},
                 "questions": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -971,25 +1087,23 @@ class QuizMasterAgent(BaseAgent):
         )
         try:
             exam_json = solved_payload if solved_payload else self._extract_json_payload(response)
-            return self._render_exam_paper(course_name=course_name, exam_json=exam_json)
+            normalized_exam = self._normalize_exam_json(course_name, exam_json)
+            return self._render_exam_paper(course_name=course_name, exam_json=normalized_exam)
         except Exception as e:
             err = str(e).strip() or "unknown_parse_error"
             self.logger.warning("[exam] parse_failed err=%s raw_preview=%s", err, str(response)[:220])
             repaired = self._repair_json_via_llm(response, schema_hint=schema_hint, max_tokens=2200)
             if repaired:
                 try:
-                    paper = self._render_exam_paper(course_name=course_name, exam_json=repaired)
+                    normalized_exam = self._normalize_exam_json(course_name, repaired)
+                    paper = self._render_exam_paper(course_name=course_name, exam_json=normalized_exam)
                     self.logger.info("[exam] parse_recovered=1")
                     return paper
                 except Exception as rec_e:
                     self.logger.warning("[exam] recover_failed err=%s", str(rec_e))
-            # 解析失败时退化为原始文本，至少保证可继续交互。
             return {
-                "content": (
-                    f"# 《{course_name}》模拟考试试卷\n\n"
-                    f"系统未能结构化解析试卷（{err}），以下为原始生成内容：\n\n"
-                    + response
-                ),
+                "content": f"本轮试卷生成失败（{err}），请重试或换一种更明确的出卷要求。",
                 "answer_sheet": [],
                 "total_score": 0,
+                "_artifact_error": err,
             }

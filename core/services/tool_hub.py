@@ -73,6 +73,81 @@ class ToolHub:
                 return f"{tool_name}:{session_id}:{taskgraph_step}:{signature}"
         return f"{tool_name}:{signature}"
 
+    @staticmethod
+    def _runtime_context() -> Dict[str, Any]:
+        ctx = getattr(MCPTools, "_context", None)
+        return ctx if isinstance(ctx, dict) else {}
+
+    @classmethod
+    def _budget_limits(cls, tool_name: str) -> Dict[str, Optional[int]]:
+        ctx = cls._runtime_context()
+        raw_budget = ctx.get("tool_budget", {})
+        budget = raw_budget if isinstance(raw_budget, dict) else {}
+
+        def _int_or_none(value: Any) -> Optional[int]:
+            try:
+                parsed = int(value)
+            except Exception:
+                return None
+            return max(0, parsed)
+
+        per_tool_raw = budget.get("per_tool")
+        per_tool_map = per_tool_raw if isinstance(per_tool_raw, dict) else {}
+        per_tool_limit = _int_or_none(per_tool_map.get(tool_name, budget.get(tool_name)))
+        return {
+            "per_request_total": _int_or_none(budget.get("per_request_total", os.getenv("ACT_MAX_TOOLS_PER_REQUEST", ""))),
+            "per_round": _int_or_none(budget.get("per_round", os.getenv("ACT_MAX_TOOLS_PER_ROUND", ""))),
+            "per_tool": per_tool_limit,
+        }
+
+    @classmethod
+    def _usage_state(cls) -> Dict[str, Any]:
+        ctx = cls._runtime_context()
+        usage = ctx.setdefault(
+            "tool_usage",
+            {
+                "executed_total": 0,
+                "per_tool": {},
+                "per_round": {},
+            },
+        )
+        if not isinstance(usage, dict):
+            usage = {"executed_total": 0, "per_tool": {}, "per_round": {}}
+            ctx["tool_usage"] = usage
+        usage.setdefault("per_tool", {})
+        usage.setdefault("per_round", {})
+        return usage
+
+    @classmethod
+    def _increment_usage(cls, tool_name: str, tool_round: int) -> None:
+        usage = cls._usage_state()
+        usage["executed_total"] = int(usage.get("executed_total", 0) or 0) + 1
+        per_tool = usage.get("per_tool", {})
+        per_tool[tool_name] = int(per_tool.get(tool_name, 0) or 0) + 1
+        usage["per_tool"] = per_tool
+        per_round = usage.get("per_round", {})
+        round_key = str(tool_round)
+        per_round[round_key] = int(per_round.get(round_key, 0) or 0) + 1
+        usage["per_round"] = per_round
+
+    def _cap_hit_decision(
+        self,
+        *,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        permission_mode: str,
+        reason: str,
+    ) -> ToolDecision:
+        signature = ToolPolicy.normalized_tool_signature(tool_name, tool_args)
+        return ToolDecision(
+            tool_name=tool_name,
+            allowed=False,
+            reason=reason,
+            signature=signature,
+            permission_mode=permission_mode,  # type: ignore[arg-type]
+            idempotency_key=self._idempotency_key(tool_name, signature),
+        )
+
     def decide(
         self,
         *,
@@ -131,6 +206,48 @@ class ToolHub:
             permission_mode=permission_mode,
             original_user_content=original_user_content,
         )
+        limits = self._budget_limits(tool_name)
+        usage = self._usage_state()
+        current_total = int(usage.get("executed_total", 0) or 0)
+        current_tool = int((usage.get("per_tool", {}) or {}).get(tool_name, 0) or 0)
+        current_round = int((usage.get("per_round", {}) or {}).get(str(tool_round), 0) or 0)
+        cap_reason = ""
+        cap_event = ""
+        if limits["per_request_total"] is not None and current_total >= int(limits["per_request_total"]):
+            cap_reason = "tool_request_total_cap"
+            cap_event = "tool_total_cap_hit_count"
+        elif limits["per_tool"] is not None and current_tool >= int(limits["per_tool"]):
+            cap_reason = "tool_per_tool_cap"
+            cap_event = "per_tool_cap_hit_count"
+        elif limits["per_round"] is not None and current_round >= int(limits["per_round"]):
+            cap_reason = "tool_per_round_cap"
+            cap_event = "tool_round_cap_hit_count"
+        if cap_reason:
+            add_event(cap_event or cap_reason, tool_name=tool_name, tool_round=tool_round)
+            denied = self._cap_hit_decision(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                permission_mode=permission_mode,
+                reason=cap_reason,
+            )
+            self._append_audit(
+                ToolAuditRecord(
+                    tool_name=tool_name,
+                    signature=denied.signature,
+                    permission_mode=permission_mode,  # type: ignore[arg-type]
+                    allowed=False,
+                    reason=cap_reason,
+                    idempotency_key=denied.idempotency_key,
+                    metadata={
+                        "tool_round": tool_round,
+                        "current_total": current_total,
+                        "current_tool": current_tool,
+                        "current_round": current_round,
+                        "limits": limits,
+                    },
+                )
+            )
+            raise ToolDeniedError(cap_reason)
         add_event(
             "tool_gate_decision",
             tool_name=tool_name,
@@ -188,6 +305,7 @@ class ToolHub:
             max_attempts = max(1, 1 + min(tool_retry_max, 1 if cap.retry_policy == "once" else 0))
             result: Dict[str, Any] = {}
             failure_class = "fatal_error"
+            self._increment_usage(tool_name, tool_round)
             while attempts < max_attempts:
                 attempts += 1
                 result = MCPTools.call_tool(tool_name, **tool_args)

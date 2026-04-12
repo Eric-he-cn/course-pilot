@@ -59,15 +59,33 @@ class GraderAgent(BaseAgent):
         super().__init__(agent_name="grader", **services)
 
     def build_context(self, session_state: SessionStateV1, **kwargs) -> AgentContextV1:
+        history_context = str(kwargs.get("history_context", "") or "")
+        rag_context = str(kwargs.get("rag_context", "") or "")
+        memory_context = str(kwargs.get("memory_context", "") or session_state.selected_memory or "")
+        merged_context = "\n\n".join(
+            part
+            for part in [
+                f"【评分依据】\n{rag_context}" if rag_context else "",
+                f"【会话摘要】\n{history_context}" if history_context else "",
+                f"【历史薄弱点】\n{memory_context}" if memory_context else "",
+            ]
+            if part
+        ).strip() or str(kwargs.get("context", "") or kwargs.get("merged_context", "") or "")
         return AgentContextV1(
             session_snapshot=session_state,
-            history_context=str(kwargs.get("history_context", "") or ""),
-            rag_context=str(kwargs.get("rag_context", "") or ""),
-            memory_context=str(kwargs.get("memory_context", "") or session_state.selected_memory or ""),
-            merged_context=str(kwargs.get("context", "") or kwargs.get("merged_context", "") or ""),
+            history_context=history_context,
+            rag_context=rag_context,
+            memory_context=memory_context,
+            merged_context=merged_context,
             citations=list(kwargs.get("citations", []) or []),
-            constraints={"agent": "grader"},
-            tool_scope={"allowed_tools": ["calculator"]},
+            constraints={
+                "agent": "grader",
+                **dict(kwargs.get("constraints", {}) or {}),
+            },
+            tool_scope={
+                "allowed_tools": ["calculator"],
+                **dict(kwargs.get("tool_scope", {}) or {}),
+            },
         )
 
     @staticmethod

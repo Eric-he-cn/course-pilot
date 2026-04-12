@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from time import perf_counter
 from typing import Any, Dict, List
 
 from backend.schemas import PracticeGradeSignal
+from core.metrics import add_event
 from mcp_tools.client import MCPTools
 
 
@@ -61,6 +63,8 @@ class MemoryService:
         agent: str = "",
         phase: str = "",
     ) -> str:
+        t0 = perf_counter()
+        cache_hit = False
         try:
             top_k = int(os.getenv("CB_MEMORY_TOPK", "2"))
             key_payload = {
@@ -76,6 +80,7 @@ class MemoryService:
             cache_key = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
             if cache_key in self._request_cache:
                 mem = self._request_cache[cache_key]
+                cache_hit = True
             else:
                 mem = MCPTools.call_tool(
                     "memory_search",
@@ -89,8 +94,34 @@ class MemoryService:
                 )
                 if isinstance(mem, dict):
                     self._request_cache[cache_key] = dict(mem)
-            return self._build_memory_ctx(mem if isinstance(mem, dict) else {}, phase=phase)
-        except Exception:
+            context = self._build_memory_ctx(mem if isinstance(mem, dict) else {}, phase=phase)
+            add_event(
+                "memory_prefetch",
+                query=query,
+                course_name=course_name,
+                mode=mode or None,
+                agent=agent or None,
+                phase=phase or None,
+                cache_hit=cache_hit,
+                success=True,
+                results_count=len((mem or {}).get("results", [])) if isinstance(mem, dict) else 0,
+                returned_chars=len(context),
+                memory_prefetch_ms=(perf_counter() - t0) * 1000.0,
+            )
+            return context
+        except Exception as exc:
+            add_event(
+                "memory_prefetch",
+                query=query,
+                course_name=course_name,
+                mode=mode or None,
+                agent=agent or None,
+                phase=phase or None,
+                cache_hit=cache_hit,
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+                memory_prefetch_ms=(perf_counter() - t0) * 1000.0,
+            )
             return ""
 
     @staticmethod

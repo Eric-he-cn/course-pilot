@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 from backend.schemas import RetrievedChunk
 from core.errors import IndexNotReadyError
+from core.metrics import add_event
 from rag.retrieve import Retriever
 from rag.store_faiss import FAISSStore
 
@@ -46,9 +47,22 @@ class RAGService:
         empty_message: str = "（检索未命中有效教材片段，本轮将基于已有上下文继续）",
     ) -> Tuple[str, List[RetrievedChunk], bool]:
         if not need_rag:
+            add_event(
+                "retrieval_skipped",
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                request_mode=mode or None,
+                reason="need_rag_false",
+            )
             return "", [], False
         retriever = self.load_retriever(course_name)
         if retriever is None:
+            add_event(
+                "retrieval_missing_index",
+                course_name=course_name,
+                retrieval_query=retrieval_query,
+                request_mode=mode or None,
+            )
             return missing_index_message, [], True
         chunks = retriever.retrieve(retrieval_query, top_k=self.top_k_for_mode(mode), mode=mode)
         if not chunks:

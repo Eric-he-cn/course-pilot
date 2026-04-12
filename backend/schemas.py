@@ -56,6 +56,27 @@ class PlanPlusV1(Plan):
     risk_level: Literal["low", "medium", "high"] = "medium"
     permission_mode: Literal["safe", "standard", "elevated"] = "standard"
     replan_policy: Literal["never", "once_on_failure"] = "once_on_failure"
+    workflow_template: Literal[
+        "learn_only",
+        "practice_only",
+        "exam_only",
+        "learn_then_practice",
+        "practice_then_review",
+        "exam_then_review",
+    ] = "learn_only"
+    action_kind: Literal[
+        "learn_explain",
+        "practice_generate",
+        "practice_grade",
+        "exam_generate",
+        "exam_grade",
+        "learn_then_practice",
+    ] = "learn_explain"
+    route_confidence: float = 0.7
+    route_reason: str = ""
+    required_artifact_kind: Literal["none", "practice", "exam"] = "none"
+    tool_budget: Dict[str, int] = Field(default_factory=dict)
+    allowed_tool_groups: List[str] = Field(default_factory=list)
 
 
 class Quiz(BaseModel):
@@ -166,6 +187,10 @@ class SessionStateV1(BaseModel):
     selected_memory: str = ""
     last_quiz: Optional[Dict[str, Any]] = None
     last_exam: Optional[Dict[str, Any]] = None
+    active_practice: Optional[Dict[str, Any]] = None
+    active_exam: Optional[Dict[str, Any]] = None
+    latest_submission: Optional[Dict[str, Any]] = None
+    latest_grading: Optional[Dict[str, Any]] = None
     permission_mode: Literal["safe", "standard", "elevated"] = "standard"
     fallback_flags: List[str] = Field(default_factory=list)
     idempotency_keys: List[str] = Field(default_factory=list)
@@ -193,6 +218,77 @@ class AgentContextV1(BaseModel):
     rag_context: str = ""
     memory_context: str = ""
     merged_context: str = ""
+    citations: List[RetrievedChunk] = Field(default_factory=list)
+    constraints: Dict[str, Any] = Field(default_factory=dict)
+    tool_scope: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ArtifactQuestionV1(BaseModel):
+    """统一题目条目：practice/exam 共用。"""
+
+    id: int
+    type: str
+    question: str
+    options: List[str] = Field(default_factory=list)
+    score: int = 0
+    standard_answer: str
+    rubric: str
+    chapter: str = ""
+    concept: str = ""
+    difficulty: str = "medium"
+
+
+class PracticeArtifactV1(BaseModel):
+    """结构化练习 artifact。"""
+
+    kind: Literal["practice"] = "practice"
+    title: str = "练习题"
+    instructions: str = "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。"
+    topic: str = ""
+    requested_num_questions: int = 1
+    question_type: str = "综合题"
+    questions: List[ArtifactQuestionV1] = Field(default_factory=list)
+    total_score: int = 100
+
+
+class ExamArtifactV1(BaseModel):
+    """结构化考试 artifact。"""
+
+    kind: Literal["exam"] = "exam"
+    title: str
+    instructions: str
+    questions: List[ArtifactQuestionV1] = Field(default_factory=list)
+    total_score: int = 100
+
+
+class SubmissionArtifactV1(BaseModel):
+    """用户提交的结构化描述。"""
+
+    source_message: str
+    artifact_kind: Literal["practice", "exam"]
+    session_id: str = ""
+
+
+class GradingArtifactV1(BaseModel):
+    """评分结果的结构化描述。"""
+
+    artifact_kind: Literal["practice", "exam"]
+    report_text: str
+    overall_score: Optional[float] = None
+    weak_topics: List[str] = Field(default_factory=list)
+    mistake_tags: List[str] = Field(default_factory=list)
+
+
+class PrefetchBundleV1(BaseModel):
+    """Runtime 预取后的候选上下文材料。"""
+
+    version: Literal["v1"] = "v1"
+    session_snapshot: SessionStateV1
+    candidate_history_context: str = ""
+    candidate_rag_context: str = ""
+    candidate_memory_context: str = ""
+    candidate_merged_context: str = ""
     citations: List[RetrievedChunk] = Field(default_factory=list)
     constraints: Dict[str, Any] = Field(default_factory=dict)
     tool_scope: Dict[str, Any] = Field(default_factory=dict)

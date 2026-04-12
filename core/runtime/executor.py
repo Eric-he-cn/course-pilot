@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Tuple
 
@@ -13,7 +14,7 @@ from core.metrics import add_event
 from core.runtime.taskgraph import TaskGraphStepV1, TaskGraphV1
 
 if TYPE_CHECKING:
-    from backend.schemas import AgentContextV1, ChatMessage, PlanPlusV1, SessionStateV1
+    from backend.schemas import AgentContextV1, ChatMessage, PlanPlusV1, PrefetchBundleV1, SessionStateV1
     from core.orchestration.runner import OrchestrationRunner
 
 
@@ -75,37 +76,160 @@ class ExecutionRuntime:
             permission_mode=str(getattr(plan, "permission_mode", "standard") or "standard"),
             current_stage="router_planned",
             current_step_index=0,
+            latest_submission={
+                "artifact_kind": "practice"
+                if str(getattr(plan, "workflow_template", "") or "").startswith("practice_then")
+                else ("exam" if str(getattr(plan, "workflow_template", "") or "").startswith("exam_then") else ""),
+                "source_message": user_message,
+                "session_id": session_state.session_id,
+            }
+            if str(getattr(plan, "action_kind", "") or "") in {"practice_grade", "exam_grade"}
+            else session_state.latest_submission,
+            metadata={
+                **dict(session_state.metadata or {}),
+                "workflow_template": str(getattr(plan, "workflow_template", "") or ""),
+                "action_kind": str(getattr(plan, "action_kind", "") or ""),
+                "tool_budget": dict(getattr(plan, "tool_budget", {}) or {}),
+                "route_reason": str(getattr(plan, "route_reason", "") or ""),
+            },
         )
         runtime_state["session_id"] = session_state.session_id
         runtime_state["session_state"] = session_state
         return plan, runtime_state, session_state, resolved_mode, history_list
 
-    def _compile_route(
+    @staticmethod
+    def _workflow_templates() -> set[str]:
+        return {
+            "learn_only",
+            "practice_only",
+            "exam_only",
+            "learn_then_practice",
+            "practice_then_review",
+            "exam_then_review",
+        }
+
+    def compile_template(
         self,
         *,
+        plan: "PlanPlusV1",
         resolved_mode: str,
         user_message: str,
-        history: List[Dict[str, str]],
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> Tuple[str, str, Dict[str, Any]]:
         metadata: Dict[str, Any] = {}
-        if resolved_mode == "learn":
-            return "run_tutor", metadata
-        if resolved_mode == "practice":
-            answer_submission = self.runner._is_answer_submission(user_message, history)
-            metadata["answer_submission"] = answer_submission
-            if answer_submission:
-                return "run_grade", metadata
+        raw_template = str(getattr(plan, "workflow_template", "") or "").strip().lower()
+        template = raw_template
+        default_like = raw_template == "learn_only" and resolved_mode != "learn"
+        if template not in self._workflow_templates() or default_like:
+            template = {
+                "learn": "learn_only",
+                "practice": "practice_only",
+                "exam": "exam_only",
+            }.get(resolved_mode, "learn_only")
+
+        action_kind = str(getattr(plan, "action_kind", "") or "").strip() or {
+            "learn_only": "learn_explain",
+            "practice_only": "practice_generate",
+            "exam_only": "exam_generate",
+            "learn_then_practice": "learn_then_practice",
+            "practice_then_review": "practice_grade",
+            "exam_then_review": "exam_grade",
+        }.get(template, "learn_explain")
+
+        if template in {"practice_only", "learn_then_practice"}:
             _, _, num_questions, question_type = self.runner._resolve_quiz_request(user_message)
             metadata["num_questions"] = num_questions
             metadata["question_type"] = question_type
-            if num_questions > 1:
-                return "run_exam", metadata
-            return "run_quiz", metadata
-        answer_submission = self.runner._is_exam_answer_submission(user_message, history)
-        metadata["answer_submission"] = answer_submission
-        if answer_submission:
-            return "run_grade", metadata
-        return "run_exam", metadata
+            metadata["generator_route"] = "run_exam" if num_questions > 1 else "run_quiz"
+        if template == "learn_only":
+            return template, action_kind, metadata
+        if template == "practice_only":
+            return template, action_kind, metadata
+        if template == "exam_only":
+            metadata["generator_route"] = "run_exam"
+            return template, action_kind, metadata
+        if template == "learn_then_practice":
+            metadata.setdefault("generator_route", "run_quiz")
+            return template, action_kind, metadata
+        metadata["artifact_kind"] = "practice" if template == "practice_then_review" else "exam"
+        return template, action_kind, metadata
+
+    def validate_template_preconditions(
+        self,
+        *,
+        template: str,
+        session_state: "SessionStateV1",
+    ) -> List[str]:
+        issues: List[str] = []
+        if template == "practice_then_review" and not (session_state.active_practice or session_state.last_quiz or session_state.last_exam):
+            issues.append("missing_active_practice")
+        if template == "exam_then_review" and not (session_state.active_exam or session_state.last_exam):
+            issues.append("missing_active_exam")
+        return issues
+
+    def compile_steps_from_template(
+        self,
+        *,
+        template: str,
+        action_kind: str,
+        route_meta: Dict[str, Any],
+        stream: bool,
+        plan: "PlanPlusV1",
+        resolved_mode: str,
+        user_message: str,
+    ) -> Tuple[str, List[TaskGraphStepV1], List[Dict[str, Any]], bool]:
+        persist_memory_needed = action_kind in {"practice_grade", "exam_grade"} or (
+            resolved_mode == "learn" and self.runner._should_persist_learn_episode(user_message)
+        )
+        execute_plan: List[Dict[str, Any]] = []
+        if template == "learn_only":
+            execute_plan = [{"step_name": "run_tutor", "owner_mode": "learn"}]
+        elif template == "practice_only":
+            execute_plan = [{"step_name": str(route_meta.get("generator_route", "run_quiz")), "owner_mode": "practice"}]
+        elif template == "exam_only":
+            execute_plan = [{"step_name": "run_exam", "owner_mode": "exam"}]
+        elif template == "learn_then_practice":
+            execute_plan = [
+                {"step_name": "run_tutor", "owner_mode": "learn"},
+                {"step_name": str(route_meta.get("generator_route", "run_quiz")), "owner_mode": "practice"},
+            ]
+        elif template == "practice_then_review":
+            execute_plan = [{"step_name": "run_grade", "owner_mode": "practice"}]
+        else:
+            execute_plan = [{"step_name": "run_grade", "owner_mode": "exam"}]
+
+        steps: List[TaskGraphStepV1] = [TaskGraphStepV1(step_name="plan_intent", phase="plan", stream=stream)]
+        if plan.need_rag:
+            steps.append(TaskGraphStepV1(step_name="prefetch_rag", phase="prefetch", stream=stream))
+        if getattr(plan, "need_memory", True):
+            steps.append(TaskGraphStepV1(step_name="prefetch_memory", phase="prefetch", stream=stream))
+        steps.append(TaskGraphStepV1(step_name="build_agent_context", phase="context", stream=stream))
+        if template in {"practice_then_review", "exam_then_review"}:
+            steps.append(
+                TaskGraphStepV1(
+                    step_name="detect_submission",
+                    phase="route",
+                    stream=stream,
+                    metadata={"resolved_mode": resolved_mode, **route_meta},
+                )
+            )
+        for execute in execute_plan:
+            steps.append(
+                TaskGraphStepV1(
+                    step_name=execute["step_name"],  # type: ignore[arg-type]
+                    phase="execute",
+                    stream=stream,
+                    side_effect=execute["step_name"] == "run_grade",
+                    metadata={"owner_mode": execute["owner_mode"], "workflow_template": template},
+                )
+            )
+        steps.append(TaskGraphStepV1(step_name="persist_session_state", phase="persist", side_effect=True, stream=stream))
+        if action_kind in {"practice_grade", "exam_grade"}:
+            steps.append(TaskGraphStepV1(step_name="persist_records", phase="persist", side_effect=True, stream=stream))
+        if persist_memory_needed:
+            steps.append(TaskGraphStepV1(step_name="persist_memory", phase="persist", side_effect=True, stream=stream))
+        steps.append(TaskGraphStepV1(step_name="synthesize_final", phase="finalize", stream=stream))
+        primary_route = str(execute_plan[-1]["step_name"])
+        return primary_route, steps, execute_plan, persist_memory_needed
 
     @staticmethod
     def _graph_digest(graph: TaskGraphV1) -> str:
@@ -113,6 +237,8 @@ class ExecutionRuntime:
             "session_id": graph.session_id,
             "mode_hint": graph.mode_hint,
             "resolved_mode": graph.resolved_mode,
+            "workflow_template": graph.workflow_template,
+            "action_kind": graph.action_kind,
             "route": graph.route,
             "steps": graph.step_names(),
             "metadata": graph.metadata,
@@ -243,7 +369,7 @@ class ExecutionRuntime:
             carried.append(item)
         return carried
 
-    def _build_agent_context(
+    def _build_prefetch_bundle(
         self,
         *,
         course_name: str,
@@ -252,7 +378,9 @@ class ExecutionRuntime:
         history: List[Dict[str, str]],
         plan: "PlanPlusV1",
         runtime_state: Dict[str, Any],
-    ) -> "AgentContextV1":
+    ) -> tuple["PrefetchBundleV1", Dict[str, Any]]:
+        from backend.schemas import PrefetchBundleV1
+
         session_state = runtime_state["session_state"]
         retrieval_query = self.runner._plan_retrieval_query(plan, user_message)
         memory_query = self.runner._plan_memory_query(plan, user_message)
@@ -268,14 +396,18 @@ class ExecutionRuntime:
         )
         mem_agent = "tutor"
         mem_phase = "answer"
-        if resolved_mode in {"practice", "exam"}:
-            route_meta = dict(getattr(runtime_state.get("graph"), "metadata", {}).get("route_meta", {}) or {})
-            answer_submission = bool(route_meta.get("answer_submission", False))
-            mem_agent = "grader" if answer_submission else "quizzer"
-            mem_phase = "grade" if answer_submission else "generate"
+        if str(getattr(plan, "action_kind", "") or "") in {"practice_grade", "exam_grade"}:
+            mem_agent = "grader"
+            mem_phase = "grade"
+        elif resolved_mode in {"practice", "exam"}:
+            mem_agent = "quizzer"
+            mem_phase = "generate"
 
         with ThreadPoolExecutor(max_workers=2) as pool:
+            rag_ctx = copy_context()
+            mem_ctx = copy_context()
             rag_future = pool.submit(
+                rag_ctx.run,
                 self.runner.rag_service.retrieve,
                 course_name=course_name,
                 retrieval_query=retrieval_query,
@@ -285,6 +417,7 @@ class ExecutionRuntime:
                 empty_message="（检索未命中有效教材片段，本轮将基于已有上下文继续）",
             )
             mem_future = pool.submit(
+                mem_ctx.run,
                 self.runner.memory_service.prefetch_history_ctx,
                 query=memory_query,
                 course_name=course_name,
@@ -295,22 +428,116 @@ class ExecutionRuntime:
             rag_text, citations, retrieval_empty = rag_future.result()
             memory_ctx = mem_future.result()
 
-        agent_context, packed, _ = self.runner._build_agent_context(
-            session_state=runtime_state["session_state"],
+        packed = self.runner.context_budgeter.build_context(
+            query=retrieval_query,
             history=history,
-            retrieval_query=retrieval_query,
             rag_text=rag_text,
             memory_text=memory_ctx,
-            citations=citations,
-            mode=resolved_mode,
+            rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
+            rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
             history_summary_state=history_summary_state,
             pending_history=pending_history,
             recent_history=recent_history,
-            history_metrics=history_metrics,
+            history_state_metrics=history_metrics,
         )
-        agent_context.metadata["retrieval_empty"] = retrieval_empty
-        agent_context.metadata["context_budget"] = self.runner._context_budget_payload(resolved_mode, len(history), packed)
+        self.runner._log_context_budget(resolved_mode, packed)
+        sections = self.runner._context_sections_from_packed(packed)
+        bundle = PrefetchBundleV1(
+            session_snapshot=runtime_state["session_state"],
+            candidate_history_context=sections["history_context"],
+            candidate_rag_context=sections["rag_context"],
+            candidate_memory_context=sections["memory_context"],
+            candidate_merged_context=sections["context"],
+            citations=list(citations or []),
+            constraints={
+                "mode": resolved_mode,
+                "workflow_template": str(getattr(plan, "workflow_template", "") or ""),
+                "action_kind": str(getattr(plan, "action_kind", "") or ""),
+            },
+            tool_scope={
+                "permission_mode": runtime_state["session_state"].permission_mode,
+                "allowed_tools": list(getattr(plan, "allowed_tools", []) or []),
+                "tool_budget": dict(getattr(plan, "tool_budget", {}) or {}),
+                "allowed_tool_groups": list(getattr(plan, "allowed_tool_groups", []) or []),
+            },
+            metadata={
+                "retrieval_query": retrieval_query,
+                "memory_query": memory_query,
+                "retrieval_empty": retrieval_empty,
+                "context_budget": self.runner._context_budget_payload(resolved_mode, len(history), packed),
+            },
+        )
+        return bundle, sections
+
+    def _agent_for_step(self, step_name: str):
+        if step_name == "run_tutor":
+            return self.runner.tutor
+        if step_name in {"run_quiz", "run_exam"}:
+            return self.runner.quizmaster
+        return self.runner.grader
+
+    def _build_agent_context_for_step(
+        self,
+        *,
+        step_name: str,
+        plan: "PlanPlusV1",
+        runtime_state: Dict[str, Any],
+        prefetch_bundle: "PrefetchBundleV1",
+    ) -> "AgentContextV1":
+        agent = self._agent_for_step(step_name)
+        session_state = runtime_state["session_state"]
+        agent_context = agent.build_context(
+            session_state,
+            history_context=prefetch_bundle.candidate_history_context,
+            rag_context=prefetch_bundle.candidate_rag_context,
+            memory_context=prefetch_bundle.candidate_memory_context,
+            merged_context=prefetch_bundle.candidate_merged_context,
+            context=prefetch_bundle.candidate_merged_context,
+            citations=list(prefetch_bundle.citations or []),
+            constraints={
+                **dict(prefetch_bundle.constraints or {}),
+                "step_name": step_name,
+            },
+            allowed_tools=list(getattr(plan, "allowed_tools", []) or []),
+            tool_scope=dict(prefetch_bundle.tool_scope or {}),
+            metadata=dict(prefetch_bundle.metadata or {}),
+        )
+        agent_context.metadata["retrieval_empty"] = bool(prefetch_bundle.metadata.get("retrieval_empty", False))
+        agent_context.metadata["context_budget"] = dict(prefetch_bundle.metadata.get("context_budget", {}) or {})
         return agent_context
+
+    def _build_agent_context(
+        self,
+        *,
+        course_name: str,
+        resolved_mode: str,
+        user_message: str,
+        history: List[Dict[str, str]],
+        plan: "PlanPlusV1",
+        runtime_state: Dict[str, Any],
+        step_name: str | None = None,
+    ) -> "AgentContextV1":
+        """兼容旧测试/探针调用：先预取，再交给对应 Agent 组装上下文。"""
+
+        prefetch_bundle, _ = self._build_prefetch_bundle(
+            course_name=course_name,
+            resolved_mode=resolved_mode,
+            user_message=user_message,
+            history=history,
+            plan=plan,
+            runtime_state=runtime_state,
+        )
+        actual_step = step_name or {
+            "learn": "run_tutor",
+            "practice": "run_quiz",
+            "exam": "run_exam",
+        }.get(resolved_mode, "run_tutor")
+        return self._build_agent_context_for_step(
+            step_name=actual_step,
+            plan=plan,
+            runtime_state=runtime_state,
+            prefetch_bundle=prefetch_bundle,
+        )
 
     def _fallback_to_legacy_sync(
         self,
@@ -353,14 +580,13 @@ class ExecutionRuntime:
         runtime_state.pop("agent_context", None)
         self._clear_runtime_controls(runtime_state)
         self._refresh_session_state_from_graph(runtime_state, graph)
-        return self._dispatch_sync(
-            course_name=course_name,
-            user_message=user_message,
-            plan=plan,
-            resolved_mode=resolved_mode,
-            runtime_state=runtime_state,
-            history=history,
-        )
+        if resolved_mode == "learn":
+            return self.runner.run_learn_mode(course_name, user_message, plan, history, state=runtime_state)
+        if resolved_mode == "practice":
+            return self.runner.run_practice_mode(course_name, user_message, plan, runtime_state, history)
+        if resolved_mode == "exam":
+            return self.runner.run_exam_mode(course_name, user_message, plan, history, state=runtime_state)
+        return self.runner.run_learn_mode(course_name, user_message, plan, history, state=runtime_state)
 
     def compile_taskgraph(
         self,
@@ -374,106 +600,133 @@ class ExecutionRuntime:
         stream: bool,
     ) -> TaskGraphV1:
         resolved_mode = str(getattr(plan, "resolved_mode", "") or mode_hint)
-        route, route_meta = self._compile_route(
+        workflow_template, action_kind, route_meta = self.compile_template(
+            plan=plan,
             resolved_mode=resolved_mode,
             user_message=user_message,
-            history=history,
         )
-
-        steps: List[TaskGraphStepV1] = [
-            TaskGraphStepV1(step_name="plan_intent", phase="plan", stream=stream),
-        ]
-        if plan.need_rag:
-            steps.append(TaskGraphStepV1(step_name="prefetch_rag", phase="prefetch", stream=stream))
-        if getattr(plan, "need_memory", True):
-            steps.append(TaskGraphStepV1(step_name="prefetch_memory", phase="prefetch", stream=stream))
-        steps.append(TaskGraphStepV1(step_name="build_agent_context", phase="context", stream=stream))
-
-        if resolved_mode in {"practice", "exam"}:
-            steps.append(
-                TaskGraphStepV1(
-                    step_name="detect_submission",
-                    phase="route",
-                    stream=stream,
-                    metadata={"resolved_mode": resolved_mode, **route_meta},
-                )
-            )
-
-        if route == "run_tutor":
-            steps.append(TaskGraphStepV1(step_name="run_tutor", phase="execute", stream=stream))
-        elif route == "run_quiz":
-            steps.append(TaskGraphStepV1(step_name="run_quiz", phase="execute", stream=stream))
-        elif route == "run_exam":
-            steps.append(TaskGraphStepV1(step_name="run_exam", phase="execute", stream=stream))
-        else:
-            steps.append(
-                TaskGraphStepV1(
-                    step_name="run_grade",
-                    phase="execute",
-                    side_effect=True,
-                    stream=stream,
-                    metadata={"resolved_mode": resolved_mode, **route_meta},
-                )
-            )
-
-        steps.append(TaskGraphStepV1(step_name="persist_session_state", phase="persist", side_effect=True, stream=stream))
-        if route in {"run_grade"}:
-            steps.append(TaskGraphStepV1(step_name="persist_records", phase="persist", side_effect=True, stream=stream))
-            steps.append(TaskGraphStepV1(step_name="persist_memory", phase="persist", side_effect=True, stream=stream))
-        steps.append(TaskGraphStepV1(step_name="synthesize_final", phase="finalize", stream=stream))
+        route, steps, execute_plan, _persist_memory_needed = self.compile_steps_from_template(
+            template=workflow_template,
+            action_kind=action_kind,
+            route_meta=route_meta,
+            stream=stream,
+            plan=plan,
+            resolved_mode=resolved_mode,
+            user_message=user_message,
+        )
 
         graph = TaskGraphV1(
             graph_id=uuid.uuid4().hex,
             session_id=session_state.session_id,
             mode_hint=mode_hint,  # type: ignore[arg-type]
             resolved_mode=resolved_mode,  # type: ignore[arg-type]
+            workflow_template=workflow_template,  # type: ignore[arg-type]
+            action_kind=action_kind,  # type: ignore[arg-type]
             route=route,  # type: ignore[arg-type]
             steps=steps,
             metadata={
                 "course_name": course_name,
                 "stream": stream,
                 "route_meta": route_meta,
+                "execute_plan": execute_plan,
             },
         )
         digest = self._graph_digest(graph)
         graph.metadata["digest"] = digest
         return graph
 
-    def _dispatch_sync(
+    def _execute_plan(self, graph: TaskGraphV1) -> List[Dict[str, Any]]:
+        raw = graph.metadata.get("execute_plan", [])
+        if not isinstance(raw, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            step_name = str(item.get("step_name", "") or "").strip()
+            owner_mode = str(item.get("owner_mode", "") or "").strip()
+            if step_name and owner_mode:
+                out.append({"step_name": step_name, "owner_mode": owner_mode})
+        return out
+
+    def _set_runtime_execute_step(self, runtime_state: Dict[str, Any], step_name: str) -> None:
+        runtime_state["_runtime_route"] = step_name
+        runtime_state["_runtime_step_name"] = step_name
+
+    def _maybe_replan_for_template(
         self,
         *,
         course_name: str,
+        mode_hint: str,
+        user_message: str,
+        history: List[Dict[str, str]],
+        runtime_state: Dict[str, Any],
+        plan: "PlanPlusV1",
+    ) -> tuple["PlanPlusV1", str]:
+        issues = self.validate_template_preconditions(
+            template=str(getattr(plan, "workflow_template", "") or ""),
+            session_state=runtime_state["session_state"],
+        )
+        enable_replan = os.getenv("ENABLE_ROUTER_REPLAN", "1") == "1"
+        if not issues or not enable_replan:
+            return plan, str(getattr(plan, "resolved_mode", "") or mode_hint)
+        reason = "；".join(issues)
+        replanned = self.runner.router.replan(
+            user_message=user_message,
+            mode=mode_hint,
+            course_name=course_name,
+            previous_plan=plan,
+            reason=reason,
+        )
+        if replanned.model_dump() == plan.model_dump():
+            return plan, str(getattr(plan, "resolved_mode", "") or mode_hint)
+        resolved_mode = str(getattr(replanned, "resolved_mode", "") or mode_hint)
+        runtime_state["session_state"] = self.runner._update_session_state(
+            runtime_state["session_state"],
+            resolved_mode=resolved_mode,
+            current_stage="router_replanned",
+        )
+        return replanned, resolved_mode
+
+    def _run_owner_sync(
+        self,
+        *,
+        step_name: str,
+        owner_mode: str,
+        course_name: str,
         user_message: str,
         plan: "PlanPlusV1",
-        resolved_mode: str,
         runtime_state: Dict[str, Any],
         history: List[Dict[str, str]],
     ) -> "ChatMessage":
-        if resolved_mode == "learn":
+        self._set_runtime_execute_step(runtime_state, step_name)
+        if owner_mode == "learn":
             return self.runner.run_learn_mode(course_name, user_message, plan, history, state=runtime_state)
-        if resolved_mode == "practice":
+        if owner_mode == "practice":
             return self.runner.run_practice_mode(course_name, user_message, plan, runtime_state, history)
-        if resolved_mode == "exam":
+        if owner_mode == "exam":
             return self.runner.run_exam_mode(course_name, user_message, plan, history, state=runtime_state)
         return self.runner.run_learn_mode(course_name, user_message, plan, history, state=runtime_state)
 
-    def _dispatch_stream(
+    def _run_owner_stream(
         self,
         *,
+        step_name: str,
+        owner_mode: str,
         course_name: str,
         user_message: str,
         plan: "PlanPlusV1",
-        resolved_mode: str,
         runtime_state: Dict[str, Any],
         history: List[Dict[str, str]],
     ) -> Iterator[Any]:
-        if resolved_mode == "learn":
+        self._set_runtime_execute_step(runtime_state, step_name)
+        if owner_mode == "learn":
             yield from self.runner.run_learn_mode_stream(course_name, user_message, plan, history, state=runtime_state)
             return
-        if resolved_mode == "practice":
+        if owner_mode == "practice":
             yield from self.runner.run_practice_mode_stream(course_name, user_message, plan, history, state=runtime_state)
             return
-        if resolved_mode == "exam":
+        if owner_mode == "exam":
             yield from self.runner.run_exam_mode_stream(course_name, user_message, plan, history, state=runtime_state)
             return
         response = self.runner.run_learn_mode(course_name, user_message, plan, history, state=runtime_state)
@@ -495,6 +748,14 @@ class ExecutionRuntime:
             state=state,
             history=history,
         )
+        plan, resolved_mode = self._maybe_replan_for_template(
+            course_name=course_name,
+            mode_hint=mode_hint,
+            user_message=user_message,
+            history=history_list,
+            runtime_state=runtime_state,
+            plan=plan,
+        )
 
         graph = self.compile_taskgraph(
             course_name=course_name,
@@ -502,7 +763,7 @@ class ExecutionRuntime:
             user_message=user_message,
             history=history_list,
             plan=plan,
-            session_state=session_state,
+            session_state=runtime_state["session_state"],
             stream=False,
         )
         runtime_state["graph"] = graph
@@ -528,7 +789,7 @@ class ExecutionRuntime:
                 self._mark_step(graph, "prefetch_rag", "completed")
             if self._step(graph, "prefetch_memory") is not None:
                 self._mark_step(graph, "prefetch_memory", "completed")
-            agent_context = self._build_agent_context(
+            prefetch_bundle, _prefetch_sections = self._build_prefetch_bundle(
                 course_name=course_name,
                 resolved_mode=resolved_mode,
                 user_message=user_message,
@@ -536,19 +797,49 @@ class ExecutionRuntime:
                 plan=plan,
                 runtime_state=runtime_state,
             )
-            runtime_state["agent_context"] = agent_context
+            runtime_state["prefetch_bundle"] = prefetch_bundle
             self._mark_step(graph, "build_agent_context", "completed")
             if self._step(graph, "detect_submission") is not None:
                 self._mark_step(graph, "detect_submission", "completed", **graph.metadata.get("route_meta", {}))
             self._refresh_session_state_from_graph(runtime_state, graph)
-            response = self._dispatch_sync(
-                course_name=course_name,
-                user_message=user_message,
-                plan=plan,
-                resolved_mode=resolved_mode,
-                runtime_state=runtime_state,
-                history=history_list,
-            )
+            responses: List["ChatMessage"] = []
+            execute_plan = self._execute_plan(graph)
+            for idx, execute in enumerate(execute_plan):
+                step_name = str(execute.get("step_name", "") or "")
+                owner_mode = str(execute.get("owner_mode", "") or "")
+                agent_context = self._build_agent_context_for_step(
+                    step_name=step_name,
+                    plan=plan,
+                    runtime_state=runtime_state,
+                    prefetch_bundle=prefetch_bundle,
+                )
+                runtime_state["agent_context"] = agent_context
+                current_question = user_message
+                if idx > 0 and step_name in {"run_quiz", "run_exam"}:
+                    current_question = str(runtime_state["session_state"].task_summary or user_message)
+                response = self._run_owner_sync(
+                    step_name=step_name,
+                    owner_mode=owner_mode,
+                    course_name=course_name,
+                    user_message=current_question,
+                    plan=plan,
+                    runtime_state=runtime_state,
+                    history=history_list,
+                )
+                responses.append(response)
+            if len(responses) == 1:
+                response = responses[0]
+            else:
+                combined_content = f"{responses[0].content}\n\n---\n\n{responses[-1].content}"
+                merged_citations: List[Any] = []
+                for resp in responses:
+                    merged_citations.extend(list(resp.citations or []))
+                response = responses[-1].model_copy(
+                    update={
+                        "content": combined_content,
+                        "citations": merged_citations or None,
+                    }
+                )
             notice = self._persist_runtime_effects(course_name=course_name, runtime_state=runtime_state)
             if notice:
                 response = response.model_copy(update={"content": f"{response.content}{notice}"})
@@ -564,10 +855,12 @@ class ExecutionRuntime:
                 reason=f"runtime_step_failed:{type(exc).__name__}",
             )
             self._reload_session_state(course_name, runtime_state)
-        self._mark_step(graph, graph.route, "completed")
+        for execute in self._execute_plan(graph):
+            self._mark_step(graph, str(execute.get("step_name", "")), "completed")
         self._mark_step(graph, "persist_session_state", "completed")
-        if graph.route == "run_grade":
+        if self._step(graph, "persist_records") is not None:
             self._mark_step(graph, "persist_records", "completed")
+        if self._step(graph, "persist_memory") is not None:
             self._mark_step(graph, "persist_memory", "completed")
         self._mark_step(graph, "synthesize_final", "completed")
         self._refresh_session_state_from_graph(runtime_state, graph)
@@ -584,95 +877,6 @@ class ExecutionRuntime:
         )
         self._reload_session_state(course_name, runtime_state)
         self._clear_runtime_controls(runtime_state)
-
-        enable_replan = os.getenv("ENABLE_ROUTER_REPLAN", "1") == "1"
-        if enable_replan and graph.route != "run_grade":
-            reasons = self.runner._collect_replan_reasons(resolved_mode, plan, response)
-            if reasons:
-                reason_text = "；".join(reasons)
-                self.runner.logger.info("[replan] trigger=1 mode=%s reasons=%s%s", resolved_mode, reason_text, self.runner._trace_tag())
-                new_plan = self.runner.router.replan(
-                    user_message=user_message,
-                    mode=mode_hint,
-                    course_name=course_name,
-                    previous_plan=plan,
-                    reason=reason_text,
-                )
-                if new_plan.model_dump() != plan.model_dump():
-                    plan = new_plan
-                    resolved_mode = str(getattr(plan, "resolved_mode", "") or mode_hint)
-                    runtime_state["session_state"] = self.runner._update_session_state(
-                        runtime_state["session_state"],
-                        resolved_mode=resolved_mode,
-                        current_stage="router_replanned",
-                    )
-                    graph = self.compile_taskgraph(
-                        course_name=course_name,
-                        mode_hint=mode_hint,
-                        user_message=user_message,
-                        history=history_list,
-                        plan=plan,
-                        session_state=runtime_state["session_state"],
-                        stream=False,
-                    )
-                    runtime_state["graph"] = graph
-                    self._install_runtime_controls(runtime_state, graph)
-                    self._mark_step(graph, "plan_intent", "completed")
-                    self._refresh_session_state_from_graph(runtime_state, graph)
-                    add_event(
-                        "taskgraph_recompiled",
-                        graph_id=graph.graph_id,
-                        session_id=graph.session_id,
-                        resolved_mode=resolved_mode,
-                        route=graph.route,
-                        step_count=len(graph.steps),
-                        digest=str(graph.metadata.get("digest", "")),
-                        stream=False,
-                    )
-                    agent_context = self._build_agent_context(
-                        course_name=course_name,
-                        resolved_mode=resolved_mode,
-                        user_message=user_message,
-                        history=history_list,
-                        plan=plan,
-                        runtime_state=runtime_state,
-                    )
-                    runtime_state["agent_context"] = agent_context
-                    self._mark_step(graph, "build_agent_context", "completed")
-                    if self._step(graph, "detect_submission") is not None:
-                        self._mark_step(graph, "detect_submission", "completed", **graph.metadata.get("route_meta", {}))
-                    self._refresh_session_state_from_graph(runtime_state, graph)
-                    response = self._dispatch_sync(
-                        course_name=course_name,
-                        user_message=user_message,
-                        plan=plan,
-                        resolved_mode=resolved_mode,
-                        runtime_state=runtime_state,
-                        history=history_list,
-                    )
-                    notice = self._persist_runtime_effects(course_name=course_name, runtime_state=runtime_state)
-                    if notice:
-                        response = response.model_copy(update={"content": f"{response.content}{notice}"})
-                    self._mark_step(graph, graph.route, "completed")
-                    self._mark_step(graph, "persist_session_state", "completed")
-                    if graph.route == "run_grade":
-                        self._mark_step(graph, "persist_records", "completed")
-                        self._mark_step(graph, "persist_memory", "completed")
-                    self._mark_step(graph, "synthesize_final", "completed")
-                    self._refresh_session_state_from_graph(runtime_state, graph)
-                    self.runner._persist_session_state(runtime_state["session_state"])
-                    response = response.model_copy(
-                        update={
-                            "tool_calls": self.runner._final_internal_tool_calls(
-                                session_state=runtime_state["session_state"],
-                                history_summary_state=dict(runtime_state["session_state"].history_summary_state or {}),
-                                extra_tool_calls=self._carry_visible_internal_tool_calls(response.tool_calls)
-                                + list((runtime_state.get("_runtime_effects", {}) or {}).get("final_tool_calls", []) or []),
-                            )
-                        }
-                    )
-                    self._reload_session_state(course_name, runtime_state)
-                    self._clear_runtime_controls(runtime_state)
 
         return response, plan, graph
 
@@ -692,6 +896,14 @@ class ExecutionRuntime:
             state=state,
             history=history,
         )
+        plan, resolved_mode = self._maybe_replan_for_template(
+            course_name=course_name,
+            mode_hint=mode_hint,
+            user_message=user_message,
+            history=history_list,
+            runtime_state=runtime_state,
+            plan=plan,
+        )
 
         graph = self.compile_taskgraph(
             course_name=course_name,
@@ -699,7 +911,7 @@ class ExecutionRuntime:
             user_message=user_message,
             history=history_list,
             plan=plan,
-            session_state=session_state,
+            session_state=runtime_state["session_state"],
             stream=True,
         )
         runtime_state["graph"] = graph
@@ -720,56 +932,14 @@ class ExecutionRuntime:
             digest=str(graph.metadata.get("digest", "")),
             stream=True,
         )
-
-        enable_replan = os.getenv("ENABLE_ROUTER_REPLAN", "1") == "1"
-        if enable_replan and plan.need_rag and self.runner.load_retriever(course_name) is None:
-            reason = "检索为空（索引缺失或未构建）"
-            new_plan = self.runner.router.replan(
-                user_message=user_message,
-                mode=mode_hint,
-                course_name=course_name,
-                previous_plan=plan,
-                reason=reason,
-            )
-            if new_plan.model_dump() != plan.model_dump():
-                self.runner.logger.info("[replan] stream_precheck mode=%s reason=%s%s", resolved_mode, reason, self.runner._trace_tag())
-                plan = new_plan
-                resolved_mode = str(getattr(plan, "resolved_mode", "") or mode_hint)
-                runtime_state["session_state"] = self.runner._update_session_state(
-                    runtime_state["session_state"],
-                    resolved_mode=resolved_mode,
-                    current_stage="router_replanned",
-                )
-                graph = self.compile_taskgraph(
-                    course_name=course_name,
-                    mode_hint=mode_hint,
-                    user_message=user_message,
-                    history=history_list,
-                    plan=plan,
-                    session_state=runtime_state["session_state"],
-                    stream=True,
-                )
-                runtime_state["graph"] = graph
-                self._install_runtime_controls(runtime_state, graph)
-                self._mark_step(graph, "plan_intent", "completed")
-                self._refresh_session_state_from_graph(runtime_state, graph)
-                add_event(
-                    "taskgraph_recompiled",
-                    graph_id=graph.graph_id,
-                    session_id=graph.session_id,
-                    resolved_mode=resolved_mode,
-                    route=graph.route,
-                    step_count=len(graph.steps),
-                    digest=str(graph.metadata.get("digest", "")),
-                    stream=True,
-                )
+        final_tool_calls_needed = True
 
         try:
             if self._step(graph, "prefetch_rag") is not None:
                 self._mark_step(graph, "prefetch_rag", "completed")
             if self._step(graph, "prefetch_memory") is not None:
                 self._mark_step(graph, "prefetch_memory", "completed")
-            agent_context = self._build_agent_context(
+            prefetch_bundle, _prefetch_sections = self._build_prefetch_bundle(
                 course_name=course_name,
                 resolved_mode=resolved_mode,
                 user_message=user_message,
@@ -777,19 +947,35 @@ class ExecutionRuntime:
                 plan=plan,
                 runtime_state=runtime_state,
             )
-            runtime_state["agent_context"] = agent_context
+            runtime_state["prefetch_bundle"] = prefetch_bundle
             self._mark_step(graph, "build_agent_context", "completed")
             if self._step(graph, "detect_submission") is not None:
                 self._mark_step(graph, "detect_submission", "completed", **graph.metadata.get("route_meta", {}))
             self._refresh_session_state_from_graph(runtime_state, graph)
-            yield from self._dispatch_stream(
-                course_name=course_name,
-                user_message=user_message,
-                plan=plan,
-                resolved_mode=resolved_mode,
-                runtime_state=runtime_state,
-                history=history_list,
-            )
+            execute_plan = self._execute_plan(graph)
+            for idx, execute in enumerate(execute_plan):
+                step_name = str(execute.get("step_name", "") or "")
+                owner_mode = str(execute.get("owner_mode", "") or "")
+                agent_context = self._build_agent_context_for_step(
+                    step_name=step_name,
+                    plan=plan,
+                    runtime_state=runtime_state,
+                    prefetch_bundle=prefetch_bundle,
+                )
+                runtime_state["agent_context"] = agent_context
+                current_question = user_message
+                if idx > 0 and step_name in {"run_quiz", "run_exam"}:
+                    current_question = str(runtime_state["session_state"].task_summary or user_message)
+                    yield "\n\n---\n\n"
+                yield from self._run_owner_stream(
+                    step_name=step_name,
+                    owner_mode=owner_mode,
+                    course_name=course_name,
+                    user_message=current_question,
+                    plan=plan,
+                    runtime_state=runtime_state,
+                    history=history_list,
+                )
             notice = self._persist_runtime_effects(course_name=course_name, runtime_state=runtime_state)
             if notice:
                 yield notice
@@ -823,29 +1009,42 @@ class ExecutionRuntime:
             runtime_state.pop("agent_context", None)
             self._clear_runtime_controls(runtime_state)
             self._refresh_session_state_from_graph(runtime_state, graph)
-            yield from self._dispatch_stream(
-                course_name=course_name,
-                user_message=user_message,
-                plan=plan,
-                resolved_mode=resolved_mode,
-                runtime_state=runtime_state,
-                history=history_list,
-            )
+            execute_plan = self._execute_plan(graph)
+            for idx, execute in enumerate(execute_plan):
+                step_name = str(execute.get("step_name", "") or "")
+                owner_mode = str(execute.get("owner_mode", "") or "")
+                current_question = user_message
+                if idx > 0 and step_name in {"run_quiz", "run_exam"}:
+                    current_question = str(runtime_state["session_state"].task_summary or user_message)
+                    yield "\n\n---\n\n"
+                yield from self._run_owner_stream(
+                    step_name=step_name,
+                    owner_mode=owner_mode,
+                    course_name=course_name,
+                    user_message=current_question,
+                    plan=plan,
+                    runtime_state=runtime_state,
+                    history=history_list,
+                )
             self._reload_session_state(course_name, runtime_state)
-        self._mark_step(graph, graph.route, "completed")
+            final_tool_calls_needed = False
+        for execute in self._execute_plan(graph):
+            self._mark_step(graph, str(execute.get("step_name", "")), "completed")
         self._mark_step(graph, "persist_session_state", "completed")
-        if graph.route == "run_grade":
+        if self._step(graph, "persist_records") is not None:
             self._mark_step(graph, "persist_records", "completed")
+        if self._step(graph, "persist_memory") is not None:
             self._mark_step(graph, "persist_memory", "completed")
         self._mark_step(graph, "synthesize_final", "completed")
         self._refresh_session_state_from_graph(runtime_state, graph)
         self.runner._persist_session_state(runtime_state["session_state"])
-        yield self.runner.event_bus.tool_calls(
-            self.runner._final_internal_tool_calls(
-                session_state=runtime_state["session_state"],
-                history_summary_state=dict(runtime_state["session_state"].history_summary_state or {}),
-                extra_tool_calls=list((runtime_state.get("_runtime_effects", {}) or {}).get("final_tool_calls", []) or []),
+        if final_tool_calls_needed:
+            yield self.runner.event_bus.tool_calls(
+                self.runner._final_internal_tool_calls(
+                    session_state=runtime_state["session_state"],
+                    history_summary_state=dict(runtime_state["session_state"].history_summary_state or {}),
+                    extra_tool_calls=list((runtime_state.get("_runtime_effects", {}) or {}).get("final_tool_calls", []) or []),
+                )
             )
-        )
         self._reload_session_state(course_name, runtime_state)
         self._clear_runtime_controls(runtime_state)

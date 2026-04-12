@@ -43,11 +43,15 @@ class SQLiteMemoryStore:
                     content     TEXT NOT NULL,    -- 问题(+答案摘要)的自然语言描述
                     importance  REAL DEFAULT 0.5, -- 0~1，错题=0.9，普通问答=0.5
                     created_at  TEXT NOT NULL,
+                    last_accessed_at TEXT NOT NULL,
                     metadata    TEXT DEFAULT '{}'  -- JSON: score, tags, doc_ids, etc.
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ep_course
                     ON episodes(user_id, course_name, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_ep_accessed
+                    ON episodes(user_id, course_name, last_accessed_at DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_ep_type
                     ON episodes(user_id, course_name, event_type);
@@ -71,6 +75,21 @@ class SQLiteMemoryStore:
             if "concept_mastery" not in col_names:
                 conn.execute(
                     "ALTER TABLE user_profiles ADD COLUMN concept_mastery TEXT DEFAULT '{}'"
+                )
+            ep_cols = conn.execute("PRAGMA table_info(episodes)").fetchall()
+            ep_col_names = {r[1] for r in ep_cols}
+            if "last_accessed_at" not in ep_col_names:
+                conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN last_accessed_at TEXT DEFAULT ''"
+                )
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET last_accessed_at = CASE
+                        WHEN last_accessed_at IS NULL OR last_accessed_at = '' THEN created_at
+                        ELSE last_accessed_at
+                    END
+                    """
                 )
             self._init_fts(conn)
 
@@ -134,12 +153,24 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 INSERT INTO episodes
-                    (id, user_id, course_name, event_type, content, importance, created_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, course_name, event_type, content, importance, created_at, last_accessed_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (eid, user_id, course_name, event_type, content, importance, now, meta_str),
+                (eid, user_id, course_name, event_type, content, importance, now, now, meta_str),
             )
         return eid
+
+    def _touch_episode_ids(self, ids: List[str]) -> None:
+        clean_ids = [str(i).strip() for i in ids if str(i).strip()]
+        if not clean_ids:
+            return
+        now = datetime.now().isoformat()
+        placeholders = ",".join(["?" for _ in clean_ids])
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE episodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
+                [now] + clean_ids,
+            )
 
     def search_episodes(
         self,
@@ -205,10 +236,15 @@ class SQLiteMemoryStore:
                 continue
             results.append(d)
         priority = {"mistake": 0, "practice": 1, "exam": 2, "qa_summary": 3, "qa": 4}
-        results.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+        results.sort(
+            key=lambda x: str(x.get("last_accessed_at", "") or x.get("created_at", "")),
+            reverse=True,
+        )
         results.sort(key=lambda x: float(x.get("importance", 0.0) or 0.0), reverse=True)
         results.sort(key=lambda x: priority.get(str(x.get("event_type", "")), 9))
-        return results[:top_k]
+        trimmed = results[:top_k]
+        self._touch_episode_ids([str(item.get("id", "") or "") for item in trimmed])
+        return trimmed
 
     def _query_terms(self, query: str) -> List[str]:
         terms = [t.strip() for t in str(query or "").split() if t.strip()]
@@ -240,7 +276,7 @@ class SQLiteMemoryStore:
             WHERE user_id = ? AND course_name = ? AND importance >= ?
               AND ({like_clauses})
               {type_clause}
-            ORDER BY importance DESC, created_at DESC
+            ORDER BY importance DESC, last_accessed_at DESC, created_at DESC
             LIMIT ?
         """
         params.append(fetch_limit)
@@ -278,7 +314,7 @@ class SQLiteMemoryStore:
               AND e.course_name = ?
               AND e.importance >= ?
               {type_clause}
-            ORDER BY e.importance DESC, e.created_at DESC
+            ORDER BY e.importance DESC, e.last_accessed_at DESC, e.created_at DESC
             LIMIT ?
         """
         try:
@@ -350,7 +386,7 @@ class SQLiteMemoryStore:
                 """
                 SELECT * FROM episodes
                 WHERE user_id = ? AND course_name = ? AND event_type = 'qa' AND importance <= ?
-                ORDER BY created_at DESC
+                ORDER BY last_accessed_at DESC, created_at DESC
                 """,
                 (user_id, course_name, float(max_importance)),
             ).fetchall()
@@ -393,8 +429,8 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 INSERT INTO episodes
-                    (id, user_id, course_name, event_type, content, importance, created_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, course_name, event_type, content, importance, created_at, last_accessed_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     eid,
@@ -403,6 +439,7 @@ class SQLiteMemoryStore:
                     "qa_summary",
                     summary_text,
                     float(importance),
+                    now,
                     now,
                     json.dumps(meta, ensure_ascii=False),
                 ),

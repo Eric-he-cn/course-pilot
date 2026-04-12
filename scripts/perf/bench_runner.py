@@ -80,6 +80,83 @@ def _extract_doc_ids(citations: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _extract_internal_meta_payload(tool_calls: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
+    for item in reversed(tool_calls or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "internal_meta" and item.get("name") == name:
+            payload = item.get("payload")
+            return dict(payload or {}) if isinstance(payload, dict) else {}
+    return {}
+
+
+def _mean_event_value(events: List[Dict[str, Any]], key: str) -> float:
+    values = [float(e.get(key, 0.0)) for e in events if isinstance(e.get(key), (int, float))]
+    return _mean(values)
+
+
+def _context_metrics(payloads: List[Dict[str, Any]]) -> Dict[str, float]:
+    history_vals = [float(p.get("history_tokens_est", 0.0) or 0.0) for p in payloads if isinstance(p, dict)]
+    rag_vals = [float(p.get("rag_tokens_est", 0.0) or 0.0) for p in payloads if isinstance(p, dict)]
+    memory_vals = [float(p.get("memory_tokens_est", 0.0) or 0.0) for p in payloads if isinstance(p, dict)]
+    final_vals = [float(p.get("final_tokens_est", 0.0) or 0.0) for p in payloads if isinstance(p, dict)]
+    pressure_vals = [float(p.get("context_pressure_ratio", 0.0) or 0.0) for p in payloads if isinstance(p, dict)]
+    input_vals = [h + r + m for h, r, m in zip(history_vals, rag_vals, memory_vals)]
+    return {
+        "avg_history_tokens_case": _mean(history_vals),
+        "avg_rag_tokens_case": _mean(rag_vals),
+        "avg_memory_tokens_case": _mean(memory_vals),
+        "avg_final_context_tokens_case": _mean(final_vals),
+        "avg_input_context_tokens_case": _mean(input_vals),
+        "avg_context_pressure_ratio_case": _mean(pressure_vals),
+    }
+
+
+def _taskgraph_status_coverage(session_state_payload: Dict[str, Any]) -> float:
+    metadata = session_state_payload.get("metadata") if isinstance(session_state_payload, dict) else {}
+    if not isinstance(metadata, dict):
+        return 0.0
+    statuses = metadata.get("taskgraph_statuses")
+    if not isinstance(statuses, dict) or not statuses:
+        return 0.0
+    covered = sum(1 for status in statuses.values() if str(status) in {"completed", "skipped"})
+    return float(covered) / float(len(statuses))
+
+
+def _trace_contract(
+    *,
+    case: Dict[str, Any],
+    citations: List[Dict[str, Any]],
+    retrieval_events: List[Dict[str, Any]],
+    retrieval_missing_index_events: List[Dict[str, Any]],
+    retrieval_skipped_events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    required = bool(case.get("need_rag")) or bool(case.get("requires_citations"))
+    if not required:
+        return {
+            "trace_contract_required": False,
+            "trace_contract_error": False,
+            "trace_contract_reason": "",
+        }
+    if not citations:
+        return {
+            "trace_contract_required": True,
+            "trace_contract_error": False,
+            "trace_contract_reason": "no_citations_emitted",
+        }
+    if retrieval_events or retrieval_missing_index_events or retrieval_skipped_events:
+        return {
+            "trace_contract_required": True,
+            "trace_contract_error": False,
+            "trace_contract_reason": "",
+        }
+    return {
+        "trace_contract_required": True,
+        "trace_contract_error": True,
+        "trace_contract_reason": "citations_without_retrieval_trace",
+    }
+
+
 def _metric_block(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     prompt_tokens = []
     for r in rows:
@@ -106,6 +183,17 @@ def _metric_block(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     fallback_rate_vals = [float(r.get("fallback_rate_case", 0.0) or 0.0) for r in rows]
     mode_override_vals = [float(r.get("resolved_mode_override_count", 0.0) or 0.0) for r in rows]
     session_store_hit_vals = [float(r.get("session_store_hit_rate_case", 0.0) or 0.0) for r in rows]
+    taskgraph_coverage_vals = [float(r.get("taskgraph_step_status_coverage_case", 0.0) or 0.0) for r in rows]
+    trace_contract_vals = [1.0 if r.get("trace_contract_error") else 0.0 for r in rows]
+    retrieval_missing_index_vals = [1.0 if r.get("retrieval_missing_index") else 0.0 for r in rows]
+    retrieval_skipped_vals = [1.0 if r.get("retrieval_skipped") else 0.0 for r in rows]
+    history_tokens_vals = [float(r.get("avg_history_tokens_case", 0.0) or 0.0) for r in rows]
+    rag_tokens_vals = [float(r.get("avg_rag_tokens_case", 0.0) or 0.0) for r in rows]
+    memory_tokens_vals = [float(r.get("avg_memory_tokens_case", 0.0) or 0.0) for r in rows]
+    final_context_vals = [float(r.get("avg_final_context_tokens_case", 0.0) or 0.0) for r in rows]
+    input_context_vals = [float(r.get("avg_input_context_tokens_case", 0.0) or 0.0) for r in rows]
+    context_pressure_vals = [float(r.get("avg_context_pressure_ratio_case", 0.0) or 0.0) for r in rows]
+    memory_prefetch_ms_vals = [float(r.get("memory_prefetch_ms_avg_trace", 0.0) or 0.0) for r in rows]
 
     tool_calls_total = _sum_key(rows, "tool_call_count")
     tool_success_total = _sum_key(rows, "tool_success_count")
@@ -136,6 +224,17 @@ def _metric_block(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         "fallback_rate": _mean(fallback_rate_vals),
         "resolved_mode_override_count": _mean(mode_override_vals),
         "session_store_hit_rate": _mean(session_store_hit_vals),
+        "taskgraph_step_status_coverage": _mean(taskgraph_coverage_vals),
+        "trace_contract_error_rate": _mean(trace_contract_vals),
+        "retrieval_missing_index_rate": _mean(retrieval_missing_index_vals),
+        "retrieval_skipped_rate": _mean(retrieval_skipped_vals),
+        "avg_history_tokens": _mean(history_tokens_vals),
+        "avg_rag_tokens": _mean(rag_tokens_vals),
+        "avg_memory_tokens": _mean(memory_tokens_vals),
+        "avg_final_context_tokens": _mean(final_context_vals),
+        "avg_input_context_tokens": _mean(input_context_vals),
+        "avg_context_pressure_ratio": _mean(context_pressure_vals),
+        "avg_memory_prefetch_ms": _mean(memory_prefetch_ms_vals),
     }
 
 
@@ -174,6 +273,17 @@ def _write_summary_markdown(path: Path, profile: str, summary: Dict[str, Any]) -
         "fallback_rate",
         "resolved_mode_override_count",
         "session_store_hit_rate",
+        "taskgraph_step_status_coverage",
+        "trace_contract_error_rate",
+        "retrieval_missing_index_rate",
+        "retrieval_skipped_rate",
+        "avg_history_tokens",
+        "avg_rag_tokens",
+        "avg_memory_tokens",
+        "avg_final_context_tokens",
+        "avg_input_context_tokens",
+        "avg_context_pressure_ratio",
+        "avg_memory_prefetch_ms",
     ]
     for key in keys:
         lines.append(f"| `{key}` | {fmt(summary.get(key, 0.0))} |")
@@ -224,6 +334,8 @@ def _run_case_once(
 
     text_parts: List[str] = []
     citations: List[Dict[str, Any]] = []
+    latest_tool_calls: List[Dict[str, Any]] = []
+    context_budget_payloads: List[Dict[str, Any]] = []
     first_token_latency_ms: float = 0.0
     case_error = None
     t0 = perf_counter()
@@ -245,6 +357,12 @@ def _run_case_once(
                     maybe_citations = chunk.get("__citations__")
                     if isinstance(maybe_citations, list):
                         citations = maybe_citations
+                    maybe_tool_calls = chunk.get("__tool_calls__")
+                    if isinstance(maybe_tool_calls, list):
+                        latest_tool_calls = maybe_tool_calls
+                    maybe_budget = chunk.get("__context_budget__")
+                    if isinstance(maybe_budget, dict):
+                        context_budget_payloads.append(dict(maybe_budget))
 
             events = list(trace.events)
     except Exception as ex:
@@ -265,6 +383,11 @@ def _run_case_once(
     mode_override_events = [e for e in events if e.get("type") == "mode_override"]
     taskgraph_events = [e for e in events if e.get("type") == "taskgraph_compiled"]
     session_store_events = [e for e in events if e.get("type") == "session_store_lookup"]
+    retrieval_missing_index_events = [e for e in events if e.get("type") == "retrieval_missing_index"]
+    retrieval_skipped_events = [e for e in events if e.get("type") == "retrieval_skipped"]
+    memory_prefetch_events = [e for e in events if e.get("type") == "memory_prefetch"]
+    trace_contract_events = [e for e in events if e.get("type") == "trace_contract_error"]
+    budget_trace_events = [e for e in events if e.get("type") == "context_budget"]
 
     llm_ms_values = [float(e["llm_ms"]) for e in llm_events if isinstance(e.get("llm_ms"), (int, float))]
     retrieval_ms_values = [
@@ -310,6 +433,25 @@ def _run_case_once(
     taskgraph_route = ""
     if taskgraph_events:
         taskgraph_route = str(taskgraph_events[-1].get("route", "") or "")
+    session_state_payload = _extract_internal_meta_payload(latest_tool_calls, "session_state")
+    if not context_budget_payloads:
+        context_budget_payloads = [dict(e) for e in budget_trace_events if isinstance(e, dict)]
+    context_metrics = _context_metrics(context_budget_payloads)
+    taskgraph_step_status_coverage_case = _taskgraph_status_coverage(session_state_payload)
+    trace_contract = _trace_contract(
+        case=case,
+        citations=citations,
+        retrieval_events=retrieval_events,
+        retrieval_missing_index_events=retrieval_missing_index_events,
+        retrieval_skipped_events=retrieval_skipped_events,
+    )
+    if trace_contract["trace_contract_error"]:
+        trace_contract_events = trace_contract_events + [
+            {
+                "type": "trace_contract_error",
+                "reason": trace_contract["trace_contract_reason"],
+            }
+        ]
     session_store_hit_rate_case = (
         float(sum(1 for e in session_store_events if bool(e.get("hit")))) / float(len(session_store_events))
         if session_store_events
@@ -341,6 +483,7 @@ def _run_case_once(
         "first_token_latency_ms": float(first_token_latency_ms),
         "e2e_latency_ms": float(e2e_latency_ms),
         "response_chars": response_chars,
+        "response_text": response_text,
         "citations": citations,
         "case_error": case_error,
         "llm_call_count": len(llm_events),
@@ -354,20 +497,29 @@ def _run_case_once(
         "retrieval_call_count": len(retrieval_events),
         "retrieval_ms_avg_trace": _mean(retrieval_ms_values),
         "retrieval_ms_values": retrieval_ms_values,
+        "retrieval_missing_index": bool(retrieval_missing_index_events),
+        "retrieval_skipped": bool(retrieval_skipped_events),
         "tool_call_count": len(tool_events),
         "tool_success_count": tool_success_count,
         "tool_elapsed_ms_avg_trace": _mean(tool_ms_values),
+        "memory_prefetch_call_count": len(memory_prefetch_events),
+        "memory_prefetch_ms_avg_trace": _mean_event_value(memory_prefetch_events, "memory_prefetch_ms"),
         "tool_dedup_event_count": dedup_total_count,
         "tool_dedup_hit_count": dedup_hit_count,
         "duplicate_tool_call_rate_case": duplicate_tool_call_rate_case,
         "fallback_rate_case": fallback_rate_case,
         "resolved_mode_override_count": resolved_mode_override_count,
         "taskgraph_route": taskgraph_route,
+        "taskgraph_step_status_coverage_case": taskgraph_step_status_coverage_case,
         "session_store_hit_rate_case": session_store_hit_rate_case,
         "regen_final": regen_final,
         "final_output_source": final_output_source,
         "replan_triggered": replan_triggered,
         "trace_status": "error" if case_error else "ok",
+        "trace_contract_required": bool(trace_contract["trace_contract_required"]),
+        "trace_contract_error": bool(trace_contract["trace_contract_error"]),
+        "trace_contract_reason": str(trace_contract["trace_contract_reason"]),
+        "trace_contract_event_count": len(trace_contract_events),
         "rag_hit": rag_hit,
         "rag_top1": rag_top1,
         "rag_precision": rag_precision,
@@ -375,6 +527,15 @@ def _run_case_once(
         "profile": profile,
         "repeat": repeat,
     }
+    row.update(context_metrics)
+    expected_route = str(case.get("expected_route", "") or "").strip()
+    if expected_route:
+        row["expected_route"] = expected_route
+        row["expected_route_match_case"] = float(expected_route == taskgraph_route)
+    latency_budget = case.get("latency_budget_ms")
+    if isinstance(latency_budget, (int, float)):
+        row["latency_budget_ms"] = float(latency_budget)
+        row["latency_budget_met_case"] = 1.0 if e2e_latency_ms <= float(latency_budget) else 0.0
     return row
 
 

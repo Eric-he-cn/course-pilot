@@ -230,6 +230,20 @@
 - checkpoint 断点续跑（按 `case_id#repeat` 去重）。
 - 输出 `raw/summary/md/checkpoint`。
 - v3 指标补充：`fallback_rate`、`resolved_mode_override_count`、`taskgraph_route`、`session_store_hit_rate`。
+- v3 上下文指标补充：`avg_history_tokens`、`avg_rag_tokens`、`avg_memory_tokens`、`avg_final_context_tokens`、`avg_input_context_tokens`、`avg_context_pressure_ratio`。
+- v3 trace contract：当 `requires_citations/need_rag=true` 且 stream 最终有 citations 时，若缺少 `retrieval / retrieval_missing_index / retrieval_skipped` 事件，会标记 `trace_contract_error=true`。
+
+补充脚本：
+- `python scripts/eval/dataset_lint.py --path benchmarks`
+- `python scripts/eval/judge_runner.py --raw data/perf_runs/<profile>/baseline_raw.jsonl --cases benchmarks/core_e2e.jsonl`
+- `python scripts/eval/review_runner.py --benchmark-summary ... --benchmark-raw ... --judge-summary ... --judge-raw ...`
+
+Judge 独立配置：
+- `EVAL_JUDGE_API_KEY`
+- `EVAL_JUDGE_BASE_URL`
+- `EVAL_JUDGE_MODEL`
+- `EVAL_JUDGE_TIMEOUT_MS`
+- `EVAL_JUDGE_TEMPERATURE`
 
 ---
 

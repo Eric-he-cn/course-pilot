@@ -33,7 +33,15 @@ class TutorAgent(BaseAgent):
         rag_context = str(kwargs.get("rag_context", "") or "")
         history_context = str(kwargs.get("history_context", "") or "")
         memory_context = str(kwargs.get("memory_context", "") or session_state.selected_memory or "")
-        merged_context = str(kwargs.get("context", "") or kwargs.get("merged_context", "") or "")
+        merged_context = "\n\n".join(
+            part
+            for part in [
+                f"【教材证据】\n{rag_context}" if rag_context else "",
+                f"【历史摘要】\n{history_context}" if history_context else "",
+                f"【长期记忆】\n{memory_context}" if memory_context else "",
+            ]
+            if part
+        ).strip() or str(kwargs.get("context", "") or kwargs.get("merged_context", "") or "")
         return AgentContextV1(
             session_snapshot=session_state,
             history_context=history_context,
@@ -41,8 +49,14 @@ class TutorAgent(BaseAgent):
             memory_context=memory_context,
             merged_context=merged_context,
             citations=list(kwargs.get("citations", []) or []),
-            constraints={"agent": "tutor"},
-            tool_scope={"allowed_tools": list(kwargs.get("allowed_tools", []) or [])},
+            constraints={
+                "agent": "tutor",
+                **dict(kwargs.get("constraints", {}) or {}),
+            },
+            tool_scope={
+                "allowed_tools": list(kwargs.get("allowed_tools", []) or []),
+                **dict(kwargs.get("tool_scope", {}) or {}),
+            },
         )
 
     @staticmethod

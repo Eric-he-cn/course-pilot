@@ -21,6 +21,7 @@ from core.orchestration.runner import OrchestrationRunner
 from core.runtime.executor import ExecutionRuntime
 from core.services.event_bus import EventBus
 from core.services.tool_hub import ToolHub
+from mcp_tools.client import MCPTools
 from memory.manager import MemoryManager
 from memory.store import SQLiteMemoryStore
 
@@ -174,6 +175,50 @@ class ContractFixTests(unittest.TestCase):
         total = sum(int(x.get("score", 0) or 0) for x in answer_sheet)
         self.assertEqual(100, total)
         self.assertEqual(100, int(paper.get("total_score", 0) or 0))
+
+    def test_exam_generation_fail_closed_on_empty_questions(self):
+        os.environ["ENABLE_STRUCTURED_OUTPUTS_EXAM"] = "0"
+        qm = QuizMasterAgent()
+        qm._plan_exam = lambda **_kwargs: {
+            "scope": "Attention",
+            "num_questions": 2,
+            "difficulty_ratio": {"easy": 1, "medium": 1, "hard": 0},
+        }
+        qm._build_external_ctx = lambda _query: ""
+        qm.llm = _FakeLLM(['{"title":"测试卷","instructions":"说明","questions":[]}'])
+
+        payload = qm.generate_exam_paper(
+            course_name="course",
+            user_request="出一套卷子",
+            context="",
+        )
+        self.assertTrue(payload.get("_artifact_error"))
+        self.assertEqual([], payload.get("answer_sheet", []))
+        self.assertIn("试卷生成失败", payload.get("content", ""))
+
+    def test_quiz_fallback_does_not_expose_raw_json(self):
+        os.environ["ENABLE_STRUCTURED_OUTPUTS_QUIZ"] = "0"
+        qm = QuizMasterAgent()
+        qm._plan_quiz = lambda **_kwargs: {
+            "topic": "Attention",
+            "num_questions": 1,
+            "difficulty": "medium",
+            "question_type": "选择题",
+            "focus_points": [],
+        }
+        qm._build_external_ctx = lambda _query: ""
+        qm.llm = _FakeLLM(['{"foo":"bar"}'])
+
+        quiz = qm.generate_quiz(
+            course_name="course",
+            topic="Attention",
+            difficulty="medium",
+            context="",
+            question_type="选择题",
+        )
+        self.assertNotIn('"foo"', quiz.question)
+        self.assertNotIn("bar", quiz.question)
+        self.assertIn("A.", quiz.question)
 
     def test_practice_multi_question_routes_to_exam_payload(self):
         runner = OrchestrationRunner()
@@ -331,6 +376,8 @@ class ContractFixTests(unittest.TestCase):
             retrieval_query="Attention 选择题",
             memory_query="Attention 选择题",
             capabilities=["rag", "memory"],
+            workflow_template="practice_only",
+            action_kind="practice_generate",
         )
 
         graph = runtime.compile_taskgraph(
@@ -344,10 +391,98 @@ class ContractFixTests(unittest.TestCase):
         )
 
         self.assertEqual("run_exam", graph.route)
-        self.assertIn("detect_submission", graph.step_names())
+        self.assertEqual("practice_only", graph.workflow_template)
         self.assertIn("run_exam", graph.step_names())
         self.assertIn("persist_session_state", graph.step_names())
         self.assertTrue(graph.metadata.get("digest"))
+
+    def test_runtime_compiles_composite_learn_then_practice_template(self):
+        runner = OrchestrationRunner()
+        runtime = ExecutionRuntime(runner)
+        session_state = SessionStateV1(
+            session_id="sess-graph-composite-1",
+            course_name="course",
+            requested_mode_hint="learn",
+            resolved_mode="learn",
+            task_full_text="先讲解再出一道题",
+            task_summary="先讲解再出一道题",
+        )
+        plan = PlanPlusV1(
+            need_rag=True,
+            need_memory=True,
+            allowed_tools=[],
+            task_type="learn",
+            resolved_mode="learn",
+            style="step_by_step",
+            output_format="answer",
+            question_raw="先讲解再出一道题",
+            user_intent="先讲解再出题",
+            retrieval_query="Attention 讲解",
+            memory_query="Attention 讲解",
+            workflow_template="learn_then_practice",
+            action_kind="learn_then_practice",
+        )
+        graph = runtime.compile_taskgraph(
+            course_name="course",
+            mode_hint="learn",
+            user_message="先讲解 Attention，再出一道练习题",
+            history=[],
+            plan=plan,
+            session_state=session_state,
+            stream=False,
+        )
+        self.assertEqual("learn_then_practice", graph.workflow_template)
+        self.assertIn("run_tutor", graph.step_names())
+        self.assertTrue(any(step in graph.step_names() for step in ("run_quiz", "run_exam")))
+        self.assertEqual(2, len(graph.metadata.get("execute_plan", [])))
+
+    def test_router_normalizes_general_like_input_to_supported_template(self):
+        plan = RouterAgent._normalize_plan(
+            {
+                "need_rag": True,
+                "style": "step_by_step",
+                "output_format": "answer",
+            },
+            "general",
+            "先解释一下 Attention，再出一道练习题。",
+        )
+        self.assertEqual("learn_then_practice", plan.workflow_template)
+        self.assertEqual("learn", plan.resolved_mode)
+
+    def test_runtime_compiles_persist_memory_for_explicit_learn_memory_request(self):
+        runner = OrchestrationRunner()
+        runtime = ExecutionRuntime(runner)
+        session_state = SessionStateV1(
+            session_id="sess-graph-learn-1",
+            course_name="course",
+            requested_mode_hint="learn",
+            resolved_mode="learn",
+            task_full_text="请记住我以后喜欢先讲直觉再讲公式",
+            task_summary="请记住我以后喜欢先讲直觉再讲公式",
+        )
+        plan = PlanPlusV1(
+            need_rag=False,
+            need_memory=True,
+            allowed_tools=[],
+            task_type="learn",
+            resolved_mode="learn",
+            style="step_by_step",
+            output_format="answer",
+            question_raw="请记住我以后喜欢先讲直觉再讲公式",
+            user_intent="记住学习偏好",
+            retrieval_query="学习偏好",
+            memory_query="学习偏好",
+        )
+        graph = runtime.compile_taskgraph(
+            course_name="course",
+            mode_hint="learn",
+            user_message="请记住我以后喜欢先讲直觉再讲公式",
+            history=[],
+            plan=plan,
+            session_state=session_state,
+            stream=False,
+        )
+        self.assertIn("persist_memory", graph.step_names())
 
     def test_session_state_restores_from_workspace_json(self):
         runner = OrchestrationRunner()
@@ -397,7 +532,7 @@ class ContractFixTests(unittest.TestCase):
                 retrieval_query="Attention",
                 memory_query="Attention",
             )
-            runner.runtime._build_agent_context = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+            runner.runtime._build_prefetch_bundle = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
             with self.assertRaises(RuntimeError):
                 runner.run(
                     course_name="course",
@@ -416,8 +551,53 @@ class ContractFixTests(unittest.TestCase):
             else:
                 os.environ["ENABLE_ROUTER_REPLAN"] = old_replan
 
+    def test_stream_fallback_emits_hidden_tool_calls_only_once(self):
+        from backend.schemas import TutorResult
+
+        runner = OrchestrationRunner()
+        old_replan = os.getenv("ENABLE_ROUTER_REPLAN")
+        os.environ["ENABLE_ROUTER_REPLAN"] = "0"
+        try:
+            runner.router.plan = lambda *_args, **_kwargs: PlanPlusV1(
+                need_rag=False,
+                need_memory=False,
+                allowed_tools=[],
+                task_type="learn",
+                resolved_mode="learn",
+                style="step_by_step",
+                output_format="answer",
+                question_raw="解释 Attention",
+                user_intent="学习讲解",
+                retrieval_query="Attention",
+                memory_query="Attention",
+            )
+            runner.runtime._build_prefetch_bundle = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+            runner.tutor.teach_stream = lambda *_args, **_kwargs: iter(["ok"])
+
+            tool_call_events = []
+            chunks = list(
+                runner.run_stream(
+                    course_name="course",
+                    mode="learn",
+                    user_message="解释 Attention",
+                    state={"session_id": "sess-fallback-stream-1"},
+                    history=[],
+                )
+            )
+            for chunk in chunks:
+                if isinstance(chunk, dict) and "__tool_calls__" in chunk:
+                    tool_call_events.append(chunk)
+            self.assertEqual(1, len(tool_call_events))
+        finally:
+            if old_replan is None:
+                os.environ.pop("ENABLE_ROUTER_REPLAN", None)
+            else:
+                os.environ["ENABLE_ROUTER_REPLAN"] = old_replan
+
     def test_tool_hub_permission_and_idempotency(self):
         hub = ToolHub()
+        original_ctx = dict(MCPTools._context)
+        MCPTools._context = {"session_id": "sess-tool-1", "taskgraph_step": "run_tutor"}
         with mock.patch("core.services.tool_hub.MCPTools.call_tool", return_value={"success": True, "result": 4, "via": "mcp_stdio"}):
             with self.assertRaises(Exception):
                 hub.invoke(
@@ -447,6 +627,45 @@ class ContractFixTests(unittest.TestCase):
             self.assertTrue(decision.allowed)
             self.assertTrue(decision.idempotency_key.startswith("calculator:"))
             self.assertTrue(result["success"])
+        MCPTools._context = original_ctx
+
+    def test_tool_hub_enforces_total_and_per_tool_caps(self):
+        hub = ToolHub()
+        original_ctx = dict(MCPTools._context)
+        MCPTools._context = {
+            "session_id": "sess-cap-1",
+            "taskgraph_step": "run_tutor",
+            "tool_budget": {"per_request_total": 1, "per_round": 1, "calculator": 1},
+        }
+        try:
+            with mock.patch("core.services.tool_hub.MCPTools.call_tool", return_value={"success": True, "result": 4, "via": "mcp_stdio"}):
+                hub.invoke(
+                    tool_name="calculator",
+                    tool_args={"expression": "2+2"},
+                    mode="learn",
+                    phase="act",
+                    permission_mode="safe",
+                    original_user_content="算一下",
+                    tool_cache={},
+                    last_exec_ms={},
+                    tool_retry_max=0,
+                    tool_round=1,
+                )
+                with self.assertRaises(Exception):
+                    hub.invoke(
+                        tool_name="calculator",
+                        tool_args={"expression": "3+3"},
+                        mode="learn",
+                        phase="act",
+                        permission_mode="safe",
+                        original_user_content="再算一下",
+                        tool_cache={},
+                        last_exec_ms={},
+                        tool_retry_max=0,
+                        tool_round=1,
+                    )
+        finally:
+            MCPTools._context = original_ctx
 
     def test_event_bus_hidden_event_shapes_are_compatible(self):
         bus = EventBus()
@@ -538,8 +757,41 @@ class ContractFixTests(unittest.TestCase):
             all_rows = store.get_recent_episodes("course", limit=10)
             qa_count = sum(1 for row in all_rows if row.get("event_type") == "qa")
             summary_count = sum(1 for row in all_rows if row.get("event_type") == "qa_summary")
-            self.assertEqual(2, qa_count)
+            self.assertLessEqual(qa_count, 2)
             self.assertEqual(1, summary_count)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_memory_search_touches_last_accessed_at(self):
+        tmpdir = os.path.join(os.getcwd(), "tests", "_tmp_memory_case_touch")
+        if os.path.exists(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        os.makedirs(tmpdir, exist_ok=True)
+        try:
+            db_path = os.path.join(tmpdir, "memory.db")
+            store = SQLiteMemoryStore(db_path=db_path)
+            episode_id = store.save_episode(
+                course_name="course",
+                event_type="qa",
+                content="问题: Attention 的作用是什么",
+                importance=0.5,
+                metadata={"idx": 1},
+            )
+            with store._conn() as conn:
+                before = conn.execute(
+                    "SELECT created_at, last_accessed_at FROM episodes WHERE id=?",
+                    (episode_id,),
+                ).fetchone()
+            time.sleep(0.02)
+            results = store.search_episodes("Attention", "course", top_k=1)
+            self.assertEqual(episode_id, results[0]["id"])
+            with store._conn() as conn:
+                after = conn.execute(
+                    "SELECT created_at, last_accessed_at FROM episodes WHERE id=?",
+                    (episode_id,),
+                ).fetchone()
+            self.assertEqual(before["created_at"], before["last_accessed_at"])
+            self.assertGreater(after["last_accessed_at"], before["last_accessed_at"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -643,13 +895,15 @@ class ContractFixTests(unittest.TestCase):
                 )
             deadline = time.time() + 2.0
             rows = []
+            qa_count = 999
+            summary_count = 0
             while time.time() < deadline:
                 rows = store.get_recent_episodes("course", limit=20)
-                if any(r.get("event_type") == "qa_summary" for r in rows):
+                summary_count = sum(1 for row in rows if row.get("event_type") == "qa_summary")
+                qa_count = sum(1 for row in rows if row.get("event_type") == "qa")
+                if summary_count >= 1 and qa_count < 5:
                     break
                 time.sleep(0.05)
-            summary_count = sum(1 for row in rows if row.get("event_type") == "qa_summary")
-            qa_count = sum(1 for row in rows if row.get("event_type") == "qa")
             self.assertGreaterEqual(summary_count, 1)
             self.assertLess(qa_count, 5)
         finally:

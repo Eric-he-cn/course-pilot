@@ -16,8 +16,11 @@ from core.metrics import get_active_trace
 
 from backend.schemas import (
     AgentContextV1,
+    ArtifactQuestionV1,
     Plan,
     PlanPlusV1,
+    PracticeArtifactV1,
+    ExamArtifactV1,
     SessionStateV1,
     ChatMessage,
     RetrievedChunk,
@@ -449,6 +452,73 @@ class OrchestrationRunner:
         legacy_history_summary_state = self._extract_history_summary_state(history or [])
         legacy_last_quiz = self._extract_internal_meta(history or [], "quiz_meta")
         legacy_last_exam = self._extract_internal_meta(history or [], "exam_meta")
+        active_practice = None
+        active_exam = None
+        if isinstance(legacy_last_quiz, dict):
+            active_practice = {
+                "kind": "practice",
+                "title": "练习题",
+                "instructions": "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。",
+                "questions": [
+                    {
+                        "id": 1,
+                        "type": "综合题",
+                        "question": str(legacy_last_quiz.get("question", "") or ""),
+                        "options": [],
+                        "score": 100,
+                        "standard_answer": str(legacy_last_quiz.get("standard_answer", "") or ""),
+                        "rubric": str(legacy_last_quiz.get("rubric", "") or ""),
+                        "chapter": str(legacy_last_quiz.get("chapter", "") or ""),
+                        "concept": str(legacy_last_quiz.get("concept", "") or ""),
+                        "difficulty": str(legacy_last_quiz.get("difficulty", "") or "medium"),
+                    }
+                ],
+                "total_score": 100,
+            }
+        if isinstance(legacy_last_exam, dict):
+            active_exam = {
+                "kind": "exam",
+                "title": "模拟考试试卷",
+                "instructions": "请将各题答案统一整理后一次性提交。",
+                "questions": list(legacy_last_exam.get("answer_sheet", []) or []),
+                "total_score": int(legacy_last_exam.get("total_score", 0) or 0),
+                "content": "",
+            }
+        if active_practice is None and mode_hint == "practice":
+            inferred_practice = self._extract_quiz_from_history(history or [])
+            if inferred_practice and not inferred_practice.startswith("（未能"):
+                active_practice = {
+                    "kind": "practice",
+                    "title": "练习题",
+                    "instructions": "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。",
+                    "questions": [
+                        {
+                            "id": 1,
+                            "type": "综合题",
+                            "question": inferred_practice,
+                            "options": [],
+                            "score": 100,
+                            "standard_answer": "",
+                            "rubric": "",
+                            "chapter": "",
+                            "concept": "",
+                            "difficulty": "medium",
+                        }
+                    ],
+                    "total_score": 100,
+                    "content": inferred_practice,
+                }
+        if active_exam is None and mode_hint == "exam":
+            inferred_exam = self._extract_exam_from_history(history or [])
+            if inferred_exam and not inferred_exam.startswith("（未能"):
+                active_exam = {
+                    "kind": "exam",
+                    "title": "模拟考试试卷",
+                    "instructions": "请将各题答案统一整理后一次性提交。",
+                    "questions": [],
+                    "total_score": 0,
+                    "content": inferred_exam,
+                }
         return SessionStateV1(
             session_id=session_id or uuid.uuid4().hex,
             course_name=course_name,
@@ -465,6 +535,8 @@ class OrchestrationRunner:
             history_summary_state=legacy_history_summary_state,
             last_quiz=legacy_last_quiz,
             last_exam=legacy_last_exam,
+            active_practice=active_practice,
+            active_exam=active_exam,
         )
 
     @staticmethod
@@ -507,6 +579,8 @@ class OrchestrationRunner:
             "runtime_route": str(taskgraph_step or "").strip(),
             "strict_new_runtime": os.getenv("STRICT_NEW_RUNTIME", "0") == "1",
             "tool_audit": [],
+            "tool_budget": dict(session_state.metadata.get("tool_budget", {}) or {}),
+            "workflow_template": str(session_state.metadata.get("workflow_template", "") or ""),
         }
 
     @staticmethod
@@ -906,11 +980,14 @@ class OrchestrationRunner:
         tool_calls = None
 
         if answer_submission:
-            has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
+            active_practice = session_state.active_practice
+            has_exam_meta = bool(active_practice and len(list(active_practice.get("questions", []) or [])) > 1)
+            if not has_exam_meta:
+                has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
             chunks = []
             if has_exam_meta:
                 self.logger.info("[route] practice answer_submission=1 target=grader_exam%s", self._trace_tag())
-                exam_paper = self._extract_exam_from_history(history)
+                exam_paper = self._practice_content_from_artifact(active_practice) or self._extract_exam_from_history(history)
                 for chunk in self.grader.grade_exam_stream(
                     exam_paper=exam_paper,
                     student_answer=user_message,
@@ -921,7 +998,7 @@ class OrchestrationRunner:
                         chunks.append(chunk)
             else:
                 self.logger.info("[route] practice answer_submission=1 target=grader%s", self._trace_tag())
-                quiz_content = self._extract_quiz_from_history(history)
+                quiz_content = self._practice_content_from_artifact(active_practice) or self._extract_quiz_from_history(history)
                 for chunk in self.grader.grade_practice_stream(
                     quiz_content=quiz_content,
                     student_answer=user_message,
@@ -959,6 +1036,15 @@ class OrchestrationRunner:
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
                 tool_audit_refs=self._extract_tool_audit_refs(),
+                latest_submission={
+                    "artifact_kind": "practice",
+                    "source_message": user_message,
+                    "session_id": session_state.session_id,
+                },
+                latest_grading={
+                    "artifact_kind": "practice",
+                    "report_text": response_text,
+                },
             )
             self._runtime_update_state_ref(state, session_state)
             tool_calls = None
@@ -985,26 +1071,45 @@ class OrchestrationRunner:
                 if not isinstance(exam_payload, dict):
                     exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
                 response_text = str(exam_payload.get("content", "")).strip()
-                if response_text.startswith("# "):
-                    response_text = response_text.replace("模拟考试试卷", "练习题（多题）", 1)
-                session_state = self._update_session_state(
-                    session_state,
-                    last_exam={
-                        "answer_sheet": exam_payload.get("answer_sheet", []),
-                        "total_score": int(exam_payload.get("total_score", 0)),
-                        "content": response_text,
-                    },
-                    current_stage="practice_generated",
-                    current_step_index=3,
-                    selected_memory=context_sections.get("memory_context", ""),
-                    history_summary_state=history_summary_state,
-                    tool_audit_refs=self._extract_tool_audit_refs(),
-                )
-                self._runtime_update_state_ref(state, session_state)
-                tool_calls = self._build_exam_meta_tool_call(
-                    exam_payload.get("answer_sheet", []),
-                    int(exam_payload.get("total_score", 0)),
-                )
+                if exam_payload.get("_artifact_error"):
+                    session_state = self._update_session_state(
+                        session_state,
+                        active_practice=None,
+                        current_stage="practice_generation_failed",
+                        current_step_index=3,
+                        selected_memory=context_sections.get("memory_context", ""),
+                        history_summary_state=history_summary_state,
+                        tool_audit_refs=self._extract_tool_audit_refs(),
+                    )
+                    self._runtime_update_state_ref(state, session_state)
+                    tool_calls = None
+                else:
+                    if response_text.startswith("# "):
+                        response_text = response_text.replace("模拟考试试卷", "练习题（多题）", 1)
+                    practice_artifact = self._practice_artifact_from_exam_payload(
+                        exam_payload,
+                        topic=topic,
+                        question_type=question_type,
+                    )
+                    session_state = self._update_session_state(
+                        session_state,
+                        last_exam={
+                            "answer_sheet": exam_payload.get("answer_sheet", []),
+                            "total_score": int(exam_payload.get("total_score", 0)),
+                            "content": response_text,
+                        },
+                        active_practice=practice_artifact.model_dump(),
+                        current_stage="practice_generated",
+                        current_step_index=3,
+                        selected_memory=context_sections.get("memory_context", ""),
+                        history_summary_state=history_summary_state,
+                        tool_audit_refs=self._extract_tool_audit_refs(),
+                    )
+                    self._runtime_update_state_ref(state, session_state)
+                    tool_calls = self._build_exam_meta_tool_call(
+                        exam_payload.get("answer_sheet", []),
+                        int(exam_payload.get("total_score", 0)),
+                    )
             else:
                 quiz = self.quizmaster.generate_quiz(
                     course_name=course_name,
@@ -1020,9 +1125,15 @@ class OrchestrationRunner:
                     question_type=question_type,
                 )
                 response_text = self._render_quiz_message(quiz)
+                practice_artifact = self._practice_artifact_from_quiz(
+                    quiz,
+                    topic=topic,
+                    question_type=question_type,
+                )
                 session_state = self._update_session_state(
                     session_state,
                     last_quiz=quiz.model_dump(),
+                    active_practice=practice_artifact.model_dump(),
                     current_stage="practice_generated",
                     current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
@@ -1171,10 +1282,13 @@ class OrchestrationRunner:
         if answer_submission:
             yield self.event_bus.status("正在批改练习答案...")
             collected = []
-            has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
+            active_practice = session_state.active_practice
+            has_exam_meta = bool(active_practice and len(list(active_practice.get("questions", []) or [])) > 1)
+            if not has_exam_meta:
+                has_exam_meta = bool(self._extract_internal_meta(history, "exam_meta"))
             if has_exam_meta:
                 self.logger.info("[route] practice_stream answer_submission=1 target=grader_exam%s", self._trace_tag())
-                exam_paper = self._extract_exam_from_history(history)
+                exam_paper = self._practice_content_from_artifact(active_practice) or self._extract_exam_from_history(history)
                 for chunk in self.grader.grade_exam_stream(
                     exam_paper=exam_paper,
                     student_answer=user_message,
@@ -1186,7 +1300,7 @@ class OrchestrationRunner:
                     yield chunk
             else:
                 self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
-                quiz_content = self._extract_quiz_from_history(history)
+                quiz_content = self._practice_content_from_artifact(active_practice) or self._extract_quiz_from_history(history)
                 for chunk in self.grader.grade_practice_stream(
                     quiz_content=quiz_content,
                     student_answer=user_message,
@@ -1225,6 +1339,15 @@ class OrchestrationRunner:
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
                 tool_audit_refs=self._extract_tool_audit_refs(),
+                latest_submission={
+                    "artifact_kind": "practice",
+                    "source_message": user_message,
+                    "session_id": session_state.session_id,
+                },
+                latest_grading={
+                    "artifact_kind": "practice",
+                    "report_text": full_response,
+                },
             )
             self._runtime_update_state_ref(state, session_state)
             if not runtime_managed:
@@ -1257,40 +1380,65 @@ class OrchestrationRunner:
                 )
                 if not isinstance(exam_payload, dict):
                     exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
-                session_state = self._update_session_state(
-                    session_state,
-                    last_exam={
-                        "answer_sheet": exam_payload.get("answer_sheet", []),
-                        "total_score": int(exam_payload.get("total_score", 0)),
-                        "content": str(exam_payload.get("content", "")).strip(),
-                    },
-                    current_stage="practice_generated",
-                    current_step_index=3,
-                    selected_memory=context_sections.get("memory_context", ""),
-                    history_summary_state=history_summary_state,
-                    tool_audit_refs=self._extract_tool_audit_refs(),
-                )
-                self._runtime_update_state_ref(state, session_state)
-                if not runtime_managed:
-                    self._persist_session_state(session_state)
-                    yield self.event_bus.tool_calls(
-                        self._final_internal_tool_calls(
-                            session_state=session_state,
-                            history_summary_state=history_summary_state,
-                            extra_tool_calls=self._build_exam_meta_tool_call(
-                                exam_payload.get("answer_sheet", []),
-                                int(exam_payload.get("total_score", 0)),
-                            ),
-                        )
-                    )
-                else:
-                    self._runtime_effects(state)["final_tool_calls"] = self._build_exam_meta_tool_call(
-                        exam_payload.get("answer_sheet", []),
-                        int(exam_payload.get("total_score", 0)),
-                    )
                 content = str(exam_payload.get("content", "")).strip()
-                if content.startswith("# "):
-                    content = content.replace("模拟考试试卷", "练习题（多题）", 1)
+                if exam_payload.get("_artifact_error"):
+                    session_state = self._update_session_state(
+                        session_state,
+                        active_practice=None,
+                        current_stage="practice_generation_failed",
+                        current_step_index=3,
+                        selected_memory=context_sections.get("memory_context", ""),
+                        history_summary_state=history_summary_state,
+                        tool_audit_refs=self._extract_tool_audit_refs(),
+                    )
+                    self._runtime_update_state_ref(state, session_state)
+                    if not runtime_managed:
+                        self._persist_session_state(session_state)
+                        yield self.event_bus.tool_calls(
+                            self._final_internal_tool_calls(
+                                session_state=session_state,
+                                history_summary_state=history_summary_state,
+                            )
+                        )
+                else:
+                    session_state = self._update_session_state(
+                        session_state,
+                        last_exam={
+                            "answer_sheet": exam_payload.get("answer_sheet", []),
+                            "total_score": int(exam_payload.get("total_score", 0)),
+                            "content": content,
+                        },
+                        active_practice=self._practice_artifact_from_exam_payload(
+                            exam_payload,
+                            topic=topic,
+                            question_type=question_type,
+                        ).model_dump(),
+                        current_stage="practice_generated",
+                        current_step_index=3,
+                        selected_memory=context_sections.get("memory_context", ""),
+                        history_summary_state=history_summary_state,
+                        tool_audit_refs=self._extract_tool_audit_refs(),
+                    )
+                    self._runtime_update_state_ref(state, session_state)
+                    if not runtime_managed:
+                        self._persist_session_state(session_state)
+                        yield self.event_bus.tool_calls(
+                            self._final_internal_tool_calls(
+                                session_state=session_state,
+                                history_summary_state=history_summary_state,
+                                extra_tool_calls=self._build_exam_meta_tool_call(
+                                    exam_payload.get("answer_sheet", []),
+                                    int(exam_payload.get("total_score", 0)),
+                                ),
+                            )
+                        )
+                    else:
+                        self._runtime_effects(state)["final_tool_calls"] = self._build_exam_meta_tool_call(
+                            exam_payload.get("answer_sheet", []),
+                            int(exam_payload.get("total_score", 0)),
+                        )
+                    if content.startswith("# "):
+                        content = content.replace("模拟考试试卷", "练习题（多题）", 1)
                 yield content
             else:
                 quiz = self.quizmaster.generate_quiz(
@@ -1309,6 +1457,11 @@ class OrchestrationRunner:
                 session_state = self._update_session_state(
                     session_state,
                     last_quiz=quiz.model_dump(),
+                    active_practice=self._practice_artifact_from_quiz(
+                        quiz,
+                        topic=topic,
+                        question_type=question_type,
+                    ).model_dump(),
                     current_stage="practice_generated",
                     current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
@@ -1438,7 +1591,7 @@ class OrchestrationRunner:
         )
         tool_calls = None
         if answer_submission:
-            exam_paper = self._extract_exam_from_history(history)
+            exam_paper = self._exam_content_from_artifact(session_state.active_exam) or self._extract_exam_from_history(history)
             chunks = []
             for chunk in self.grader.grade_exam_stream(
                 exam_paper=exam_paper,
@@ -1475,6 +1628,15 @@ class OrchestrationRunner:
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
                 tool_audit_refs=self._extract_tool_audit_refs(),
+                latest_submission={
+                    "artifact_kind": "exam",
+                    "source_message": user_message,
+                    "session_id": session_state.session_id,
+                },
+                latest_grading={
+                    "artifact_kind": "exam",
+                    "report_text": response_text,
+                },
             )
             self._runtime_update_state_ref(state, session_state)
             tool_calls = None
@@ -1493,28 +1655,42 @@ class OrchestrationRunner:
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
             response_text = str(exam_payload.get("content", "")).strip()
-            session_state = self._update_session_state(
-                session_state,
-                last_exam={
-                    "answer_sheet": exam_payload.get("answer_sheet", []),
-                    "total_score": int(exam_payload.get("total_score", 0)),
-                    "content": response_text,
-                },
-                current_stage="exam_generated",
-                current_step_index=3,
-                selected_memory=context_sections.get("memory_context", ""),
-                history_summary_state=history_summary_state,
-                tool_audit_refs=self._extract_tool_audit_refs(),
-            )
-            self._runtime_update_state_ref(state, session_state)
-            tool_calls = self._build_exam_meta_tool_call(
-                exam_payload.get("answer_sheet", []),
-                int(exam_payload.get("total_score", 0)),
-            )
-            tool_calls = self._merge_internal_tool_calls(
-                tool_calls,
-                self._build_history_summary_tool_call(history_summary_state),
-            )
+            if exam_payload.get("_artifact_error"):
+                session_state = self._update_session_state(
+                    session_state,
+                    active_exam=None,
+                    current_stage="exam_generation_failed",
+                    current_step_index=3,
+                    selected_memory=context_sections.get("memory_context", ""),
+                    history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
+                )
+                self._runtime_update_state_ref(state, session_state)
+                tool_calls = self._build_history_summary_tool_call(history_summary_state)
+            else:
+                session_state = self._update_session_state(
+                    session_state,
+                    last_exam={
+                        "answer_sheet": exam_payload.get("answer_sheet", []),
+                        "total_score": int(exam_payload.get("total_score", 0)),
+                        "content": response_text,
+                    },
+                    active_exam=self._exam_artifact_from_payload(exam_payload).model_dump(),
+                    current_stage="exam_generated",
+                    current_step_index=3,
+                    selected_memory=context_sections.get("memory_context", ""),
+                    history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
+                )
+                self._runtime_update_state_ref(state, session_state)
+                tool_calls = self._build_exam_meta_tool_call(
+                    exam_payload.get("answer_sheet", []),
+                    int(exam_payload.get("total_score", 0)),
+                )
+                tool_calls = self._merge_internal_tool_calls(
+                    tool_calls,
+                    self._build_history_summary_tool_call(history_summary_state),
+                )
 
         self._last_run_meta = {
             "mode": "exam",
@@ -1652,7 +1828,7 @@ class OrchestrationRunner:
         )
         if answer_submission:
             yield self.event_bus.status("正在批改考试答案...")
-            exam_paper = self._extract_exam_from_history(history)
+            exam_paper = self._exam_content_from_artifact(session_state.active_exam) or self._extract_exam_from_history(history)
             collected = []
             for chunk in self.grader.grade_exam_stream(
                 exam_paper=exam_paper,
@@ -1690,6 +1866,15 @@ class OrchestrationRunner:
                 selected_memory=context_sections.get("memory_context", ""),
                 history_summary_state=history_summary_state,
                 tool_audit_refs=self._extract_tool_audit_refs(),
+                latest_submission={
+                    "artifact_kind": "exam",
+                    "source_message": user_message,
+                    "session_id": session_state.session_id,
+                },
+                latest_grading={
+                    "artifact_kind": "exam",
+                    "report_text": full_response,
+                },
             )
             self._runtime_update_state_ref(state, session_state)
             if not runtime_managed:
@@ -1714,38 +1899,60 @@ class OrchestrationRunner:
             )
             if not isinstance(exam_payload, dict):
                 exam_payload = {"content": str(exam_payload), "answer_sheet": [], "total_score": 0}
-            session_state = self._update_session_state(
-                session_state,
-                last_exam={
-                    "answer_sheet": exam_payload.get("answer_sheet", []),
-                    "total_score": int(exam_payload.get("total_score", 0)),
-                    "content": str(exam_payload.get("content", "")).strip(),
-                },
-                current_stage="exam_generated",
-                current_step_index=3,
+            content = str(exam_payload.get("content", "")).strip()
+            if exam_payload.get("_artifact_error"):
+                session_state = self._update_session_state(
+                    session_state,
+                    active_exam=None,
+                    current_stage="exam_generation_failed",
+                    current_step_index=3,
                     selected_memory=context_sections.get("memory_context", ""),
                     history_summary_state=history_summary_state,
                     tool_audit_refs=self._extract_tool_audit_refs(),
                 )
-            self._runtime_update_state_ref(state, session_state)
-            if not runtime_managed:
-                self._persist_session_state(session_state)
-                yield self.event_bus.tool_calls(
-                    self._final_internal_tool_calls(
-                        session_state=session_state,
-                        history_summary_state=history_summary_state,
-                        extra_tool_calls=self._build_exam_meta_tool_call(
-                            exam_payload.get("answer_sheet", []),
-                            int(exam_payload.get("total_score", 0)),
-                        ),
+                self._runtime_update_state_ref(state, session_state)
+                if not runtime_managed:
+                    self._persist_session_state(session_state)
+                    yield self.event_bus.tool_calls(
+                        self._final_internal_tool_calls(
+                            session_state=session_state,
+                            history_summary_state=history_summary_state,
+                        )
                     )
-                )
             else:
-                self._runtime_effects(state)["final_tool_calls"] = self._build_exam_meta_tool_call(
-                    exam_payload.get("answer_sheet", []),
-                    int(exam_payload.get("total_score", 0)),
+                session_state = self._update_session_state(
+                    session_state,
+                    last_exam={
+                        "answer_sheet": exam_payload.get("answer_sheet", []),
+                        "total_score": int(exam_payload.get("total_score", 0)),
+                        "content": content,
+                    },
+                    active_exam=self._exam_artifact_from_payload(exam_payload).model_dump(),
+                    current_stage="exam_generated",
+                    current_step_index=3,
+                    selected_memory=context_sections.get("memory_context", ""),
+                    history_summary_state=history_summary_state,
+                    tool_audit_refs=self._extract_tool_audit_refs(),
                 )
-            yield str(exam_payload.get("content", "")).strip()
+                self._runtime_update_state_ref(state, session_state)
+                if not runtime_managed:
+                    self._persist_session_state(session_state)
+                    yield self.event_bus.tool_calls(
+                        self._final_internal_tool_calls(
+                            session_state=session_state,
+                            history_summary_state=history_summary_state,
+                            extra_tool_calls=self._build_exam_meta_tool_call(
+                                exam_payload.get("answer_sheet", []),
+                                int(exam_payload.get("total_score", 0)),
+                            ),
+                        )
+                    )
+                else:
+                    self._runtime_effects(state)["final_tool_calls"] = self._build_exam_meta_tool_call(
+                        exam_payload.get("answer_sheet", []),
+                        int(exam_payload.get("total_score", 0)),
+                    )
+            yield content
 
         self._last_run_meta = {
             "mode": "exam",
@@ -1923,6 +2130,145 @@ class OrchestrationRunner:
             f"{quiz.question}\n\n"
             "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。"
         )
+
+    @staticmethod
+    def _practice_artifact_from_quiz(
+        quiz: Quiz,
+        *,
+        topic: str = "",
+        question_type: str = "综合题",
+    ) -> PracticeArtifactV1:
+        return PracticeArtifactV1(
+            title="练习题",
+            instructions="请回答上述题目，回答完毕后我会为你评分并给出详细讲解。",
+            topic=topic,
+            requested_num_questions=1,
+            question_type=question_type,
+            questions=[
+                ArtifactQuestionV1(
+                    id=1,
+                    type=question_type,
+                    question=quiz.question,
+                    options=[],
+                    score=100,
+                    standard_answer=quiz.standard_answer,
+                    rubric=quiz.rubric,
+                    chapter=str(quiz.chapter or ""),
+                    concept=str(quiz.concept or ""),
+                    difficulty=quiz.difficulty,
+                )
+            ],
+            total_score=100,
+        )
+
+    @staticmethod
+    def _practice_artifact_from_exam_payload(
+        exam_payload: Dict[str, Any],
+        *,
+        topic: str = "",
+        question_type: str = "综合题",
+    ) -> PracticeArtifactV1:
+        questions: List[ArtifactQuestionV1] = []
+        for idx, item in enumerate(list(exam_payload.get("answer_sheet", []) or []), start=1):
+            if not isinstance(item, dict):
+                continue
+            questions.append(
+                ArtifactQuestionV1(
+                    id=int(item.get("id", idx) or idx),
+                    type=str(item.get("type", question_type) or question_type),
+                    question=str(item.get("question", "") or ""),
+                    options=list(item.get("options", []) or []),
+                    score=int(item.get("score", 0) or 0),
+                    standard_answer=str(item.get("standard_answer", "") or ""),
+                    rubric=str(item.get("rubric", "") or ""),
+                    chapter=str(item.get("chapter", "") or ""),
+                    concept=str(item.get("concept", "") or ""),
+                    difficulty=str(item.get("difficulty", "medium") or "medium"),
+                )
+            )
+        return PracticeArtifactV1(
+            title="练习题（多题）",
+            instructions="请将各题答案统一整理后一次性提交。",
+            topic=topic,
+            requested_num_questions=max(1, len(questions)),
+            question_type=question_type,
+            questions=questions,
+            total_score=int(exam_payload.get("total_score", 0) or 0),
+        )
+
+    @staticmethod
+    def _exam_artifact_from_payload(exam_payload: Dict[str, Any]) -> ExamArtifactV1:
+        questions: List[ArtifactQuestionV1] = []
+        for idx, item in enumerate(list(exam_payload.get("answer_sheet", []) or []), start=1):
+            if not isinstance(item, dict):
+                continue
+            questions.append(
+                ArtifactQuestionV1(
+                    id=int(item.get("id", idx) or idx),
+                    type=str(item.get("type", "综合题") or "综合题"),
+                    question=str(item.get("question", "") or ""),
+                    options=list(item.get("options", []) or []),
+                    score=int(item.get("score", 0) or 0),
+                    standard_answer=str(item.get("standard_answer", "") or ""),
+                    rubric=str(item.get("rubric", "") or ""),
+                    chapter=str(item.get("chapter", "") or ""),
+                    concept=str(item.get("concept", "") or ""),
+                    difficulty=str(item.get("difficulty", "medium") or "medium"),
+                )
+            )
+        return ExamArtifactV1(
+            title=str(exam_payload.get("title", "") or "模拟考试试卷"),
+            instructions=str(exam_payload.get("instructions", "") or "请将各题答案统一整理后一次性提交。"),
+            questions=questions,
+            total_score=int(exam_payload.get("total_score", 0) or 0),
+        )
+
+    @staticmethod
+    def _practice_content_from_artifact(artifact: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(artifact, dict):
+            return ""
+        content = str(artifact.get("content", "") or "").strip()
+        if content:
+            return content
+        questions = list(artifact.get("questions", []) or [])
+        if not questions:
+            return ""
+        lines = ["## 练习题", ""]
+        for idx, item in enumerate(questions, start=1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{idx}. {str(item.get('question', '') or '').strip()}")
+            options = list(item.get("options", []) or [])
+            if options:
+                lines.append("")
+                lines.extend(str(opt) for opt in options)
+            lines.append("")
+        lines.append(str(artifact.get("instructions", "") or "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。"))
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _exam_content_from_artifact(artifact: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(artifact, dict):
+            return ""
+        content = str(artifact.get("content", "") or "").strip()
+        if content:
+            return content
+        title = str(artifact.get("title", "") or "模拟考试试卷")
+        instructions = str(artifact.get("instructions", "") or "请将各题答案统一整理后一次性提交。")
+        questions = list(artifact.get("questions", []) or [])
+        lines = [f"# {title}", "", f"**考试须知**：{instructions}", "", "---", ""]
+        for idx, item in enumerate(questions, start=1):
+            if not isinstance(item, dict):
+                continue
+            score = int(item.get("score", 0) or 0)
+            lines.append(f"{idx}. {str(item.get('question', '') or '').strip()}（{score}分）")
+            options = list(item.get("options", []) or [])
+            if options:
+                lines.append("")
+                lines.extend(str(opt) for opt in options)
+            lines.append("")
+        lines.extend(["---", "", "✅ 请将各题答案统一整理后一次性提交。"])
+        return "\n".join(lines).strip()
 
     """将 Quiz 元数据挂载到内部 tool_calls，避免污染正文显示。"""
     @staticmethod

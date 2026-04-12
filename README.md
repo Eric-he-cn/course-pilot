@@ -421,17 +421,39 @@ SSE 每帧格式：`data: <JSON字符串>\n\n`，需 `json.loads()` 解码。
 
 ---
 
-## 性能评测模块（V2）
+## 评测与动态审阅（V3）
 
-- 评测入口：`scripts/perf/bench_runner.py`
-- 基准用例：`benchmarks/cases_v1.jsonl`，RAG 标注：`benchmarks/rag_gold_v1.jsonl`
-- 支持 checkpoint 续跑：中断后按 `case_id#repeat` 去重，继续未完成任务
-- 产物目录：`data/perf_runs/<profile>/`
-  - `baseline_raw.jsonl`：逐条原始结果
+- 性能评测入口：`scripts/perf/bench_runner.py`
+- 单 case 下钻：`scripts/perf/trace_case.py`
+- usage 诊断：`scripts/perf/usage_diagnose.py`
+- 数据集校验：`scripts/eval/dataset_lint.py`
+- LLM-as-Judge：`scripts/eval/judge_runner.py`
+- 动态审阅汇总：`scripts/eval/review_runner.py`
+- 旧 baseline 仍保留：`benchmarks/cases_v1.jsonl` + `benchmarks/rag_gold_v1.jsonl`
+- v3 分层数据集新增：
+  - `benchmarks/smoke_contract.jsonl`
+  - `benchmarks/core_e2e.jsonl`
+  - `benchmarks/multi_turn_sessions.jsonl`
+  - `benchmarks/tooling_and_permissions.jsonl`
+  - `benchmarks/dynamic_review_queue.jsonl`
+  - `benchmarks/rag_gold_v2.jsonl`
+- benchmark 产物目录：`data/perf_runs/<profile>/`
+  - `baseline_raw.jsonl`：逐 case 原始结果，含 `response_text`、trace contract、v3 Runtime 指标
   - `baseline_summary.json`：聚合指标
   - `baseline_summary.md`：可读报告
   - `baseline_checkpoint.json`：断点状态
-- 核心指标：token、TTFT、LLM/RAG/端到端耗时、tool 成功率、RAG 命中率、error/replan 等
+- v3 核心指标保留并扩展：
+  - `TTFT / E2E / retrieval / memory_prefetch`
+  - `hit_at_k / top1_acc / precision_at_k`
+  - `fallback_rate / resolved_mode_override_count / session_store_hit_rate`
+  - `taskgraph_step_status_coverage / avg_input_context_tokens / avg_context_pressure_ratio`
+- Judge 独立配置，默认可继续走 DeepSeek：
+  - `EVAL_JUDGE_API_KEY`
+  - `EVAL_JUDGE_BASE_URL`
+  - `EVAL_JUDGE_MODEL`
+  - `EVAL_JUDGE_TIMEOUT_MS`
+  - `EVAL_JUDGE_TEMPERATURE=0`
+- 无 Judge 配置时，`judge_runner.py` 会优雅跳过并产出 `judge_skipped` 结果，不影响 deterministic benchmark。
 
 ## 日志与可观测性（V2）
 

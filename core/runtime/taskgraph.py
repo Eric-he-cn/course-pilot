@@ -43,6 +43,22 @@ class TaskGraphV1(BaseModel):
     session_id: str
     mode_hint: Literal["learn", "practice", "exam"]
     resolved_mode: Literal["learn", "practice", "exam"]
+    workflow_template: Literal[
+        "learn_only",
+        "practice_only",
+        "exam_only",
+        "learn_then_practice",
+        "practice_then_review",
+        "exam_then_review",
+    ]
+    action_kind: Literal[
+        "learn_explain",
+        "practice_generate",
+        "practice_grade",
+        "exam_generate",
+        "exam_grade",
+        "learn_then_practice",
+    ]
     route: Literal["run_tutor", "run_quiz", "run_exam", "run_grade"]
     steps: List[TaskGraphStepV1] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)

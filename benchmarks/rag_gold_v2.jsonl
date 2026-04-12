@@ -1,0 +1,10 @@
+{"case_id":"smoke_learn_rank","gold_doc_ids":["矩阵理论教案.pdf"],"gold_pages":[206],"gold_chunk_ids":["矩阵理论教案.pdf_p206_c0"],"should_retrieve":true}
+{"case_id":"smoke_learn_inverse","gold_doc_ids":["矩阵理论教案.pdf"],"gold_pages":[329],"gold_chunk_ids":["矩阵理论教案.pdf_p329_c0"],"should_retrieve":true}
+{"case_id":"core_learn_rank_matrix","gold_doc_ids":["矩阵理论教案.pdf"],"gold_pages":[206],"gold_chunk_ids":["矩阵理论教案.pdf_p206_c0"],"should_retrieve":true}
+{"case_id":"core_learn_linear_algebra_basis","gold_doc_ids":["线性代数讲义.pdf"],"gold_pages":[12],"gold_chunk_ids":["线性代数讲义.pdf_p12_c0"],"should_retrieve":true}
+{"case_id":"core_learn_probability_expectation","gold_doc_ids":["概率论讲义.pdf"],"gold_pages":[18],"gold_chunk_ids":["概率论讲义.pdf_p18_c0"],"should_retrieve":true}
+{"case_id":"core_learn_signal_sampling","gold_doc_ids":["信号与系统讲义.pdf"],"gold_pages":[45],"gold_chunk_ids":["信号与系统讲义.pdf_p45_c0"],"should_retrieve":true}
+{"case_id":"session_learn_followup_rank","gold_doc_ids":["矩阵理论教案.pdf"],"gold_pages":[206],"gold_chunk_ids":["矩阵理论教案.pdf_p206_c0"],"should_retrieve":true}
+{"case_id":"session_learn_history_heavy","gold_doc_ids":["信号与系统讲义.pdf"],"gold_pages":[52],"gold_chunk_ids":["信号与系统讲义.pdf_p52_c0"],"should_retrieve":true}
+{"case_id":"review_trace_contract_candidate","gold_doc_ids":["矩阵理论教案.pdf"],"gold_pages":[206],"gold_chunk_ids":["矩阵理论教案.pdf_p206_c0"],"should_retrieve":true}
+{"case_id":"review_session_resume_case","gold_doc_ids":["信号与系统讲义.pdf"],"gold_pages":[52],"gold_chunk_ids":["信号与系统讲义.pdf_p52_c0"],"should_retrieve":true}
