@@ -42,6 +42,21 @@ def _by_case_id(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _has_rag_gold(row: Dict[str, Any] | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return float(row.get("rag_has_gold", 0.0) or 0.0) > 0.0
+
+
+def _has_valid_judge(summary: Dict[str, Any] | None, rows: List[Dict[str, Any]] | None) -> bool:
+    info = dict(summary or {})
+    if int(info.get("num_judged", 0) or 0) > 0:
+        return True
+    if rows:
+        return any(not bool(r.get("judge_skipped")) for r in rows if isinstance(r, dict))
+    return False
+
+
 def _is_case_regression(
     *,
     candidate_row: Dict[str, Any],
@@ -64,7 +79,9 @@ def _is_case_regression(
     if float(candidate_row.get("latency_budget_met_case", 1.0) or 1.0) < 1.0:
         reasons.append("latency_budget_exceeded")
     if baseline_row:
-        if float(candidate_row.get("rag_hit", 0.0) or 0.0) < float(baseline_row.get("rag_hit", 0.0) or 0.0):
+        if _has_rag_gold(candidate_row) and _has_rag_gold(baseline_row) and (
+            float(candidate_row.get("rag_hit", 0.0) or 0.0) < float(baseline_row.get("rag_hit", 0.0) or 0.0)
+        ):
             reasons.append("rag_hit_regressed")
         base_e2e = float(baseline_row.get("e2e_latency_ms", 0.0) or 0.0)
         cand_e2e = float(candidate_row.get("e2e_latency_ms", 0.0) or 0.0)
@@ -98,10 +115,16 @@ def build_review_report(
 
     regression_cases: List[Dict[str, Any]] = []
     human_review_queue: List[Dict[str, Any]] = []
+    rag_gold_missing_case_count = 0
     for case_id, candidate_row in candidate_by_case.items():
         candidate_judge = candidate_judge_by_case.get(case_id, {})
         baseline_row = baseline_by_case.get(case_id)
         baseline_judge = baseline_judge_by_case.get(case_id)
+        candidate_missing_rag_gold = bool(
+            baseline_row and _has_rag_gold(baseline_row) and not _has_rag_gold(candidate_row)
+        )
+        if candidate_missing_rag_gold:
+            rag_gold_missing_case_count += 1
         is_regression, reasons = _is_case_regression(
             candidate_row=candidate_row,
             candidate_judge=candidate_judge,
@@ -114,6 +137,7 @@ def build_review_report(
             "reasons": reasons,
             "candidate_e2e_ms": candidate_row.get("e2e_latency_ms"),
             "candidate_rag_hit": candidate_row.get("rag_hit"),
+            "candidate_rag_has_gold": candidate_row.get("rag_has_gold", 0.0),
             "candidate_judge_score": candidate_judge.get("overall_score"),
             "candidate_judge_confidence": candidate_judge.get("confidence"),
             "pairwise_winner": candidate_judge.get("pairwise_winner", ""),
@@ -123,12 +147,15 @@ def build_review_report(
         if baseline_row:
             review_item["baseline_e2e_ms"] = baseline_row.get("e2e_latency_ms")
             review_item["baseline_rag_hit"] = baseline_row.get("rag_hit")
+            review_item["baseline_rag_has_gold"] = baseline_row.get("rag_has_gold", 0.0)
+        review_item["candidate_missing_rag_gold"] = candidate_missing_rag_gold
         if baseline_judge:
             review_item["baseline_judge_score"] = baseline_judge.get("overall_score")
         if is_regression:
             regression_cases.append({**review_item, "review_regression": True})
         if (
             is_regression
+            or candidate_missing_rag_gold
             or float(candidate_row.get("fallback_rate_case", 0.0) or 0.0) > 0
             or candidate_row.get("trace_contract_error")
             or float(candidate_judge.get("confidence", 1.0) or 1.0) < 0.55
@@ -138,8 +165,15 @@ def build_review_report(
 
     candidate_e2e = float(benchmark_summary.get("p50_e2e_latency_ms", 0.0) or 0.0)
     baseline_e2e = float((baseline_benchmark_summary or {}).get("p50_e2e_latency_ms", 0.0) or 0.0)
-    candidate_judge_score = float(judge_summary.get("avg_overall_score", 0.0) or 0.0)
-    baseline_judge_score = float((baseline_judge_summary or {}).get("avg_overall_score", 0.0) or 0.0)
+    candidate_has_judge = _has_valid_judge(judge_summary, judge_rows)
+    baseline_has_judge = _has_valid_judge(baseline_judge_summary, baseline_judge_rows)
+    candidate_judge_score = float(judge_summary.get("avg_overall_score", 0.0) or 0.0) if candidate_has_judge else None
+    baseline_judge_score = (
+        float((baseline_judge_summary or {}).get("avg_overall_score", 0.0) or 0.0) if baseline_has_judge else None
+    )
+    delta_avg_judge_score = None
+    if candidate_judge_score is not None and baseline_judge_score is not None:
+        delta_avg_judge_score = candidate_judge_score - baseline_judge_score
     report = {
         "candidate_summary": {
             "benchmark": benchmark_summary,
@@ -155,12 +189,13 @@ def build_review_report(
             "human_review_queue_count": len(human_review_queue),
             "trace_contract_error_count": sum(1 for row in benchmark_rows if row.get("trace_contract_error")),
             "fallback_case_count": sum(1 for row in benchmark_rows if float(row.get("fallback_rate_case", 0.0) or 0.0) > 0),
+            "rag_gold_missing_case_count": rag_gold_missing_case_count,
             "candidate_p50_e2e_latency_ms": candidate_e2e,
             "baseline_p50_e2e_latency_ms": baseline_e2e,
             "candidate_avg_judge_score": candidate_judge_score,
             "baseline_avg_judge_score": baseline_judge_score,
             "delta_p50_e2e_latency_ms": candidate_e2e - baseline_e2e,
-            "delta_avg_judge_score": candidate_judge_score - baseline_judge_score,
+            "delta_avg_judge_score": delta_avg_judge_score,
         },
         "regression_cases": regression_cases,
         "human_review_queue": human_review_queue,
@@ -176,6 +211,12 @@ def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 def _write_markdown(path: Path, report: Dict[str, Any]) -> None:
     headline = report.get("headline", {})
+
+    def _fmt_optional_float(v: Any, precision: int = 4) -> str:
+        if isinstance(v, (int, float)):
+            return f"{float(v):.{precision}f}"
+        return "N/A"
+
     lines = [
         "# Dynamic Review Summary",
         "",
@@ -184,10 +225,11 @@ def _write_markdown(path: Path, report: Dict[str, Any]) -> None:
         f"- human_review_queue_count: {headline.get('human_review_queue_count', 0)}",
         f"- trace_contract_error_count: {headline.get('trace_contract_error_count', 0)}",
         f"- fallback_case_count: {headline.get('fallback_case_count', 0)}",
-        f"- candidate_p50_e2e_latency_ms: {float(headline.get('candidate_p50_e2e_latency_ms', 0.0)):.2f}",
-        f"- baseline_p50_e2e_latency_ms: {float(headline.get('baseline_p50_e2e_latency_ms', 0.0)):.2f}",
-        f"- candidate_avg_judge_score: {float(headline.get('candidate_avg_judge_score', 0.0)):.4f}",
-        f"- baseline_avg_judge_score: {float(headline.get('baseline_avg_judge_score', 0.0)):.4f}",
+        f"- rag_gold_missing_case_count: {headline.get('rag_gold_missing_case_count', 0)}",
+        f"- candidate_p50_e2e_latency_ms: {_fmt_optional_float(headline.get('candidate_p50_e2e_latency_ms'), 2)}",
+        f"- baseline_p50_e2e_latency_ms: {_fmt_optional_float(headline.get('baseline_p50_e2e_latency_ms'), 2)}",
+        f"- candidate_avg_judge_score: {_fmt_optional_float(headline.get('candidate_avg_judge_score'), 4)}",
+        f"- baseline_avg_judge_score: {_fmt_optional_float(headline.get('baseline_avg_judge_score'), 4)}",
         "",
         "## Regression Cases",
         "",

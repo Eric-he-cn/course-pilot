@@ -45,9 +45,77 @@ class WorkspaceStore:
     def save_session_state(self, session_state: SessionStateV1) -> str:
         sessions_dir = self._ensure_dir(self.get_workspace_path(session_state.course_name), "sessions")
         path = os.path.join(sessions_dir, f"{session_state.session_id}.json")
+        payload = session_state.model_dump()
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata["updated_at"] = datetime.now().isoformat()
+        payload["metadata"] = metadata
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(session_state.model_dump(), f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         return path
+
+    def delete_session_state(self, course_name: str, session_id: str) -> bool:
+        if not session_id:
+            return False
+        sessions_dir = self._ensure_dir(self.get_workspace_path(course_name), "sessions")
+        path = os.path.join(sessions_dir, f"{session_id}.json")
+        if not os.path.exists(path):
+            return False
+        os.remove(path)
+        return True
+
+    @staticmethod
+    def _parse_iso_dt(raw: Any) -> Optional[datetime]:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text)
+        except Exception:
+            return None
+
+    def cleanup_session_states(self, course_name: str, ttl_days: int = 30) -> Dict[str, Any]:
+        ttl = max(1, int(ttl_days or 30))
+        sessions_dir = self._ensure_dir(self.get_workspace_path(course_name), "sessions")
+        now = datetime.now().timestamp()
+        expire_before = now - float(ttl * 86400)
+        removed: List[str] = []
+        scanned = 0
+        for filename in os.listdir(sessions_dir):
+            if not filename.endswith(".json"):
+                continue
+            scanned += 1
+            path = os.path.join(sessions_dir, filename)
+            try:
+                stat_ts = os.path.getmtime(path)
+            except Exception:
+                continue
+            session_ts = stat_ts
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+                if isinstance(metadata, dict):
+                    maybe_dt = self._parse_iso_dt(metadata.get("updated_at"))
+                    if maybe_dt is not None:
+                        session_ts = max(session_ts, maybe_dt.timestamp())
+            except Exception:
+                pass
+            if session_ts >= expire_before:
+                continue
+            try:
+                os.remove(path)
+                removed.append(filename[:-5] if filename.endswith(".json") else filename)
+            except Exception:
+                continue
+        return {
+            "course_name": course_name,
+            "ttl_days": ttl,
+            "scanned": scanned,
+            "removed_count": len(removed),
+            "removed_session_ids": removed,
+        }
 
     def save_mistake(
         self,

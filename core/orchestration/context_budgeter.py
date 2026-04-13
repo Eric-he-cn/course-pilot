@@ -65,6 +65,13 @@ class ContextBudgeter:
         self.rag_max_tokens = _env_int("CB_RAG_MAX_TOKENS", 1800)
         self.memory_max_tokens = _env_int("CB_MEMORY_MAX_TOKENS", 450)
         self.rag_compress_owner = str(os.getenv("RAG_COMPRESS_OWNER", "retriever")).strip().lower() or "retriever"
+        self.rag_compression_mode = str(os.getenv("RAG_COMPRESSION_MODE", "adaptive")).strip().lower() or "adaptive"
+        if self.rag_compression_mode not in {"adaptive", "always", "off"}:
+            self.rag_compression_mode = "adaptive"
+        self.rag_adaptive_pressure_threshold = max(
+            0.5,
+            min(1.5, _env_float("RAG_ADAPTIVE_PRESSURE_THRESHOLD", 0.9)),
+        )
 
         self.enable_llm_history_compress = _env_bool("CB_ENABLE_LLM_HISTORY_COMPRESS", True)
         self.llm_compress_trigger_tokens = max(120, _env_int("CB_LLM_COMPRESS_TRIGGER_TOKENS", 600))
@@ -504,22 +511,24 @@ class ContextBudgeter:
         history_budget = self.history_summary_max_tokens + max(120, recent_turns_for_budget * 120) + max(0, history_pending_tokens)
         hist_text = self._trim_to_tokens(hist_text, history_budget)
 
+        rag_raw_text = str(rag_text or "").strip()
         rag_budgeter_compress_applied = False
-        if self.rag_compress_owner == "budgeter":
+        rag_adaptive_compress_applied = False
+        if self.rag_compression_mode == "always" and self.rag_compress_owner == "budgeter":
             rag_comp = self.compress_rag_text(
                 query=query,
-                rag_text=rag_text,
+                rag_text=rag_raw_text,
                 sent_per_chunk=rag_sent_per_chunk,
                 sent_max_chars=rag_sent_max_chars,
             )
             rag_budgeter_compress_applied = True
         else:
-            # 默认由 Retriever 负责句级压缩；Budgeter 只做 token 预算裁切，避免重复压缩。
-            rag_comp = str(rag_text or "").strip()
+            rag_comp = rag_raw_text
         rag_comp = self._trim_to_tokens(rag_comp, self.rag_max_tokens)
 
         mem_comp = self._trim_to_tokens(memory_text, self.memory_max_tokens)
 
+        hard_budget = max(256, self.ctx_total_tokens - self.ctx_safety_margin)
         sections = []
         if hist_text:
             sections.append(hist_text)
@@ -528,9 +537,35 @@ class ContextBudgeter:
         if mem_comp:
             sections.append(mem_comp)
         final = "\n\n".join(sections).strip()
-
-        hard_budget = max(256, self.ctx_total_tokens - self.ctx_safety_margin)
         final_before_hard_trim_tokens = estimate_text_tokens(final)
+        context_pressure_ratio_pre = float(final_before_hard_trim_tokens) / float(max(1, hard_budget))
+
+        if (
+            self.rag_compression_mode == "adaptive"
+            and rag_raw_text
+            and context_pressure_ratio_pre > self.rag_adaptive_pressure_threshold
+        ):
+            rag_comp_adaptive = self.compress_rag_text(
+                query=query,
+                rag_text=rag_raw_text,
+                sent_per_chunk=rag_sent_per_chunk,
+                sent_max_chars=rag_sent_max_chars,
+            )
+            rag_comp_adaptive = self._trim_to_tokens(rag_comp_adaptive, self.rag_max_tokens)
+            if rag_comp_adaptive and rag_comp_adaptive != rag_comp:
+                rag_comp = rag_comp_adaptive
+                rag_budgeter_compress_applied = True
+                rag_adaptive_compress_applied = True
+                sections = []
+                if hist_text:
+                    sections.append(hist_text)
+                if rag_comp:
+                    sections.append("【教材参考】\n" + rag_comp)
+                if mem_comp:
+                    sections.append(mem_comp)
+                final = "\n\n".join(sections).strip()
+                final_before_hard_trim_tokens = estimate_text_tokens(final)
+
         final = self._trim_to_tokens(final, hard_budget)
         hard_truncated = final_before_hard_trim_tokens > hard_budget
         history_tokens = estimate_text_tokens(hist_text)
@@ -553,6 +588,9 @@ class ContextBudgeter:
             history_summary_state_hit=history_summary_state_hit,
             history_block_compress_ms=metrics.get("history_block_compress_ms"),
             rag_compress_owner=self.rag_compress_owner,
+            rag_compression_mode=self.rag_compression_mode,
+            rag_adaptive_pressure_threshold=self.rag_adaptive_pressure_threshold,
+            rag_adaptive_compress_applied=rag_adaptive_compress_applied,
             rag_budgeter_compress_applied=rag_budgeter_compress_applied,
             rag_tokens_est=rag_tokens,
             memory_tokens_est=memory_tokens,
@@ -569,6 +607,9 @@ class ContextBudgeter:
             "history_llm_compress_applied": llm_applied,
             "history_llm_compress_ms": llm_compress_ms,
             "rag_compress_owner": self.rag_compress_owner,
+            "rag_compression_mode": self.rag_compression_mode,
+            "rag_adaptive_pressure_threshold": self.rag_adaptive_pressure_threshold,
+            "rag_adaptive_compress_applied": rag_adaptive_compress_applied,
             "rag_budgeter_compress_applied": rag_budgeter_compress_applied,
             "rag_text": rag_comp,
             "memory_text": mem_comp,

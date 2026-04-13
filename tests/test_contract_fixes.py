@@ -449,6 +449,66 @@ class ContractFixTests(unittest.TestCase):
         self.assertEqual("learn_then_practice", plan.workflow_template)
         self.assertEqual("learn", plan.resolved_mode)
 
+    def test_session_state_restores_active_practice_from_visible_history(self):
+        runner = OrchestrationRunner()
+        history = [
+            {
+                "role": "assistant",
+                "content": "## 练习题\n\n说明矩阵秩的定义，并给出一个 2x2 矩阵的秩。\n\n请回答上述题目，回答完毕后我会为你评分并给出详细讲解。",
+            }
+        ]
+        restored = runner._extract_session_state(
+            history=history,
+            course_name="course",
+            mode_hint="practice",
+            user_message="我的答案是：矩阵秩就是非零行的个数。",
+            state={},
+        )
+        self.assertTrue(restored.active_practice)
+        self.assertEqual("practice", restored.active_practice["kind"])
+
+    def test_session_state_restores_active_exam_from_visible_history(self):
+        runner = OrchestrationRunner()
+        history = [
+            {
+                "role": "assistant",
+                "content": "# 《矩阵理论》模拟考试试卷\n\n一、解释矩阵秩的定义。\n二、说明矩阵可逆的判定条件。\n三、解释特征值的含义。\n\n请将各题答案统一整理后一次性提交。",
+            }
+        ]
+        restored = runner._extract_session_state(
+            history=history,
+            course_name="course",
+            mode_hint="exam",
+            user_message="这是我的答卷：第一题我写了秩的定义。",
+            state={},
+        )
+        self.assertTrue(restored.active_exam)
+        self.assertEqual("exam", restored.active_exam["kind"])
+
+    def test_router_prefers_review_template_when_active_artifact_and_answer_like(self):
+        session_state = SessionStateV1(
+            session_id="sess-review-route",
+            course_name="course",
+            requested_mode_hint="practice",
+            resolved_mode="practice",
+            task_full_text="练习评分",
+            task_summary="练习评分",
+            active_practice={"kind": "practice", "questions": [{"id": 1, "question": "Q"}]},
+        )
+        plan = RouterAgent._normalize_plan(
+            {
+                "need_rag": True,
+                "style": "step_by_step",
+                "output_format": "answer",
+                "workflow_template": "practice_only",
+            },
+            "practice",
+            "我的答案是：矩阵秩就是非零行的个数。",
+            session_state,
+        )
+        self.assertEqual("practice_then_review", plan.workflow_template)
+        self.assertEqual("practice_grade", plan.action_kind)
+
     def test_runtime_compiles_persist_memory_for_explicit_learn_memory_request(self):
         runner = OrchestrationRunner()
         runtime = ExecutionRuntime(runner)

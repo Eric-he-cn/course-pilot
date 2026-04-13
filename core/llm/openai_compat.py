@@ -230,13 +230,55 @@ def _anchor_system_and_user(messages: List[Dict[str, Any]]) -> tuple[Optional[Di
     return system_msg, user_idx
 
 
+def _strip_budget_hint_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "system"
+            and str(msg.get("content", "")).startswith("[TOOL_BUDGET]")
+        ):
+            continue
+        out.append(msg)
+    return out
+
+
+def _tool_budget_snapshot_text(round_no: int) -> str:
+    try:
+        snapshot = get_default_tool_hub().budget_snapshot(tool_round=round_no)
+        remaining = snapshot.get("remaining", {}) if isinstance(snapshot, dict) else {}
+        usage = snapshot.get("usage", {}) if isinstance(snapshot, dict) else {}
+        limits = snapshot.get("limits", {}) if isinstance(snapshot, dict) else {}
+        add_event(
+            "tool_budget_snapshot",
+            tool_round=round_no,
+            tool_budget_snapshot=snapshot,
+        )
+        return (
+            "[TOOL_BUDGET]\n"
+            "你当前处于工具调用推理轮。请优先使用最少必要工具。\n"
+            f"- 当前轮次: {round_no}\n"
+            f"- 请求总预算剩余: {remaining.get('per_request_total')}\n"
+            f"- 本轮预算剩余: {remaining.get('per_round')}\n"
+            f"- 当前已调用总次数: {usage.get('executed_total')}\n"
+            f"- 预算上限: {json.dumps(limits, ensure_ascii=False)}\n"
+            f"- 按工具剩余额度: {json.dumps(remaining.get('per_tool', {}), ensure_ascii=False)}"
+        )
+    except Exception:
+        return ""
+
+
 def _compact_messages_for_tool_round(
     messages: List[Dict[str, Any]],
     original_user_content: str,
     round_no: int,
 ) -> List[Dict[str, Any]]:
+    messages = _strip_budget_hint_messages(messages)
+    budget_hint = _tool_budget_snapshot_text(round_no)
     full_rounds = max(1, _env_int("TOOL_ROUND_FULL_CONTEXT_ROUNDS", 1))
     if round_no <= full_rounds:
+        if budget_hint:
+            return [*messages, {"role": "system", "content": budget_hint}]
         return messages
     keep_last_tool_msgs = max(1, _env_int("TOOL_ROUND_KEEP_LAST_TOOL_MSGS", 2))
     rag_max_tokens = max(80, _env_int("TOOL_ROUND_RAG_SUMMARY_MAX_TOKENS", 400))
@@ -251,6 +293,8 @@ def _compact_messages_for_tool_round(
         rag_max_tokens=rag_max_tokens,
         memory_max_tokens=memory_max_tokens,
     )
+    if budget_hint:
+        compact_user = (compact_user + "\n\n" + budget_hint).strip() if compact_user else budget_hint
     out: List[Dict[str, Any]] = []
     if system_msg is not None:
         out.append(system_msg)

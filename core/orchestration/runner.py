@@ -580,6 +580,7 @@ class OrchestrationRunner:
             "strict_new_runtime": os.getenv("STRICT_NEW_RUNTIME", "0") == "1",
             "tool_audit": [],
             "tool_budget": dict(session_state.metadata.get("tool_budget", {}) or {}),
+            "allowed_tool_groups": list(session_state.metadata.get("allowed_tool_groups", []) or []),
             "workflow_template": str(session_state.metadata.get("workflow_template", "") or ""),
         }
 
@@ -2453,9 +2454,23 @@ class OrchestrationRunner:
         for msg in reversed(history[-12:]):
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
-                quiz_signals = ["题目", "选择题", "判断题", "填空题", "简答题",
-                                "第1题", "第一题", "标准答案", "答案选", "下列哪", "以下哪"]
-                if sum(1 for kw in quiz_signals if kw in content) >= 2:
+                quiz_signals = [
+                    "练习题",
+                    "题目",
+                    "选择题",
+                    "判断题",
+                    "填空题",
+                    "简答题",
+                    "第1题",
+                    "第一题",
+                    "标准答案",
+                    "答案选",
+                    "下列哪",
+                    "以下哪",
+                    "请回答上述题目",
+                    "回答完毕后我会为你评分",
+                ]
+                if sum(1 for kw in quiz_signals if kw in content) >= 1:
                     return content
         return "（未能从历史中提取题目，请检查对话上下文）"
 
@@ -2486,8 +2501,16 @@ class OrchestrationRunner:
         for msg in reversed(history[-20:]):
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
-                signals = ["模拟考试试卷", "第一部分", "考试须知"]
-                if sum(1 for kw in signals if kw in content) >= 2:
+                signals = [
+                    "模拟考试试卷",
+                    "第一部分",
+                    "考试须知",
+                    "请将各题答案统一整理后一次性提交",
+                    "一、",
+                    "二、",
+                    "三、",
+                ]
+                if sum(1 for kw in signals if kw in content) >= 1:
                     return content
         return "（未能从历史中提取试卷，请检查对话上下文）"
 

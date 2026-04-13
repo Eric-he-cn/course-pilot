@@ -90,6 +90,7 @@ class ExecutionRuntime:
                 "workflow_template": str(getattr(plan, "workflow_template", "") or ""),
                 "action_kind": str(getattr(plan, "action_kind", "") or ""),
                 "tool_budget": dict(getattr(plan, "tool_budget", {}) or {}),
+                "allowed_tool_groups": list(getattr(plan, "allowed_tool_groups", []) or []),
                 "route_reason": str(getattr(plan, "route_reason", "") or ""),
             },
         )
@@ -459,6 +460,14 @@ class ExecutionRuntime:
                 "allowed_tools": list(getattr(plan, "allowed_tools", []) or []),
                 "tool_budget": dict(getattr(plan, "tool_budget", {}) or {}),
                 "allowed_tool_groups": list(getattr(plan, "allowed_tool_groups", []) or []),
+                "tool_budget_snapshot": {
+                    "limits": {
+                        "per_request_total": dict(getattr(plan, "tool_budget", {}) or {}).get("per_request_total"),
+                        "per_round": dict(getattr(plan, "tool_budget", {}) or {}).get("per_round"),
+                        "per_tool": dict(getattr(plan, "tool_budget", {}) or {}).get("per_tool", {}),
+                    },
+                    "usage": {"executed_total": 0, "current_round": 1, "current_round_used": 0, "per_tool_used": {}},
+                },
             },
             metadata={
                 "retrieval_query": retrieval_query,

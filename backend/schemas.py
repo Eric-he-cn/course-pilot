@@ -75,7 +75,7 @@ class PlanPlusV1(Plan):
     route_confidence: float = 0.7
     route_reason: str = ""
     required_artifact_kind: Literal["none", "practice", "exam"] = "none"
-    tool_budget: Dict[str, int] = Field(default_factory=dict)
+    tool_budget: Dict[str, Any] = Field(default_factory=dict)
     allowed_tool_groups: List[str] = Field(default_factory=list)
 
 
@@ -119,6 +119,7 @@ class ChatRequest(BaseModel):
     mode: Literal["learn", "practice", "exam"]
     message: str
     session_id: Optional[str] = None
+    shadow_eval: bool = False
     history: List[ChatMessage] = Field(default_factory=list)
 
 

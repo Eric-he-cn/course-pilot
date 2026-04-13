@@ -9,6 +9,7 @@
 import os
 import json
 import threading
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from memory.store import SQLiteMemoryStore
 
@@ -33,6 +34,7 @@ class MemoryManager:
         self.user_id = user_id
         self._store = store or _get_store()
         self._qa_archive_lock = threading.Lock()
+        self._evict_lock = threading.Lock()
 
     @staticmethod
     def _format_qa_summary_card(fields: Dict[str, List[str]]) -> str:
@@ -383,6 +385,7 @@ class MemoryManager:
 
         if event_type == "qa":
             self._maybe_archive_qa_async(course_name)
+        self._maybe_evict_async(course_name)
 
         return eid
 
@@ -423,10 +426,51 @@ class MemoryManager:
 
         threading.Thread(target=_worker, daemon=True, name="memory-qa-archive").start()
 
+    def _maybe_evict_async(self, course_name: str) -> None:
+        if str(os.getenv("MEMORY_EVICT_ENABLE", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        soft_cap = max(50, int(os.getenv("MEMORY_EPISODES_SOFT_CAP", "2000")))
+        batch_size = max(1, int(os.getenv("MEMORY_EVICT_BATCH_SIZE", "200")))
+        protect_importance = float(os.getenv("MEMORY_EVICT_PROTECT_IMPORTANCE", "0.8"))
+
+        def _worker() -> None:
+            if not self._evict_lock.acquire(blocking=False):
+                return
+            try:
+                self._store.evict_episodes_soft_cap(
+                    course_name=course_name,
+                    user_id=self.user_id,
+                    soft_cap=soft_cap,
+                    batch_size=batch_size,
+                    protect_importance=protect_importance,
+                )
+            except Exception:
+                pass
+            finally:
+                self._evict_lock.release()
+
+        threading.Thread(target=_worker, daemon=True, name="memory-evict").start()
+
     def get_profile_context(self, course_name: str) -> str:
         """生成注入 prompt 用的用户画像摘要（一段话）。"""
         p = self.get_profile(course_name)
         parts = []
+        preference_items = p.get("preference_items", [])
+        if isinstance(preference_items, list):
+            try:
+                pref_topk = max(1, int(os.getenv("MEMORY_PROFILE_PREFERENCES_TOPK", "3")))
+            except Exception:
+                pref_topk = 3
+            pref_texts: List[str] = []
+            for item in preference_items:
+                if isinstance(item, dict):
+                    text = str(item.get("text", "")).strip()
+                else:
+                    text = str(item).strip()
+                if text:
+                    pref_texts.append(text)
+            if pref_texts:
+                parts.append(f"用户偏好：{'；'.join(pref_texts[:pref_topk])}。")
         if p["weak_points"]:
             weak_str = "、".join(p["weak_points"][:8])  # 最多展示 8 个
             parts.append(f"该用户的薄弱知识点：{weak_str}，讲解时请重点关注。")
@@ -450,6 +494,40 @@ class MemoryManager:
                 f"已做 {p['total_practice']} 道练习题，平均得分 {p['avg_score']:.0f} 分。"
             )
         return " ".join(parts) if parts else ""
+
+    @staticmethod
+    def _normalize_preference_items(items: List[Dict[str, Any]], limit: int = 50) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            text = text[:180]
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            source = str(item.get("source", "implicit")).strip().lower()
+            if source not in {"explicit", "implicit"}:
+                source = "implicit"
+            updated_at = str(item.get("updated_at", "")).strip() or datetime.now().isoformat()
+            out.append({"text": text, "source": source, "updated_at": updated_at})
+            if len(out) >= limit:
+                break
+        return out
+
+    def upsert_preferences(self, course_name: str, items: List[Dict[str, Any]], merge: bool = True) -> List[Dict[str, Any]]:
+        profile = self.get_profile(course_name)
+        merged: List[Dict[str, Any]] = []
+        if merge and isinstance(profile.get("preference_items"), list):
+            merged.extend([x for x in profile.get("preference_items", []) if isinstance(x, dict)])
+        merged.extend([x for x in items if isinstance(x, dict)])
+        normalized = self._normalize_preference_items(merged)
+        self._store.upsert_profile(self.user_id, course_name, preference_items=normalized)
+        return normalized
 
     def update_weak_points(self, course_name: str, new_tags: List[str]) -> None:
         """合并错题标签到薄弱知识点列表（去重，最多保留 20 条）。"""
@@ -493,6 +571,7 @@ class MemoryManager:
             profile = self.get_profile(course_name)
             stats["weak_points"] = profile["weak_points"]
             stats["concept_mastery"] = profile.get("concept_mastery", {})
+            stats["preference_items"] = profile.get("preference_items", [])
             stats["total_qa"] = profile["total_qa"]
             stats["total_practice"] = profile["total_practice"]
             stats["avg_score"] = profile["avg_score"]

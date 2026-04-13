@@ -11,11 +11,13 @@ from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from openai import OpenAI
+from dotenv import load_dotenv
 
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+load_dotenv(ROOT / ".env")
 
 
 JUDGE_DIMENSIONS = (
@@ -25,6 +27,53 @@ JUDGE_DIMENSIONS = (
     "pedagogy_clarity",
     "instruction_following",
 )
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _heuristic_dimensions(case: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, float]:
+    response_text = str(row.get("response_text", "") or row.get("response_preview", "") or "").strip()
+    response_chars = len(response_text)
+    citations = row.get("citations") if isinstance(row.get("citations"), list) else []
+    has_citations = bool(citations)
+    rag_hit = _clamp01(float(row.get("rag_hit", 0.0) or 0.0))
+    case_error = bool(row.get("case_error"))
+
+    if case_error or not response_text:
+        return {name: 0.0 for name in JUDGE_DIMENSIONS}
+
+    correctness = _clamp01(0.45 + 0.35 * rag_hit + (0.10 if response_chars >= 350 else 0.0))
+    groundedness = _clamp01(0.30 + (0.35 if has_citations else 0.0) + 0.25 * rag_hit)
+    completeness = _clamp01(0.35 + min(0.45, float(response_chars) / 1800.0))
+    pedagogy_clarity = _clamp01(0.45 + (0.20 if ("###" in response_text or "1." in response_text) else 0.0))
+    instruction_following = _clamp01(0.40 + (0.25 if response_chars >= 240 else 0.0) + (0.10 if has_citations else 0.0))
+
+    return {
+        "correctness": correctness,
+        "groundedness": groundedness,
+        "completeness": completeness,
+        "pedagogy_clarity": pedagogy_clarity,
+        "instruction_following": instruction_following,
+    }
+
+
+def _heuristic_pairwise_winner(candidate_row: Dict[str, Any], baseline_row: Dict[str, Any]) -> Tuple[str, float, str]:
+    cand_rag = _clamp01(float(candidate_row.get("rag_hit", 0.0) or 0.0))
+    base_rag = _clamp01(float(baseline_row.get("rag_hit", 0.0) or 0.0))
+    if cand_rag > base_rag + 0.05:
+        return "candidate", 0.45, "heuristic_rag_hit_better"
+    if base_rag > cand_rag + 0.05:
+        return "baseline", 0.45, "heuristic_rag_hit_worse"
+
+    cand_len = len(str(candidate_row.get("response_text", "") or ""))
+    base_len = len(str(baseline_row.get("response_text", "") or ""))
+    if cand_len > base_len * 1.2:
+        return "candidate", 0.30, "heuristic_response_richer"
+    if base_len > cand_len * 1.2:
+        return "baseline", 0.30, "heuristic_response_shorter"
+    return "tie", 0.20, "heuristic_tie"
 
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -185,6 +234,7 @@ def judge_row(
     baseline_row: Optional[Dict[str, Any]],
     temperature: float,
     timeout_ms: int,
+    allow_heuristic_fallback: bool,
 ) -> Dict[str, Any]:
     case_id = str(row.get("case_id", case.get("case_id", "")) or "").strip()
     mode = str(row.get("mode", case.get("mode", "learn")) or "learn")
@@ -195,6 +245,7 @@ def judge_row(
         "judge_model": model,
         "rubric_version": "v1",
         "judge_skipped": False,
+        "judge_fallback": False,
         "pairwise_winner": "",
         "pairwise_confidence": 0.0,
         "pairwise_reasoning": "",
@@ -214,9 +265,37 @@ def judge_row(
         )
         return result
     if client is None:
+        if allow_heuristic_fallback:
+            dimensions = _heuristic_dimensions(case, row)
+            overall_score = _overall_from_dimensions(dimensions)
+            label = _label_from_score(overall_score)
+            result.update(
+                {
+                    "judge_skipped": False,
+                    "judge_fallback": True,
+                    "judge_skip_reason": "",
+                    "overall_score": overall_score,
+                    "judge_score": overall_score,
+                    "label": label,
+                    "confidence": 0.35,
+                    "reasoning": "heuristic_fallback_missing_judge_config",
+                    "dimensions": dimensions,
+                }
+            )
+            if baseline_row and baseline_row.get("response_text") and row.get("response_text"):
+                winner, confidence, reasoning = _heuristic_pairwise_winner(row, baseline_row)
+                result.update(
+                    {
+                        "pairwise_winner": winner,
+                        "pairwise_confidence": confidence,
+                        "pairwise_reasoning": reasoning,
+                    }
+                )
+            return result
         result.update(
             {
                 "judge_skipped": True,
+                "judge_fallback": False,
                 "judge_skip_reason": "missing_judge_config",
                 "overall_score": 0.0,
                 "judge_score": 0.0,
@@ -282,6 +361,7 @@ def judge_row(
 
 def summarize_judge_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     judged = [row for row in rows if not row.get("judge_skipped")]
+    fallback_judged = [row for row in judged if bool(row.get("judge_fallback"))]
     by_mode: Dict[str, Dict[str, Any]] = {}
     for mode in ("learn", "practice", "exam"):
         mode_rows = [row for row in judged if str(row.get("mode", "")) == mode]
@@ -303,6 +383,7 @@ def summarize_judge_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "num_rows": len(rows),
         "num_judged": len(judged),
+        "num_fallback_judged": len(fallback_judged),
         "judge_skipped": len(judged) == 0,
         "avg_overall_score": mean(float(row.get("overall_score", 0.0) or 0.0) for row in judged) if judged else 0.0,
         "avg_confidence": mean(float(row.get("confidence", 0.0) or 0.0) for row in judged) if judged else 0.0,
@@ -327,6 +408,7 @@ def _write_markdown(path: Path, summary: Dict[str, Any]) -> None:
         "",
         f"- num_rows: {summary.get('num_rows', 0)}",
         f"- num_judged: {summary.get('num_judged', 0)}",
+        f"- num_fallback_judged: {summary.get('num_fallback_judged', 0)}",
         f"- judge_skipped: {summary.get('judge_skipped', False)}",
         f"- avg_overall_score: {summary.get('avg_overall_score', 0.0):.4f}",
         f"- avg_confidence: {summary.get('avg_confidence', 0.0):.4f}",
@@ -355,6 +437,11 @@ def main() -> int:
     parser.add_argument("--max-cases", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=float(os.getenv("EVAL_JUDGE_TEMPERATURE", "0")))
     parser.add_argument("--timeout-ms", type=int, default=int(os.getenv("EVAL_JUDGE_TIMEOUT_MS", "20000")))
+    parser.add_argument(
+        "--allow-heuristic-fallback",
+        type=int,
+        default=int(os.getenv("EVAL_JUDGE_ALLOW_HEURISTIC_FALLBACK", "1")),
+    )
     args = parser.parse_args()
 
     raw_rows = load_jsonl(Path(args.raw))
@@ -368,6 +455,8 @@ def main() -> int:
 
     cfg = _judge_client_config()
     client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"]) if cfg["api_key"] else None
+    if client is None and int(args.allow_heuristic_fallback) > 0:
+        print("[judge] missing API key; using heuristic fallback scoring")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "judge_raw.jsonl"
@@ -388,6 +477,7 @@ def main() -> int:
             baseline_row=baseline_map.get(case_id),
             temperature=float(args.temperature),
             timeout_ms=int(args.timeout_ms),
+            allow_heuristic_fallback=bool(int(args.allow_heuristic_fallback)),
         )
         append_jsonl(raw_path, judged)
         rows.append(judged)

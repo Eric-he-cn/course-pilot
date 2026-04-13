@@ -6,11 +6,12 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Set, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +78,240 @@ def _extract_doc_ids(citations: List[Dict[str, Any]]) -> List[str]:
             doc_id = c.get("doc_id")
             if isinstance(doc_id, str) and doc_id:
                 out.append(doc_id)
+    return out
+
+
+def _extract_chunk_ids(citations: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for c in citations:
+        if isinstance(c, dict):
+            chunk_id = c.get("chunk_id")
+            if isinstance(chunk_id, str) and chunk_id:
+                out.append(chunk_id)
+    return out
+
+
+def _extract_pages(citations: List[Dict[str, Any]]) -> List[int]:
+    out: List[int] = []
+    for c in citations:
+        if not isinstance(c, dict):
+            continue
+        page = c.get("page")
+        if isinstance(page, (int, float)):
+            out.append(int(page))
+        elif isinstance(page, str) and page.strip().isdigit():
+            out.append(int(page.strip()))
+    return out
+
+
+def _citation_text_blob(citations: List[Dict[str, Any]]) -> str:
+    texts: List[str] = []
+    for c in citations:
+        if not isinstance(c, dict):
+            continue
+        text = c.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    return "\n".join(texts)
+
+
+def _normalize_text(text: str) -> str:
+    value = str(text or "").strip().lower().replace("\\", "/")
+    value = value.split("/")[-1]
+    value = "".join(value.split())
+    return value
+
+
+def _normalize_keyword(text: str) -> str:
+    value = str(text or "").strip().lower()
+    value = re.sub(r"\s+", "", value)
+    return value
+
+
+def _safe_int_list(values: Any) -> List[int]:
+    out: List[int] = []
+    if not isinstance(values, list):
+        return out
+    for item in values:
+        if isinstance(item, (int, float)):
+            out.append(int(item))
+        elif isinstance(item, str) and item.strip().isdigit():
+            out.append(int(item.strip()))
+    return out
+
+
+def _safe_str_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out = [str(item).strip() for item in values if isinstance(item, str) and str(item).strip()]
+    return out
+
+
+def _build_gold_targets(gold_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    targets: Dict[str, Dict[str, Any]] = {}
+    for row in gold_rows:
+        cid = str(row.get("case_id", "") or "").strip()
+        if not cid:
+            continue
+        targets[cid] = {
+            "gold_doc_ids": _safe_str_list(row.get("gold_doc_ids")),
+            "gold_pages": _safe_int_list(row.get("gold_pages")),
+            "gold_chunk_ids": _safe_str_list(row.get("gold_chunk_ids")),
+            "gold_keywords": _safe_str_list(row.get("gold_keywords")),
+            "should_retrieve": bool(row.get("should_retrieve", True)),
+        }
+    return targets
+
+
+def _gold_coverage(cases: List[Dict[str, Any]], gold_targets: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    case_ids = [str(c.get("case_id", "") or "").strip() for c in cases]
+    case_ids = [cid for cid in case_ids if cid]
+    total = len(case_ids)
+    if total <= 0:
+        return {"case_total": 0.0, "gold_matched": 0.0, "gold_coverage": 0.0}
+    matched = sum(1 for cid in case_ids if cid in gold_targets)
+    return {
+        "case_total": float(total),
+        "gold_matched": float(matched),
+        "gold_coverage": float(matched) / float(total),
+    }
+
+
+def _evaluate_rag_against_gold(
+    *,
+    citations: List[Dict[str, Any]],
+    response_text: str,
+    gold_target: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    target = dict(gold_target or {})
+    should_retrieve = bool(target.get("should_retrieve", True))
+    gold_doc_ids = _safe_str_list(target.get("gold_doc_ids"))
+    gold_pages = _safe_int_list(target.get("gold_pages"))
+    gold_chunk_ids = _safe_str_list(target.get("gold_chunk_ids"))
+    gold_keywords = _safe_str_list(target.get("gold_keywords"))
+
+    if not should_retrieve:
+        return {
+            "rag_has_gold": 0.0,
+            "rag_hit": 0.0,
+            "rag_top1": 0.0,
+            "rag_precision": 0.0,
+            "rag_match_strategy": "not_required",
+            "rag_match_signal": "not_required",
+        }
+
+    has_gold = bool(gold_doc_ids or gold_pages or gold_chunk_ids or gold_keywords)
+    if not has_gold:
+        return {
+            "rag_has_gold": 0.0,
+            "rag_hit": 0.0,
+            "rag_top1": 0.0,
+            "rag_precision": 0.0,
+            "rag_match_strategy": "missing_gold",
+            "rag_match_signal": "missing_gold",
+        }
+
+    doc_ids = _extract_doc_ids(citations)
+    chunk_ids = _extract_chunk_ids(citations)
+    pages = _extract_pages(citations)
+    citation_text_blob = _normalize_keyword(_citation_text_blob(citations))
+    response_blob = _normalize_keyword(response_text)
+
+    norm_gold_docs: Set[str] = {_normalize_text(d) for d in gold_doc_ids}
+    norm_docs: List[str] = [_normalize_text(d) for d in doc_ids]
+    norm_gold_chunks: Set[str] = {_normalize_text(cid) for cid in gold_chunk_ids}
+    norm_chunks: List[str] = [_normalize_text(cid) for cid in chunk_ids]
+    gold_page_set = set(gold_pages)
+    page_hits = [p for p in pages if p in gold_page_set]
+    doc_hit_count = sum(1 for d in norm_docs if d in norm_gold_docs)
+    chunk_hit_count = sum(1 for c in norm_chunks if c in norm_gold_chunks)
+
+    keywords = [_normalize_keyword(k) for k in gold_keywords if _normalize_keyword(k)]
+    keyword_hits = [k for k in keywords if k in citation_text_blob or k in response_blob]
+
+    strategy = "doc_id"
+    signal = "no_hit"
+    rag_hit = 0.0
+    rag_top1 = 0.0
+    rag_precision = 0.0
+
+    if norm_gold_chunks:
+        strategy = "chunk_id"
+        rag_hit = 1.0 if chunk_hit_count > 0 else 0.0
+        rag_top1 = 1.0 if norm_chunks and norm_chunks[0] in norm_gold_chunks else 0.0
+        rag_precision = float(chunk_hit_count) / float(len(norm_chunks)) if norm_chunks else 0.0
+        signal = "chunk_hit" if rag_hit > 0 else "chunk_miss"
+    elif gold_page_set and norm_gold_docs:
+        strategy = "doc_page"
+        page_doc_hit = 0
+        for c in citations:
+            if not isinstance(c, dict):
+                continue
+            d = _normalize_text(str(c.get("doc_id", "") or ""))
+            p = c.get("page")
+            if isinstance(p, str) and p.strip().isdigit():
+                p = int(p.strip())
+            if isinstance(p, float):
+                p = int(p)
+            if isinstance(p, int) and d in norm_gold_docs and p in gold_page_set:
+                page_doc_hit += 1
+        rag_hit = 1.0 if page_doc_hit > 0 else 0.0
+        if citations:
+            first = citations[0] if isinstance(citations[0], dict) else {}
+            first_d = _normalize_text(str(first.get("doc_id", "") or ""))
+            first_p = first.get("page")
+            if isinstance(first_p, str) and first_p.strip().isdigit():
+                first_p = int(first_p.strip())
+            if isinstance(first_p, float):
+                first_p = int(first_p)
+            if isinstance(first_p, int) and first_d in norm_gold_docs and first_p in gold_page_set:
+                rag_top1 = 1.0
+        rag_precision = float(page_doc_hit) / float(len(citations)) if citations else 0.0
+        signal = "doc_page_hit" if rag_hit > 0 else "doc_page_miss"
+    elif norm_gold_docs:
+        strategy = "doc_id"
+        rag_hit = 1.0 if doc_hit_count > 0 else 0.0
+        rag_top1 = 1.0 if norm_docs and norm_docs[0] in norm_gold_docs else 0.0
+        rag_precision = float(doc_hit_count) / float(len(norm_docs)) if norm_docs else 0.0
+        signal = "doc_hit" if rag_hit > 0 else "doc_miss"
+    elif gold_page_set:
+        strategy = "page"
+        rag_hit = 1.0 if page_hits else 0.0
+        rag_top1 = 1.0 if pages and pages[0] in gold_page_set else 0.0
+        rag_precision = float(len(page_hits)) / float(len(pages)) if pages else 0.0
+        signal = "page_hit" if rag_hit > 0 else "page_miss"
+    elif keywords:
+        strategy = "keyword"
+        rag_hit = 1.0 if keyword_hits else 0.0
+        rag_top1 = rag_hit
+        rag_precision = rag_hit
+        signal = "keyword_hit" if rag_hit > 0 else "keyword_miss"
+
+    return {
+        "rag_has_gold": 1.0,
+        "rag_hit": rag_hit,
+        "rag_top1": rag_top1,
+        "rag_precision": rag_precision,
+        "rag_match_strategy": strategy,
+        "rag_match_signal": signal,
+    }
+
+
+def _recompute_rows_with_gold(
+    rows: List[Dict[str, Any]],
+    gold_targets: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        case_id = str(row.get("case_id", "") or "").strip()
+        rag_eval = _evaluate_rag_against_gold(
+            citations=list(row.get("citations") or []),
+            response_text=str(row.get("response_text", "") or ""),
+            gold_target=gold_targets.get(case_id),
+        )
+        merged = dict(row)
+        merged.update(rag_eval)
+        out.append(merged)
     return out
 
 
@@ -313,7 +548,7 @@ def _run_case_once(
     case: Dict[str, Any],
     repeat: int,
     profile: str,
-    gold_map: Dict[str, List[str]],
+    gold_targets: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     case_id = str(case.get("case_id", "")).strip()
     mode = str(case.get("mode", "learn")).strip()
@@ -458,21 +693,11 @@ def _run_case_once(
         else 0.0
     )
 
-    doc_ids = _extract_doc_ids(citations)
-    gold_doc_ids = gold_map.get(case_id, [])
-    gold_set = set(gold_doc_ids)
-    if gold_set:
-        rag_has_gold = 1.0
-        rag_hit = 1.0 if any(d in gold_set for d in doc_ids) else 0.0
-        rag_top1 = 1.0 if doc_ids and doc_ids[0] in gold_set else 0.0
-        rag_precision = (
-            float(sum(1 for d in doc_ids if d in gold_set)) / float(len(doc_ids)) if doc_ids else 0.0
-        )
-    else:
-        rag_has_gold = 0.0
-        rag_hit = 0.0
-        rag_top1 = 0.0
-        rag_precision = 0.0
+    rag_eval = _evaluate_rag_against_gold(
+        citations=citations,
+        response_text=response_text,
+        gold_target=gold_targets.get(case_id),
+    )
 
     row: Dict[str, Any] = {
         "case_id": case_id,
@@ -520,10 +745,12 @@ def _run_case_once(
         "trace_contract_error": bool(trace_contract["trace_contract_error"]),
         "trace_contract_reason": str(trace_contract["trace_contract_reason"]),
         "trace_contract_event_count": len(trace_contract_events),
-        "rag_hit": rag_hit,
-        "rag_top1": rag_top1,
-        "rag_precision": rag_precision,
-        "rag_has_gold": rag_has_gold,
+        "rag_hit": float(rag_eval["rag_hit"]),
+        "rag_top1": float(rag_eval["rag_top1"]),
+        "rag_precision": float(rag_eval["rag_precision"]),
+        "rag_has_gold": float(rag_eval["rag_has_gold"]),
+        "rag_match_strategy": str(rag_eval["rag_match_strategy"]),
+        "rag_match_signal": str(rag_eval["rag_match_signal"]),
         "profile": profile,
         "repeat": repeat,
     }
@@ -546,6 +773,9 @@ def main() -> int:
     parser.add_argument("--output-dir", default=str(ROOT / "data" / "perf_runs" / "baseline_v1"))
     parser.add_argument("--profile", default="baseline_v1")
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--recompute-only", action="store_true")
+    parser.add_argument("--gold-min-coverage", type=float, default=0.5)
+    parser.add_argument("--gold-mismatch-policy", choices=["warn", "fail"], default="fail")
     args = parser.parse_args()
 
     cases_path = Path(args.cases)
@@ -564,12 +794,24 @@ def main() -> int:
         return 1
 
     gold_rows = _load_jsonl(gold_path)
-    gold_map: Dict[str, List[str]] = {}
-    for row in gold_rows:
-        cid = str(row.get("case_id", "")).strip()
-        g = row.get("gold_doc_ids") or []
-        if cid:
-            gold_map[cid] = [str(x) for x in g if isinstance(x, str)]
+    gold_targets = _build_gold_targets(gold_rows)
+    coverage = _gold_coverage(cases, gold_targets)
+    print(
+        "[bench] gold coverage="
+        f"{coverage['gold_matched']:.0f}/{coverage['case_total']:.0f} "
+        f"({coverage['gold_coverage']:.3f})"
+    )
+    if coverage["case_total"] > 0 and coverage["gold_coverage"] < float(args.gold_min_coverage):
+        msg = (
+            "[bench] gold coverage below threshold: "
+            f"coverage={coverage['gold_coverage']:.3f} "
+            f"min={float(args.gold_min_coverage):.3f}; "
+            "rag_hit may be invalid due to case_id mismatch"
+        )
+        if str(args.gold_mismatch_policy) == "fail":
+            print(msg)
+            return 2
+        print(f"[bench][warn] {msg}")
 
     existing_rows = _load_jsonl(raw_path)
     done_keys = {_case_repeat_key(str(r.get("case_id", "")), int(r.get("repeat", 0))) for r in existing_rows}
@@ -581,44 +823,60 @@ def main() -> int:
     print(f"[bench] profile={args.profile} cases={len(cases)} repeats={args.repeats} total={total}")
     print(f"[bench] output={out_dir}")
 
-    try:
-        for case in cases:
-            case_id = str(case.get("case_id", "")).strip()
-            for repeat in range(1, int(args.repeats) + 1):
-                key = _case_repeat_key(case_id, repeat)
-                if key in done_keys:
-                    continue
-                row = _run_case_once(
-                    runner=runner,
-                    case=case,
-                    repeat=repeat,
-                    profile=args.profile,
-                    gold_map=gold_map,
-                )
-                _append_jsonl(raw_path, row)
-                existing_rows.append(row)
-                done_keys.add(key)
-                completed += 1
+    if args.recompute_only:
+        if not existing_rows:
+            print(f"[bench] no raw rows found for recompute: {raw_path}")
+            return 1
+        existing_rows = _recompute_rows_with_gold(existing_rows, gold_targets)
+        with raw_path.open("w", encoding="utf-8") as f:
+            for row in existing_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        completed = len(existing_rows)
+        print(f"[bench] recompute-only done rows={completed}")
+    else:
+        try:
+            for case in cases:
+                case_id = str(case.get("case_id", "")).strip()
+                for repeat in range(1, int(args.repeats) + 1):
+                    key = _case_repeat_key(case_id, repeat)
+                    if key in done_keys:
+                        continue
+                    row = _run_case_once(
+                        runner=runner,
+                        case=case,
+                        repeat=repeat,
+                        profile=args.profile,
+                        gold_targets=gold_targets,
+                    )
+                    _append_jsonl(raw_path, row)
+                    existing_rows.append(row)
+                    done_keys.add(key)
+                    completed += 1
 
-                checkpoint = {
-                    "profile": args.profile,
-                    "completed": completed,
-                    "total": total,
-                    "done": completed >= total,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
-                print(
-                    f"[bench] {completed}/{total} "
-                    f"{row['case_id']}#r{row['repeat']} "
-                    f"e2e={row['e2e_latency_ms']:.1f}ms err={int(bool(row['case_error']))}"
-                )
-    except KeyboardInterrupt:
-        print("\n[bench] interrupted by user")
+                    checkpoint = {
+                        "profile": args.profile,
+                        "completed": completed,
+                        "total": total,
+                        "done": completed >= total,
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
+                    print(
+                        f"[bench] {completed}/{total} "
+                        f"{row['case_id']}#r{row['repeat']} "
+                        f"e2e={row['e2e_latency_ms']:.1f}ms err={int(bool(row['case_error']))}"
+                    )
+        except KeyboardInterrupt:
+            print("\n[bench] interrupted by user")
 
     summary = _metric_block(existing_rows)
     summary["profile"] = args.profile
     summary["num_rows"] = len(existing_rows)
+    summary["gold_case_total"] = int(coverage.get("case_total", 0.0))
+    summary["gold_case_matched"] = int(coverage.get("gold_matched", 0.0))
+    summary["gold_case_coverage"] = float(coverage.get("gold_coverage", 0.0))
+    summary["gold_source"] = str(gold_path)
+    summary["recompute_only"] = bool(args.recompute_only)
     by_mode = {}
     for mode in ("learn", "practice", "exam"):
         mode_rows = [r for r in existing_rows if str(r.get("mode")) == mode]

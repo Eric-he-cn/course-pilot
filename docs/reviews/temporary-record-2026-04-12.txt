@@ -1,0 +1,844 @@
+course-pilot v3改进 先把当前版本保存git。 然后对当前项目进行阅读，了解项目结构是实现方式 然后，认真审阅CoursePilot 项目审阅与架构升级方案.pdf中的改进方案，这是专家写的，很有参考价值，根据CoursePilot 项目审阅与架构升级方案.pdf生成详细的项目改进计划，我审阅后执行
+没有正在进行的任务
+
+
+course-pilot  v3改进
+
+先把当前版本保存git。 
+然后对当前项目进行阅读，了解项目结构是实现方式 
+然后，认真审阅CoursePilot 项目审阅与架构升级方案.pdf中的改进方案，这是专家写的，很有参考价值，根据CoursePilot 项目审阅与架构升级方案.pdf生成详细的项目改进计划，我审阅后执行
+
+
+我先做一轮不改动仓库的摸底：确认当前 git 状态、定位你提到的 PDF 和关键文档、快速看项目入口和技术栈。这样我们后面出的改进计划会更贴着现状，也能把“先保存当前版本到 git”这一步规划清楚。
+
+
+Ran 3 commands
+仓库当前在 main 分支，工作区基本干净，只有一个未跟踪文件 docs/reviews/coursepilot-architecture-upgrade-plan-2026-04-10.md。接下来我会把项目骨架和 PDF 的主要章节抽出来，先建立“现状”和“建议方案”两条线，再把它们对齐成可执行计划。
+
+
+Ran 5 commands
+我已经确认了现有代码骨架：这是一个 FastAPI + Streamlit + Python orchestrator + RAG + MCP tools + memory 的单仓项目，而且文档里已经把不少“当前实现事实”写得很清楚。现在我转去啃 PDF 本身和核心编排代码，重点是找出“专家建议”和“现状实现”之间的差距，再把差距拆成分阶段改进计划。
+
+
+Ran 5 commands
+PDF 在当前环境里没法直接用常见 Python 库读取，所以我在找替代入口；好消息是仓库里已经有一份基于该 PDF 整理出来的升级实施文档，可以先作为“专家方案的结构化映射”来核对代码。接下来我继续读核心模块和评测/状态相关代码，确认哪些建议已经部分落地、哪些还只是设计层。
+
+
+Ran 7 commands
+找到系统里的 pdftotext 了，这样就能直接读 PDF 原文，不用只依赖派生文档。我会先抓目录和前几章，再看是否和仓库内那份升级实施文档一致，有差异的地方会优先按 PDF 原意处理。
+
+
+Ran 6 commands
+PDF 和仓库里的实施文档基本一致，而且 PDF 讲得更明确：不是“大换血重写”，而是保留中心编排边界，逐步引入 SessionState / Service 层 / TaskGraph Runtime / 权限治理。我再补一轮关键实现细节，尤其是 internal_meta、SSE 事件、memory、tool hub 和安全基线，这样最终计划会细到可以直接拆 PR。
+
+
+Ran 6 commands
+我已经看到几个和 PDF 完全对上的薄弱点了：Runner 里大量 internal_meta 扫描、流式事件散落在模式分支里、ToolPolicy 现在还是“代码层全开 + prompt 约束为主”。再补两块就可以收束成正式计划了：一是安全/配置/测试基线，二是现有测试和基准脚本的实际可运行性。
+
+
+Ran 6 commands
+基线里又冒出一个很有价值的问题：当前终端里的默认 python 还是 3.6，导致 typing.Literal 导入直接炸掉，这和仓库文档里写的 3.11 明显不一致。这个不是实现细节，是执行改进计划前必须先钉住的环境前提，我再确认一下解释器现状，把它纳入计划的“第 0 步”。
+
+
+Ran 6 commands
+现状已经足够清楚了：PDF 主张的方向和代码现状是对得上的，而且我还确认了一个新增前置风险，当前环境默认 python=3.6，会让很多“应该先跑的基线测试”直接失真。接下来我只补一个轻量问题来锁定实施优先级，然后给你完整的 v3 改进计划。
+
+
+Ran 2 commands
+study_agnet环境可以运行
+
+study_agent环境可以运行
+
+这条信息很关键，说明基线验证应该切到 study_agent 环境，而不是当前默认的 Python 3.6。 我先确认这个环境的调用方式，再用它补跑一轮关键测试，把最终计划里的“环境前置条件”和“第 0 阶段”写得更准确。
+
+
+Ran 3 commands
+我已经定位到 study_agent 是一个 conda 环境。接下来我会用它直接跑解释器版本和核心测试，这样计划里就能区分“代码问题”和“只是默认解释器选错”的问题。
+
+
+Ran 3 commands
+conda run 这台机器上本身有点毛病，不过环境路径已经拿到了。 我改成直接调用 study_agent 里的 python.exe，这样更稳，也更接近后续实际执行时的方式。
+
+
+Ran 3 commands
+关键基线现在更清楚了：study_agent 下核心契约测试是通过的，但 test_basic.py 先被 Windows 控制台编码卡住了，还没走到它真正的外部依赖问题。 我再把这条链路看完，这样最终计划里“测试体系整顿”会更准确，不会只停留在抽象建议。
+
+
+Ran 3 commands
+有两个偏好会直接影响计划拆法，我先把它们锁一下：一个是“怎么保存当前版本到 git”，一个是“v3 首轮到底是先稳架构还是把安全/扩展也一并纳入”。你选完后，我就把完整的实施计划定稿成可直接执行的版本。
+
+
+套餐
+
+
+打开
+
+CoursePilot v3 架构稳态升级计划
+Summary
+目标：按 PDF 的建议做“渐进式升级”，保留现有 learn / practice / exam 三模式、/chat 与 /chat/stream 接口、MCP stdio 工具主路径，不做大爆炸重写。
+实施原则：先固化基线与环境，再统一状态与事件契约，再抽离能力层，最后引入受约束 Runtime/TaskGraph。
+已确认前提：执行环境使用 C:\Users\10423\miniconda3\envs\study_agent\python.exe（Python 3.11.14）；不要使用当前默认 python（3.6.4）。
+当前基线事实：HEAD= d53f9566d39a758e6eefada593e2dc4f57502de6，无 tag；当前工作区额外有未跟踪文件 docs/reviews/coursepilot-architecture-upgrade-plan-2026-04-10.md。
+Phase 0: Baseline Freeze
+在 main 上保存当前工作区快照，包含当前已存在的未跟踪评审文档；提交信息固定为 chore: snapshot pre-v3 baseline。
+在该提交上创建注释 tag：baseline/pre-v3-2026-04-11。
+从该 tag 创建工作分支：v3/architecture-upgrade，后续所有改动只落在该分支。
+在仓库根增加统一执行约定：
+study_agent 解释器为唯一标准解释器；测试、脚本、bench 都显式走该解释器。
+不在此阶段改业务逻辑；只建立可回滚基线和执行前提。
+Phase 1: 状态与事件契约收口
+在 backend/schemas.py 新增 SessionStateV1，统一承载：
+course_name、mode、history_summary_state、last_quiz、last_exam、permission_mode、idempotency_keys、last_taskgraph_digest。
+保留旧 quiz_meta / exam_meta / history_summary_state 的兼容读取；运行时优先读 session_state，缺失时从旧 meta 合成。
+在 core/orchestration/runner.py 把所有 internal meta 的生成/提取统一为：
+_extract_session_state()、_emit_session_state_tool_call()、_merge_session_state()。
+保持前端协议兼容：SSE 事件名继续使用 __status__ / __citations__ / __context_budget__ / __tool_calls__，前端继续隐藏 internal_meta，不显示 session_state。
+修正同步/流式边界：
+非流式 run_*_mode() 只返回 ChatMessage，绝不 yield；
+流式 run_*_mode_stream() 统一发出 __context_budget__。
+将上下文显式分段为 rag_context / history_context / memory_context / merged_context，Agent prompt 不再把混合上下文统称为“教材”。
+Phase 2: 能力层抽离，Runner 薄化
+从 Runner 中抽离 5 个内部服务：
+RAGService、MemoryService、ContextAssembler、WorkspaceStore、Telemetry。
+Runner 保留职责收敛为：
+请求解析、模式分流、调用 Planner/Runtime、拼装最终 ChatMessage 或 SSE。
+RAGService 负责 retriever 生命周期、按课程缓存、索引存在性检查、top_k 策略。
+MemoryService 负责预取、写入、qa_summary 归档、画像更新与 request-scope 去重。
+ContextAssembler 负责预算、压缩、分段注入，不让 Tutor/Quiz/Grader 直接接触 raw history。
+WorkspaceStore 统一管理 notes/practices/exams/mistakes 的保存与路径策略。
+Telemetry 统一管理 trace 事件、tool 审计、benchmark 采样点。
+在该阶段完成 RAG 与 Memory 预取并行化，优先使用线程池，不引入 async 大改。
+Phase 3: 工具治理升级为 ToolHub
+在现有 ToolPolicy 基础上引入 ToolHub，统一承接：
+schema、phase contract、risk level、permission mode、request dedup、idempotency key、audit log。
+permission_mode 固定为三档：
+safe、standard、elevated。
+默认策略：
+learn/practice/exam 首轮使用 standard；
+filewriter 需 elevated；
+websearch 保持 standard；
+calculator、get_datetime 保持低风险可用。
+所有工具调用继续只走 MCP stdio，不恢复本地 fallback。
+ToolHub 对重复调用返回缓存结果并写 tool_dedup trace 事件。
+为所有副作用型工具生成稳定 idempotency_key，为后续 Runtime 重试做准备。
+Phase 4: Planner 升级与 Runtime/TaskGraph 引入
+保留当前中心编排路线，不改成自由自治多 Agent。
+将 RouterAgent 进化为内部 LeadAgent 能力，但 v3 外部仍沿用 Plan 兼容返回；新增可选字段组成 PlanPlusV1：
+capabilities、risk_level、permission_mode、replan_policy。
+新增 TaskGraphV1 白名单步骤，只允许：
+prefetch_rag、prefetch_memory、build_context、detect_submission、run_tutor、run_quiz、run_exam、run_grade、persist_meta、persist_records、persist_memory、synthesize_final。
+新增 AgentContextV1，Worker 只能接收预算后的只读快照，不直接操作文件系统、数据库和全局状态。
+提交检测仍由确定性逻辑完成，不交给 LLM 自由判断。
+Replan 仍限制为最多一次；带副作用步骤不可自由重跑，只能在 idempotency 保护下重试。
+Phase 5: 测试、依赖与基准整顿
+统一依赖真源，建议以 pyproject.toml + lock 为主，requirements.txt 只作为导出产物；若团队更偏 pip，则反向统一为 requirements*.txt 单真源，但必须只保留一种。
+新增统一执行入口，确保测试与脚本都使用 study_agent 解释器。
+调整测试分层：
+unit 纯本地可跑；
+contract 校验 schema/事件/内部状态；
+integration 允许依赖 key，但默认跳过。
+修复 tests/test_basic.py 的终端编码脆弱性：
+去掉 emoji 输出或统一 UTF-8；
+不把控制台编码当作测试成败因素。
+保留并扩展 scripts/perf/bench_runner.py 作为每阶段回归基线。
+v3 第一阶段不做 OCR、多模态、鉴权、远端向量库落地，只在架构上预留扩展点。
+Public Interfaces / Type Changes
+ChatRequest、ChatResponse、/chat、/chat/stream 对外保持兼容，不改路径、不改核心字段名。
+Plan 对外兼容保留；PlanPlusV1 作为内部扩展，新增字段全部设为可选。
+新增内部类型：
+SessionStateV1、AgentContextV1、TaskGraphV1、ToolSpec/ToolDecision。
+前端 SSE 事件名不变；__tool_calls__ 中新增的 session_state 仍按 hidden meta 处理，不直接渲染。
+旧历史里已有的 quiz_meta/exam_meta/history_summary_state 必须可继续被读取至少一个版本周期。
+Test Plan
+基线验证：
+用 study_agent 运行 python -m unittest tests.test_contract_fixes 必须通过；
+tests/test_basic.py 在 UTF-8 控制台下必须稳定通过。
+状态兼容：
+旧 history 仅含 quiz_meta/exam_meta/history_summary_state 时，仍能正确恢复练习/考试提交链路。
+接口契约：
+run_learn_mode/run_practice_mode/run_exam_mode 都不是 generator；
+/chat 返回结构化响应；
+/chat/stream 三模式都能发出 __context_budget__。
+行为回归：
+单题练习仍走 quiz_meta 语义，多题练习/考试仍走 exam_meta 语义；
+评分、记录保存、记忆写入行为不变。
+工具治理：
+safe/standard/elevated 对工具放行结果可测；
+重复工具调用会命中 dedup；
+副作用工具具备 idempotency 防重。
+性能基准：
+对现有 benchmark 做 before/after delta；
+若 p50 TTFT 或 p50 E2E 退化超过 10%，必须给出原因和补偿收益，否则不合并。
+文档验收：
+架构文档、配置总览、安全文档要同步更新到新术语：
+SessionState、ToolHub、Runtime/TaskGraph、permission_mode。
+Assumptions / Defaults
+按你刚才的选择，baseline 采用“提交 + tag + 分支”策略，v3 第一阶段采用“架构稳态优先”。
+执行时默认把当前已有未跟踪评审文档一起纳入 baseline snapshot。
+不做 UI 重设计，不扩增 Agent 数量，不把 RAG/Memory 降级为可选插件。
+MCP 继续是唯一工具调用主路径；不改成本地直调或远端 server 聚合。
+生产化安全项（鉴权、限流、CORS 收敛、上传扫描）作为 v3.1/v3.2 后续阶段处理，不阻塞 v3 第一阶段的架构升级。
+展开计划
+几个确认的点：
+1. router是主agent，负责制订计划，三种模式由他来决定
+2. 上下文管理现在分成了两层，session state作为会话全局的短期记忆，每个agent有自己的记上下文管理器，session state维护全局信息与当前状态，例如任务全文，任务摘要，当前执行到了第几部，历史记忆等，负责把上下文选择性注入agent的上下文，同时也会从agent中接收更新的状态，从某种意义，session state成为了agent之间通信的方式。
+3. 可以设计fallback和兼容，而且对于系统稳定性非常有必要，但是要考虑到如何确定我们的新版方案可能正常工作，而不是fallback完成了新版方案没完成的功能
+
+
+我先把你的 3 点吸收进方案里了，方向很明确：
+
+Router 升级成真正的主 Agent，不只是补字段，而是负责模式判定和计划生成。
+SessionState 不只是兼容容器，而是变成 Agent 之间共享短期记忆和状态交换的主通道。
+fallback 要保留，但不能让它把“新方案其实没生效”这件事遮住，所以必须配套验证与观测机制。
+还有两个实现层决策会直接影响 v3 设计，我建议现在锁定。这样下一版计划就能按你的思路完整收束。
+
+
+套餐
+
+
+打开
+
+CoursePilot v3 主 Agent + SessionState Runtime 升级计划
+Summary
+Router 升级为主 Agent，负责两件事：mode 判定和执行计划生成。前端传入的 mode 不再是硬决定，而是 mode hint；最终以 Router 的 resolved_mode 为准。
+SessionState 升级为服务端持久化的会话状态中心，承担短期记忆、执行进度、Agent 间通信和状态回写；各 Specialist Agent 只通过自己的上下文管理器读写 SessionState。
+v3 继续保留 learn / practice / exam 三模式和现有 API 兼容层，但内部执行改为“Lead Router -> Runtime -> Specialist Agent -> State Patch”。
+fallback 保留，但必须是“影子校验 + 可观测回退”，不能静默掩盖新链路失效。
+Key Decisions
+Git 基线：
+先提交当前状态，打 tag baseline/pre-v3-2026-04-11，再创建分支 v3/architecture-upgrade。
+Python 基线：
+统一使用 C:\Users\10423\miniconda3\envs\study_agent\python.exe；禁止用当前默认 python 3.6。
+模式判定：
+ChatRequest.mode 对外保留，但语义改为 mode_hint。
+Router 输出 resolved_mode、mode_reason、plan_version。
+Runtime 只按 resolved_mode 执行。
+SessionState：
+第一版采用服务端持久化优先。
+API 新增可选 session_id；没有则服务端创建。
+客户端继续传 history 以兼容旧链路，但状态真源切到服务端 SessionState。
+Agent 通信：
+不再用零散 quiz_meta / exam_meta / history_summary_state 作为主通道。
+统一改为 SessionState + StatePatch。
+Fallback：
+默认走新链路。
+仅在关键节点失败时回退到兼容链路，并强制写 telemetry、audit、trace。
+测试和灰度环境提供 strict_new_runtime=1，关闭 fallback，确保新架构真实可跑。
+Implementation Changes
+1. Lead Router
+将当前 RouterAgent 升级为 LeadRouterAgent。
+输入：message、mode_hint、课程信息、用户画像、最近会话摘要、长期记忆摘要。
+输出：PlanPlusV1，至少包含：
+resolved_mode、mode_reason、need_rag、need_memory、style、output_format、retrieval_query、memory_query、capabilities、risk_level、permission_mode、replan_policy。
+resolved_mode 允许与 mode_hint 不同；若不同，Runtime 记录一次 mode_override 事件。
+2. SessionState + Agent Context
+新增 SessionStateV1 作为服务端真源，至少包含：
+session_id、course_name、requested_mode_hint、resolved_mode、task_full_text、task_summary、current_stage、current_step_index、history_summary、selected_memory、last_quiz、last_exam、tool_audit_refs、permission_mode、fallback_flags、idempotency_keys。
+新增 StatePatchV1：
+Agent 不直接改全局状态，只返回 patch。
+为每个 Specialist Agent 配置独立上下文管理器：
+TutorContextManager、QuizContextManager、GraderContextManager。
+这些管理器负责：
+从 SessionState 中做选择性注入；
+控制 token 预算；
+从 Agent 输出中提取 StatePatch 并回写。
+SessionState 成为 Agent 间通信主通道：
+Quiz 出题写入 last_quiz/last_exam；
+Grader 读取并更新评分、弱点、当前阶段；
+Tutor 读取任务摘要、上下文和历史学习状态。
+3. Runtime / TaskGraph
+引入 ExecutionRuntime 和 TaskGraphV1。
+TaskGraphV1 只允许白名单步骤：
+plan_intent、prefetch_rag、prefetch_memory、build_agent_context、detect_submission、run_tutor、run_quiz、run_exam、run_grade、persist_session_state、persist_records、persist_memory、synthesize_final。
+Router 决定模式和参数，但不能自由创造新步骤。
+submission 检测仍保持代码侧确定性规则，不交给 LLM 自由判断。
+Runtime 负责执行顺序、并发、重试、fallback、事件上报、幂等控制。
+4. Service Layer
+从 Runner 抽出 6 个服务：
+RAGService、MemoryService、ContextAssembler、ToolHub、WorkspaceStore、TelemetryService。
+RAGService：
+管理 retriever 生命周期、课程级缓存、索引可用性检查。
+MemoryService：
+负责长期记忆检索、写入、画像更新、qa_summary 归档。
+ContextAssembler：
+负责全局预算和分层注入，不再把混合上下文伪装成“教材”。
+ToolHub：
+统一工具权限、phase contract、risk level、dedup、idempotency、审计日志。
+WorkspaceStore：
+统一 notes/practices/exams/mistakes 的保存。
+TelemetryService：
+统一 trace、fallback 记录、对比指标。
+5. API / Compatibility
+保留 /chat、/chat/stream。
+ChatRequest 新增可选 session_id，保留 mode 但内部按 mode_hint 解释。
+/chat 返回中附带 session_id 和 resolved_mode。
+/chat/stream 首轮 hidden meta 中回传 session_id、resolved_mode、current_stage。
+旧前端若只依赖 history + tool_calls，仍可工作；新前端优先用 session_id 续聊。
+旧 quiz_meta / exam_meta / history_summary_state 保留一个兼容周期，仅用于读取，不再作为主写入格式。
+6. Fallback Validation
+每个关键节点都记录：
+path=new|fallback、reason、step_name、session_id、request_id。
+新链路 happy path 必须满足：
+单元测试中 fallback 次数为 0；
+契约测试中 fallback 次数为 0；
+benchmark 基线中 fallback rate 低于 1%。
+CI 增加两套执行：
+compat mode：允许 fallback，验证兼容。
+strict new runtime：禁止 fallback，验证新链路独立可运行。
+若某功能只能靠 fallback 完成，则视为新架构未完成，不算通过。
+Public Interfaces / Types
+ChatRequest.mode：
+对外保留，内部重命名语义为 mode_hint。
+新增 session_id：
+/chat、/chat/stream 都支持。
+新增内部类型：
+PlanPlusV1、SessionStateV1、StatePatchV1、TaskGraphV1、AgentContextV1。
+resolved_mode 成为对外可见的运行结果字段。
+前端模式选择器保留，但当 resolved_mode != mode_hint 时显示一次“已自动切换到 X 模式”的提示。
+Test Plan
+基线测试：
+使用 study_agent 运行现有契约测试，作为 pre-v3 基线。
+Router 测试：
+验证 mode_hint=learn 时 Router 可改判为 practice/exam；
+验证 mode_reason、resolved_mode 正确返回。
+SessionState 测试：
+多轮对话中 current_stage、current_step_index、last_quiz/last_exam 能持续更新；
+Agent 只能通过 StatePatch 改状态。
+兼容测试：
+旧 history 仅带 quiz_meta/exam_meta/history_summary_state 时仍能恢复旧会话。
+Runtime 测试：
+三模式都能跑通；
+detect_submission 正确；
+同步接口不返回 generator；
+流式接口能持续发 __context_budget__。
+Fallback 测试：
+strict 模式下新链路必须独立通过；
+fallback 触发时必须落 trace/audit。
+性能测试：
+比较 prefetch 并行化前后 TTFT、E2E、tool call count、prompt token。
+文档测试：
+架构文档、安全文档、配置文档同步更新并与实现一致。
+Assumptions
+v3 第一阶段优先做架构稳态，不纳入 OCR、多模态、额外 Agent 扩容。
+Router 是主 Agent，但仍处于 Runtime 白名单约束下，不直接控制副作用。
+SessionState 是短期记忆和通信中心；长期学习沉淀仍由 MemoryService + SQLite 承担。
+fallback 仅是稳定性保护，不是功能主路径。
+现有前端交互方式保留，先兼容再逐步收敛到 session_id + resolved_mode 语义。
+展开计划
+Router 不改名
+可不可以这样：agent主类，其他agent
+
+
+Router 不改名
+可不可以这样：agent主类，其他agent从他这里继承，ontextManager就不用每个单独设计了
+我们只是细化，不要忘记之前定好的任务条目
+
+
+套餐
+
+
+打开
+
+CoursePilot v3 细化升级计划
+Summary
+保留 Router 这个名字，不改名；它就是主 Agent，负责模式判定、计划生成、重规划建议。
+Agent 结构改为“一个主 BaseAgent 基类 + 多个具体 Agent 子类”，不为每个 Agent 单独做一套 ContextManager。
+ContextManager 采用“一套统一实现 + 配置化上下文策略”的方案：共享机制一致，差异通过 profile/policy 配置表达。
+保留之前已经确认的任务条目：Git 基线冻结、study_agent 作为唯一执行环境、SessionState 服务端优先、Runtime/TaskGraph、ToolHub、fallback 可观测验证、接口兼容。
+Core Design
+1. Router 仍是主 Agent
+Router 保持现有名字，不引入 LeadAgent 或其他新命名。
+Router 角色升级为主 Agent，但职责仍受 Runtime 约束：
+负责 resolved_mode、plan、capabilities、risk_level、permission_mode、replan_policy。
+前端传入的 mode 继续保留，但内部语义为 mode_hint。
+Runtime 始终按 Router.resolved_mode 执行，不再直接按前端 mode 硬切。
+Router 只决定“做什么”和“约束条件”，不直接执行副作用步骤。
+2. Agent 主类 + 子类继承
+新增统一 BaseAgent，由 Router、TutorAgent、QuizMasterAgent、GraderAgent 继承。
+BaseAgent 统一承载：
+LLM client 获取、上下文构建入口、工具权限接入、状态 patch 回写接口、telemetry 打点、错误分类、fallback hook。
+子类只保留自己的领域逻辑：
+Router 负责任务规划；
+TutorAgent 负责学习讲解；
+QuizMasterAgent 负责练习/考试出题；
+GraderAgent 负责评卷与讲评。
+所有 Agent 输出统一结构：
+AgentResultV1(content, state_patch, tool_logs, citations, diagnostics)。
+旧接口兼容期内允许内部适配成现有 TutorResult / Quiz / GradeReport / ChatMessage。
+3. 单一 ContextManager
+不给每个 Agent 单独设计独立 ContextManager 类。
+采用一个统一 ContextManager，输入：
+session_state、agent_type、resolved_mode、task_stage、token_budget。
+ContextManager 内部通过 profile 配置处理差异，而不是通过多个类分裂实现。
+profile 最少包含：
+router_profile、tutor_profile、quiz_profile、grader_profile。
+这些 profile 只定义差异项：
+可注入哪些字段、history 保留策略、RAG/Memory 权重、是否允许工具结果回灌、是否允许引用教材块。
+共享逻辑保持统一：
+历史摘要、RAG 注入、memory 注入、token 预算、裁剪、上下文分段格式化、trace。
+SessionState / Runtime
+4. SessionState 作为主通信通道
+SessionStateV1 作为服务端持久化真源。
+它承担：
+全局短期记忆、任务全文、任务摘要、当前阶段、当前步骤、最近 quiz/exam 元数据、历史摘要、已选长期记忆、权限模式、fallback 标记、幂等键。
+Agent 不直接彼此通信，统一通过 SessionState + StatePatch 间接通信。
+兼容读取旧 quiz_meta / exam_meta / history_summary_state，但主写入改到 SessionState。
+5. Runtime / TaskGraph 保留
+保留之前确定的 ExecutionRuntime + TaskGraphV1。
+白名单步骤不变：
+plan_intent、prefetch_rag、prefetch_memory、build_context、detect_submission、run_tutor、run_quiz、run_exam、run_grade、persist_session_state、persist_records、persist_memory、synthesize_final。
+Router 决定模式和参数，但不能自由发明流程节点。
+submission 检测仍由代码规则完成，不交给 LLM 自由判断。
+保留的既定任务条目
+6. 基线冻结
+先提交当前代码快照。
+打 tag：baseline/pre-v3-2026-04-11。
+创建分支：v3/architecture-upgrade。
+把当前评审文档一并纳入基线快照。
+7. 执行环境统一
+唯一标准解释器：
+C:\Users\10423\miniconda3\envs\study_agent\python.exe
+所有测试、脚本、bench、CI 均显式使用此解释器。
+禁止继续依赖当前默认 python 3.6。
+8. Service Layer 抽离
+保留之前定好的服务层拆分：
+RAGService、MemoryService、ContextManager、ToolHub、WorkspaceStore、TelemetryService。
+这里只调整一点：
+原先分散的 agent-specific context 管理，统一收口到单个 ContextManager。
+9. ToolHub 与权限治理
+保留 ToolHub 设计，不变。
+permission_mode 仍为：
+safe、standard、elevated。
+统一工具入口、dedup、idempotency、审计、phase contract。
+MCP stdio 仍是唯一主路径。
+10. Fallback 策略
+保留“影子校验 + 可观测回退”。
+所有 fallback 必须记录：
+session_id、request_id、agent_type、step_name、reason、from=new_runtime、to=compat_path。
+CI 和灰度期提供 strict_new_runtime=1，禁止 fallback 掩盖问题。
+只要某条主链路只能依赖 fallback 成功，就视为新架构该项未完成。
+Public Interface Changes
+/chat、/chat/stream 路径不变。
+ChatRequest.mode 保留，对内解释为 mode_hint。
+新增可选 session_id。
+返回中新增：
+session_id、resolved_mode、current_stage。
+Router、TutorAgent、QuizMasterAgent、GraderAgent 类名尽量保持现有命名稳定，减少迁移成本。
+Test Plan
+基线测试：
+用 study_agent 跑现有契约测试和基础测试，作为 pre-v3 baseline。
+BaseAgent 测试：
+所有子类都能共享统一的上下文构建、telemetry、state patch 接口。
+ContextManager 测试：
+同一 ContextManager 在不同 profile 下能正确产出 Router/Tutor/Quiz/Grader 所需上下文。
+Router 测试：
+mode_hint 与 resolved_mode 可不同；
+resolved_mode 一旦确定，Runtime 正确执行对应链路。
+SessionState 测试：
+多轮会话中步骤、摘要、最近 quiz/exam、fallback 标记能持续更新。
+兼容测试：
+旧 meta 历史仍能恢复旧会话。
+Fallback 测试：
+strict 模式下主链路独立可跑；
+compat 模式下 fallback 全量可追踪。
+性能测试：
+比较 v2 与 v3 的 TTFT、E2E、tool call count、prompt tokens、fallback rate。
+Assumptions
+这次是细化，不推翻之前已经确定的任务条目。
+允许统一 BaseAgent + ContextManager，但不能把差异逻辑硬塞进 if/else 泥团；差异必须通过 profile/config 显式表达。
+Router 名称稳定优先，减少认知迁移和代码 churn。
+SessionState 仍是本次 v3 的核心，不因为统一 ContextManager 而弱化。
+展开计划
+每个agent contextManager策略应该不同，通过继承来实现差异化， ContextManager就是agent的方法
+
+
+套餐
+
+
+打开
+
+CoursePilot v3 细化架构升级计划
+Summary
+保留 Router 名称不变，它就是主 Agent，负责模式判定、计划生成、重规划建议。
+Agent 体系采用“BaseAgent 抽象基类 + 各业务 Agent 继承”的方式实现。
+ContextManager 不再作为独立统一服务类存在，而是 Agent 自身的方法族；每个 Agent 通过继承和重写上下文策略实现差异化。
+SessionState 仍是本次 v3 的核心，作为服务端持久化的短期会话状态中心，承担 Agent 间通信、执行状态、任务摘要和上下文注入来源。
+保留之前已经确认的任务条目：Git 基线冻结、study_agent 统一环境、Runtime/TaskGraph、ToolHub、fallback 可观测验证、接口兼容。
+Architecture Changes
+1. Router 作为主 Agent
+Router 保持现有类名，不改名。
+Router 的职责升级为：
+解析用户请求；
+结合 mode_hint、SessionState、长期记忆、课程状态决定 resolved_mode；
+生成 PlanPlusV1；
+在失败场景下给出一次 replan 建议。
+前端传入的 mode 保留，但内部解释为 mode_hint。
+Runtime 只按 Router.resolved_mode 执行，不再把前端 mode 当作最终真源。
+2. BaseAgent + 继承式 ContextManager
+新增 BaseAgent，由 Router、TutorAgent、QuizMasterAgent、GraderAgent 继承。
+BaseAgent 提供统一模板方法：
+load_session_state()、build_context()、build_messages()、invoke_llm()、extract_state_patch()、emit_telemetry()、handle_fallback()。
+ContextManager 不是独立对象，而是每个 Agent 内部的一组方法，核心入口统一叫 build_context()。
+各 Agent 通过继承重写这些策略方法实现差异化：
+Router.build_context() 偏全局状态、任务摘要、模式线索、用户画像；
+TutorAgent.build_context() 偏教材证据、历史摘要、学习偏好、知识薄弱点；
+QuizMasterAgent.build_context() 偏题型约束、最近练习/考试状态、出题范围、历史错题；
+GraderAgent.build_context() 偏标准答案、评分规则、提交内容、最近任务状态。
+若需要共用裁剪/分段/预算逻辑，放在 BaseAgent 的 protected 方法中，例如：
+_budget_context()、_select_history()、_select_memory()、_format_context_sections()。
+差异必须通过方法重写体现，不用“大量 if/else 按 agent_type 分支”的单体 ContextManager。
+3. SessionState 作为 Agent 通信总线
+SessionStateV1 作为服务端持久化真源，至少包含：
+session_id、course_name、requested_mode_hint、resolved_mode、task_full_text、task_summary、current_stage、current_step_index、history_summary_state、selected_memory、last_quiz、last_exam、permission_mode、fallback_flags、idempotency_keys。
+Agent 不直接彼此传结构体，统一通过：
+读取 SessionState；
+产出 StatePatchV1；
+由 Runtime 合并回 SessionState。
+SessionState 同时承担上下文注入来源：
+每个 Agent 的 build_context() 从其中选择性读取所需字段。
+兼容期继续支持从旧 quiz_meta / exam_meta / history_summary_state 恢复状态，但主写入统一切到 SessionState。
+4. Runtime / TaskGraph 保留并细化
+保留 ExecutionRuntime + TaskGraphV1 路线。
+TaskGraph 白名单步骤固定为：
+plan_intent、prefetch_rag、prefetch_memory、build_agent_context、detect_submission、run_tutor、run_quiz、run_exam、run_grade、persist_session_state、persist_records、persist_memory、synthesize_final。
+Router 只决定模式、能力和参数，不允许自由创造步骤。
+detect_submission 仍由代码确定性规则执行，不交给 LLM 自由判断。
+Runtime 负责：
+调用哪个 Agent；
+在何时读写 SessionState；
+何时 fallback；
+如何记 telemetry 和 audit。
+5. Service Layer 保留，但移除独立 ContextManager
+服务层保留：
+RAGService、MemoryService、ToolHub、WorkspaceStore、TelemetryService。
+不再把 ContextManager 作为独立 service。
+上下文预算和裁剪共用能力放到 BaseAgent 内部共享方法，或下沉为纯工具函数，不作为顶层架构角色。
+RAGService 和 MemoryService 只负责“提供材料”，由具体 Agent 的 build_context() 决定如何使用。
+6. ToolHub 与权限治理保持既定方案
+ToolHub 保持为唯一工具入口。
+permission_mode 保持：
+safe、standard、elevated。
+工具调用统一承载：
+schema、phase contract、risk level、dedup、idempotency、audit、MCP stdio 调用。
+各 Agent 能否用工具，既受 Router plan 影响，也受 ToolHub 硬约束影响。
+7. Fallback 继续保留，但不能掩盖新链路失败
+默认走新 Runtime。
+fallback 仅在关键节点失败时触发，且必须记录：
+session_id、request_id、agent、step_name、reason、from_path、to_path。
+提供两套运行模式：
+compat：允许 fallback，保障稳定。
+strict_new_runtime：禁止 fallback，验证新链路是否真正完成。
+只要某功能必须靠 fallback 才能成功，就判定该功能在 v3 中未完成。
+Execution Phases
+Phase 0: Baseline Freeze
+提交当前仓库快照，包含现有评审文档。
+创建 tag：baseline/pre-v3-2026-04-11。
+创建分支：v3/architecture-upgrade。
+锁定标准解释器：
+C:\Users\10423\miniconda3\envs\study_agent\python.exe。
+Phase 1: State First
+在共享 schema 中引入 SessionStateV1、StatePatchV1、PlanPlusV1。
+兼容读取旧 meta。
+/chat 与 /chat/stream 新增可选 session_id。
+返回中增加 resolved_mode、session_id、current_stage。
+Phase 2: Agent Base Class
+引入 BaseAgent。
+将 Router、TutorAgent、QuizMasterAgent、GraderAgent 迁移到继承模型。
+把各 Agent 原有 prompt 组装、上下文注入、telemetry 打点逐步迁移到统一模板方法框架。
+Phase 3: Per-Agent Context Strategy
+为四个 Agent 分别实现自己的 build_context() 和相关 protected hooks。
+上下文差异通过继承实现，不做单一大分支管理器。
+完成从 SessionState + Services 到各 Agent 上下文的选择性注入。
+Phase 4: Runtime / TaskGraph
+引入 ExecutionRuntime。
+将现有 Runner 的硬编码流程迁移为 TaskGraph 执行。
+Runner 逐步薄化为 API 兼容外壳和运行入口。
+Phase 5: ToolHub / Fallback / Validation
+接入 ToolHub 的权限、幂等、审计。
+接入 fallback 记录与 strict 模式。
+用 benchmark 和 trace 验证新链路不靠 fallback 也能跑通。
+Public Interfaces / Types
+保留类名：
+Router、TutorAgent、QuizMasterAgent、GraderAgent。
+新增基类：
+BaseAgent。
+新增内部类型：
+PlanPlusV1、SessionStateV1、StatePatchV1、AgentResultV1、TaskGraphV1。
+保留 API：
+/chat、/chat/stream。
+ChatRequest.mode 保留，但内部语义为 mode_hint。
+新增可选 session_id。
+SSE 事件名保持兼容，不新增破坏性字段。
+Test Plan
+基线测试：
+使用 study_agent 运行现有契约测试和基础测试。
+BaseAgent 测试：
+所有 Agent 子类都走统一模板调用链。
+Context Strategy 测试：
+四个 Agent 的 build_context() 输出应符合各自职责，且不互相污染。
+SessionState 测试：
+多轮请求中状态可持续更新，StatePatch 合并正确。
+Router 测试：
+mode_hint 与 resolved_mode 可不同，且 Runtime 按 resolved_mode 执行。
+Runtime 测试：
+三模式主链路可跑通；
+detect_submission 行为不回退；
+同步接口不返回 generator；
+流式接口正常发 __context_budget__。
+Fallback 测试：
+strict 模式下主链路能独立通过；
+compat 模式下所有 fallback 都有 trace 记录。
+性能测试：
+比较 v2 与 v3 的 TTFT、E2E、tool call count、prompt tokens、fallback rate。
+Assumptions
+这次是在既定任务条目上继续细化，不推翻之前已确认的阶段和目标。
+Router 名称稳定优先。
+ContextManager 以 Agent 方法形式存在，差异通过继承实现。
+SessionState 仍是全局短期记忆和 Agent 通信核心。
+fallback 是稳定性保护，不是主功能完成的判定依据。
+展开计划
+最后再审阅一遍计划结合pdf和我们的讨论结果，有没有遗漏的，如有冲突以我为准
+
+
+套餐
+
+
+打开
+
+CoursePilot v3 最终升级计划
+Summary
+保留 Router 名称不变，它就是主 Agent，负责三种模式判定、计划生成和一次重规划建议。
+上下文采用两层结构：
+SessionState 负责全局短期会话状态；
+每个 Agent 通过继承 BaseAgent 的上下文方法实现自己的上下文策略。
+不再设计独立顶层 ContextManager 服务；“context manager”就是 Agent 的方法族。
+保留之前已确认条目：Git 基线冻结、study_agent 统一运行环境、SessionState 服务端优先、Runtime/TaskGraph、ToolHub、兼容层、可观测 fallback、benchmark 与测试整顿。
+补回此前容易遗漏但和 PDF 一致的项：统一 SSE EventBus、RAG/Memory 并行预取、错误分类、依赖真源统一、strict 模式验证新链路真实可用。
+Core Design
+1. Router 作为主 Agent
+Router 输入：
+message、mode_hint、课程信息、SessionState 摘要、长期记忆摘要、用户画像。
+Router 输出 PlanPlusV1，至少包含：
+resolved_mode、mode_reason、need_rag、need_memory、style、output_format、retrieval_query、memory_query、capabilities、risk_level、permission_mode、replan_policy。
+前端 mode 保留，但内部按 mode_hint 解释；最终执行模式以 Router.resolved_mode 为准。
+Router 只决定“做什么”和“约束条件”，不直接执行副作用步骤。
+2. BaseAgent + 继承式上下文策略
+新增 BaseAgent，Router、TutorAgent、QuizMasterAgent、GraderAgent 都继承它。
+BaseAgent 统一提供模板方法：
+load_session_state()、build_context()、build_messages()、invoke_llm()、extract_state_patch()、emit_telemetry()、handle_fallback()。
+每个 Agent 通过继承重写上下文策略，不新建独立 ContextManager 类。
+Router.build_context() 侧重：
+任务全文、任务摘要、当前阶段、模式线索、用户画像、最近关键记忆。
+TutorAgent.build_context() 侧重：
+RAG 证据、学习历史摘要、薄弱点、用户偏好。
+QuizMasterAgent.build_context() 侧重：
+出题范围、题型约束、最近 quiz/exam 状态、历史错题。
+GraderAgent.build_context() 侧重：
+标准答案、评分规则、学生提交、最近任务状态、必要教材证据。
+共用逻辑放在 BaseAgent 的受保护方法里，例如：
+_select_history()、_select_memory()、_budget_context()、_format_context_sections()。
+3. SessionState 作为全局短期记忆与通信总线
+SessionStateV1 作为服务端持久化真源，至少包含：
+session_id、course_name、requested_mode_hint、resolved_mode、task_full_text、task_summary、current_stage、current_step_index、history_summary_state、selected_memory、last_quiz、last_exam、permission_mode、fallback_flags、idempotency_keys。
+它承担：
+全局短期记忆；
+任务当前状态；
+执行到第几步；
+Agent 间通信；
+上下文注入来源。
+Agent 不直接互传对象，只通过：
+读取 SessionState；
+输出 StatePatchV1；
+由 Runtime 合并回 SessionState。
+旧 quiz_meta / exam_meta / history_summary_state 保留一个兼容周期，只读不主写。
+4. Runtime / TaskGraph / EventBus
+保留 ExecutionRuntime + TaskGraphV1。
+白名单步骤固定为：
+plan_intent、prefetch_rag、prefetch_memory、build_agent_context、detect_submission、run_tutor、run_quiz、run_exam、run_grade、persist_session_state、persist_records、persist_memory、synthesize_final。
+detect_submission 继续由代码规则完成，不交给 LLM 自由判断。
+EventBus 统一 SSE 元事件，继续沿用现有事件名：
+__status__、__citations__、__context_budget__、__tool_calls__。
+RAG 与 Memory 预取默认并行执行，降低 TTFT。
+5. Service Layer
+保留并抽离：
+RAGService、MemoryService、ToolHub、WorkspaceStore、TelemetryService。
+不再单列 ContextManager 为服务层角色。
+RAGService 负责检索器生命周期和课程级缓存。
+MemoryService 负责长期记忆检索、写入、画像更新、归档。
+ToolHub 负责工具权限、phase contract、dedup、idempotency、audit。
+WorkspaceStore 负责 notes/practices/exams/mistakes 的统一保存。
+TelemetryService 负责 trace、benchmark、fallback 和审计事件。
+6. ToolHub、错误分类与 Fallback
+permission_mode 固定为：
+safe、standard、elevated。
+所有工具继续只走 MCP stdio，不恢复本地 fallback。
+引入标准错误分类：
+UserInputError、IndexNotReadyError、ToolDeniedError、ToolTransientError、LLMProviderError。
+fallback 策略为“影子校验 + 可观测回退”：
+默认走新链路；
+关键节点失败才 fallback；
+每次 fallback 必须记录 session_id、request_id、agent、step_name、reason、from_path、to_path。
+提供两套模式：
+compat 允许 fallback；
+strict_new_runtime 禁止 fallback，用于验证新链路是否真正完成。
+Execution Phases
+Phase 0: Baseline & Environment
+提交当前仓库快照，打 tag：baseline/pre-v3-2026-04-11。
+创建分支：v3/architecture-upgrade。
+统一标准解释器：
+C:\Users\10423\miniconda3\envs\study_agent\python.exe。
+统一依赖真源，避免 requirements.txt 与 pyproject.toml 漂移。
+Phase 1: Schemas & Compatibility
+新增 PlanPlusV1、SessionStateV1、StatePatchV1、AgentResultV1、TaskGraphV1。
+在接口层加入可选 session_id。
+保留旧 history/meta 的兼容读取。
+对外继续兼容 /chat、/chat/stream 和三模式语义。
+Phase 2: BaseAgent & Router First
+引入 BaseAgent。
+将 Router、TutorAgent、QuizMasterAgent、GraderAgent 迁移为继承体系。
+完成 Router 的主 Agent 化：
+由它决定 resolved_mode 和主计划。
+Phase 3: Agent-specific Context Methods
+为四个 Agent 完成各自的 build_context() 和相关 hook。
+将上下文差异完全收敛到继承重写，不做单体分支式 ContextManager。
+SessionState 成为所有 Agent 上下文装配和状态回写的中心。
+Phase 4: Runtime / EventBus / Parallel Prefetch
+引入 ExecutionRuntime 与 TaskGraphV1。
+接入统一 EventBus。
+将现有 Runner 的硬编码流程迁移为 Runtime 执行图。
+开启 RAG/Memory 并行预取。
+Phase 5: ToolHub / Validation / Docs
+接入 ToolHub 的权限、审计、幂等、错误分类。
+建立 strict_new_runtime 验证路径。
+更新架构文档、配置文档、安全文档和 benchmark 基线。
+Public Interfaces
+保留类名：
+Router、TutorAgent、QuizMasterAgent、GraderAgent。
+新增 BaseAgent，不改现有 Agent 对外命名。
+保留 /chat、/chat/stream。
+ChatRequest.mode 保留，但内部语义是 mode_hint。
+新增可选 session_id。
+返回中新增：
+session_id、resolved_mode、current_stage。
+SSE 事件名保持不变，旧前端无需立刻大改。
+Test Plan
+基线测试：
+使用 study_agent 运行当前契约测试和基础测试，作为 pre-v3 baseline。
+BaseAgent 测试：
+所有 Agent 子类都走统一模板调用链。
+Agent 上下文测试：
+四个 Agent 的 build_context() 输出分别符合自身职责，不互相污染。
+Router 测试：
+mode_hint 可被改判；
+Runtime 始终按 resolved_mode 执行。
+SessionState 测试：
+多轮请求中 task_summary、current_stage、current_step_index、last_quiz、last_exam 能持续更新。
+兼容测试：
+旧 quiz_meta / exam_meta / history_summary_state 仍可恢复旧会话。
+Runtime 测试：
+三模式主链路可跑通；
+detect_submission 行为稳定；
+同步接口不返回 generator；
+流式接口正常发 __context_budget__。
+Fallback 测试：
+strict_new_runtime 下主链路独立通过；
+compat 下所有 fallback 都有 trace 和审计记录。
+性能测试：
+对比 v2 与 v3 的 TTFT、E2E、tool call count、prompt tokens、fallback rate。
+测试工程化：
+修正控制台编码脆弱性；
+将外部依赖测试与本地 deterministic 测试分层。
+Assumptions
+如与 PDF 有冲突，以你的最新决定为准。
+Router 不改名。
+ContextManager 不是独立类，而是 Agent 的方法和继承策略。
+SessionState 仍是全局短期记忆和 Agent 通信核心。
+fallback 是稳定性保障，不算新链路完成依据。
+v3 当前只做架构稳态细化，不扩增 Agent 数量，不纳入 OCR/多模态等新能力。
+展开计划
+执行计划
+
+
+
+上 66 条消息
+已开始执行，并完成了第一批可运行的 v3 骨架。
+
+当前已做完：
+
+已把现状冻结到 git：基线提交 6b7efdb，tag baseline/pre-v3-2026-04-11，并切到分支 v3/architecture-upgrade。
+加入了 v3 核心类型：backend/schemas.py
+现在有 PlanPlusV1、SessionStateV1、StatePatchV1、AgentResultV1，同时 ChatRequest/ChatResponse 接上了 session_id、resolved_mode、current_stage。
+加入了 Agent 基类：core/agents/base.py
+Router、TutorAgent、QuizMasterAgent、GraderAgent 都已经改成继承 BaseAgent，并各自有自己的 build_context() 策略入口。
+Router 已经开始承担主 Agent 职责：core/agents/router.py
+会产出 resolved_mode、mode_reason、permission_mode 等字段，并支持基于用户意图的模式改判。
+SessionState 已接进主链路：core/orchestration/runner.py
+现在 runner 会提取/恢复 session_state，兼容旧的 quiz_meta / exam_meta / history_summary_state，并在非流式和流式返回里都挂回 hidden meta。
+API 已接好新字段：backend/api.py
+/chat 现在会回 session_id、resolved_mode、current_stage；/chat/stream 也会把 session_id 带进 runner。
+我补了两条契约测试：tests/test_contract_fixes.py
+一条验证 Router 的 resolved_mode，一条验证 session_state 确实被挂进返回的 hidden meta。
+验证结果：
+
+study_agent 环境下 python -m unittest tests.test_contract_fixes 通过，15/15。
+study_agent 环境下 tests/test_basic.py 通过，5/5。
+这轮还没做的部分是下一批：
+
+ExecutionRuntime / TaskGraph
+EventBus
+ToolHub 权限/审计/幂等
+SessionState 的持久化从当前“服务端内存注册表 + history 兼容恢复”升级成更稳定的持久存储
+当前改动还没有做第二次提交，留在工作区里方便你先看。如果你愿意，我下一步就继续落 Runtime + TaskGraph 这一批。
+
+
+26 个文件已更改
++1039
+-311
+撤销
+
+审核
+backend/schemas.py
+core/agents/base.py
+core/agents/router.py
+core/agents/tutor.py
+core/agents/quizmaster.py
+core/agents/grader.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+core/orchestration/runner.py
+backend/api.py
+backend/api.py
+backend/api.py
+core/agents/__init__.py
+tests/test_contract_fixes.py
+core/agents/router.py
+
+你的 Codex 消息限额已用尽
+你的额度将于 16:57重置。要继续使用 Codex，请增加额度或立即升级至 Pro 套餐。
+升级
+增加额度
+
+
+
+
+GPT-5.4
+
+超高
+
+IDE 背景信息
+
+
+本地0%
+
+完全访问权限

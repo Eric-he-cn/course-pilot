@@ -11,6 +11,7 @@ import logging
 import shutil
 import uuid
 import contextvars
+import time
 from queue import Empty, Queue
 from threading import Thread
 from typing import List, Optional
@@ -37,6 +38,7 @@ from rag.ingest import DocumentParser
 from rag.chunk import chunk_documents
 from rag.store_faiss import build_index
 from core.orchestration.runner import OrchestrationRunner
+from core.services import get_default_online_shadow_eval
 
 app = FastAPI(title="Course Learning Agent API")
 
@@ -51,6 +53,7 @@ app.add_middleware(
 
 # 全局编排器实例
 runner = OrchestrationRunner()
+online_shadow_eval = get_default_online_shadow_eval()
 
 # 内存工作区注册表（生产环境建议换数据库）
 workspaces = {}
@@ -87,10 +90,6 @@ def load_workspaces_from_disk():
             os.makedirs(os.path.join(course_path, subdir), exist_ok=True)
 
 
-# 启动时恢复
-load_workspaces_from_disk()
-
-
 class CreateWorkspaceRequest(BaseModel):
     """创建课程工作区的请求体。"""
     course_name: str
@@ -102,6 +101,11 @@ class MessageRequest(BaseModel):
     message: str
 
 
+class SessionCleanupRequest(BaseModel):
+    """手动触发 SessionState 清理请求。"""
+    ttl_days: Optional[int] = None
+
+
 def _extract_session_state_payload(tool_calls: Optional[list]) -> dict:
     for tool_call in reversed(tool_calls or []):
         if not isinstance(tool_call, dict):
@@ -111,6 +115,95 @@ def _extract_session_state_payload(tool_calls: Optional[list]) -> dict:
             if isinstance(payload, dict):
                 return payload
     return {}
+
+
+def _enqueue_shadow_eval_record(
+    *,
+    request_id: str,
+    api: str,
+    request: ChatRequest,
+    history: List[dict],
+    response_text: str,
+    citations: Optional[list],
+    tool_calls: Optional[list],
+    e2e_latency_ms: float,
+    first_token_latency_ms: Optional[float] = None,
+    case_error: bool = False,
+) -> None:
+    if not bool(getattr(request, "shadow_eval", False)):
+        return
+    session_payload = _extract_session_state_payload(tool_calls)
+    case_id = f"online_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}"
+    payload = {
+        "case_id": case_id,
+        "api": api,
+        "request_id": request_id,
+        "course_name": request.course_name,
+        "mode": request.mode,
+        "message": request.message,
+        "history": history,
+        "session_id": session_payload.get("session_id") or request.session_id,
+        "resolved_mode": session_payload.get("resolved_mode"),
+        "current_stage": session_payload.get("current_stage"),
+        "response_text": response_text,
+        "citations": citations if isinstance(citations, list) else [],
+        "tool_calls": tool_calls if isinstance(tool_calls, list) else [],
+        "e2e_latency_ms": float(e2e_latency_ms or 0.0),
+        "first_token_latency_ms": float(first_token_latency_ms or 0.0) if first_token_latency_ms is not None else 0.0,
+        "case_error": bool(case_error),
+    }
+    try:
+        online_shadow_eval.enqueue(payload)
+    except Exception as ex:
+        logger.warning("[shadow_eval] enqueue_failed request_id=%s err=%s", request_id, str(ex))
+
+
+def _session_ttl_days() -> int:
+    try:
+        return max(1, int(os.getenv("SESSION_TTL_DAYS", "30")))
+    except Exception:
+        return 30
+
+
+def _session_cleanup_interval_sec() -> float:
+    try:
+        return max(60.0, float(os.getenv("SESSION_CLEANUP_INTERVAL_SEC", "900")))
+    except Exception:
+        return 900.0
+
+
+def _start_session_cleanup_worker() -> None:
+    if str(os.getenv("SESSION_CLEANUP_ENABLED", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    def _worker() -> None:
+        while True:
+            ttl_days = _session_ttl_days()
+            try:
+                for course_name in list(workspaces.keys()):
+                    summary = runner.workspace_store.cleanup_session_states(course_name, ttl_days=ttl_days)
+                    removed_count = int(summary.get("removed_count", 0) or 0)
+                    if removed_count > 0:
+                        logger.info(
+                            "[session.cleanup] course=%s ttl_days=%d removed=%d scanned=%d",
+                            course_name,
+                            ttl_days,
+                            removed_count,
+                            int(summary.get("scanned", 0) or 0),
+                        )
+            except Exception as ex:
+                logger.warning("[session.cleanup] worker_error=%s", str(ex))
+            time.sleep(_session_cleanup_interval_sec())
+
+    Thread(target=_worker, daemon=True, name="session-cleanup-worker").start()
+
+
+@app.on_event("startup")
+async def _startup_bootstrap() -> None:
+    """应用启动时恢复 workspace 并启动后台维护任务。"""
+    load_workspaces_from_disk()
+    _start_session_cleanup_worker()
+    online_shadow_eval.start_worker()
 
 
 @app.get("/")
@@ -275,6 +368,26 @@ async def delete_workspace_index(course_name: str):
     return {"message": "索引已删除"}
 
 
+@app.delete("/workspaces/{course_name}/sessions/{session_id}")
+async def delete_workspace_session(course_name: str, session_id: str):
+    """删除单个 SessionState 文件。"""
+    if course_name not in workspaces:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    deleted = runner.workspace_store.delete_session_state(course_name, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    return {"message": "session deleted", "course_name": course_name, "session_id": session_id}
+
+
+@app.post("/workspaces/{course_name}/sessions/cleanup")
+async def cleanup_workspace_sessions(course_name: str, request: SessionCleanupRequest):
+    """按 TTL 清理课程目录下过期 SessionState。"""
+    if course_name not in workspaces:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    ttl_days = int(request.ttl_days) if request.ttl_days is not None else _session_ttl_days()
+    return runner.workspace_store.cleanup_session_states(course_name, ttl_days=max(1, ttl_days))
+
+
 
 """为课程构建 RAG 向量索引。
     - 目的：根据课程已上传的教材文件，解析文本内容，分块处理，并构建 FAISS 向量索引，供后续对话检索使用。
@@ -381,12 +494,15 @@ async def chat(request: ChatRequest):
                 course_name=request.course_name,
                 history_len=len(history),
             )
+            runtime_state = {"session_id": request.session_id} if request.session_id else {}
+            if request.shadow_eval:
+                runtime_state["shadow_eval"] = True
             # 执行编排主流程
             response_message, plan = runner.run(
                 course_name=request.course_name,
                 mode=request.mode,
                 user_message=request.message,
-                state={"session_id": request.session_id} if request.session_id else {},
+                state=runtime_state,
                 history=history,
             )
             elapsed_ms = (perf_counter() - t0) * 1000.0
@@ -402,6 +518,25 @@ async def chat(request: ChatRequest):
                 request_id,
                 trace.trace_id,
                 elapsed_ms,
+            )
+            citations_payload: List[dict] = []
+            if isinstance(response_message.citations, list):
+                for c in response_message.citations:
+                    if hasattr(c, "model_dump"):
+                        citations_payload.append(c.model_dump())
+                    elif isinstance(c, dict):
+                        citations_payload.append(c)
+            _enqueue_shadow_eval_record(
+                request_id=request_id,
+                api="/chat",
+                request=request,
+                history=history,
+                response_text=str(response_message.content or ""),
+                citations=citations_payload,
+                tool_calls=response_message.tool_calls if isinstance(response_message.tool_calls, list) else [],
+                e2e_latency_ms=elapsed_ms,
+                first_token_latency_ms=None,
+                case_error=False,
             )
     except Exception as e:
         elapsed_ms = (perf_counter() - t0) * 1000.0
@@ -446,6 +581,9 @@ async def chat_stream(request: ChatRequest):
         first_chunk_latency_ms = None
         emitted_chunks = 0
         q: Queue = Queue()
+        streamed_text_parts: List[str] = []
+        citations_payload: List[dict] = []
+        tool_calls_payload: List[dict] = []
 
         def _emit(payload):
             nonlocal first_chunk_latency_ms, emitted_chunks
@@ -456,11 +594,14 @@ async def chat_stream(request: ChatRequest):
 
         def _runner_worker():
             try:
+                runtime_state = {"session_id": request.session_id} if request.session_id else {}
+                if request.shadow_eval:
+                    runtime_state["shadow_eval"] = True
                 for chunk in runner.run_stream(
                     course_name=request.course_name,
                     mode=request.mode,
                     user_message=request.message,
-                    state={"session_id": request.session_id} if request.session_id else {},
+                    state=runtime_state,
                     history=history,
                 ):
                     q.put(("chunk", chunk))
@@ -496,6 +637,13 @@ async def chat_stream(request: ChatRequest):
                         continue
                     if kind == "chunk":
                         if payload:
+                            if isinstance(payload, str):
+                                streamed_text_parts.append(payload)
+                            elif isinstance(payload, dict):
+                                if isinstance(payload.get("__citations__"), list):
+                                    citations_payload = list(payload.get("__citations__") or [])
+                                if isinstance(payload.get("__tool_calls__"), list):
+                                    tool_calls_payload = list(payload.get("__tool_calls__") or [])
                             # 用 JSON 序列化 chunk，换行符等特殊字符会被转义，不会破坏 SSE 行格式
                             yield _emit(payload)
                         continue
@@ -521,6 +669,18 @@ async def chat_stream(request: ChatRequest):
                     elapsed_ms,
                     emitted_chunks,
                 )
+                _enqueue_shadow_eval_record(
+                    request_id=request_id,
+                    api="/chat/stream",
+                    request=request,
+                    history=history,
+                    response_text="".join(streamed_text_parts),
+                    citations=citations_payload,
+                    tool_calls=tool_calls_payload,
+                    e2e_latency_ms=elapsed_ms,
+                    first_token_latency_ms=float(first_chunk_latency_ms) if first_chunk_latency_ms is not None else None,
+                    case_error=False,
+                )
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -542,6 +702,18 @@ async def chat_stream(request: ChatRequest):
                 elapsed_ms,
                 emitted_chunks,
                 str(e),
+            )
+            _enqueue_shadow_eval_record(
+                request_id=request_id,
+                api="/chat/stream",
+                request=request,
+                history=history,
+                response_text="".join(streamed_text_parts),
+                citations=citations_payload,
+                tool_calls=tool_calls_payload,
+                e2e_latency_ms=elapsed_ms,
+                first_token_latency_ms=float(first_chunk_latency_ms) if first_chunk_latency_ms is not None else None,
+                case_error=True,
             )
             yield _emit(f"（生成回答时出错：{e}）")
         finally:

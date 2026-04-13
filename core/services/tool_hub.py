@@ -48,6 +48,14 @@ class ToolHub:
         "websearch": "standard",
         "filewriter": "elevated",
     }
+    TOOL_GROUPS = {
+        "calculator": {"calculator", "grading"},
+        "get_datetime": {"utility", "teaching"},
+        "memory_search": {"memory", "teaching", "grading"},
+        "mindmap_generator": {"teaching"},
+        "websearch": {"rag", "teaching", "generation"},
+        "filewriter": {"teaching", "generation", "grading"},
+    }
 
     @classmethod
     def _permission_allows(cls, tool_name: str, permission_mode: str) -> bool:
@@ -117,6 +125,61 @@ class ToolHub:
         usage.setdefault("per_tool", {})
         usage.setdefault("per_round", {})
         return usage
+
+    @classmethod
+    def _group_allows(cls, tool_name: str) -> bool:
+        ctx = cls._runtime_context()
+        raw = ctx.get("allowed_tool_groups", [])
+        allowed = {str(x).strip().lower() for x in raw if str(x).strip()} if isinstance(raw, list) else set()
+        if not allowed:
+            return True
+        tool_groups = {str(x).strip().lower() for x in cls.TOOL_GROUPS.get(tool_name, set())}
+        if not tool_groups:
+            return False
+        return bool(tool_groups.intersection(allowed))
+
+    @classmethod
+    def budget_snapshot(cls, tool_round: int) -> Dict[str, Any]:
+        usage = cls._usage_state()
+        limits = cls._budget_limits("__all__")
+        per_tool_limits = {}
+        for name in cls.TOOL_PERMISSION.keys():
+            per_tool_limits[name] = cls._budget_limits(name).get("per_tool")
+        executed_total = int(usage.get("executed_total", 0) or 0)
+        round_key = str(tool_round)
+        round_used = int((usage.get("per_round", {}) or {}).get(round_key, 0) or 0)
+        per_tool_used = {str(k): int(v or 0) for k, v in dict(usage.get("per_tool", {}) or {}).items()}
+
+        def _remaining(limit: Any, used: int) -> Optional[int]:
+            if limit is None:
+                return None
+            try:
+                return max(0, int(limit) - int(used))
+            except Exception:
+                return None
+
+        per_tool_remaining = {
+            name: _remaining(per_tool_limits.get(name), int(per_tool_used.get(name, 0) or 0))
+            for name in per_tool_limits.keys()
+        }
+        return {
+            "limits": {
+                "per_request_total": limits.get("per_request_total"),
+                "per_round": limits.get("per_round"),
+                "per_tool": per_tool_limits,
+            },
+            "usage": {
+                "executed_total": executed_total,
+                "current_round": tool_round,
+                "current_round_used": round_used,
+                "per_tool_used": per_tool_used,
+            },
+            "remaining": {
+                "per_request_total": _remaining(limits.get("per_request_total"), executed_total),
+                "per_round": _remaining(limits.get("per_round"), round_used),
+                "per_tool": per_tool_remaining,
+            },
+        }
 
     @classmethod
     def _increment_usage(cls, tool_name: str, tool_round: int) -> None:
@@ -206,6 +269,27 @@ class ToolHub:
             permission_mode=permission_mode,
             original_user_content=original_user_content,
         )
+        budget_snapshot = self.budget_snapshot(tool_round=tool_round)
+        if decision.allowed and not self._group_allows(tool_name):
+            add_event("tool_group_denied_count", tool_name=tool_name, tool_round=tool_round)
+            denied = decision.model_copy(update={"allowed": False, "reason": "tool_group_denied"})
+            self._append_audit(
+                ToolAuditRecord(
+                    tool_name=tool_name,
+                    signature=denied.signature,
+                    permission_mode=permission_mode,  # type: ignore[arg-type]
+                    allowed=False,
+                    reason="tool_group_denied",
+                    idempotency_key=denied.idempotency_key,
+                    metadata={
+                        "tool_round": tool_round,
+                        "allowed_tool_groups": list(self._runtime_context().get("allowed_tool_groups", []) or []),
+                        "tool_groups": sorted(list(self.TOOL_GROUPS.get(tool_name, set()))),
+                        "tool_budget_snapshot": budget_snapshot,
+                    },
+                )
+            )
+            raise ToolDeniedError("tool_group_denied")
         limits = self._budget_limits(tool_name)
         usage = self._usage_state()
         current_total = int(usage.get("executed_total", 0) or 0)
@@ -244,6 +328,7 @@ class ToolHub:
                         "current_tool": current_tool,
                         "current_round": current_round,
                         "limits": limits,
+                        "tool_budget_snapshot": budget_snapshot,
                     },
                 )
             )
@@ -356,6 +441,7 @@ class ToolHub:
                 "args": ToolPolicy.normalized_tool_args(tool_name, tool_args),
                 "session_id": str(getattr(MCPTools, "_context", {}).get("session_id", "") or ""),
                 "taskgraph_step": str(getattr(MCPTools, "_context", {}).get("taskgraph_step", "") or ""),
+                "tool_budget_snapshot": budget_snapshot,
             },
         )
         self._append_audit(record)
