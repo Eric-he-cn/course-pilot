@@ -8,7 +8,8 @@
 """
 import os
 from typing import List, Optional
-from core.llm.openai_compat import get_llm_client
+from backend.schemas import AgentContextV1, SessionStateV1
+from core.agents.base import BaseAgent
 from core.orchestration.prompts import (
     TUTOR_PROMPT,
     TUTOR_DEFAULT_SYSTEM_PROMPT,
@@ -22,11 +23,41 @@ from core.metrics import add_event, estimate_text_tokens
 TutorAgent：统一承载学习讲解、练习出题、考试对话等生成任务。
 职责：组装消息、注入工具与用户画像规则、调用 LLM 返回文本。
 """
-class TutorAgent:
+class TutorAgent(BaseAgent):
     
     """初始化 TutorAgent，复用全局 LLM 客户端。"""
-    def __init__(self):
-        self.llm = get_llm_client()
+    def __init__(self, **services):
+        super().__init__(agent_name="tutor", **services)
+
+    def build_context(self, session_state: SessionStateV1, **kwargs) -> AgentContextV1:
+        rag_context = str(kwargs.get("rag_context", "") or "")
+        history_context = str(kwargs.get("history_context", "") or "")
+        memory_context = str(kwargs.get("memory_context", "") or session_state.selected_memory or "")
+        merged_context = "\n\n".join(
+            part
+            for part in [
+                f"【教材证据】\n{rag_context}" if rag_context else "",
+                f"【历史摘要】\n{history_context}" if history_context else "",
+                f"【长期记忆】\n{memory_context}" if memory_context else "",
+            ]
+            if part
+        ).strip() or str(kwargs.get("context", "") or kwargs.get("merged_context", "") or "")
+        return AgentContextV1(
+            session_snapshot=session_state,
+            history_context=history_context,
+            rag_context=rag_context,
+            memory_context=memory_context,
+            merged_context=merged_context,
+            citations=list(kwargs.get("citations", []) or []),
+            constraints={
+                "agent": "tutor",
+                **dict(kwargs.get("constraints", {}) or {}),
+            },
+            tool_scope={
+                "allowed_tools": list(kwargs.get("allowed_tools", []) or []),
+                **dict(kwargs.get("tool_scope", {}) or {}),
+            },
+        )
 
     @staticmethod
     def _normalize_context_sections(context: str, context_sections: Optional[dict]) -> dict:
@@ -85,8 +116,7 @@ class TutorAgent:
 
         # 注入用户画像（薄弱知识点等），失败不影响主流程
         try:
-            from memory.manager import get_memory_manager
-            profile_ctx = get_memory_manager().get_profile_context(course_name)
+            profile_ctx = self.memory_service.get_profile_context(course_name)
             if profile_ctx:
                 system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
         except Exception:

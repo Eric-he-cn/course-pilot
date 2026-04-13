@@ -2,7 +2,7 @@
 
 本文档描述 CoursePilot 项目当前代码状态下的安全控制、已知风险与生产部署建议。
 
-- 最后更新：2026-03-18
+- 最后更新：2026-04-12
 - 适用范围：当前仓库代码（开发/测试环境）
 - 声明：本项目尚未进行独立第三方安全审计
 
@@ -13,7 +13,7 @@
 ### 1.1 路径与文件安全
 
 1. 课程名路径净化  
-`core/orchestration/runner.py` 的 `get_workspace_path()` 对 `course_name` 使用 `os.path.basename(course_name.strip())`，并拒绝 `.`/`..`，用于阻断路径穿越。
+`core/services/workspace_store.py` 对 `course_name` 使用 `basename + '.'/'..' 拒绝`，用于阻断路径穿越。
 
 2. 上传文件名净化与类型白名单  
 `backend/api.py` 的上传接口仅使用 `os.path.basename(file.filename)`，并限制扩展名为：
@@ -30,9 +30,15 @@
 ### 1.2 工具调用与权限控制
 
 1. 统一 MCP 调用与运行时约束  
-工具调用统一走 `MCPTools.call_tool -> mcp_stdio`，无本地 fallback；`core/orchestration/policies.py` 当前对三模式均放行 `ALL_TOOLS`，实际权限收敛由 Runner 路由与 Agent 内部实现（如 Grader 仅允许 `calculator`）保证。
+工具调用统一走 `ToolHub -> MCPTools.call_tool -> mcp_stdio`，无本地 fallback；`ToolHub` 负责权限、幂等、去重与审计，`STRICT_NEW_RUNTIME=1` 下任何兼容回退都会直接暴露为失败。
 
-2. 计算器受限执行环境  
+2. 权限模式分级  
+当前工具权限固定为 `safe / standard / elevated`：
+- `filewriter` 仅允许 `elevated`
+- `websearch` 仅允许 `standard`
+- `calculator / get_datetime / memory_search` 允许 `safe`
+
+3. 计算器受限执行环境  
 `mcp_tools/client.py` 的 `calculator` 使用受限 `eval`：
 - `__builtins__` 为空
 - 仅暴露预定义数学/统计函数
@@ -51,15 +57,18 @@
 ### 1.4 数据隔离与存储
 
 1. 课程级隔离目录  
-数据按课程隔离在 `data/workspaces/<course_name>/` 下，上传文件、索引、笔记、练习/考试记录分别落在子目录。
+数据按课程隔离在 `data/workspaces/<course_name>/` 下，上传文件、索引、笔记、练习/考试记录、`sessions/<session_id>.json` 分别落在子目录。
 
 2. 记忆库使用参数化 SQL  
 `memory/store.py` 使用 SQLite 并采用参数化查询（`?` 占位），降低 SQL 注入风险。
 
+3. SessionState 文件持久化  
+短期会话状态以 `SessionStateV1` 写入课程 workspace；恢复时优先按 `session_id` 读取文件真源，再兼容旧 `quiz_meta / exam_meta / history_summary_state`。
+
 ### 1.5 接口层
 
 1. SSE 输出做 JSON 包装  
-`backend/api.py` 的 `/chat/stream` 以 JSON 编码 chunk，减少换行/特殊字符破坏 SSE 协议的风险。
+`backend/api.py` 的 `/chat/stream` 以 JSON 编码 chunk，减少换行/特殊字符破坏 SSE 协议的风险；隐藏事件统一通过 `EventBus` 生成，避免业务代码手写 SSE 结构。
 
 2. CORS 当前为全开放  
 `allow_origins=["*"]` 仅适合开发阶段，生产需收敛白名单。
@@ -106,6 +115,9 @@
 
 8. Secrets 管理仍偏开发态  
 默认依赖本地 `.env`，生产环境应迁移到专业密钥管理服务。
+
+9. SessionState 属于服务端状态文件  
+当前为 JSON 文件真源，适合单机/开发环境；若进入多实例部署，需要引入共享状态存储和锁策略。
 
 ---
 

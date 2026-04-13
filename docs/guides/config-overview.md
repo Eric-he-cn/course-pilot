@@ -1,8 +1,8 @@
-# CoursePilot 关键配置总览（面试版）
+# CoursePilot 关键配置总览
 
-更新时间：2026-03-29  
-适用范围：当前主干代码（`core/`, `rag/`, `memory/`, `mcp_tools/`, `backend/`, `frontend/`, `scripts/perf/`）  
-说明：本清单按“模块 -> 参数 -> 默认值/行为”整理，便于面试问答。密钥类信息不写明文。
+更新时间：2026-04-12  
+适用范围：当前主干代码（`core/`, `rag/`, `memory/`, `mcp_tools/`, `backend/`, `frontend/`, `scripts/`）  
+说明：本清单按“模块 -> 参数 -> 默认值/行为”整理，便于定位配置归属与运行行为。密钥类信息不写明文。
 
 ---
 
@@ -13,8 +13,13 @@
 | `API_HOST` | `0.0.0.0` | FastAPI 监听地址 |
 | `API_PORT` | `8000` | FastAPI 端口 |
 | `API_BASE` | `http://localhost:8000` | Streamlit 前端请求后端地址 |
+| `API_RELOAD` | `0` | 是否开启 Uvicorn 自动重载（开发态可设为 `1`） |
+| `DATA_DIR` | `./data/workspaces` | 课程工作区与 `SessionState` 文件根目录 |
 | `SSE_HEARTBEAT_SEC` | `8` | `/chat/stream` 心跳状态推送间隔 |
 | `CONTEXT_BUDGET_EVENT_TIMEOUT_SEC` | `3.0` | 前端预算事件超时提示阈值 |
+| `SESSION_TTL_DAYS` | `30` | SessionState 过期清理天数 |
+| `SESSION_CLEANUP_ENABLED` | `1` | 是否启用后台会话清理线程 |
+| `SESSION_CLEANUP_INTERVAL_SEC` | `900` | 会话清理扫描间隔（秒） |
 
 ---
 
@@ -24,7 +29,7 @@
 |---|---|---|
 | `OPENAI_API_KEY` | 无 | LLM API 密钥 |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
-| `DEFAULT_MODEL` | `gpt-3.5-turbo` | 对话模型名 |
+| `DEFAULT_MODEL` | 环境变量 | 对话模型名（由运行环境决定） |
 
 补充：
 - 流式调用中会优先请求 `stream_options.include_usage=true`；不支持时自动降级重试。
@@ -41,6 +46,7 @@
 | `ALWAYS_FINAL_STREAM` | `1` | 是否始终保留最终单独流式回答轮 |
 | `TOOL_RETRY_MAX` | `1` | 工具重试上限（仅支持一次重试策略） |
 | `TOOL_DEDUP_MIN_INTERVAL_MS` | `1500` | 重复工具调用最小间隔判定 |
+| `STRICT_NEW_RUNTIME` | `0` | 开启后禁止 Runtime fallback，任何兼容回退都视为失败 |
 | `TOOL_ROUND_FULL_CONTEXT_ROUNDS` | `1` | 前几轮保留全量上下文 |
 | `TOOL_ROUND_KEEP_LAST_TOOL_MSGS` | `2` | 工具轮保留最近 tool 消息数 |
 | `TOOL_ROUND_RAG_SUMMARY_MAX_TOKENS` | `400` | 工具轮 RAG 摘要预算 |
@@ -69,6 +75,8 @@
 | `CB_RAG_SENT_MAX_CHARS` | `120` | 句级压缩单句最大长度 |
 | `CB_MEMORY_TOPK` | `2` | memory 注入条数 |
 | `CB_MEMORY_ITEM_MAX_CHARS` | `100` | 单条 memory 注入长度 |
+| `RAG_COMPRESSION_MODE` | `adaptive` | RAG 压缩模式（`adaptive/always/off`） |
+| `RAG_ADAPTIVE_PRESSURE_THRESHOLD` | `0.9` | `adaptive` 下触发压缩的上下文压力阈值 |
 
 ### 4.2 历史压缩（LLM 条件触发）
 
@@ -156,9 +164,10 @@
 | `SERPAPI_API_KEY` | 无 | `websearch` 工具密钥 |
 
 关键机制：
-- 工具链路固定：`OpenAI tool_call -> MCPTools.call_tool -> stdio MCP -> server_stdio`。
+- 工具链路固定：`OpenAI tool_call -> ToolHub -> MCPTools.call_tool -> stdio MCP -> server_stdio`。
 - MCP 客户端超时默认 `20s`，失败自动重启重试一次。
 - 不做本地直调 fallback（协议一致性优先）。
+- 权限模式固定为 `safe / standard / elevated`。
 
 ---
 
@@ -177,6 +186,10 @@
 | `MEMORY_QA_ARCHIVE_MAX_IMPORTANCE` | `0.55` | 参与归档的 `qa` 重要度上限 |
 | `MEMORY_QA_SUMMARY_TARGET_TOKENS` | `220` | 单条 `qa_summary` 目标长度 |
 | `MEMORY_QA_SUMMARY_MAX_TOKENS` | `320` | 单条 `qa_summary` 最大长度 |
+| `MEMORY_EPISODES_SOFT_CAP` | `2000` | episodes 软上限（触发 LRU-like 淘汰） |
+| `MEMORY_EVICT_BATCH_SIZE` | `200` | 单次淘汰批大小 |
+| `MEMORY_EVICT_ENABLE` | `1` | 是否启用异步淘汰 |
+| `MEMORY_EVICT_PROTECT_IMPORTANCE` | `0.8` | 高重要度保护阈值 |
 
 数据模型：
 - `episodes`：`qa/qa_summary/mistake/practice/exam`
@@ -192,6 +205,44 @@
 | `ENABLE_ROUTER_REPLAN` | `1` | 是否启用重规划 |
 | `REPLAN_MIN_CHARS` | `160` | 低质量判定阈值（字符） |
 | `REPLAN_MIN_SENTENCES` | `2` | 低质量判定阈值（句数） |
+
+补充：
+- Replan 最多发生一次。
+- 只允许发生在任何 `persist_*` 副作用步骤之前。
+
+### 9.1 Router v3 规划字段（非环境变量）
+
+以下字段由 `PlanPlusV1` 在运行时生成与消费，不通过 `.env` 配置：
+
+- `workflow_template`: `learn_only / practice_only / exam_only / learn_then_practice / practice_then_review / exam_then_review`
+- `action_kind`: `learn_explain / practice_generate / practice_grade / exam_generate / exam_grade / learn_then_practice`
+- `route_confidence`
+- `route_reason`
+- `required_artifact_kind`
+- `tool_budget`
+- `allowed_tool_groups`
+
+执行语义：`ExecutionRuntime` 优先根据 `workflow_template + action_kind` 编译 `TaskGraphV1`，`task_type` 保留为兼容字段。
+
+### 9.2 ToolHub 硬限制参数
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `ACT_MAX_TOOLS_PER_REQUEST` | 未设置（由 plan.tool_budget 优先） | 单请求工具调用总上限 |
+| `ACT_MAX_TOOLS_PER_ROUND` | 未设置（由 plan.tool_budget 优先） | 单轮工具调用上限 |
+
+补充：
+- `per_tool` 上限优先来自 `plan.tool_budget.per_tool`（按工具名）。
+- 命中上限会在 trace 中打点：`tool_total_cap_hit_count / per_tool_cap_hit_count / tool_round_cap_hit_count`。
+- ToolHub 仍保留 `permission_mode + phase gate + dedup + idempotency + audit`。
+
+### 9.3 Memory LRU-like 行为
+
+`episodes` 新增 `last_accessed_at`：
+
+- 命中检索时会 touch 更新时间。
+- 检索排序按 `importance DESC + last_accessed_at DESC + created_at DESC`。
+- 归档/淘汰优先淘汰“低 importance 且最久未访问”记录，而不是纯 `created_at`。
 
 ---
 
@@ -218,14 +269,65 @@
 | `--output-dir` | `data/perf_runs/baseline_v1` | 输出目录 |
 | `--profile` | `baseline_v1` | 评测 profile |
 | `--repeats` | `2` | 每条重复次数 |
+| `--recompute-only` | `false` | 只重算已有 `baseline_raw.jsonl` 的 RAG 指标，不重跑模型 |
+| `--gold-min-coverage` | `0.5` | case_id 与 gold 的最小覆盖率阈值 |
+| `--gold-mismatch-policy` | `fail` | 覆盖率不足时 `warn/fail` |
 
 支持：
 - checkpoint 断点续跑（按 `case_id#repeat` 去重）。
 - 输出 `raw/summary/md/checkpoint`。
+- v3 指标补充：`fallback_rate`、`resolved_mode_override_count`、`taskgraph_route`、`session_store_hit_rate`。
+- v3 上下文指标补充：`avg_history_tokens`、`avg_rag_tokens`、`avg_memory_tokens`、`avg_final_context_tokens`、`avg_input_context_tokens`、`avg_context_pressure_ratio`。
+- v3 trace contract：当 `requires_citations/need_rag=true` 且 stream 最终有 citations 时，若缺少 `retrieval / retrieval_missing_index / retrieval_skipped` 事件，会标记 `trace_contract_error=true`。
+
+RAG 命中判定策略（按优先级）：
+- `gold_chunk_ids` -> `chunk_id`
+- `gold_doc_ids + gold_pages` -> `doc_page`
+- `gold_doc_ids` -> `doc_id`
+- `gold_pages` -> `page`
+- `gold_keywords` -> `keyword`
+
+输出会附带：
+- `rag_match_strategy`
+- `rag_match_signal`
+- `gold_case_total/gold_case_matched/gold_case_coverage`
+
+补充脚本：
+- `python scripts/eval/dataset_lint.py --path benchmarks`
+- `python scripts/eval/judge_runner.py --raw data/perf_runs/<profile>/baseline_raw.jsonl --cases benchmarks/core_e2e.jsonl`
+- `python scripts/eval/review_runner.py --benchmark-summary ... --benchmark-raw ... --judge-summary ... --judge-raw ...`
+
+Judge 独立配置：
+- `EVAL_JUDGE_API_KEY`
+- `EVAL_JUDGE_BASE_URL`
+- `EVAL_JUDGE_MODEL`
+- `EVAL_JUDGE_TIMEOUT_MS`
+- `EVAL_JUDGE_TEMPERATURE`
 
 ---
 
-## 12. 当前本地 `.env`（脱敏快照）
+## 12. 在线影子评测（会话级异步）
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `ONLINE_EVAL_WORKER_ENABLED` | `0` | 是否启动在线影子评测后台 worker（默认关闭，显式开启） |
+| `ONLINE_EVAL_POLL_SEC` | `30` | 队列轮询间隔（秒） |
+| `ONLINE_EVAL_RUN_JUDGE_REVIEW` | `1` | 是否自动触发 judge/review 子流程 |
+| `ONLINE_EVAL_PYTHON_BIN` | 空（自动） | 在线评测子进程解释器 |
+| `ONLINE_EVAL_JUDGE_TIMEOUT_SEC` | `1800` | `judge_runner` 超时 |
+| `ONLINE_EVAL_REVIEW_TIMEOUT_SEC` | `900` | `review_runner` 超时 |
+
+行为说明：
+- 前端会话可开启 `shadow_eval`，后端将请求/响应写入 `data/perf_runs/online_eval/<date>/eval_queue.jsonl`。
+- worker 异步消费队列并生成：
+  - `benchmark_raw_online.jsonl`
+  - `benchmark_summary_online.json`
+  - `judge/*`
+  - `review/*`
+
+---
+
+## 13. 当前本地 `.env`（脱敏快照）
 
 已设置（示例）：
 - `OPENAI_BASE_URL=https://api.deepseek.com`
@@ -246,7 +348,7 @@
 
 ---
 
-## 13. 面试建议：最常被问的“为什么这么配”
+## 14. 面试建议：最常被问的“为什么这么配”
 
 - `ACT_MAX_TOKENS=160`：限制工具轮冗余长文本，减少中间轮耗时。
 - `ALWAYS_FINAL_STREAM=1`：保证最终答案轮有可感知的 TTFT 与流式体验。

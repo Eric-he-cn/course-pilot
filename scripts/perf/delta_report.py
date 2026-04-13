@@ -24,6 +24,9 @@ KEYS = [
     "tool_success_rate",
     "error_rate",
     "replan_trigger_rate",
+    "fallback_rate",
+    "resolved_mode_override_count",
+    "session_store_hit_rate",
 ]
 
 
@@ -118,4 +121,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -49,6 +49,20 @@ def strip_source_markers(text: str) -> str:
     return re.sub(r"\[来源\d+\]", "", text)
 
 
+def extract_session_state_from_tool_calls(tool_calls):
+    """从隐藏 tool_calls 中提取 session_state payload。"""
+    if not isinstance(tool_calls, list):
+        return {}
+    for item in reversed(tool_calls):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "internal_meta" and item.get("name") == "session_state":
+            payload = item.get("payload")
+            if isinstance(payload, dict):
+                return payload
+    return {}
+
+
 def render_mermaid(mermaid_code: str, idx: int = 0, height: int = 520) -> None:
     """使用 Mermaid CDN + components.html 渲染思维导图，并提供 SVG/PNG 下载按钮。"""
     import streamlit.components.v1 as components
@@ -204,6 +218,7 @@ HELP_CONTENT = """
   <li>AI 生成完整试卷后，将所有答案<b>一次性提交</b></li>
   <li>AI 出具逐题批改报告和总得分，并分析薄弱知识点</li>
   <li>考试模式默认允许联网搜索，但受工具契约约束，仅在必要时调用</li>
+  <li>影子评测默认关闭；只有手动打开侧边栏中的「🧪 开启影子评测」后，当前会话才会写入在线评测队列</li>
 </ul>
 
 <h3>🛠️ 实用技巧</h3>
@@ -238,6 +253,10 @@ if "latest_context_budget" not in st.session_state:
     st.session_state.latest_context_budget = None
 if "_pending_context_budget" not in st.session_state:
     st.session_state._pending_context_budget = None
+if "current_session_id" not in st.session_state:
+    st.session_state.current_session_id = None
+if "shadow_eval_enabled" not in st.session_state:
+    st.session_state.shadow_eval_enabled = False
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -573,6 +592,8 @@ def send_message(course_name: str, mode: str, message: str):
                 "course_name": course_name,
                 "mode": mode,
                 "message": message,
+                "session_id": st.session_state.current_session_id,
+                "shadow_eval": bool(st.session_state.shadow_eval_enabled),
                 "history": history_payload
             },
             timeout=120
@@ -611,6 +632,8 @@ def stream_chat(course_name: str, mode: str, message: str):
         "course_name": course_name,
         "mode": mode,
         "message": message,
+        "session_id": st.session_state.current_session_id,
+        "shadow_eval": bool(st.session_state.shadow_eval_enabled),
         "history": history_payload,
     }
     # 先发送连接状态，避免前端“无响应感”。
@@ -722,6 +745,7 @@ with st.sidebar:
         if selected != st.session_state.current_course:
             st.session_state.current_course = selected
             st.session_state.chat_history = []
+            st.session_state.current_session_id = None
     else:
         st.info("暂无课程，请创建新课程")
     
@@ -739,6 +763,12 @@ with st.sidebar:
     )
     if mode != st.session_state.current_mode:
         st.session_state.current_mode = mode
+
+    st.toggle(
+        "🧪 开启影子评测",
+        key="shadow_eval_enabled",
+        help="开启后当前会话会异步写入在线评测队列，不影响主链路响应。",
+    )
     
     # 步骤5：管理知识库文件与索引。
     if st.session_state.current_course:
@@ -822,6 +852,35 @@ with st.sidebar:
                     build_index(course)
                 st.rerun()
 
+        st.markdown("**🧹 会话状态清理**")
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            if st.button("清理过期会话", use_container_width=True):
+                try:
+                    resp = requests.post(f"{API_BASE}/workspaces/{course}/sessions/cleanup", json={}, timeout=20)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        st.success(f"已清理 {int(data.get('removed_count', 0) or 0)} 个过期会话")
+                    else:
+                        st.error(resp.json().get("detail", "清理失败"))
+                except Exception as ex:
+                    st.error(str(ex))
+        with col_s2:
+            if st.button("删除当前会话", use_container_width=True, disabled=not bool(st.session_state.current_session_id)):
+                try:
+                    sid = str(st.session_state.current_session_id or "").strip()
+                    if sid:
+                        resp = requests.delete(f"{API_BASE}/workspaces/{course}/sessions/{sid}", timeout=20)
+                        if resp.status_code == 200:
+                            st.success("当前会话已删除")
+                            st.session_state.current_session_id = None
+                            st.session_state.chat_history = []
+                            st.rerun()
+                        else:
+                            st.error(resp.json().get("detail", "删除失败"))
+                except Exception as ex:
+                    st.error(str(ex))
+
 
 # 主内容区：展示状态栏、历史消息和流式回复。
 if st.session_state.current_course:
@@ -845,6 +904,7 @@ if st.session_state.current_course:
         with btn_col2:
             if st.button("🗑 清空", use_container_width=True, help="清空当前对话历史"):
                 st.session_state.chat_history = []
+                st.session_state.current_session_id = None
 
     # ── 帮助面板（可折叠） ───────────────────────────────────────────────────
     if st.session_state.show_help:
@@ -958,6 +1018,11 @@ if st.session_state.current_course:
                     # 工具元数据事件：用于下一轮评分，不在当前对话中显示
                     if isinstance(chunk, dict) and "__tool_calls__" in chunk:
                         st.session_state._pending_tool_calls = chunk["__tool_calls__"] or []
+                        session_state_payload = extract_session_state_from_tool_calls(st.session_state._pending_tool_calls)
+                        if isinstance(session_state_payload, dict):
+                            sid = str(session_state_payload.get("session_id", "") or "").strip()
+                            if sid:
+                                st.session_state.current_session_id = sid
                         continue
 
                     # 上下文预算事件：显示“背景信息窗口”并记录最新预算状态

@@ -30,6 +30,13 @@ class Retriever:
             b=self._env_float("BM25_B", 0.75),
         )
 
+    @staticmethod
+    def _rag_compression_mode() -> str:
+        raw = str(os.getenv("RAG_COMPRESSION_MODE", "adaptive")).strip().lower()
+        if raw in {"adaptive", "always", "off"}:
+            return raw
+        return "adaptive"
+
     """_env_int 和 _env_float: 用于从环境变量中读取整数和浮点数配置，提供默认值并确保合理范围。"""
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -177,10 +184,16 @@ class Retriever:
             success = False
             raise
         
+        compression_mode = self._rag_compression_mode()
+        sentence_compress_applied = compression_mode == "always"
         retrieved = []
         for chunk, score in results:
-            # 句级压缩：保留每个 chunk 的 top-N 相关句；失败时回退首句。
-            comp_text = self._compress_chunk_text(query=query, chunk_text=chunk["text"])
+            if compression_mode == "always":
+                # 明确开启时，检索层直接句级压缩。
+                comp_text = self._compress_chunk_text(query=query, chunk_text=chunk["text"])
+            else:
+                # adaptive/off 模式都在预算层决定是否二次压缩，检索层保留完整 chunk。
+                comp_text = str(chunk.get("text", "") or "")
             retrieved.append(RetrievedChunk(
                 text=comp_text,
                 doc_id=chunk["doc_id"],
@@ -197,6 +210,8 @@ class Retriever:
             top_k=top_k,
             candidate_count=candidate_count,
             returned_count=len(retrieved),
+            rag_compression_mode=compression_mode,
+            rag_sentence_compress_applied=sentence_compress_applied,
             success=success,
         )
         return retrieved

@@ -9,7 +9,8 @@
 import json
 import os
 from typing import List, Optional
-from core.llm.openai_compat import get_llm_client
+from backend.schemas import AgentContextV1, SessionStateV1
+from core.agents.base import BaseAgent
 from core.orchestration.prompts import (
     GRADER_PROMPT,
     GRADER_GRADE_SYSTEM_PROMPT,
@@ -50,12 +51,42 @@ _CALCULATOR_TOOL = [
 ]
 
 """GraderAgent：负责对答案评分、讲评，并按需写入记忆系统。"""
-class GraderAgent:
+class GraderAgent(BaseAgent):
     """评分 Agent 主体。"""
 
     """初始化 GraderAgent，复用全局 LLM 客户端。"""
-    def __init__(self):
-        self.llm = get_llm_client()
+    def __init__(self, **services):
+        super().__init__(agent_name="grader", **services)
+
+    def build_context(self, session_state: SessionStateV1, **kwargs) -> AgentContextV1:
+        history_context = str(kwargs.get("history_context", "") or "")
+        rag_context = str(kwargs.get("rag_context", "") or "")
+        memory_context = str(kwargs.get("memory_context", "") or session_state.selected_memory or "")
+        merged_context = "\n\n".join(
+            part
+            for part in [
+                f"【评分依据】\n{rag_context}" if rag_context else "",
+                f"【会话摘要】\n{history_context}" if history_context else "",
+                f"【历史薄弱点】\n{memory_context}" if memory_context else "",
+            ]
+            if part
+        ).strip() or str(kwargs.get("context", "") or kwargs.get("merged_context", "") or "")
+        return AgentContextV1(
+            session_snapshot=session_state,
+            history_context=history_context,
+            rag_context=rag_context,
+            memory_context=memory_context,
+            merged_context=merged_context,
+            citations=list(kwargs.get("citations", []) or []),
+            constraints={
+                "agent": "grader",
+                **dict(kwargs.get("constraints", {}) or {}),
+            },
+            tool_scope={
+                "allowed_tools": ["calculator"],
+                **dict(kwargs.get("tool_scope", {}) or {}),
+            },
+        )
 
     @staticmethod
     def _env_bool(name: str, default: bool = False) -> bool:
@@ -403,30 +434,12 @@ class GraderAgent:
         mistake_tags: List[str],
     ) -> None:
         try:
-            from memory.manager import get_memory_manager
-            mgr = get_memory_manager()
-            is_mistake = score < 60
-            importance = 0.9 if is_mistake else 0.4
-            content = f"题目: {question[:200]}\n学生答案: {student_answer[:200]}\n得分: {score:.0f}"
-            if mistake_tags:
-                content += f"\n错误类型: {', '.join(mistake_tags)}"
-            event_type = "mistake" if is_mistake else "practice"
-            mgr.save_episode(
+            self.memory_service.save_practice_grade(
                 course_name=course_name,
-                event_type=event_type,
-                content=content,
-                importance=importance,
-                metadata={
-                    "score": score,
-                    "tags": mistake_tags,
-                    "mode": "practice",
-                    "agent": "grader",
-                    "phase": "grade",
-                },
+                user_answer=student_answer,
+                history=[{"role": "assistant", "content": question}],
+                response_text=f"得分: {score:.0f}\n错误类型: {', '.join(mistake_tags)}",
             )
-            if mistake_tags and is_mistake:
-                mgr.update_weak_points(course_name, mistake_tags)
-            mgr.record_practice_result(course_name, score, is_mistake)
         except Exception as e:
             print(f"[Memory] 错题记忆写入失败（不影响评分）: {e}")
 
@@ -475,8 +488,7 @@ class GraderAgent:
 
         # 2) 注入用户学习档案（失败不影响主流程）
         try:
-            from memory.manager import get_memory_manager
-            profile_ctx = get_memory_manager().get_profile_context(course_name)
+            profile_ctx = self.memory_service.get_profile_context(course_name)
             if profile_ctx:
                 system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
         except Exception:
@@ -528,8 +540,7 @@ class GraderAgent:
         system_prompt += "\n请严格按内部评卷计划执行，并输出完整批改讲解。"
 
         try:
-            from memory.manager import get_memory_manager
-            profile_ctx = get_memory_manager().get_profile_context(course_name)
+            profile_ctx = self.memory_service.get_profile_context(course_name)
             if profile_ctx:
                 system_prompt += f"\n\n【用户学习档案】{profile_ctx}"
         except Exception:

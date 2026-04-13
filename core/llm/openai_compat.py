@@ -14,8 +14,10 @@ from typing import List, Dict, Any, Optional
 from time import perf_counter
 from openai import OpenAI
 from dotenv import load_dotenv
+from core.errors import ToolDeniedError
 from core.metrics import add_event, estimate_prompt_tokens, estimate_text_tokens, get_active_trace
 from core.orchestration.policies import ToolPolicy, ToolCapability
+from core.services import get_default_event_bus, get_default_tool_hub
 
 load_dotenv()
 
@@ -228,13 +230,55 @@ def _anchor_system_and_user(messages: List[Dict[str, Any]]) -> tuple[Optional[Di
     return system_msg, user_idx
 
 
+def _strip_budget_hint_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "system"
+            and str(msg.get("content", "")).startswith("[TOOL_BUDGET]")
+        ):
+            continue
+        out.append(msg)
+    return out
+
+
+def _tool_budget_snapshot_text(round_no: int) -> str:
+    try:
+        snapshot = get_default_tool_hub().budget_snapshot(tool_round=round_no)
+        remaining = snapshot.get("remaining", {}) if isinstance(snapshot, dict) else {}
+        usage = snapshot.get("usage", {}) if isinstance(snapshot, dict) else {}
+        limits = snapshot.get("limits", {}) if isinstance(snapshot, dict) else {}
+        add_event(
+            "tool_budget_snapshot",
+            tool_round=round_no,
+            tool_budget_snapshot=snapshot,
+        )
+        return (
+            "[TOOL_BUDGET]\n"
+            "你当前处于工具调用推理轮。请优先使用最少必要工具。\n"
+            f"- 当前轮次: {round_no}\n"
+            f"- 请求总预算剩余: {remaining.get('per_request_total')}\n"
+            f"- 本轮预算剩余: {remaining.get('per_round')}\n"
+            f"- 当前已调用总次数: {usage.get('executed_total')}\n"
+            f"- 预算上限: {json.dumps(limits, ensure_ascii=False)}\n"
+            f"- 按工具剩余额度: {json.dumps(remaining.get('per_tool', {}), ensure_ascii=False)}"
+        )
+    except Exception:
+        return ""
+
+
 def _compact_messages_for_tool_round(
     messages: List[Dict[str, Any]],
     original_user_content: str,
     round_no: int,
 ) -> List[Dict[str, Any]]:
+    messages = _strip_budget_hint_messages(messages)
+    budget_hint = _tool_budget_snapshot_text(round_no)
     full_rounds = max(1, _env_int("TOOL_ROUND_FULL_CONTEXT_ROUNDS", 1))
     if round_no <= full_rounds:
+        if budget_hint:
+            return [*messages, {"role": "system", "content": budget_hint}]
         return messages
     keep_last_tool_msgs = max(1, _env_int("TOOL_ROUND_KEEP_LAST_TOOL_MSGS", 2))
     rag_max_tokens = max(80, _env_int("TOOL_ROUND_RAG_SUMMARY_MAX_TOKENS", 400))
@@ -249,6 +293,8 @@ def _compact_messages_for_tool_round(
         rag_max_tokens=rag_max_tokens,
         memory_max_tokens=memory_max_tokens,
     )
+    if budget_hint:
+        compact_user = (compact_user + "\n\n" + budget_hint).strip() if compact_user else budget_hint
     out: List[Dict[str, Any]] = []
     if system_msg is not None:
         out.append(system_msg)
@@ -444,6 +490,84 @@ def _tool_call_preflight(
     )
 
 
+def _permission_mode() -> str:
+    try:
+        from mcp_tools.client import MCPTools
+
+        raw = str(MCPTools._context.get("permission_mode", "standard")).strip().lower()
+    except Exception:
+        raw = "standard"
+    if raw in {"safe", "standard", "elevated"}:
+        return raw
+    return "standard"
+
+
+def _tool_call_via_hub(
+    *,
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    phase: str,
+    original_user_content: str,
+    tool_cache: Dict[str, Dict[str, Any]],
+    last_exec_ms: Dict[str, float],
+    tool_retry_max: int,
+    tool_round: int,
+) -> tuple[bool, str, ToolCapability, str, Dict[str, Any]]:
+    capability = ToolPolicy.get_capability(tool_name)
+    hub = get_default_tool_hub()
+    mode = _active_mode()
+    permission_mode = _permission_mode()
+    signature = ToolPolicy.normalized_tool_signature(tool_name, tool_args)
+    if tool_name == "memory_search":
+        shared = _request_cache_get(signature)
+        if isinstance(shared, dict) and signature not in tool_cache:
+            tool_cache[signature] = dict(shared)
+    try:
+        decision, tool_result = hub.invoke(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            mode=mode,
+            phase=phase,
+            permission_mode=permission_mode,
+            original_user_content=original_user_content,
+            tool_cache=tool_cache,
+            last_exec_ms=last_exec_ms,
+            tool_retry_max=tool_retry_max,
+            tool_round=tool_round,
+        )
+        if tool_name == "memory_search" and isinstance(tool_result, dict):
+            _request_cache_put(decision.signature, tool_result)
+        return True, "allowed", capability, decision.signature, dict(tool_result or {})
+    except ToolDeniedError:
+        decision = hub.decide(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            mode=mode,
+            phase=phase,
+            permission_mode=permission_mode,
+            original_user_content=original_user_content,
+        )
+        add_event(
+            "tool_skip",
+            tool_name=tool_name,
+            tool_skip_reason=decision.reason,
+            tool_signature=decision.signature,
+            tool_round=tool_round,
+        )
+        return (
+            False,
+            decision.reason,
+            capability,
+            decision.signature,
+            {
+                "tool": tool_name,
+                "success": False,
+                "error": f"tool gated: {decision.reason}",
+                "failure_class": "fatal_error",
+            },
+        )
+
+
 class LLMClient:
     """OpenAI 兼容的 LLM 客户端封装。"""
     
@@ -520,8 +644,6 @@ class LLMClient:
     ) -> str:
         """带 Function Calling 的对话（显式 Act/Synthesize 两阶段，非流式最终输出）。"""
         logger = logging.getLogger("llm.tools")
-        from mcp_tools.client import MCPTools
-
         if not tools:
             return self.chat(messages, temperature, max_tokens)
 
@@ -628,29 +750,17 @@ class LLMClient:
                         tool_args = {}
                     tool_args = _rewrite_memory_search_args(tool_name, tool_args, original_user_content)
 
-                    allowed, gate_reason, capability, cache_key = _tool_call_preflight(
+                    allowed, gate_reason, capability, cache_key, tool_result = _tool_call_via_hub(
                         tool_name=tool_name,
                         tool_args=tool_args,
                         phase="act",
                         original_user_content=original_user_content,
-                    )
-                    add_event(
-                        "tool_gate_decision",
-                        tool_name=tool_name,
-                        phase="act",
-                        tool_gate_decision=allowed,
-                        tool_skip_reason=None if allowed else gate_reason,
-                        tool_signature=cache_key,
+                        tool_cache=tool_cache,
+                        last_exec_ms=last_exec_ms,
+                        tool_retry_max=tool_retry_max,
                         tool_round=round_no,
                     )
                     if not allowed:
-                        add_event(
-                            "tool_skip",
-                            tool_name=tool_name,
-                            tool_skip_reason=gate_reason,
-                            tool_signature=cache_key,
-                            tool_round=round_no,
-                        )
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -666,89 +776,24 @@ class LLMClient:
                         })
                         continue
 
-                    now_ms = perf_counter() * 1000.0
-                    dedup_reason = None
-                    if cache_key in tool_cache:
-                        dedup_reason = "exact_match_cache"
-                    elif tool_name == "memory_search":
-                        shared = _request_cache_get(cache_key)
-                        if isinstance(shared, dict):
-                            tool_cache[cache_key] = dict(shared)
-                            dedup_reason = "request_scope_cache"
-                        elif (
-                            cache_key in last_exec_ms
-                            and (now_ms - float(last_exec_ms.get(cache_key, 0.0))) < dedup_min_interval_ms
-                            and cache_key in tool_cache
-                        ):
-                            dedup_reason = "memory_search_min_interval"
-
-                    t_tool = perf_counter()
-                    if dedup_reason:
-                        tool_result = dict(tool_cache.get(cache_key, {}))
+                    logger.info(
+                        "[tools] hub_result name=%s success=%s via=%s signature=%s%s",
+                        tool_name,
+                        bool(tool_result.get("success", False)) if isinstance(tool_result, dict) else False,
+                        tool_result.get("via", "unknown") if isinstance(tool_result, dict) else "unknown",
+                        cache_key,
+                        _trace_tag(),
+                    )
+                    failure_class = _tool_failure_class(tool_result if isinstance(tool_result, dict) else {})
+                    if failure_class in {"retryable_error", "fatal_error"} and capability.fallback_mode == "synthesize":
+                        fallback_triggered = True
                         add_event(
-                            "tool_dedup",
-                            tool_name=tool_name,
-                            dedup_hit=True,
-                            dedup_reason=dedup_reason,
-                            tool_round=round_no,
-                        )
-                        logger.info("[tools] dedup_hit name=%s reason=%s%s", tool_name, dedup_reason, _trace_tag())
-                    else:
-                        logger.debug("[tools] execute name=%s args=%s", tool_name, tool_args)
-                        attempts = 0
-                        max_attempts = max(1, 1 + min(tool_retry_max, 1 if capability.retry_policy == "once" else 0))
-                        tool_result: Dict[str, Any] = {}
-                        failure_class = "fatal_error"
-                        while attempts < max_attempts:
-                            attempts += 1
-                            tool_result = MCPTools.call_tool(tool_name, **tool_args)
-                            failure_class = _tool_failure_class(tool_result if isinstance(tool_result, dict) else {})
-                            if failure_class != "retryable_error" or attempts >= max_attempts:
-                                break
-                            add_event(
-                                "tool_retry_count",
-                                tool_name=tool_name,
-                                tool_retry_count=attempts,
-                                tool_failure_class=failure_class,
-                                tool_round=round_no,
-                            )
-                        tool_result = dict(tool_result) if isinstance(tool_result, dict) else {"result": str(tool_result)}
-                        tool_result.setdefault("failure_class", failure_class)
-                        tool_cache[cache_key] = dict(tool_result)
-                        if tool_name == "memory_search" and isinstance(tool_result, dict):
-                            _request_cache_put(cache_key, tool_result)
-                        last_exec_ms[cache_key] = perf_counter() * 1000.0
-                        add_event(
-                            "tool_dedup",
-                            tool_name=tool_name,
-                            dedup_hit=False,
-                            dedup_reason="executed",
-                            tool_round=round_no,
-                        )
-                        add_event(
-                            "tool_failure_class",
+                            "tool_fallback_triggered",
                             tool_name=tool_name,
                             tool_failure_class=failure_class,
-                            tool_retry_count=max(0, attempts - 1),
                             tool_round=round_no,
+                            tool_fallback_triggered=True,
                         )
-                        logger.info(
-                            "[tools] executed name=%s success=%s via=%s elapsed_ms=%.1f%s",
-                            tool_name,
-                            bool(tool_result.get("success", False)) if isinstance(tool_result, dict) else False,
-                            tool_result.get("via", "unknown") if isinstance(tool_result, dict) else "unknown",
-                            (perf_counter() - t_tool) * 1000,
-                            _trace_tag(),
-                        )
-                        if failure_class in {"retryable_error", "fatal_error"} and capability.fallback_mode == "synthesize":
-                            fallback_triggered = True
-                            add_event(
-                                "tool_fallback_triggered",
-                                tool_name=tool_name,
-                                tool_failure_class=failure_class,
-                                tool_round=round_no,
-                                tool_fallback_triggered=True,
-                            )
                     logger.debug("[tools] result name=%s body=%s", tool_name, str(tool_result)[:300])
                     messages.append({
                         "role": "tool",
@@ -890,7 +935,7 @@ class LLMClient:
     ):
         """工具调用（Act 非流式）+ 最终答案（Synthesize 流式）。"""
         logger = logging.getLogger("llm.stream_tools")
-        from mcp_tools.client import MCPTools
+        event_bus = get_default_event_bus()
 
         def _status_for_tool(tool_name: str) -> str:
             mapping = {
@@ -925,7 +970,7 @@ class LLMClient:
 
         try:
             add_event("react_phase", phase="act", round=1, stream_tools=True)
-            yield {"__status__": "模型正在分析问题（Plan）..."}
+            yield event_bus.status("模型正在分析问题（Plan）...")
             for round_idx in range(max_rounds):
                 round_no = round_idx + 1
                 messages = _compact_messages_for_tool_round(
@@ -977,7 +1022,7 @@ class LLMClient:
                         _trace_tag(),
                     )
                     if final_text and not _env_bool("ALWAYS_FINAL_STREAM", True):
-                        yield {"__status__": "正在输出最终答案..."}
+                        yield event_bus.status("正在输出最终答案...")
                         yield from _stream_text_chunks(final_text)
                         return
                     break
@@ -991,7 +1036,7 @@ class LLMClient:
                     _trace_tag(),
                 )
                 for tool_name in dict.fromkeys(requested):
-                    yield {"__status__": _status_for_tool(tool_name)}
+                    yield event_bus.status(_status_for_tool(tool_name))
 
                 messages.append({
                     "role": "assistant",
@@ -1014,29 +1059,17 @@ class LLMClient:
                         tool_args = {}
                     tool_args = _rewrite_memory_search_args(tool_name, tool_args, original_user_content)
 
-                    allowed, gate_reason, capability, cache_key = _tool_call_preflight(
+                    allowed, gate_reason, capability, cache_key, tool_result = _tool_call_via_hub(
                         tool_name=tool_name,
                         tool_args=tool_args,
                         phase="act",
                         original_user_content=original_user_content,
-                    )
-                    add_event(
-                        "tool_gate_decision",
-                        tool_name=tool_name,
-                        phase="act",
-                        tool_gate_decision=allowed,
-                        tool_skip_reason=None if allowed else gate_reason,
-                        tool_signature=cache_key,
+                        tool_cache=tool_cache,
+                        last_exec_ms=last_exec_ms,
+                        tool_retry_max=tool_retry_max,
                         tool_round=round_no,
                     )
                     if not allowed:
-                        add_event(
-                            "tool_skip",
-                            tool_name=tool_name,
-                            tool_skip_reason=gate_reason,
-                            tool_signature=cache_key,
-                            tool_round=round_no,
-                        )
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -1052,89 +1085,24 @@ class LLMClient:
                         })
                         continue
 
-                    now_ms = perf_counter() * 1000.0
-                    dedup_reason = None
-                    if cache_key in tool_cache:
-                        dedup_reason = "exact_match_cache"
-                    elif tool_name == "memory_search":
-                        shared = _request_cache_get(cache_key)
-                        if isinstance(shared, dict):
-                            tool_cache[cache_key] = dict(shared)
-                            dedup_reason = "request_scope_cache"
-                        elif (
-                            cache_key in last_exec_ms
-                            and (now_ms - float(last_exec_ms.get(cache_key, 0.0))) < dedup_min_interval_ms
-                            and cache_key in tool_cache
-                        ):
-                            dedup_reason = "memory_search_min_interval"
-
-                    t_tool = perf_counter()
-                    if dedup_reason:
-                        tool_result = dict(tool_cache.get(cache_key, {}))
+                    logger.info(
+                        "[stream_tools] hub_result name=%s success=%s via=%s signature=%s%s",
+                        tool_name,
+                        bool(tool_result.get("success", False)) if isinstance(tool_result, dict) else False,
+                        tool_result.get("via", "unknown") if isinstance(tool_result, dict) else "unknown",
+                        cache_key,
+                        _trace_tag(),
+                    )
+                    failure_class = _tool_failure_class(tool_result if isinstance(tool_result, dict) else {})
+                    if failure_class in {"retryable_error", "fatal_error"} and capability.fallback_mode == "synthesize":
+                        fallback_triggered = True
                         add_event(
-                            "tool_dedup",
-                            tool_name=tool_name,
-                            dedup_hit=True,
-                            dedup_reason=dedup_reason,
-                            tool_round=round_no,
-                        )
-                        logger.info("[stream_tools] dedup_hit name=%s reason=%s%s", tool_name, dedup_reason, _trace_tag())
-                    else:
-                        logger.debug("[stream_tools] execute name=%s args=%s", tool_name, tool_args)
-                        attempts = 0
-                        max_attempts = max(1, 1 + min(tool_retry_max, 1 if capability.retry_policy == "once" else 0))
-                        tool_result: Dict[str, Any] = {}
-                        failure_class = "fatal_error"
-                        while attempts < max_attempts:
-                            attempts += 1
-                            tool_result = MCPTools.call_tool(tool_name, **tool_args)
-                            failure_class = _tool_failure_class(tool_result if isinstance(tool_result, dict) else {})
-                            if failure_class != "retryable_error" or attempts >= max_attempts:
-                                break
-                            add_event(
-                                "tool_retry_count",
-                                tool_name=tool_name,
-                                tool_retry_count=attempts,
-                                tool_failure_class=failure_class,
-                                tool_round=round_no,
-                            )
-                        tool_result = dict(tool_result) if isinstance(tool_result, dict) else {"result": str(tool_result)}
-                        tool_result.setdefault("failure_class", failure_class)
-                        tool_cache[cache_key] = dict(tool_result)
-                        if tool_name == "memory_search" and isinstance(tool_result, dict):
-                            _request_cache_put(cache_key, tool_result)
-                        last_exec_ms[cache_key] = perf_counter() * 1000.0
-                        add_event(
-                            "tool_dedup",
-                            tool_name=tool_name,
-                            dedup_hit=False,
-                            dedup_reason="executed",
-                            tool_round=round_no,
-                        )
-                        add_event(
-                            "tool_failure_class",
+                            "tool_fallback_triggered",
                             tool_name=tool_name,
                             tool_failure_class=failure_class,
-                            tool_retry_count=max(0, attempts - 1),
                             tool_round=round_no,
+                            tool_fallback_triggered=True,
                         )
-                        logger.info(
-                            "[stream_tools] executed name=%s success=%s via=%s elapsed_ms=%.1f%s",
-                            tool_name,
-                            bool(tool_result.get("success", False)) if isinstance(tool_result, dict) else False,
-                            tool_result.get("via", "unknown") if isinstance(tool_result, dict) else "unknown",
-                            (perf_counter() - t_tool) * 1000,
-                            _trace_tag(),
-                        )
-                        if failure_class in {"retryable_error", "fatal_error"} and capability.fallback_mode == "synthesize":
-                            fallback_triggered = True
-                            add_event(
-                                "tool_fallback_triggered",
-                                tool_name=tool_name,
-                                tool_failure_class=failure_class,
-                                tool_round=round_no,
-                                tool_fallback_triggered=True,
-                            )
                     logger.debug("[stream_tools] result name=%s body=%s", tool_name, str(tool_result)[:300])
                     messages.append({
                         "role": "tool",
@@ -1146,7 +1114,7 @@ class LLMClient:
                 if fallback_triggered:
                     logger.info("[stream_tools] act_stop_on_tool_failure round=%d%s", round_no, _trace_tag())
                     break
-                yield {"__status__": "工具调用完成，继续推理中..."}
+                yield event_bus.status("工具调用完成，继续推理中...")
                 add_event(
                     "tool_round_status",
                     tool_round=round_no,
@@ -1155,7 +1123,7 @@ class LLMClient:
 
             add_event("react_phase", phase="synthesize", round="final", stream_tools=True)
             logger.info("[stream_tools] phase=synthesize fallback=%s%s", int(fallback_triggered), _trace_tag())
-            yield {"__status__": "工具调用完成，正在生成最终答案（Synthesize）..."}
+            yield event_bus.status("工具调用完成，正在生成最终答案（Synthesize）...")
             final_messages = _rehydrate_messages_for_final(messages, original_user_content)
             if act_last_content:
                 final_messages = list(final_messages) + [
@@ -1172,7 +1140,7 @@ class LLMClient:
 
         except Exception as e:
             logger.exception("[stream_tools] call.error fallback_to_stream_plain=1%s", _trace_tag())
-            yield {"__status__": "工具调用异常，正在降级生成回答..."}
+            yield event_bus.status("工具调用异常，正在降级生成回答...")
             yield f"（工具调用出错，降级回答）\n"
             yield from self.chat_stream(messages, temperature, max_tokens=max_tokens)
 

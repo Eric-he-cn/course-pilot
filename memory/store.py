@@ -43,11 +43,15 @@ class SQLiteMemoryStore:
                     content     TEXT NOT NULL,    -- 问题(+答案摘要)的自然语言描述
                     importance  REAL DEFAULT 0.5, -- 0~1，错题=0.9，普通问答=0.5
                     created_at  TEXT NOT NULL,
+                    last_accessed_at TEXT NOT NULL,
                     metadata    TEXT DEFAULT '{}'  -- JSON: score, tags, doc_ids, etc.
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ep_course
                     ON episodes(user_id, course_name, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_ep_accessed
+                    ON episodes(user_id, course_name, last_accessed_at DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_ep_type
                     ON episodes(user_id, course_name, event_type);
@@ -57,6 +61,7 @@ class SQLiteMemoryStore:
                     course_name TEXT NOT NULL,
                     weak_points TEXT DEFAULT '[]',   -- JSON list of str
                     concept_mastery TEXT DEFAULT '{}', -- JSON dict: concept -> {mastery, attempts, avg_score}
+                    preference_items TEXT DEFAULT '[]', -- JSON list: {text, source, updated_at}
                     pref_style  TEXT DEFAULT 'step_by_step',
                     total_qa    INTEGER DEFAULT 0,
                     total_practice INTEGER DEFAULT 0,
@@ -71,6 +76,25 @@ class SQLiteMemoryStore:
             if "concept_mastery" not in col_names:
                 conn.execute(
                     "ALTER TABLE user_profiles ADD COLUMN concept_mastery TEXT DEFAULT '{}'"
+                )
+            if "preference_items" not in col_names:
+                conn.execute(
+                    "ALTER TABLE user_profiles ADD COLUMN preference_items TEXT DEFAULT '[]'"
+                )
+            ep_cols = conn.execute("PRAGMA table_info(episodes)").fetchall()
+            ep_col_names = {r[1] for r in ep_cols}
+            if "last_accessed_at" not in ep_col_names:
+                conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN last_accessed_at TEXT DEFAULT ''"
+                )
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET last_accessed_at = CASE
+                        WHEN last_accessed_at IS NULL OR last_accessed_at = '' THEN created_at
+                        ELSE last_accessed_at
+                    END
+                    """
                 )
             self._init_fts(conn)
 
@@ -134,12 +158,24 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 INSERT INTO episodes
-                    (id, user_id, course_name, event_type, content, importance, created_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, course_name, event_type, content, importance, created_at, last_accessed_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (eid, user_id, course_name, event_type, content, importance, now, meta_str),
+                (eid, user_id, course_name, event_type, content, importance, now, now, meta_str),
             )
         return eid
+
+    def _touch_episode_ids(self, ids: List[str]) -> None:
+        clean_ids = [str(i).strip() for i in ids if str(i).strip()]
+        if not clean_ids:
+            return
+        now = datetime.now().isoformat()
+        placeholders = ",".join(["?" for _ in clean_ids])
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE episodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
+                [now] + clean_ids,
+            )
 
     def search_episodes(
         self,
@@ -205,10 +241,15 @@ class SQLiteMemoryStore:
                 continue
             results.append(d)
         priority = {"mistake": 0, "practice": 1, "exam": 2, "qa_summary": 3, "qa": 4}
-        results.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+        results.sort(
+            key=lambda x: str(x.get("last_accessed_at", "") or x.get("created_at", "")),
+            reverse=True,
+        )
         results.sort(key=lambda x: float(x.get("importance", 0.0) or 0.0), reverse=True)
         results.sort(key=lambda x: priority.get(str(x.get("event_type", "")), 9))
-        return results[:top_k]
+        trimmed = results[:top_k]
+        self._touch_episode_ids([str(item.get("id", "") or "") for item in trimmed])
+        return trimmed
 
     def _query_terms(self, query: str) -> List[str]:
         terms = [t.strip() for t in str(query or "").split() if t.strip()]
@@ -240,7 +281,7 @@ class SQLiteMemoryStore:
             WHERE user_id = ? AND course_name = ? AND importance >= ?
               AND ({like_clauses})
               {type_clause}
-            ORDER BY importance DESC, created_at DESC
+            ORDER BY importance DESC, last_accessed_at DESC, created_at DESC
             LIMIT ?
         """
         params.append(fetch_limit)
@@ -278,7 +319,7 @@ class SQLiteMemoryStore:
               AND e.course_name = ?
               AND e.importance >= ?
               {type_clause}
-            ORDER BY e.importance DESC, e.created_at DESC
+            ORDER BY e.importance DESC, e.last_accessed_at DESC, e.created_at DESC
             LIMIT ?
         """
         try:
@@ -350,7 +391,7 @@ class SQLiteMemoryStore:
                 """
                 SELECT * FROM episodes
                 WHERE user_id = ? AND course_name = ? AND event_type = 'qa' AND importance <= ?
-                ORDER BY created_at DESC
+                ORDER BY last_accessed_at DESC, created_at DESC
                 """,
                 (user_id, course_name, float(max_importance)),
             ).fetchall()
@@ -393,8 +434,8 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 INSERT INTO episodes
-                    (id, user_id, course_name, event_type, content, importance, created_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, course_name, event_type, content, importance, created_at, last_accessed_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     eid,
@@ -403,6 +444,7 @@ class SQLiteMemoryStore:
                     "qa_summary",
                     summary_text,
                     float(importance),
+                    now,
                     now,
                     json.dumps(meta, ensure_ascii=False),
                 ),
@@ -457,6 +499,7 @@ class SQLiteMemoryStore:
                 "course_name": course_name,
                 "weak_points": [],
                 "concept_mastery": {},
+                "preference_items": [],
                 "pref_style": "step_by_step",
                 "total_qa": 0,
                 "total_practice": 0,
@@ -474,6 +517,12 @@ class SQLiteMemoryStore:
                 d["concept_mastery"] = {}
         except Exception:
             d["concept_mastery"] = {}
+        try:
+            d["preference_items"] = json.loads(d.get("preference_items", "[]") or "[]")
+            if not isinstance(d["preference_items"], list):
+                d["preference_items"] = []
+        except Exception:
+            d["preference_items"] = []
         return d
 
     def upsert_profile(self, user_id: str, course_name: str, **fields) -> None:
@@ -486,21 +535,24 @@ class SQLiteMemoryStore:
         # concept_mastery 序列化
         if isinstance(profile.get("concept_mastery"), dict):
             profile["concept_mastery"] = json.dumps(profile["concept_mastery"], ensure_ascii=False)
+        if isinstance(profile.get("preference_items"), list):
+            profile["preference_items"] = json.dumps(profile["preference_items"], ensure_ascii=False)
         profile["updated_at"] = datetime.now().isoformat()
 
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO user_profiles
-                    (user_id, course_name, weak_points, concept_mastery, pref_style,
+                    (user_id, course_name, weak_points, concept_mastery, preference_items, pref_style,
                      total_qa, total_practice, avg_score, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
                     course_name,
                     profile["weak_points"],
                     profile["concept_mastery"],
+                    profile["preference_items"],
                     profile["pref_style"],
                     profile["total_qa"],
                     profile["total_practice"],
@@ -508,6 +560,62 @@ class SQLiteMemoryStore:
                     profile["updated_at"],
                 ),
             )
+
+    def evict_episodes_soft_cap(
+        self,
+        *,
+        course_name: str,
+        user_id: str = "default",
+        soft_cap: int = 2000,
+        batch_size: int = 200,
+        protect_importance: float = 0.8,
+    ) -> Dict[str, Any]:
+        cap = max(50, int(soft_cap or 0))
+        batch = max(1, int(batch_size or 1))
+        protect = max(0.0, min(1.0, float(protect_importance)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, importance, created_at, last_accessed_at, metadata
+                FROM episodes
+                WHERE user_id = ? AND course_name = ?
+                """,
+                (user_id, course_name),
+            ).fetchall()
+        total = len(rows)
+        if total <= cap:
+            return {"total": total, "removed": 0, "target_cap": cap}
+
+        overflow = total - cap
+        to_remove = min(max(overflow, 1), batch)
+        candidates: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            importance = float(item.get("importance", 0.0) or 0.0)
+            if importance >= protect:
+                continue
+            meta_raw = item.get("metadata", "{}")
+            try:
+                meta = json.loads(meta_raw) if isinstance(meta_raw, str) else {}
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict) and meta.get("explicit_memory_request"):
+                continue
+            candidates.append(item)
+        candidates.sort(
+            key=lambda x: (
+                float(x.get("importance", 0.0) or 0.0),
+                str(x.get("last_accessed_at", "") or x.get("created_at", "")),
+                str(x.get("created_at", "")),
+            )
+        )
+        remove_ids = [str(x.get("id", "")).strip() for x in candidates[:to_remove] if str(x.get("id", "")).strip()]
+        if not remove_ids:
+            return {"total": total, "removed": 0, "target_cap": cap}
+        placeholders = ",".join(["?" for _ in remove_ids])
+        with self._conn() as conn:
+            conn.execute(f"DELETE FROM episodes WHERE id IN ({placeholders})", remove_ids)
+        return {"total": total, "removed": len(remove_ids), "target_cap": cap}
 
     def get_stats(self, user_id: str = "default", course_name: str = None) -> Dict[str, Any]:
         """返回记忆库统计信息。"""
