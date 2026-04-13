@@ -192,7 +192,7 @@ python scripts/eval/review_runner.py \
    - `review/review_summary.json`
 
 可控开关（环境变量）：
-- `ONLINE_EVAL_WORKER_ENABLED`
+- `ONLINE_EVAL_WORKER_ENABLED`（默认 `0`，需要时显式开启）
 - `ONLINE_EVAL_POLL_SEC`
 - `ONLINE_EVAL_RUN_JUDGE_REVIEW`
 - `ONLINE_EVAL_PYTHON_BIN`

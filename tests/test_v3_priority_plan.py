@@ -23,6 +23,12 @@ from memory.store import SQLiteMemoryStore
 
 
 class V3PriorityPlanTests(unittest.TestCase):
+    @staticmethod
+    def _local_tmpdir(prefix: str) -> str:
+        base_dir = os.path.join(os.getcwd(), "tests", "_tmp")
+        os.makedirs(base_dir, exist_ok=True)
+        return tempfile.mkdtemp(prefix=prefix, dir=base_dir)
+
     def test_context_budgeter_adaptive_compress_only_under_pressure(self) -> None:
         env = {
             "RAG_COMPRESSION_MODE": "adaptive",
@@ -66,7 +72,8 @@ class V3PriorityPlanTests(unittest.TestCase):
                 self.assertEqual(0, patched.call_count)
 
     def test_workspace_store_session_cleanup_and_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        td = self._local_tmpdir("workspace_store_")
+        try:
             store = WorkspaceStore(td)
             course_name = "线性代数"
             old_state = SessionStateV1(
@@ -105,6 +112,8 @@ class V3PriorityPlanTests(unittest.TestCase):
             self.assertIsNotNone(store.load_session_state(course_name, "sess-new"))
             self.assertTrue(store.delete_session_state(course_name, "sess-new"))
             self.assertFalse(store.delete_session_state(course_name, "sess-new"))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
     def test_toolhub_group_gate_blocks_mismatched_group(self) -> None:
         hub = ToolHub()
@@ -142,57 +151,65 @@ class V3PriorityPlanTests(unittest.TestCase):
         self.assertIn("tool_budget_snapshot", audit_tail.get("metadata", {}))
 
     def test_memory_preferences_and_lru_like_eviction(self) -> None:
-        td = tempfile.mkdtemp(prefix="cp_mem_")
+        td = self._local_tmpdir("cp_mem_")
         try:
             db_path = os.path.join(td, "memory.db")
             with mock.patch.dict(os.environ, {"MEMORY_DB_PATH": db_path}, clear=False):
-                mgr = MemoryManager(user_id="u1")
-                mgr.upsert_preferences(
-                    "线性代数",
-                    [
-                        {"text": "偏好中文回答", "source": "explicit"},
-                        {"text": "偏好先讲思路再给答案", "source": "explicit"},
-                    ],
-                )
-                mgr.upsert_preferences(
-                    "线性代数",
-                    [{"text": "偏好中文回答", "source": "implicit"}],
-                    merge=True,
-                )
-                profile_ctx = mgr.get_profile_context("线性代数")
-                self.assertIn("偏好", profile_ctx)
-                stats = mgr.get_stats(course_name="线性代数")
-                self.assertTrue(isinstance(stats.get("preference_items"), list))
+                import memory.manager as memory_manager_module
 
-                store = SQLiteMemoryStore(os.path.join(td, "evict.db"))
-                e1 = store.save_episode("线性代数", "qa", "old-low", importance=0.1, metadata={}, user_id="u1")
-                for i in range(50):
-                    store.save_episode("线性代数", "qa", f"low-{i}", importance=0.1, metadata={}, user_id="u1")
-                e3 = store.save_episode("线性代数", "qa", "high", importance=0.95, metadata={}, user_id="u1")
-                store._touch_episode_ids([e3])
-                evicted = store.evict_episodes_soft_cap(
-                    course_name="线性代数",
-                    user_id="u1",
-                    soft_cap=50,
-                    batch_size=5,
-                    protect_importance=0.8,
-                )
-                self.assertGreaterEqual(int(evicted.get("removed", 0)), 1)
-                remain = store.search_episodes(
-                    "low high",
-                    user_id="u1",
-                    course_name="线性代数",
-                    top_k=10,
-                    min_importance=0.0,
-                )
-                remain_ids = {r.get("id") for r in remain}
-                self.assertIn(e3, remain_ids)
-                self.assertNotIn(e1, remain_ids)
+                original_store = memory_manager_module._store
+                memory_manager_module._store = None
+                mgr = MemoryManager(user_id="u1")
+                try:
+                    mgr.upsert_preferences(
+                        "线性代数",
+                        [
+                            {"text": "偏好中文回答", "source": "explicit"},
+                            {"text": "偏好先讲思路再给答案", "source": "explicit"},
+                        ],
+                    )
+                    mgr.upsert_preferences(
+                        "线性代数",
+                        [{"text": "偏好中文回答", "source": "implicit"}],
+                        merge=True,
+                    )
+                    profile_ctx = mgr.get_profile_context("线性代数")
+                    self.assertIn("偏好", profile_ctx)
+                    stats = mgr.get_stats(course_name="线性代数")
+                    self.assertTrue(isinstance(stats.get("preference_items"), list))
+
+                    store = SQLiteMemoryStore(os.path.join(td, "evict.db"))
+                    e1 = store.save_episode("线性代数", "qa", "old-low", importance=0.1, metadata={}, user_id="u1")
+                    for i in range(50):
+                        store.save_episode("线性代数", "qa", f"low-{i}", importance=0.1, metadata={}, user_id="u1")
+                    e3 = store.save_episode("线性代数", "qa", "high", importance=0.95, metadata={}, user_id="u1")
+                    store._touch_episode_ids([e3])
+                    evicted = store.evict_episodes_soft_cap(
+                        course_name="线性代数",
+                        user_id="u1",
+                        soft_cap=50,
+                        batch_size=5,
+                        protect_importance=0.8,
+                    )
+                    self.assertGreaterEqual(int(evicted.get("removed", 0)), 1)
+                    remain = store.search_episodes(
+                        "low high",
+                        user_id="u1",
+                        course_name="线性代数",
+                        top_k=10,
+                        min_importance=0.0,
+                    )
+                    remain_ids = {r.get("id") for r in remain}
+                    self.assertIn(e3, remain_ids)
+                    self.assertNotIn(e1, remain_ids)
+                finally:
+                    memory_manager_module._store = original_store
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
     def test_online_shadow_eval_queue_and_process(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        td = self._local_tmpdir("online_eval_")
+        try:
             svc = OnlineShadowEvalService(base_dir=td)
             payload = {
                 "case_id": "online_case_001",
@@ -213,6 +230,8 @@ class V3PriorityPlanTests(unittest.TestCase):
             self.assertTrue((day_dir / "benchmark_raw_online.jsonl").exists())
             self.assertTrue((day_dir / "benchmark_summary_online.json").exists())
             self.assertTrue((day_dir / "cases_online.jsonl").exists())
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,15 @@ class OnlineShadowEvalService:
         return out
 
     def _state_save(self, state: Dict[str, int]) -> None:
-        self._state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        serialized = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True)
+        if self._state_path.exists():
+            try:
+                current = self._state_path.read_text(encoding="utf-8")
+                if current == serialized:
+                    return
+            except Exception:
+                pass
+        self._state_path.write_text(serialized, encoding="utf-8")
 
     def enqueue(self, payload: Dict[str, Any]) -> str:
         day = datetime.now().strftime("%Y-%m-%d")
@@ -280,7 +288,7 @@ class OnlineShadowEvalService:
     def start_worker(self) -> None:
         if self._worker_started:
             return
-        if not self._env_bool("ONLINE_EVAL_WORKER_ENABLED", True):
+        if not self._env_bool("ONLINE_EVAL_WORKER_ENABLED", False):
             return
         thread = threading.Thread(target=self._worker_loop, daemon=True, name="online-shadow-eval-worker")
         thread.start()

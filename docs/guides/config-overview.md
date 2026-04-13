@@ -13,6 +13,7 @@
 | `API_HOST` | `0.0.0.0` | FastAPI 监听地址 |
 | `API_PORT` | `8000` | FastAPI 端口 |
 | `API_BASE` | `http://localhost:8000` | Streamlit 前端请求后端地址 |
+| `API_RELOAD` | `0` | 是否开启 Uvicorn 自动重载（开发态可设为 `1`） |
 | `DATA_DIR` | `./data/workspaces` | 课程工作区与 `SessionState` 文件根目录 |
 | `SSE_HEARTBEAT_SEC` | `8` | `/chat/stream` 心跳状态推送间隔 |
 | `CONTEXT_BUDGET_EVENT_TIMEOUT_SEC` | `3.0` | 前端预算事件超时提示阈值 |
@@ -309,7 +310,7 @@ Judge 独立配置：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `ONLINE_EVAL_WORKER_ENABLED` | `1` | 是否启动在线影子评测后台 worker |
+| `ONLINE_EVAL_WORKER_ENABLED` | `0` | 是否启动在线影子评测后台 worker（默认关闭，显式开启） |
 | `ONLINE_EVAL_POLL_SEC` | `30` | 队列轮询间隔（秒） |
 | `ONLINE_EVAL_RUN_JUDGE_REVIEW` | `1` | 是否自动触发 judge/review 子流程 |
 | `ONLINE_EVAL_PYTHON_BIN` | 空（自动） | 在线评测子进程解释器 |

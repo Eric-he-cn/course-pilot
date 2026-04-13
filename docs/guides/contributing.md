@@ -36,9 +36,11 @@ git checkout -b feature/your-feature-name
 建议先跑一次基础测试：
 
 ```bash
-python tests/test_basic.py
-python -m unittest tests.test_contract_fixes tests.test_mcp_stdio tests.test_bench_rag_eval
+py -3.11 tests/test_basic.py
+py -3.11 -m unittest tests.test_contract_fixes tests.test_mcp_stdio tests.test_bench_rag_eval tests.test_v3_priority_plan
 ```
+
+如果你已经激活 Python 3.11 环境，也可以把上面的 `py -3.11` 替换成 `python`。请避免直接使用系统默认的 Python 3.6/3.7 运行回归测试。
 
 完成修改后提交：
 

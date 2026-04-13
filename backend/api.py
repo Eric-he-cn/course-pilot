@@ -731,9 +731,10 @@ async def chat_stream(request: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    reload_enabled = str(os.getenv("API_RELOAD", "0")).strip().lower() in {"1", "true", "yes", "on"}
     uvicorn.run(
         "backend.api:app",
         host=os.getenv("API_HOST", "0.0.0.0"),
         port=int(os.getenv("API_PORT", "8000")),
-        reload=True
+        reload=reload_enabled
     )

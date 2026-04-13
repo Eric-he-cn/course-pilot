@@ -50,6 +50,8 @@ ExecutionRuntime + TaskGraph（模板执行器）
 pip install -r requirements.txt
 ```
 
+建议在 Python 3.11 环境中运行本项目。若系统默认 `python` 不是 3.11，请先激活对应的 `conda`/`venv`，或在 Windows 上使用 `py -3.11 -m pip install -r requirements.txt`。
+
 ### 2) 配置环境变量
 
 在项目根目录创建 `.env`，至少包含：
@@ -76,7 +78,8 @@ RAG_COMPRESSION_MODE=adaptive   # adaptive|always|off
 SESSION_TTL_DAYS=30
 MEMORY_EPISODES_SOFT_CAP=2000
 MEMORY_EVICT_BATCH_SIZE=200
-ONLINE_EVAL_WORKER_ENABLED=1
+ONLINE_EVAL_WORKER_ENABLED=0    # 默认关闭；需要在线影子评测时再显式开启
+API_RELOAD=0                    # 开发时可设为 1 开启 uvicorn reload
 ```
 
 ### 3) 启动后端与前端
@@ -90,6 +93,8 @@ streamlit run frontend/streamlit_app.py
 ```
 
 默认后端端口 `8000`，前端端口 `8501`。
+
+如果你在 Windows 上没有把 Python 3.11 设为默认解释器，可使用 `py -3.11 -m backend.api` 启动后端。
 
 ---
 
@@ -135,9 +140,11 @@ python rebuild_indexes.py
 基础测试：
 
 ```bash
-python -m unittest discover -s tests -p "test*.py"
-python tests/test_basic.py
+py -3.11 -m unittest discover -s tests -p "test*.py"
+py -3.11 tests/test_basic.py
 ```
+
+若已激活 Python 3.11 虚拟环境，也可以继续使用 `python ...`。
 
 动态评测建议顺序：
 

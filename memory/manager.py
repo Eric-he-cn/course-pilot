@@ -20,8 +20,14 @@ _store: Optional[SQLiteMemoryStore] = None
 
 def _get_store() -> SQLiteMemoryStore:
     global _store
+    current_db_path = os.path.abspath(os.getenv("MEMORY_DB_PATH", "./data/memory/memory.db"))
     if _store is None:
-        _store = SQLiteMemoryStore()
+        _store = SQLiteMemoryStore(db_path=current_db_path)
+        return _store
+
+    existing_db_path = os.path.abspath(getattr(_store, "db_path", current_db_path))
+    if existing_db_path != current_db_path or not os.path.isdir(os.path.dirname(existing_db_path)):
+        _store = SQLiteMemoryStore(db_path=current_db_path)
     return _store
 
 """MemoryManager: 统一记忆管理接口，供 Runner、Grader 与 MCP 工具调用。
