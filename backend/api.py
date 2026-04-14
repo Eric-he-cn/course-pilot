@@ -217,6 +217,21 @@ async def _preload_embedding_model() -> None:
         logger.warning("[startup] embedding_preload_failed err=%s", str(ex))
 
 
+async def _preload_reranker_model() -> None:
+    if not _env_bool("RERANK_ENABLED", True):
+        return
+    if not _env_bool("RERANK_PRELOAD_ON_STARTUP", True):
+        return
+    logger.info("[startup] rerank_preload_start")
+    try:
+        from rag.rerank import get_reranker_model
+
+        await anyio.to_thread.run_sync(get_reranker_model)
+        logger.info("[startup] rerank_preload_success")
+    except Exception as ex:
+        logger.warning("[startup] rerank_preload_failed err=%s", str(ex))
+
+
 @app.on_event("startup")
 async def _startup_bootstrap() -> None:
     """应用启动时恢复 workspace 并启动后台维护任务。"""
@@ -224,6 +239,7 @@ async def _startup_bootstrap() -> None:
     _start_session_cleanup_worker()
     online_shadow_eval.start_worker()
     await _preload_embedding_model()
+    await _preload_reranker_model()
 
 
 @app.get("/")

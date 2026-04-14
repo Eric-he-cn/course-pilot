@@ -33,6 +33,7 @@ class RetrievedChunk(BaseModel):
     dense_score: Optional[float] = None
     bm25_score: Optional[float] = None
     rrf_score: Optional[float] = None
+    rerank_score: Optional[float] = None
     evidence_passed: Optional[bool] = None
 
 

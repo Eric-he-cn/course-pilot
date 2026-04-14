@@ -21,6 +21,7 @@ from core.services.rag_service import RAGService
 from core.services.tool_hub import ToolHub
 from core.services.workspace_store import WorkspaceStore
 from core.services.shadow_eval_service import OnlineShadowEvalService
+from rag.retrieve import Retriever
 from mcp_tools.client import MCPTools
 from memory.manager import MemoryManager
 from memory.store import SQLiteMemoryStore
@@ -552,6 +553,94 @@ class V3PriorityPlanTests(unittest.TestCase):
         gated = rag_service._gate_chunks(chunks)
         self.assertEqual([], gated)
 
+    def test_retriever_hybrid_rerank_applies_for_learn(self) -> None:
+        chunks = [
+            {"text": "片段A", "doc_id": "a.pdf", "page": 1, "chunk_id": "c1"},
+            {"text": "片段B", "doc_id": "b.pdf", "page": 2, "chunk_id": "c2"},
+            {"text": "片段C", "doc_id": "c.pdf", "page": 3, "chunk_id": "c3"},
+            {"text": "片段D", "doc_id": "d.pdf", "page": 4, "chunk_id": "c4"},
+            {"text": "片段E", "doc_id": "e.pdf", "page": 5, "chunk_id": "c5"},
+        ]
+        store = mock.Mock()
+        store.chunks = chunks
+        retriever = Retriever(store)
+        dense_results = [(chunks[0], 0.91), (chunks[1], 0.83), (chunks[2], 0.79)]
+        bm25_results = [(chunks[1], 5.0), (chunks[3], 4.2), (chunks[4], 3.8)]
+
+        class FakeReranker:
+            def rerank(self, query: str, texts: list[str]) -> list[float]:
+                self.query = query
+                self.texts = list(texts)
+                return [0.1, 0.9, 0.2, 0.8, 0.7]
+
+        fake_reranker = FakeReranker()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RETRIEVAL_MODE": "hybrid",
+                "RERANK_ENABLED": "1",
+                "RERANK_CANDIDATES_LEARN_PRACTICE": "12",
+            },
+            clear=False,
+        ), mock.patch.object(retriever, "_dense_search", return_value=dense_results), mock.patch.object(
+            retriever.lexical_index, "search", return_value=bm25_results
+        ), mock.patch("rag.retrieve.get_reranker_model", return_value=fake_reranker):
+            results = retriever.retrieve("Layer Norm", top_k=4, mode="learn")
+
+        self.assertEqual(4, len(results))
+        self.assertEqual("a.pdf", results[0].doc_id)
+        self.assertTrue(all(item.rerank_score is not None for item in results))
+        self.assertTrue(all(item.rrf_score is not None for item in results))
+        self.assertTrue(all(float(item.score) == float(item.rerank_score or 0.0) for item in results))
+
+    def test_retriever_hybrid_rerank_skips_exam(self) -> None:
+        chunks = [
+            {"text": "片段A", "doc_id": "a.pdf", "page": 1, "chunk_id": "c1"},
+            {"text": "片段B", "doc_id": "b.pdf", "page": 2, "chunk_id": "c2"},
+        ]
+        store = mock.Mock()
+        store.chunks = chunks
+        retriever = Retriever(store)
+        dense_results = [(chunks[0], 0.91), (chunks[1], 0.83)]
+        bm25_results = [(chunks[1], 5.0)]
+        with mock.patch.dict(
+            os.environ,
+            {"RETRIEVAL_MODE": "hybrid", "RERANK_ENABLED": "1"},
+            clear=False,
+        ), mock.patch.object(retriever, "_dense_search", return_value=dense_results), mock.patch.object(
+            retriever.lexical_index, "search", return_value=bm25_results
+        ), mock.patch("rag.retrieve.get_reranker_model") as patched_reranker:
+            results = retriever.retrieve("Layer Norm", top_k=2, mode="exam")
+
+        self.assertEqual(2, len(results))
+        self.assertFalse(any(item.rerank_score is not None for item in results))
+        patched_reranker.assert_not_called()
+
+    def test_retriever_hybrid_rerank_falls_back_on_failure(self) -> None:
+        chunks = [
+            {"text": "片段A", "doc_id": "a.pdf", "page": 1, "chunk_id": "c1"},
+            {"text": "片段B", "doc_id": "b.pdf", "page": 2, "chunk_id": "c2"},
+            {"text": "片段C", "doc_id": "c.pdf", "page": 3, "chunk_id": "c3"},
+        ]
+        store = mock.Mock()
+        store.chunks = chunks
+        retriever = Retriever(store)
+        dense_results = [(chunks[0], 0.91), (chunks[1], 0.83)]
+        bm25_results = [(chunks[1], 5.0), (chunks[2], 4.0)]
+        with mock.patch.dict(
+            os.environ,
+            {"RETRIEVAL_MODE": "hybrid", "RERANK_ENABLED": "1"},
+            clear=False,
+        ), mock.patch.object(retriever, "_dense_search", return_value=dense_results), mock.patch.object(
+            retriever.lexical_index, "search", return_value=bm25_results
+        ), mock.patch("rag.retrieve.get_reranker_model", side_effect=RuntimeError("rerank load failed")):
+            results = retriever.retrieve("Layer Norm", top_k=2, mode="learn")
+
+        self.assertEqual(2, len(results))
+        self.assertTrue(all(item.rerank_score is None for item in results))
+        self.assertTrue(all(item.rrf_score is not None for item in results))
+        self.assertTrue(all(float(item.score) == float(item.rrf_score or 0.0) for item in results))
+
     def test_sqlite_store_enables_wal_and_busy_timeout(self) -> None:
         td = self._local_tmpdir("sqlite_pragmas_")
         try:
@@ -671,6 +760,17 @@ class V3PriorityPlanTests(unittest.TestCase):
             import asyncio
 
             asyncio.run(backend_api._preload_embedding_model())
+        self.assertEqual(1, patched.call_count)
+
+    def test_rerank_preload_runs_on_startup_when_enabled(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"RERANK_ENABLED": "1", "RERANK_PRELOAD_ON_STARTUP": "1"},
+            clear=False,
+        ), mock.patch("rag.rerank.get_reranker_model", return_value=object()) as patched:
+            import asyncio
+
+            asyncio.run(backend_api._preload_reranker_model())
         self.assertEqual(1, patched.call_count)
 
 

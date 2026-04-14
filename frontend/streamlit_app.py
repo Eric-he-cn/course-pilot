@@ -64,22 +64,22 @@ def extract_session_state_from_tool_calls(tool_calls):
 
 
 def format_citation_metrics(citation: dict) -> str:
-    """格式化引用分数：展示向量相似度、BM25 分数和融合排序分。"""
+    """格式化引用分数：展示重排分、向量相似度、BM25 分数和融合排序分。"""
     if not isinstance(citation, dict):
         return ""
     items: list[str] = []
     metric_specs = [
+        ("rerank_score", "重排分"),
         ("dense_score", "向量相似度"),
         ("bm25_score", "BM25 分数"),
         ("rrf_score", "融合排序分"),
     ]
     for key, label in metric_specs:
         raw = citation.get(key)
+        if raw is None and key == "rrf_score" and citation.get("rerank_score") is None:
+            raw = citation.get("score")
         if raw is None:
-            if key == "rrf_score":
-                raw = citation.get("score")
-            else:
-                continue
+            continue
         try:
             items.append(f"{label} {float(raw):.2f}")
         except Exception:

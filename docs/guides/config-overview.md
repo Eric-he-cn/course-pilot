@@ -145,12 +145,15 @@
 | `HYBRID_BM25_WEIGHT` | `1.0` | bm25 权重 |
 | `HYBRID_DENSE_CANDIDATES_MULTIPLIER` | `3` | dense 候选扩展倍数 |
 | `HYBRID_BM25_CANDIDATES_MULTIPLIER` | `3` | bm25 候选扩展倍数 |
+| `RERANK_ENABLED` | `1` | 是否为 `learn/practice` 启用 Cross-Encoder 二阶段精排 |
+| `RERANK_CANDIDATES_LEARN_PRACTICE` | `12` | `learn/practice` 进入 rerank 的 fused candidate 数量 |
 | `RAG_EVIDENCE_DENSE_MIN` | `0.40` | 证据准入的最低向量相似度门槛 |
 | `RAG_EVIDENCE_BM25_MIN` | `1.0` | 证据准入的最低 BM25 原始分门槛 |
 | `RAG_EVIDENCE_MAX_FUSED_RANK` | `4` | 只允许融合排序前 N 的 chunk 进入证据集 |
 
 实现细节：
 - 向量库为 `FAISS IndexFlatL2`（当前未采用 IVF/PQ/HNSW）。
+- rerank 当前仅覆盖 `learn/practice`，链路为 `dense + bm25 -> RRF -> Cross-Encoder rerank -> evidence gate`。
 
 ---
 
@@ -162,6 +165,10 @@
 | `EMBEDDING_DEVICE` | `auto` | `cpu/cuda/auto` |
 | `EMBEDDING_BATCH_SIZE` | 按设备自适应 | 嵌入批大小 |
 | `EMBEDDING_PRELOAD_ON_STARTUP` | `1` | 服务启动时是否预加载嵌入模型 |
+| `RERANK_MODEL` | `BAAI/bge-reranker-base` | Cross-Encoder rerank 模型 |
+| `RERANK_DEVICE` | `auto` | `cpu/cuda/auto` |
+| `RERANK_BATCH_SIZE` | 按设备自适应 | rerank 批大小 |
+| `RERANK_PRELOAD_ON_STARTUP` | `1` | 服务启动时是否预加载 reranker |
 | `DATA_DIR` | `./data/workspaces` | 课程工作区根目录 |
 
 ---

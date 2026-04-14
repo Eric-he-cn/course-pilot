@@ -185,12 +185,16 @@ flowchart LR
 2. session cleanup worker：定期清理过期 `sessions/*.json`
 3. online shadow eval worker：后台处理评测队列
 4. embedding preload：若 `EMBEDDING_PRELOAD_ON_STARTUP=1`，在启动时预热嵌入模型
+5. rerank preload：若 `RERANK_ENABLED=1` 且 `RERANK_PRELOAD_ON_STARTUP=1`，在启动时预热 reranker
 
 当前 API 层的启动日志会区分：
 
 - `embedding_preload_start`
 - `embedding_preload_success`
 - `embedding_preload_failed`
+- `rerank_preload_start`
+- `rerank_preload_success`
+- `rerank_preload_failed`
 
 ---
 
@@ -585,8 +589,9 @@ flowchart LR
     Q --> B[BM25 检索]
     D --> F[RRF 融合]
     B --> F
-    F --> G[Evidence Gate]
-    G --> OUT[doc_id / page / dense_score / bm25_score / rrf_score]
+    F --> R[Cross-Encoder Rerank]
+    R --> G[Evidence Gate]
+    G --> OUT[doc_id / page / dense_score / bm25_score / rrf_score / rerank_score]
 ```
 
 #### 7.4.1 检索阶段对照表
@@ -596,7 +601,8 @@ flowchart LR
 | Query Encoding | `embed.py` | query | query embedding | BGE 中文模型会自动补 query instruction |
 | Dense Retrieval | `store_faiss.py` | embedding | FAISS Top-K | 当前为精确检索 |
 | Lexical Retrieval | `lexical.py` | query | BM25 排序结果 | 作为 dense 补充通道 |
-| Hybrid Fusion | `retrieve.py` | dense + bm25 排名 | fused ranking | 当前采用 RRF |
+| Hybrid Fusion | `retrieve.py` | dense + bm25 排名 | fused candidate pool | 当前采用 RRF |
+| Rerank | `rerank.py` + `retrieve.py` | fused candidates | reranked chunks | 当前默认覆盖 `learn/practice` |
 | Citation Binding | `retrieve.py` | metadata | `RetrievedChunk` | 保留多分数字段 |
 | Evidence Gate | `rag_service.py` | ranked chunks | gated chunks | 过滤弱证据 |
 
@@ -610,6 +616,16 @@ flowchart LR
 | 归一化 | `normalize_embeddings=True` |
 | 预热 | `EMBEDDING_PRELOAD_ON_STARTUP=1` 时，服务启动即预热 |
 
+Rerank 当前实现：
+
+| 项目 | 当前实现 |
+|---|---|
+| 默认模型 | `BAAI/bge-reranker-base` |
+| 覆盖范围 | `learn/practice` |
+| 候选规模 | `RERANK_CANDIDATES_LEARN_PRACTICE=12` |
+| 设备选择 | `RERANK_DEVICE=auto|cuda|cpu` |
+| 预热 | `RERANK_PRELOAD_ON_STARTUP=1` 时，服务启动即预热 |
+
 #### 7.4.3 检索模式与 RRF
 
 当前支持三种模式：
@@ -621,8 +637,10 @@ flowchart LR
 `hybrid` 默认使用 RRF 融合。这里要特别注意：
 
 - `rrf_score` 是融合排序分，不是语义相似度
+- `rerank_score` 是 Cross-Encoder 精排分，只有 `learn/practice` 默认会产出
 - `dense_score` 与 `bm25_score` 量纲不同，不能直接横向比较
-- 前端当前显示三列分数，是为了帮助调试与解释，不是让用户拿它们当统一置信度
+- 前端当前显示多列分数，是为了帮助调试与解释，不是让用户拿它们当统一置信度
+- 当前默认链路是 `dense + bm25 -> RRF -> rerank(top12) -> final top_k -> evidence gate`
 
 #### 7.4.4 课程级 retriever cache
 
