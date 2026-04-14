@@ -387,6 +387,22 @@ def _summarize_tool_result(tool_name: str, tool_result: Any) -> str:
     return json.dumps(summary, ensure_ascii=False)
 
 
+def _tool_failure_summary_text(failed_tools: List[Dict[str, str]]) -> str:
+    if not failed_tools:
+        return ""
+    parts: List[str] = []
+    for item in failed_tools[:6]:
+        name = str(item.get("tool_name", "") or "").strip() or "unknown_tool"
+        error = _trim_text(item.get("error", ""), 120)
+        parts.append(f"- {name}: {error or '调用失败'}")
+    return (
+        "如果工具失败、被门控或未能拿到结果，你必须在最终回答中向用户明确说明，"
+        "不要假装工具成功。\n"
+        "本轮工具异常摘要：\n"
+        + "\n".join(parts)
+    )
+
+
 def _stream_text_chunks(text: str, chunk_chars: int = 80):
     from time import sleep
 
@@ -456,8 +472,8 @@ def _rewrite_memory_search_args(tool_name: str, tool_args: Dict[str, Any], origi
     try:
         from mcp_tools.client import MCPTools
 
-        preferred_query = str(MCPTools._context.get("memory_query", "")).strip()
-        preferred_course = str(MCPTools._context.get("course_name", "")).strip()
+        preferred_query = str(MCPTools.get_context_value("memory_query", "")).strip()
+        preferred_course = str(MCPTools.get_context_value("course_name", "")).strip()
     except Exception:
         preferred_query = ""
         preferred_course = ""
@@ -494,7 +510,7 @@ def _permission_mode() -> str:
     try:
         from mcp_tools.client import MCPTools
 
-        raw = str(MCPTools._context.get("permission_mode", "standard")).strip().lower()
+        raw = str(MCPTools.get_context_value("permission_mode", "standard")).strip().lower()
     except Exception:
         raw = "standard"
     if raw in {"safe", "standard", "elevated"}:
@@ -662,6 +678,7 @@ class LLMClient:
         dedup_min_interval_ms = _env_float("TOOL_DEDUP_MIN_INTERVAL_MS", 1500.0)
         fallback_triggered = False
         act_last_content = ""
+        failed_tools: List[Dict[str, str]] = []
 
         try:
             add_event("react_phase", phase="act", round=1)
@@ -761,6 +778,7 @@ class LLMClient:
                         tool_round=round_no,
                     )
                     if not allowed:
+                        failed_tools.append({"tool_name": tool_name, "error": f"tool gated: {gate_reason}"})
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -785,6 +803,13 @@ class LLMClient:
                         _trace_tag(),
                     )
                     failure_class = _tool_failure_class(tool_result if isinstance(tool_result, dict) else {})
+                    if not bool(tool_result.get("success", False)) if isinstance(tool_result, dict) else True:
+                        failed_tools.append(
+                            {
+                                "tool_name": tool_name,
+                                "error": str(tool_result.get("error", "")) if isinstance(tool_result, dict) else "tool failed",
+                            }
+                        )
                     if failure_class in {"retryable_error", "fatal_error"} and capability.fallback_mode == "synthesize":
                         fallback_triggered = True
                         add_event(
@@ -809,10 +834,17 @@ class LLMClient:
             add_event("react_phase", phase="synthesize", round="final")
             logger.info("[tools] phase=synthesize fallback=%s%s", int(fallback_triggered), _trace_tag())
             final_messages = _rehydrate_messages_for_final(messages, original_user_content)
+            failure_summary = _tool_failure_summary_text(failed_tools)
             if act_last_content:
                 final_messages = list(final_messages) + [
                     {"role": "assistant", "content": _trim_text(act_last_content, 220)},
-                    {"role": "user", "content": "请基于以上工具结果，给出最终完整回答。"},
+                    {
+                        "role": "user",
+                        "content": (
+                            "请基于以上工具结果，给出最终完整回答。"
+                            + (f"\n\n{failure_summary}" if failure_summary else "")
+                        ),
+                    },
                 ]
             t_synth = perf_counter()
             final = self.client.chat.completions.create(
@@ -967,6 +999,7 @@ class LLMClient:
         dedup_min_interval_ms = _env_float("TOOL_DEDUP_MIN_INTERVAL_MS", 1500.0)
         fallback_triggered = False
         act_last_content = ""
+        failed_tools: List[Dict[str, str]] = []
 
         try:
             add_event("react_phase", phase="act", round=1, stream_tools=True)
@@ -1070,6 +1103,7 @@ class LLMClient:
                         tool_round=round_no,
                     )
                     if not allowed:
+                        failed_tools.append({"tool_name": tool_name, "error": f"tool gated: {gate_reason}"})
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -1094,6 +1128,13 @@ class LLMClient:
                         _trace_tag(),
                     )
                     failure_class = _tool_failure_class(tool_result if isinstance(tool_result, dict) else {})
+                    if not bool(tool_result.get("success", False)) if isinstance(tool_result, dict) else True:
+                        failed_tools.append(
+                            {
+                                "tool_name": tool_name,
+                                "error": str(tool_result.get("error", "")) if isinstance(tool_result, dict) else "tool failed",
+                            }
+                        )
                     if failure_class in {"retryable_error", "fatal_error"} and capability.fallback_mode == "synthesize":
                         fallback_triggered = True
                         add_event(
@@ -1125,6 +1166,7 @@ class LLMClient:
             logger.info("[stream_tools] phase=synthesize fallback=%s%s", int(fallback_triggered), _trace_tag())
             yield event_bus.status("工具调用完成，正在生成最终答案（Synthesize）...")
             final_messages = _rehydrate_messages_for_final(messages, original_user_content)
+            failure_summary = _tool_failure_summary_text(failed_tools)
             if act_last_content:
                 final_messages = list(final_messages) + [
                     {
@@ -1133,7 +1175,10 @@ class LLMClient:
                     },
                     {
                         "role": "user",
-                        "content": "请基于以上工具结果，直接给出对用户可见的最终完整回答。",
+                        "content": (
+                            "请基于以上工具结果，直接给出对用户可见的最终完整回答。"
+                            + (f"\n\n{failure_summary}" if failure_summary else "")
+                        ),
                     },
                 ]
             yield from self.chat_stream(final_messages, temperature, max_tokens=max_tokens)

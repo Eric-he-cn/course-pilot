@@ -10,8 +10,8 @@
 import os
 import sys
 
-# 确保从项目根目录运行
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# 支持从 scripts/ 目录直接运行，同时显式把仓库根目录加入导入路径。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from dotenv import load_dotenv

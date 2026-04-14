@@ -80,6 +80,14 @@ class ContextBudgeter:
         self.llm_compress_max_retries = max(0, _env_int("CB_LLM_COMPRESS_MAX_RETRIES", 0))
         self.llm_compress_model = str(os.getenv("CB_LLM_COMPRESS_MODEL", "")).strip()
         self.llm_compress_temperature = _env_float("CB_LLM_COMPRESS_TEMPERATURE", 0.1)
+        self.llm_compression_threshold = max(
+            0.5,
+            min(1.5, _env_float("CONTEXT_LLM_COMPRESSION_THRESHOLD", 0.9)),
+        )
+        disabled_modes_raw = str(os.getenv("CB_DISABLE_LLM_HISTORY_COMPRESS_MODES", "practice,exam")).strip()
+        self.llm_compress_disabled_modes = {
+            part.strip().lower() for part in disabled_modes_raw.split(",") if part.strip()
+        }
 
     @staticmethod
     def _history_recent_text(history: List[Dict[str, Any]], recent_turns: int) -> str:
@@ -445,6 +453,7 @@ class ContextBudgeter:
         memory_text: str,
         rag_sent_per_chunk: int,
         rag_sent_max_chars: int,
+        mode: str = "",
         history_summary_state: Optional[Dict[str, Any]] = None,
         pending_history: Optional[List[Dict[str, Any]]] = None,
         recent_history: Optional[List[Dict[str, Any]]] = None,
@@ -490,7 +499,21 @@ class ContextBudgeter:
             summary_source = "none"
             llm_compress_ms = None
             if older_lines:
-                summary_text, llm_compress_ms, summary_source = self._llm_summary_card(older_lines)
+                hard_budget = max(256, self.ctx_total_tokens - self.ctx_safety_margin)
+                mode_key = str(mode or "").strip().lower()
+                pressure_probe = (
+                    estimate_text_tokens(recent_text)
+                    + estimate_text_tokens(self._history_lines_to_text(older_lines))
+                    + estimate_text_tokens(rag_text)
+                    + estimate_text_tokens(memory_text)
+                )
+                allow_llm_history_compress = (
+                    mode_key not in self.llm_compress_disabled_modes
+                    and (float(pressure_probe) / float(max(1, hard_budget))) >= self.llm_compression_threshold
+                )
+                summary_text, llm_compress_ms, summary_source = (
+                    self._llm_summary_card(older_lines) if allow_llm_history_compress else ("", None, "skip")
+                )
                 if not summary_text:
                     summary_text = self._heuristic_summary_card(older_lines)
                     summary_source = "heuristic"
@@ -597,6 +620,7 @@ class ContextBudgeter:
             final_tokens_before_hard_trim_est=final_before_hard_trim_tokens,
             final_tokens_est=final_tokens,
             budget_tokens_est=hard_budget,
+            context_pressure_ratio=context_pressure_ratio_pre,
             hard_truncated=hard_truncated,
         )
         return {
@@ -625,5 +649,6 @@ class ContextBudgeter:
             "final_tokens_before_hard_trim_est": final_before_hard_trim_tokens,
             "final_tokens_est": final_tokens,
             "budget_tokens_est": hard_budget,
+            "context_pressure_ratio": context_pressure_ratio_pre,
             "hard_truncated": hard_truncated,
         }

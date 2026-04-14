@@ -255,6 +255,26 @@ class QuizMasterAgent(BaseAgent):
             return ""
         return "【历史错题/薄弱点参考】\n" + "\n".join(f"- {s}" for s in snippets)
 
+    @staticmethod
+    def _resolve_prompt_sections(
+        context: str,
+        rag_context: str,
+        history_context: str,
+        memory_context: str,
+    ) -> Dict[str, str]:
+        rag_text = str(rag_context or "").strip()
+        history_text = str(history_context or "").strip()
+        memory_text = str(memory_context or "").strip()
+        legacy_text = str(context or "").strip()
+        if not any((rag_text, history_text, memory_text)) and legacy_text:
+            history_text = legacy_text
+        return {
+            "rag_context": rag_text,
+            "history_context": history_text,
+            "memory_context": memory_text,
+            "context": legacy_text,
+        }
+
     """规范化难度字段，兼容中文与大小写写法。"""
     @staticmethod
     def _normalize_difficulty(value: str, fallback: str = "medium") -> str:
@@ -774,6 +794,7 @@ class QuizMasterAgent(BaseAgent):
         rag_context: str = "",
         history_context: str = "",
         memory_context: str = "",
+        retrieval_empty: bool = False,
         prefetched_memory_ctx: str = "",
         prefetched_memory_checked: bool = False,
         num_questions: int = 1,
@@ -794,6 +815,12 @@ class QuizMasterAgent(BaseAgent):
                 memory_ctx = self._build_memory_ctx(mem)
             except Exception:
                 memory_ctx = ""
+        prompt_sections = self._resolve_prompt_sections(
+            context=context,
+            rag_context=rag_context,
+            history_context=history_context,
+            memory_context=memory_ctx,
+        )
 
         # 1.5) 先做内部计划（Plan），再按计划生成题目（Solve）
         quiz_plan = self._plan_quiz(
@@ -838,14 +865,19 @@ class QuizMasterAgent(BaseAgent):
             course_name=course_name,
             topic=planned_topic,
             difficulty=planned_difficulty,
-            context=context,
-            rag_context=rag_context,
-            history_context=history_context,
-            memory_context=memory_ctx,
+            rag_context=prompt_sections["rag_context"],
+            history_context=prompt_sections["history_context"],
+            memory_context=memory_ctx or prompt_sections["memory_context"],
             memory_ctx=memory_ctx,
             num_questions=planned_num_questions,
             question_type=planned_question_type,
         )
+        if retrieval_empty:
+            prompt += (
+                "\n\n【教材证据状态】本轮未找到可靠教材片段。"
+                "请明确承认未命中教材证据，本次出题只能基于通用知识与已有上下文，"
+                "不要假装题目来自教材原文，也不要编造教材引用。"
+            )
         prompt += (
             "\n\n【内部出题计划（请执行但不要原样复述）】\n"
             + json.dumps(quiz_plan, ensure_ascii=False)
@@ -973,6 +1005,7 @@ class QuizMasterAgent(BaseAgent):
         rag_context: str = "",
         history_context: str = "",
         memory_context: str = "",
+        retrieval_empty: bool = False,
         prefetched_memory_ctx: str = "",
         prefetched_memory_checked: bool = False,
     ) -> Dict[str, Any]:
@@ -990,6 +1023,12 @@ class QuizMasterAgent(BaseAgent):
                 memory_ctx = self._build_memory_ctx(mem)
             except Exception:
                 memory_ctx = ""
+        prompt_sections = self._resolve_prompt_sections(
+            context=context,
+            rag_context=rag_context,
+            history_context=history_context,
+            memory_context=memory_ctx,
+        )
 
         exam_plan = self._plan_exam(user_request=user_request, memory_ctx=memory_ctx)
         external_ctx = self._build_external_ctx(user_request)
@@ -997,11 +1036,15 @@ class QuizMasterAgent(BaseAgent):
             course_name=course_name,
             num_questions=exam_plan["num_questions"],
             difficulty_ratio=exam_plan["difficulty_ratio"],
-            context=context,
-            rag_context=rag_context,
-            history_context=history_context,
-            memory_context=memory_ctx,
+            rag_context=prompt_sections["rag_context"],
+            history_context=prompt_sections["history_context"],
+            memory_context=memory_ctx or prompt_sections["memory_context"],
         )
+        if retrieval_empty:
+            prompt += (
+                "\n\n【教材证据状态】本轮未找到可靠教材片段。"
+                "你必须明确按通用知识和已有上下文出卷，不要假装试题直接来自教材，也不要编造教材引用。"
+            )
         prompt += (
             "\n\n【内部考试计划（请执行但不要原样复述）】\n"
             + json.dumps(exam_plan, ensure_ascii=False)

@@ -208,9 +208,9 @@
 - 代码锚点：`rag/retrieve.py:137`，`core/orchestration/runner.py:674`，`frontend/streamlit_app.py:647`
 
 ### 2.9 索引重建流程如何保证一致性？
-- 标准回答：`rebuild_indexes.py` 使用与后端相同的解析/切块/建库函数，保证离线重建与在线构建逻辑一致。
+- 标准回答：`scripts/rebuild_indexes.py` 使用与后端相同的解析/切块/建库函数，保证离线重建与在线构建逻辑一致。
 - 详细补充：可强调离线重建脚本复用同一管线，避免“线上检索逻辑”和“离线建库逻辑”漂移。
-- 代码锚点：`rebuild_indexes.py:22`，`rebuild_indexes.py:56`，`rebuild_indexes.py:72`，`rebuild_indexes.py:76`
+- 代码锚点：`scripts/rebuild_indexes.py`
 
 ### 2.10 当前 RAG 已知短板是什么？
 - 标准回答：当前仍无 Cross-Encoder reranker；虽然已支持 `chapter_hybrid` 分层切分和句级压缩，但排序阶段主要依赖 dense+BM25+RRF，复杂语义排序仍有上限。

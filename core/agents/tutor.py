@@ -62,11 +62,17 @@ class TutorAgent(BaseAgent):
     @staticmethod
     def _normalize_context_sections(context: str, context_sections: Optional[dict]) -> dict:
         sections = dict(context_sections or {})
+        rag_context = str(sections.get("rag_context", "") or "")
+        history_context = str(sections.get("history_context", "") or "")
+        memory_context = str(sections.get("memory_context", "") or "")
+        legacy_context = str(sections.get("context", context or ""))
+        if not any((rag_context, history_context, memory_context)) and legacy_context:
+            history_context = legacy_context
         return {
-            "context": str(sections.get("context", context or "")),
-            "rag_context": str(sections.get("rag_context", "")),
-            "history_context": str(sections.get("history_context", "")),
-            "memory_context": str(sections.get("memory_context", "")),
+            "context": legacy_context,
+            "rag_context": rag_context,
+            "history_context": history_context,
+            "memory_context": memory_context,
         }
 
     """统一组装消息列表（system + history + user），仅负责提示词与消息构造。"""
@@ -76,6 +82,7 @@ class TutorAgent(BaseAgent):
         course_name: str,
         context: str,
         context_sections: Optional[dict] = None,
+        retrieval_empty: bool = False,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,
@@ -114,6 +121,13 @@ class TutorAgent(BaseAgent):
         else:
             system_prompt = TUTOR_DEFAULT_SYSTEM_PROMPT
 
+        if retrieval_empty:
+            system_prompt += (
+                "\n\n【教材证据状态】本轮未找到可靠教材片段。"
+                "你必须明确告知用户这次没有命中可靠教材证据，"
+                "本次回答只能基于通用知识、题面或已有上下文，禁止伪造教材引用。"
+            )
+
         # 注入用户画像（薄弱知识点等），失败不影响主流程
         try:
             profile_ctx = self.memory_service.get_profile_context(course_name)
@@ -140,7 +154,9 @@ class TutorAgent(BaseAgent):
             "prompt_budget",
             system_tokens_est=estimate_text_tokens(system_prompt),
             history_tokens_est=estimate_text_tokens("\n".join(str(m.get("content", "")) for m in messages if m.get("role") in ("user", "assistant"))),
-            context_tokens_est=estimate_text_tokens(sections["context"]),
+            context_tokens_est=estimate_text_tokens(
+                sections["context"] if not any((sections["rag_context"], sections["history_context"], sections["memory_context"])) else ""
+            ),
             rag_context_tokens_est=estimate_text_tokens(sections["rag_context"]),
             history_context_tokens_est=estimate_text_tokens(sections["history_context"]),
             memory_context_tokens_est=estimate_text_tokens(sections["memory_context"]),
@@ -165,6 +181,7 @@ class TutorAgent(BaseAgent):
         course_name: str,
         context: str,
         context_sections: Optional[dict] = None,
+        retrieval_empty: bool = False,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,  # 练习/考试模式用此覆盖
@@ -179,6 +196,7 @@ class TutorAgent(BaseAgent):
             course_name=course_name,
             context=context,
             context_sections=context_sections,
+            retrieval_empty=retrieval_empty,
             allowed_tools=allowed_tools,
             history=history,
             system_prompt_override=system_prompt_override,
@@ -203,6 +221,7 @@ class TutorAgent(BaseAgent):
         course_name: str,
         context: str,
         context_sections: Optional[dict] = None,
+        retrieval_empty: bool = False,
         allowed_tools: Optional[List[str]] = None,
         history: Optional[List[dict]] = None,
         system_prompt_override: Optional[str] = None,
@@ -217,6 +236,7 @@ class TutorAgent(BaseAgent):
             course_name=course_name,
             context=context,
             context_sections=context_sections,
+            retrieval_empty=retrieval_empty,
             allowed_tools=allowed_tools,
             history=history,
             system_prompt_override=system_prompt_override,

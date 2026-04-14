@@ -15,6 +15,7 @@ import time
 from queue import Empty, Queue
 from threading import Thread
 from typing import List, Optional
+import anyio
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -198,12 +199,31 @@ def _start_session_cleanup_worker() -> None:
     Thread(target=_worker, daemon=True, name="session-cleanup-worker").start()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+async def _preload_embedding_model() -> None:
+    if not _env_bool("EMBEDDING_PRELOAD_ON_STARTUP", True):
+        return
+    logger.info("[startup] embedding_preload_start")
+    try:
+        from rag.embed import get_embedding_model
+
+        await anyio.to_thread.run_sync(get_embedding_model)
+        logger.info("[startup] embedding_preload_success")
+    except Exception as ex:
+        logger.warning("[startup] embedding_preload_failed err=%s", str(ex))
+
+
 @app.on_event("startup")
 async def _startup_bootstrap() -> None:
     """应用启动时恢复 workspace 并启动后台维护任务。"""
     load_workspaces_from_disk()
     _start_session_cleanup_worker()
     online_shadow_eval.start_worker()
+    await _preload_embedding_model()
 
 
 @app.get("/")
@@ -403,7 +423,7 @@ async def build_workspace_index(course_name: str):
     workspace_path = runner.get_workspace_path(course_name)
     uploads_dir = os.path.join(workspace_path, "uploads")
 
-    try:
+    def _build_index_sync():
         # 直接扫描 uploads/ 目录，避免内存列表与磁盘不同步导致漏文件
         allowed_exts = {".pdf", ".txt", ".md", ".docx", ".pptx", ".ppt"}
         disk_files = []
@@ -452,6 +472,9 @@ async def build_workspace_index(course_name: str):
             "num_chunks": len(chunks),
             "num_documents": len(workspace.documents)
         }
+
+    try:
+        return await anyio.to_thread.run_sync(_build_index_sync)
     except HTTPException:
         raise
     except Exception as e:
@@ -498,12 +521,14 @@ async def chat(request: ChatRequest):
             if request.shadow_eval:
                 runtime_state["shadow_eval"] = True
             # 执行编排主流程
-            response_message, plan = runner.run(
-                course_name=request.course_name,
-                mode=request.mode,
-                user_message=request.message,
-                state=runtime_state,
-                history=history,
+            response_message, plan = await anyio.to_thread.run_sync(
+                lambda: runner.run(
+                    course_name=request.course_name,
+                    mode=request.mode,
+                    user_message=request.message,
+                    state=runtime_state,
+                    history=history,
+                )
             )
             elapsed_ms = (perf_counter() - t0) * 1000.0
             add_event(

@@ -7,7 +7,7 @@
 - 将公开文档、审阅材料、工程笔记统一迁入 `docs/` 子目录：
   - `docs/guides/`
   - `docs/reviews/`
-  - `docs/notes/`
+  - `docs/internal/notes/`
   - `docs/changelog/`
 - `README.md` 保持在根目录，继续作为项目入口。
 - 更新 `.gitignore`，显式忽略：
@@ -77,8 +77,8 @@
 - `docs/guides/architecture.md`
 - `docs/guides/config-overview.md`
 - `docs/guides/contributing.md`
-- `docs/notes/qa.md`
-- `docs/notes/debug.md`
+- `docs/internal/notes/qa.md`
+- `docs/internal/notes/debug.md`
 
 重点修正内容：
 

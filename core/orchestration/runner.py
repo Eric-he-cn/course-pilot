@@ -567,31 +567,37 @@ class OrchestrationRunner:
     ) -> None:
         workspace_path = self.get_workspace_path(course_name)
         notes_dir = os.path.abspath(os.path.join(workspace_path, "notes"))
-        MCPTools._context = {
+        trace = get_active_trace()
+        trace_meta = dict(getattr(trace, "meta", {}) or {})
+        taskgraph_step = str(taskgraph_step or "").strip()
+        MCPTools.set_request_context(
+            {
+            "request_id": str(trace_meta.get("request_id", "") or "").strip(),
+            "course_name": course_name,
+            "mode": session_state.resolved_mode,
+            "user_id": "default",
+            "trace_id": str(getattr(trace, "trace_id", "") or "").strip(),
+            "budget_state": {},
+            "tool_audit": [],
+            "idempotency_namespace": f"{session_state.session_id}:{taskgraph_step}" if taskgraph_step else session_state.session_id,
             "notes_dir": notes_dir,
             "memory_query": memory_query,
             "retrieval_query": retrieval_query,
             "question_raw": question_raw,
-            "course_name": course_name,
             "session_id": session_state.session_id,
             "permission_mode": permission_mode,
-            "taskgraph_step": str(taskgraph_step or "").strip(),
-            "runtime_route": str(taskgraph_step or "").strip(),
+            "taskgraph_step": taskgraph_step,
+            "runtime_route": taskgraph_step,
             "strict_new_runtime": os.getenv("STRICT_NEW_RUNTIME", "0") == "1",
-            "tool_audit": [],
             "tool_budget": dict(session_state.metadata.get("tool_budget", {}) or {}),
             "allowed_tool_groups": list(session_state.metadata.get("allowed_tool_groups", []) or []),
             "workflow_template": str(session_state.metadata.get("workflow_template", "") or ""),
-        }
+            }
+        )
 
     @staticmethod
     def _extract_tool_audit_refs() -> List[str]:
-        ctx = getattr(MCPTools, "_context", None)
-        if not isinstance(ctx, dict):
-            return []
-        audit = ctx.get("tool_audit", [])
-        if not isinstance(audit, list):
-            return []
+        audit = MCPTools.get_request_context().tool_audit
         refs: List[str] = []
         for item in audit:
             if not isinstance(item, dict):
@@ -647,6 +653,7 @@ class OrchestrationRunner:
             memory_text=memory_text,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            mode=mode,
             history_summary_state=history_summary_state,
             pending_history=pending_history,
             recent_history=recent_history,
@@ -782,6 +789,7 @@ class OrchestrationRunner:
         else:
             rag_text, citations, retrieval_empty = self.rag_service.retrieve(
                 course_name=course_name,
+                question_raw=question_raw,
                 retrieval_query=retrieval_query,
                 mode="learn",
                 need_rag=plan.need_rag,
@@ -820,6 +828,7 @@ class OrchestrationRunner:
         result: TutorResult = self.tutor.teach(
             user_message, course_name, context,
             context_sections=context_sections,
+            retrieval_empty=retrieval_empty,
             allowed_tools=plan.allowed_tools,
             history=history,
         )
@@ -829,6 +838,7 @@ class OrchestrationRunner:
             result = self.tutor.teach(
                 user_message, course_name, context,
                 context_sections=context_sections,
+                retrieval_empty=retrieval_empty,
                 allowed_tools=plan.allowed_tools,
                 history=history,
             )
@@ -920,6 +930,7 @@ class OrchestrationRunner:
             )
             rag_text, citations, retrieval_empty = self.rag_service.retrieve(
                 course_name=course_name,
+                question_raw=str(getattr(plan, "question_raw", "") or user_message),
                 retrieval_query=retrieval_query,
                 mode="practice",
                 need_rag=plan.need_rag,
@@ -989,22 +1000,26 @@ class OrchestrationRunner:
             if has_exam_meta:
                 self.logger.info("[route] practice answer_submission=1 target=grader_exam%s", self._trace_tag())
                 exam_paper = self._practice_content_from_artifact(active_practice) or self._extract_exam_from_history(history)
+                grade_history_ctx = self._dedupe_grading_history_ctx(history_ctx, exam_paper)
                 for chunk in self.grader.grade_exam_stream(
                     exam_paper=exam_paper,
                     student_answer=user_message,
                     course_name=course_name,
-                    history_ctx=history_ctx,
+                    history_ctx=grade_history_ctx,
+                    retrieval_empty=retrieval_empty,
                 ):
                     if isinstance(chunk, str):
                         chunks.append(chunk)
             else:
                 self.logger.info("[route] practice answer_submission=1 target=grader%s", self._trace_tag())
                 quiz_content = self._practice_content_from_artifact(active_practice) or self._extract_quiz_from_history(history)
+                grade_history_ctx = self._dedupe_grading_history_ctx(history_ctx, quiz_content)
                 for chunk in self.grader.grade_practice_stream(
                     quiz_content=quiz_content,
                     student_answer=user_message,
                     course_name=course_name,
-                    history_ctx=history_ctx,
+                    history_ctx=grade_history_ctx,
+                    retrieval_empty=retrieval_empty,
                 ):
                     if isinstance(chunk, str):
                         chunks.append(chunk)
@@ -1066,6 +1081,7 @@ class OrchestrationRunner:
                     rag_context=context_sections["rag_context"],
                     history_context=context_sections["history_context"],
                     memory_context=context_sections["memory_context"],
+                    retrieval_empty=retrieval_empty,
                     prefetched_memory_ctx=context_sections["memory_context"],
                     prefetched_memory_checked=True,
                 )
@@ -1120,6 +1136,7 @@ class OrchestrationRunner:
                     rag_context=context_sections["rag_context"],
                     history_context=context_sections["history_context"],
                     memory_context=context_sections["memory_context"],
+                    retrieval_empty=retrieval_empty,
                     prefetched_memory_ctx=context_sections["memory_context"],
                     prefetched_memory_checked=True,
                     num_questions=num_questions,
@@ -1209,6 +1226,7 @@ class OrchestrationRunner:
             yield self.event_bus.status("正在检索教材证据...")
             rag_text, citations, retrieval_empty = self.rag_service.retrieve(
                 course_name=course_name,
+                question_raw=str(getattr(plan, "question_raw", "") or user_message),
                 retrieval_query=retrieval_query,
                 mode="practice",
                 need_rag=plan.need_rag,
@@ -1290,11 +1308,13 @@ class OrchestrationRunner:
             if has_exam_meta:
                 self.logger.info("[route] practice_stream answer_submission=1 target=grader_exam%s", self._trace_tag())
                 exam_paper = self._practice_content_from_artifact(active_practice) or self._extract_exam_from_history(history)
+                grade_history_ctx = self._dedupe_grading_history_ctx(history_ctx, exam_paper)
                 for chunk in self.grader.grade_exam_stream(
                     exam_paper=exam_paper,
                     student_answer=user_message,
                     course_name=course_name,
-                    history_ctx=history_ctx,
+                    history_ctx=grade_history_ctx,
+                    retrieval_empty=retrieval_empty,
                 ):
                     if isinstance(chunk, str):
                         collected.append(chunk)
@@ -1302,11 +1322,13 @@ class OrchestrationRunner:
             else:
                 self.logger.info("[route] practice_stream answer_submission=1 target=grader%s", self._trace_tag())
                 quiz_content = self._practice_content_from_artifact(active_practice) or self._extract_quiz_from_history(history)
+                grade_history_ctx = self._dedupe_grading_history_ctx(history_ctx, quiz_content)
                 for chunk in self.grader.grade_practice_stream(
                     quiz_content=quiz_content,
                     student_answer=user_message,
                     course_name=course_name,
-                    history_ctx=history_ctx,
+                    history_ctx=grade_history_ctx,
+                    retrieval_empty=retrieval_empty,
                 ):
                     if isinstance(chunk, str):
                         collected.append(chunk)
@@ -1376,6 +1398,7 @@ class OrchestrationRunner:
                     rag_context=context_sections["rag_context"],
                     history_context=context_sections["history_context"],
                     memory_context=context_sections["memory_context"],
+                    retrieval_empty=retrieval_empty,
                     prefetched_memory_ctx=context_sections["memory_context"],
                     prefetched_memory_checked=True,
                 )
@@ -1450,6 +1473,7 @@ class OrchestrationRunner:
                     rag_context=context_sections["rag_context"],
                     history_context=context_sections["history_context"],
                     memory_context=context_sections["memory_context"],
+                    retrieval_empty=retrieval_empty,
                     prefetched_memory_ctx=context_sections["memory_context"],
                     prefetched_memory_checked=True,
                     num_questions=num_questions,
@@ -1532,6 +1556,7 @@ class OrchestrationRunner:
             )
             rag_text, citations, retrieval_empty = self.rag_service.retrieve(
                 course_name=course_name,
+                question_raw=str(getattr(plan, "question_raw", "") or user_message),
                 retrieval_query=retrieval_query,
                 mode="exam",
                 need_rag=True,
@@ -1593,12 +1618,14 @@ class OrchestrationRunner:
         tool_calls = None
         if answer_submission:
             exam_paper = self._exam_content_from_artifact(session_state.active_exam) or self._extract_exam_from_history(history)
+            grade_history_ctx = self._dedupe_grading_history_ctx(history_ctx, exam_paper)
             chunks = []
             for chunk in self.grader.grade_exam_stream(
                 exam_paper=exam_paper,
                 student_answer=user_message,
                 course_name=course_name,
-                history_ctx=history_ctx,
+                history_ctx=grade_history_ctx,
+                retrieval_empty=retrieval_empty,
             ):
                 if isinstance(chunk, str):
                     chunks.append(chunk)
@@ -1650,6 +1677,7 @@ class OrchestrationRunner:
                 rag_context=context_sections["rag_context"],
                 history_context=context_sections["history_context"],
                 memory_context=context_sections["memory_context"],
+                retrieval_empty=retrieval_empty,
                 prefetched_memory_ctx=context_sections["memory_context"],
                 prefetched_memory_checked=True,
             )
@@ -1757,6 +1785,7 @@ class OrchestrationRunner:
             yield self.event_bus.status("正在检索教材证据...")
             rag_text, citations, retrieval_empty = self.rag_service.retrieve(
                 course_name=course_name,
+                question_raw=str(getattr(plan, "question_raw", "") or user_message),
                 retrieval_query=retrieval_query,
                 mode="exam",
                 need_rag=True,
@@ -1830,12 +1859,14 @@ class OrchestrationRunner:
         if answer_submission:
             yield self.event_bus.status("正在批改考试答案...")
             exam_paper = self._exam_content_from_artifact(session_state.active_exam) or self._extract_exam_from_history(history)
+            grade_history_ctx = self._dedupe_grading_history_ctx(history_ctx, exam_paper)
             collected = []
             for chunk in self.grader.grade_exam_stream(
                 exam_paper=exam_paper,
                 student_answer=user_message,
                 course_name=course_name,
-                history_ctx=history_ctx,
+                history_ctx=grade_history_ctx,
+                retrieval_empty=retrieval_empty,
             ):
                 if isinstance(chunk, str):
                     collected.append(chunk)
@@ -1895,6 +1926,7 @@ class OrchestrationRunner:
                 rag_context=context_sections["rag_context"],
                 history_context=context_sections["history_context"],
                 memory_context=context_sections["memory_context"],
+                retrieval_empty=retrieval_empty,
                 prefetched_memory_ctx=context_sections["memory_context"],
                 prefetched_memory_checked=True,
             )
@@ -2271,6 +2303,63 @@ class OrchestrationRunner:
         lines.extend(["---", "", "✅ 请将各题答案统一整理后一次性提交。"])
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _normalize_overlap_text(text: str) -> str:
+        import re
+
+        return re.sub(r"\s+", "", str(text or "")).strip().lower()
+
+    @classmethod
+    def _dedupe_grading_history_ctx(cls, history_ctx: str, artifact_text: str) -> str:
+        import re
+
+        history_text = str(history_ctx or "").strip()
+        artifact = str(artifact_text or "").strip()
+        if not history_text or not artifact:
+            return history_text
+
+        norm_history = cls._normalize_overlap_text(history_text)
+        norm_artifact = cls._normalize_overlap_text(artifact)
+        if len(norm_artifact) < 40:
+            return history_text
+
+        if norm_history and norm_history in norm_artifact:
+            return ""
+        if norm_artifact in norm_history:
+            extra_chars = len(norm_history) - len(norm_artifact)
+            if extra_chars <= max(20, len(norm_artifact) // 5):
+                return ""
+
+        artifact_lines = {
+            cls._normalize_overlap_text(line)
+            for line in artifact.splitlines()
+            if len(cls._normalize_overlap_text(line)) >= 12
+        }
+        if not artifact_lines:
+            return history_text
+
+        kept_blocks: List[str] = []
+        for block in re.split(r"\n\s*\n", history_text):
+            block_text = str(block or "").strip()
+            if not block_text:
+                continue
+            norm_block = cls._normalize_overlap_text(block_text)
+            if len(norm_block) >= 120 and (norm_block in norm_artifact or norm_artifact in norm_block):
+                continue
+            block_lines = [
+                cls._normalize_overlap_text(line)
+                for line in block_text.splitlines()
+                if len(cls._normalize_overlap_text(line)) >= 12
+            ]
+            if block_lines and all(line in artifact_lines for line in block_lines) and len(norm_block) >= 20:
+                continue
+            if len(block_lines) >= 3:
+                overlap_ratio = sum(1 for line in block_lines if line in artifact_lines) / len(block_lines)
+                if overlap_ratio >= 0.6:
+                    continue
+            kept_blocks.append(block_text)
+        return "\n\n".join(kept_blocks).strip()
+
     """将 Quiz 元数据挂载到内部 tool_calls，避免污染正文显示。"""
     @staticmethod
     def _build_quiz_meta_tool_call(quiz: Quiz) -> List[Dict[str, Any]]:
@@ -2633,6 +2722,7 @@ class OrchestrationRunner:
             yield self.event_bus.status("正在检索教材证据...")
             rag_text, citations, retrieval_empty = self.rag_service.retrieve(
                 course_name=course_name,
+                question_raw=question_raw,
                 retrieval_query=retrieval_query,
                 mode="learn",
                 need_rag=plan.need_rag,
@@ -2689,6 +2779,7 @@ class OrchestrationRunner:
         yield from self.tutor.teach_stream(
             user_message, course_name, context,
             context_sections=context_sections,
+            retrieval_empty=retrieval_empty,
             allowed_tools=plan.allowed_tools,
             history=history
         )

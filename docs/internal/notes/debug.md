@@ -148,7 +148,7 @@
 - 发现问题：根目录残留调试脚本，`data/perf_runs` 混入 smoke 目录，影响可读性。
 - 解决思路：按“归档优先，不硬删除”清理。
 - 解决步骤：
-  - 调试文件移动到 `tools/debug_archive/20260315_v2/`；
+  - 调试文件移动到 `docs/archive/debug/20260315_v2/`；
   - 非 canonical perf 结果移动到 `data/perf_runs/_archive/20260315_v2_cleanup/`；
   - 两处均生成 `ARCHIVE_INDEX.md`。
 - 解决结果：主目录只保留 canonical baseline/after 和正式运行入口。

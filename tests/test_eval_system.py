@@ -8,7 +8,7 @@ from core.services.rag_service import RAGService
 from scripts.eval.dataset_lint import lint_cases
 from scripts.eval.judge_runner import summarize_judge_rows
 from scripts.eval.review_runner import build_review_report
-from scripts.perf.bench_runner import _context_metrics, _taskgraph_status_coverage, _trace_contract
+from scripts.perf.bench_runner import _context_metrics, _gate_failures, _taskgraph_status_coverage, _trace_contract
 
 
 class EvalSystemTests(unittest.TestCase):
@@ -111,6 +111,18 @@ class EvalSystemTests(unittest.TestCase):
             }
         )
         self.assertAlmostEqual(2.0 / 3.0, coverage)
+
+    def test_bench_gate_failures_detect_nonzero_error_and_fallback(self):
+        failures = _gate_failures(
+            {
+                "error_rate": 0.1,
+                "fallback_rate": 0.2,
+                "trace_contract_error_rate": 0.0,
+                "taskgraph_step_status_coverage": 1.0,
+            }
+        )
+        self.assertIn("error_rate=0.1000 expected=0.0000", failures)
+        self.assertIn("fallback_rate=0.2000 expected=0.0000", failures)
 
     def test_dataset_lint_reports_schema_and_coverage(self):
         rows = [

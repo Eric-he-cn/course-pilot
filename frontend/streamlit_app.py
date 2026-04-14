@@ -63,6 +63,30 @@ def extract_session_state_from_tool_calls(tool_calls):
     return {}
 
 
+def format_citation_metrics(citation: dict) -> str:
+    """格式化引用分数：展示向量相似度、BM25 分数和融合排序分。"""
+    if not isinstance(citation, dict):
+        return ""
+    items: list[str] = []
+    metric_specs = [
+        ("dense_score", "向量相似度"),
+        ("bm25_score", "BM25 分数"),
+        ("rrf_score", "融合排序分"),
+    ]
+    for key, label in metric_specs:
+        raw = citation.get(key)
+        if raw is None:
+            if key == "rrf_score":
+                raw = citation.get("score")
+            else:
+                continue
+        try:
+            items.append(f"{label} {float(raw):.2f}")
+        except Exception:
+            continue
+    return ("  " + " · ".join(items)) if items else ""
+
+
 def render_mermaid(mermaid_code: str, idx: int = 0, height: int = 520) -> None:
     """使用 Mermaid CDN + components.html 渲染思维导图，并提供 SVG/PNG 下载按钮。"""
     import streamlit.components.v1 as components
@@ -940,7 +964,7 @@ if st.session_state.current_course:
                 with st.expander(f"📑 查看引用来源（共 {len(msg['citations'])} 条）"):
                     for i, citation in enumerate(msg["citations"]):
                         page_str = f"  第 {citation['page']} 页" if citation.get("page") else ""
-                        score_str = f"  相关度 {citation['score']:.2f}" if citation.get("score") is not None else ""
+                        score_str = format_citation_metrics(citation)
                         st.markdown(
                             f"**[来源{i+1}]** `{citation['doc_id']}`{page_str}{score_str}"
                         )
@@ -1081,7 +1105,7 @@ if st.session_state.current_course:
                     with st.expander(f"📑 查看引用来源（共 {len(citations)} 条）"):
                         for i, citation in enumerate(citations):
                             page_str = f"  第 {citation['page']} 页" if citation.get("page") else ""
-                            score_str = f"  相关度 {citation['score']:.2f}" if citation.get("score") is not None else ""
+                            score_str = format_citation_metrics(citation)
                             st.markdown(
                                 f"**[来源{i+1}]** `{citation['doc_id']}`{page_str}{score_str}"
                             )

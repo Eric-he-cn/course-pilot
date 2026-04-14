@@ -382,9 +382,38 @@ class ExecutionRuntime:
     ) -> tuple["PrefetchBundleV1", Dict[str, Any]]:
         from backend.schemas import PrefetchBundleV1
 
-        session_state = runtime_state["session_state"]
         retrieval_query = self.runner._plan_retrieval_query(plan, user_message)
         memory_query = self.runner._plan_memory_query(plan, user_message)
+        prefetch_signature = json.dumps(
+            {
+                "course_name": course_name,
+                "resolved_mode": resolved_mode,
+                "question_raw": str(getattr(plan, "question_raw", "") or user_message),
+                "retrieval_query": retrieval_query,
+                "memory_query": memory_query,
+                "need_rag": bool(getattr(plan, "need_rag", True)),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        cached_bundle = runtime_state.get("prefetch_bundle")
+        if isinstance(cached_bundle, PrefetchBundleV1):
+            cached_signature = str((cached_bundle.metadata or {}).get("prefetch_signature", "") or "")
+            if cached_signature and cached_signature == prefetch_signature:
+                add_event(
+                    "prefetch_bundle_cache_hit",
+                    course_name=course_name,
+                    resolved_mode=resolved_mode,
+                )
+                sections = {
+                    "history_context": cached_bundle.candidate_history_context,
+                    "rag_context": cached_bundle.candidate_rag_context,
+                    "memory_context": cached_bundle.candidate_memory_context,
+                    "context": cached_bundle.candidate_merged_context,
+                }
+                return cached_bundle, sections
+
+        session_state = runtime_state["session_state"]
         history_summary_state, pending_history, recent_history, history_metrics = self.runner._prepare_history_summary_inputs(history)
         runtime_state["session_state"] = self.runner._update_session_state(
             session_state,
@@ -411,6 +440,7 @@ class ExecutionRuntime:
                 rag_ctx.run,
                 self.runner.rag_service.retrieve,
                 course_name=course_name,
+                question_raw=str(getattr(plan, "question_raw", "") or user_message),
                 retrieval_query=retrieval_query,
                 mode=resolved_mode,
                 need_rag=bool(getattr(plan, "need_rag", True)),
@@ -436,6 +466,7 @@ class ExecutionRuntime:
             memory_text=memory_ctx,
             rag_sent_per_chunk=int(os.getenv("CB_RAG_SENT_PER_CHUNK", "2")),
             rag_sent_max_chars=int(os.getenv("CB_RAG_SENT_MAX_CHARS", "120")),
+            mode=resolved_mode,
             history_summary_state=history_summary_state,
             pending_history=pending_history,
             recent_history=recent_history,
@@ -474,6 +505,7 @@ class ExecutionRuntime:
                 "memory_query": memory_query,
                 "retrieval_empty": retrieval_empty,
                 "context_budget": self.runner._context_budget_payload(resolved_mode, len(history), packed),
+                "prefetch_signature": prefetch_signature,
             },
         )
         return bundle, sections

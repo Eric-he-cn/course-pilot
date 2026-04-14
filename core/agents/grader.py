@@ -463,6 +463,7 @@ class GraderAgent(BaseAgent):
         student_answer: str,
         course_name: Optional[str] = None,
         history_ctx: str = "",
+        retrieval_empty: bool = False,
     ):
         # 0) 第一阶段：先生成内部评分计划（不对用户展示）
         practice_plan = self._generate_practice_plan(
@@ -474,6 +475,12 @@ class GraderAgent(BaseAgent):
         system_prompt = GRADER_SYSTEM
         if history_ctx:
             system_prompt += f"\n\n{history_ctx}"
+        if retrieval_empty:
+            system_prompt += (
+                "\n\n【教材证据状态】本轮未找到可靠教材片段。"
+                "如需提及教材依据，必须明确说明未命中可靠教材证据，"
+                "本次评分讲解应仅基于题面、标准答案、学生作答与已有上下文。"
+            )
         system_prompt += (
             "\n\n【内部评分计划（不要在最终回答中复述本段原文）】\n"
             + json.dumps(practice_plan, ensure_ascii=False)
@@ -527,12 +534,19 @@ class GraderAgent(BaseAgent):
         student_answer: str,
         course_name: Optional[str] = None,
         history_ctx: str = "",
+        retrieval_empty: bool = False,
     ):
         exam_plan = self._generate_exam_plan(exam_paper=exam_paper, student_answer=student_answer)
 
         system_prompt = GRADER_SYSTEM
         if history_ctx:
             system_prompt += f"\n\n{history_ctx}"
+        if retrieval_empty:
+            system_prompt += (
+                "\n\n【教材证据状态】本轮未找到可靠教材片段。"
+                "如需提及教材依据，必须明确说明未命中可靠教材证据，"
+                "本次评卷与讲解应仅基于试卷、标准答案、学生作答与已有上下文。"
+            )
         system_prompt += (
             "\n\n【内部评卷计划（不要在最终回答中复述本段）】\n"
             + json.dumps(exam_plan, ensure_ascii=False)

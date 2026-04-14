@@ -72,8 +72,8 @@ git push origin feature/your-feature-name
 推荐的验证顺序：
 
 ```bash
-python scripts/eval/dataset_lint.py --path benchmarks --output-dir data/perf_runs/_lint
-python scripts/perf/bench_runner.py --cases benchmarks/smoke_contract.jsonl --gold benchmarks/rag_gold_v2.jsonl --output-dir data/perf_runs/smoke
+py -3.11 scripts/eval/dataset_lint.py --path benchmarks --output-dir data/perf_runs/_lint
+py -3.11 scripts/perf/bench_runner.py --cases benchmarks/smoke_contract.jsonl --gold benchmarks/rag_gold_v2.jsonl --output-dir data/perf_runs/smoke
 ```
 
 ---
