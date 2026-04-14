@@ -35,6 +35,19 @@ class BaseAgent:
         self._direct_tool_last_exec_ms: Dict[str, float] = {}
 
     @staticmethod
+    def _request_tool_state() -> tuple[Dict[str, Dict[str, Any]], Dict[str, float]]:
+        ctx = MCPTools.get_request_context()
+        tool_cache = ctx.get("_agent_tool_cache")
+        if not isinstance(tool_cache, dict):
+            tool_cache = {}
+            ctx.set("_agent_tool_cache", tool_cache)
+        last_exec_ms = ctx.get("_agent_tool_last_exec_ms")
+        if not isinstance(last_exec_ms, dict):
+            last_exec_ms = {}
+            ctx.set("_agent_tool_last_exec_ms", last_exec_ms)
+        return tool_cache, last_exec_ms
+
+    @staticmethod
     def load_session_state(session_state: Any) -> SessionStateV1:
         """兼容 dict / model 两种输入。"""
 
@@ -99,6 +112,7 @@ class BaseAgent:
         args = dict(tool_args or {})
         if self.tool_hub is None:
             return MCPTools.call_tool(tool_name, **args)
+        tool_cache, last_exec_ms = self._request_tool_state()
         decision, result = self.tool_hub.invoke(
             tool_name=tool_name,
             tool_args=args,
@@ -106,8 +120,8 @@ class BaseAgent:
             phase=phase,
             permission_mode=permission_mode,
             original_user_content=original_user_content,
-            tool_cache=self._direct_tool_cache,
-            last_exec_ms=self._direct_tool_last_exec_ms,
+            tool_cache=tool_cache,
+            last_exec_ms=last_exec_ms,
             tool_retry_max=tool_retry_max,
             tool_round=tool_round,
         )

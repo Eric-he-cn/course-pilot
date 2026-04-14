@@ -208,13 +208,13 @@
 - 代码锚点：`rag/retrieve.py:137`，`core/orchestration/runner.py:674`，`frontend/streamlit_app.py:647`
 
 ### 2.9 索引重建流程如何保证一致性？
-- 标准回答：`rebuild_indexes.py` 使用与后端相同的解析/切块/建库函数，保证离线重建与在线构建逻辑一致。
+- 标准回答：`scripts/rebuild_indexes.py` 使用与后端相同的解析/切块/建库函数，保证离线重建与在线构建逻辑一致。
 - 详细补充：可强调离线重建脚本复用同一管线，避免“线上检索逻辑”和“离线建库逻辑”漂移。
-- 代码锚点：`rebuild_indexes.py:22`，`rebuild_indexes.py:56`，`rebuild_indexes.py:72`，`rebuild_indexes.py:76`
+- 代码锚点：`scripts/rebuild_indexes.py`
 
 ### 2.10 当前 RAG 已知短板是什么？
-- 标准回答：当前仍无 Cross-Encoder reranker；虽然已支持 `chapter_hybrid` 分层切分和句级压缩，但排序阶段主要依赖 dense+BM25+RRF，复杂语义排序仍有上限。
-- 详细补充：建议把短板分成“召回、排序、切块”三类讲，更像工程评估而不是泛泛而谈。
+- 标准回答：当前已上线 `RRF + Cross-Encoder rerank` 的二阶段排序，但 rerank 默认只覆盖 `learn/practice`；考试链路仍以 dense+BM25+RRF 为主，另外扫描版 PDF 无 OCR、课程覆盖与长文档切块仍是主要短板。
+- 详细补充：建议把短板分成“召回、排序、切块、文档解析”四类讲，更像工程评估而不是泛泛而谈。
 - 代码锚点：`rag/chunk.py:13`，`rag/lexical.py:15`，`rag/retrieve.py:65`
 
 ### 2.11 你的 RAG 流水线具体是什么？从文档接入到最终生成答案，中间有哪些模块？
@@ -234,8 +234,8 @@
 - 代码锚点：`rag/lexical.py`，`rag/retrieve.py`
 
 ### 2.14 重排序你是怎么做的？为什么需要 rerank？
-- 标准回答：当前线上是 `RRF rank fusion + 句级压缩筛句`，还没有启用 Cross-Encoder rerank。需要 rerank 是因为很多错误来自“召回到了但排序靠后”，二阶段精排可以提升 top 证据质量。
-- 详细补充：若上 rerank，通常放在召回候选之后（例如 top12）再裁到最终 top_k。
+- 标准回答：当前线上是 `dense + bm25 -> RRF 融合去重 -> Cross-Encoder rerank -> final top_k`。需要 rerank 是因为很多错误来自“召回到了但排序靠后”，二阶段精排可以提升前几条证据质量。
+- 详细补充：当前默认只在 `learn/practice` 启用 rerank，通常先保留 fused top12 候选，再裁到最终 top_k；`exam` 仍保留旧排序链路以控制时延。
 - 代码锚点：`rag/retrieve.py`
 
 ### 2.15 如果答案错了，你怎么判断是检索错了还是生成错了？
@@ -483,8 +483,8 @@
 - 面试高频反问：top_k 过大带来的负面影响是什么？
 
 ### 5.7 什么时候需要引入 reranker？
-- 标准回答：当 top-k 里“有召回但排序不理想”频繁出现时，reranker 能显著提升前几位精度。当前链路仍以 RRF 排序为主，Cross-Encoder reranker 仍是后续提升空间。
-- 详细补充：当你发现“相关块已召回但排序靠后”时，就是引入 reranker 的典型信号。
+- 标准回答：当 top-k 里“有召回但排序不理想”频繁出现时，就适合引入 reranker。当前项目已经在 `learn/practice` 上启用 Cross-Encoder rerank，用来把 RRF 候选池进一步精排。
+- 详细补充：当你发现“相关块已召回但排序靠后”时，就是 reranker 最能发挥价值的典型信号；如果时延压力更高，也可以只对部分模式开启。
 - 代码锚点：`rag/retrieve.py:65`，`rag/retrieve.py:137`
 - 面试高频反问：你会把 reranker 放在 dense 前还是后？
 

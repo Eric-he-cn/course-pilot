@@ -20,6 +20,10 @@
 | `SESSION_TTL_DAYS` | `30` | SessionState 过期清理天数 |
 | `SESSION_CLEANUP_ENABLED` | `1` | 是否启用后台会话清理线程 |
 | `SESSION_CLEANUP_INTERVAL_SEC` | `900` | 会话清理扫描间隔（秒） |
+| `EMBEDDING_PRELOAD_ON_STARTUP` | `1` | 后端启动时主动预热 embedding 模型，减少首个请求冷启动 |
+
+补充：
+- 推荐统一使用 Python `3.11` 作为开发、测试与评测解释器。
 
 ---
 
@@ -89,6 +93,8 @@
 | `CB_LLM_COMPRESS_MAX_RETRIES` | `0` | 压缩重试次数 |
 | `CB_LLM_COMPRESS_MODEL` | 空 | 压缩模型（空=沿用主模型） |
 | `CB_LLM_COMPRESS_TEMPERATURE` | `0.1` | 历史压缩温度 |
+| `CONTEXT_LLM_COMPRESSION_THRESHOLD` | `0.9` | 仅当上下文压力达到阈值时才触发昂贵 LLM 压缩 |
+| `CB_DISABLE_LLM_HISTORY_COMPRESS_MODES` | `practice,exam` | 这些模式默认禁用历史 LLM 二次压缩 |
 
 ### 4.3 滚动摘要（Rolling Summary）
 
@@ -139,9 +145,15 @@
 | `HYBRID_BM25_WEIGHT` | `1.0` | bm25 权重 |
 | `HYBRID_DENSE_CANDIDATES_MULTIPLIER` | `3` | dense 候选扩展倍数 |
 | `HYBRID_BM25_CANDIDATES_MULTIPLIER` | `3` | bm25 候选扩展倍数 |
+| `RERANK_ENABLED` | `1` | 是否为 `learn/practice` 启用 Cross-Encoder 二阶段精排 |
+| `RERANK_CANDIDATES_LEARN_PRACTICE` | `12` | `learn/practice` 进入 rerank 的 fused candidate 数量 |
+| `RAG_EVIDENCE_DENSE_MIN` | `0.40` | 证据准入的最低向量相似度门槛 |
+| `RAG_EVIDENCE_BM25_MIN` | `1.0` | 证据准入的最低 BM25 原始分门槛 |
+| `RAG_EVIDENCE_MAX_FUSED_RANK` | `4` | 只允许融合排序前 N 的 chunk 进入证据集 |
 
 实现细节：
 - 向量库为 `FAISS IndexFlatL2`（当前未采用 IVF/PQ/HNSW）。
+- rerank 当前仅覆盖 `learn/practice`，链路为 `dense + bm25 -> RRF -> Cross-Encoder rerank -> evidence gate`。
 
 ---
 
@@ -152,6 +164,11 @@
 | `EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | 嵌入模型 |
 | `EMBEDDING_DEVICE` | `auto` | `cpu/cuda/auto` |
 | `EMBEDDING_BATCH_SIZE` | 按设备自适应 | 嵌入批大小 |
+| `EMBEDDING_PRELOAD_ON_STARTUP` | `1` | 服务启动时是否预加载嵌入模型 |
+| `RERANK_MODEL` | `BAAI/bge-reranker-base` | Cross-Encoder rerank 模型 |
+| `RERANK_DEVICE` | `auto` | `cpu/cuda/auto` |
+| `RERANK_BATCH_SIZE` | 按设备自适应 | rerank 批大小 |
+| `RERANK_PRELOAD_ON_STARTUP` | `1` | 服务启动时是否预加载 reranker |
 | `DATA_DIR` | `./data/workspaces` | 课程工作区根目录 |
 
 ---
@@ -162,11 +179,12 @@
 |---|---|---|
 | `MCP_PYTHON_BIN` | 当前解释器 | MCP 子进程 Python |
 | `SERPAPI_API_KEY` | 无 | `websearch` 工具密钥 |
+| `MCP_INPROCESS_FASTPATH` | `0` | 是否为低风险本地工具启用进程内快路径 |
 
 关键机制：
 - 工具链路固定：`OpenAI tool_call -> ToolHub -> MCPTools.call_tool -> stdio MCP -> server_stdio`。
 - MCP 客户端超时默认 `20s`，失败自动重启重试一次。
-- 不做本地直调 fallback（协议一致性优先）。
+- 默认不做本地直调 fallback；仅当 `MCP_INPROCESS_FASTPATH=1` 时，对少量低风险本地工具开放进程内快路径。
 - 权限模式固定为 `safe / standard / elevated`。
 
 ---
@@ -203,6 +221,8 @@
 | 参数 | 默认值 | 作用 |
 |---|---|---|
 | `ENABLE_ROUTER_REPLAN` | `1` | 是否启用重规划 |
+| `ENABLE_STRUCTURED_OUTPUTS_ROUTER` | `1` | Router 优先使用 strict json_schema 输出 |
+| `ROUTER_PLAN_RETRY_ON_PARSE_FAIL` | `1` | Router 解析/校验失败后是否自动重试一次 |
 | `REPLAN_MIN_CHARS` | `160` | 低质量判定阈值（字符） |
 | `REPLAN_MIN_SENTENCES` | `2` | 低质量判定阈值（句数） |
 
@@ -272,6 +292,7 @@
 | `--recompute-only` | `false` | 只重算已有 `baseline_raw.jsonl` 的 RAG 指标，不重跑模型 |
 | `--gold-min-coverage` | `0.5` | case_id 与 gold 的最小覆盖率阈值 |
 | `--gold-mismatch-policy` | `fail` | 覆盖率不足时 `warn/fail` |
+| `--gate-policy` | `fail` | 基准门禁失败时 `warn/fail/off` |
 
 支持：
 - checkpoint 断点续跑（按 `case_id#repeat` 去重）。

@@ -11,6 +11,7 @@ from backend.schemas import ToolAuditRecord, ToolDecision
 from core.errors import ToolDeniedError
 from core.metrics import add_event
 from core.orchestration.policies import ToolPolicy
+from core.runtime.request_context import RequestContext
 from mcp_tools.client import MCPTools
 
 
@@ -73,18 +74,19 @@ class ToolHub:
 
     @staticmethod
     def _idempotency_key(tool_name: str, signature: str) -> str:
-        ctx = getattr(MCPTools, "_context", None)
-        if isinstance(ctx, dict):
-            session_id = str(ctx.get("session_id", "") or "").strip()
-            taskgraph_step = str(ctx.get("taskgraph_step", "") or ctx.get("runtime_route", "") or "").strip()
-            if session_id or taskgraph_step:
-                return f"{tool_name}:{session_id}:{taskgraph_step}:{signature}"
+        ctx = MCPTools.get_request_context()
+        session_id = str(ctx.get("session_id", "") or "").strip()
+        taskgraph_step = str(ctx.get("taskgraph_step", "") or ctx.get("runtime_route", "") or "").strip()
+        namespace = str(ctx.idempotency_namespace or "").strip()
+        if namespace:
+            return f"{tool_name}:{namespace}:{signature}"
+        if session_id or taskgraph_step:
+            return f"{tool_name}:{session_id}:{taskgraph_step}:{signature}"
         return f"{tool_name}:{signature}"
 
     @staticmethod
-    def _runtime_context() -> Dict[str, Any]:
-        ctx = getattr(MCPTools, "_context", None)
-        return ctx if isinstance(ctx, dict) else {}
+    def _runtime_context() -> RequestContext:
+        return MCPTools.get_request_context()
 
     @classmethod
     def _budget_limits(cls, tool_name: str) -> Dict[str, Optional[int]]:
@@ -111,7 +113,7 @@ class ToolHub:
     @classmethod
     def _usage_state(cls) -> Dict[str, Any]:
         ctx = cls._runtime_context()
-        usage = ctx.setdefault(
+        usage = ctx.budget_state.setdefault(
             "tool_usage",
             {
                 "executed_total": 0,
@@ -121,7 +123,7 @@ class ToolHub:
         )
         if not isinstance(usage, dict):
             usage = {"executed_total": 0, "per_tool": {}, "per_round": {}}
-            ctx["tool_usage"] = usage
+            ctx.budget_state["tool_usage"] = usage
         usage.setdefault("per_tool", {})
         usage.setdefault("per_round", {})
         return usage
@@ -369,14 +371,24 @@ class ToolHub:
             tool_name == "memory_search"
             and decision.signature in last_exec_ms
             and (now_ms - float(last_exec_ms.get(decision.signature, 0.0))) < float(os.getenv("TOOL_DEDUP_MIN_INTERVAL_MS", "2000"))
-            and decision.signature in tool_cache
         ):
             dedup_reason = "memory_search_min_interval"
 
         start = perf_counter()
         if dedup_reason:
             decision = decision.model_copy(update={"dedup_hit": True, "dedup_reason": dedup_reason})
-            result = dict(tool_cache.get(decision.signature, {}))
+            if dedup_reason == "memory_search_min_interval" and decision.signature not in tool_cache:
+                result = {
+                    "tool": tool_name,
+                    "query": str(tool_args.get("query", "") or ""),
+                    "results": [],
+                    "success": True,
+                    "message": "memory_search deduped by min interval",
+                    "via": "toolhub_dedup",
+                    "failure_class": "success",
+                }
+            else:
+                result = dict(tool_cache.get(decision.signature, {}))
             add_event(
                 "tool_dedup",
                 tool_name=tool_name,
@@ -439,8 +451,8 @@ class ToolHub:
             elapsed_ms=(perf_counter() - start) * 1000.0,
             metadata={
                 "args": ToolPolicy.normalized_tool_args(tool_name, tool_args),
-                "session_id": str(getattr(MCPTools, "_context", {}).get("session_id", "") or ""),
-                "taskgraph_step": str(getattr(MCPTools, "_context", {}).get("taskgraph_step", "") or ""),
+                "session_id": str(self._runtime_context().get("session_id", "") or ""),
+                "taskgraph_step": str(self._runtime_context().get("taskgraph_step", "") or ""),
                 "tool_budget_snapshot": budget_snapshot,
             },
         )
@@ -449,12 +461,8 @@ class ToolHub:
 
     @staticmethod
     def _append_audit(record: ToolAuditRecord) -> None:
-        ctx = getattr(MCPTools, "_context", None)
-        if not isinstance(ctx, dict):
-            return
-        audit = ctx.setdefault("tool_audit", [])
-        if isinstance(audit, list):
-            audit.append(record.model_dump())
+        ctx = MCPTools.get_request_context()
+        ctx.tool_audit.append(record.model_dump())
 
 
 _DEFAULT_TOOL_HUB = ToolHub()

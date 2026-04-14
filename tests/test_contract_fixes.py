@@ -17,6 +17,7 @@ from unittest import mock
 from backend.schemas import AgentContextV1, ChatMessage, Plan, PlanPlusV1, SessionStateV1
 from core.agents.quizmaster import QuizMasterAgent
 from core.agents.router import RouterAgent
+from core.agents.tutor import TutorAgent
 from core.orchestration.runner import OrchestrationRunner
 from core.runtime.executor import ExecutionRuntime
 from core.services.event_bus import EventBus
@@ -195,6 +196,103 @@ class ContractFixTests(unittest.TestCase):
         self.assertTrue(payload.get("_artifact_error"))
         self.assertEqual([], payload.get("answer_sheet", []))
         self.assertIn("试卷生成失败", payload.get("content", ""))
+
+    def test_tutor_uses_split_context_and_legacy_only_as_fallback(self):
+        tutor = TutorAgent()
+        messages = tutor._build_messages(
+            question="解释 Layer Norm",
+            course_name="深度学习",
+            context="MERGED legacy context",
+            context_sections={
+                "rag_context": "RAG 证据",
+                "history_context": "历史摘要",
+                "memory_context": "长期记忆",
+            },
+            allowed_tools=[],
+            history=[],
+        )
+        prompt = messages[-1]["content"]
+        self.assertIn("RAG 证据", prompt)
+        self.assertIn("历史摘要", prompt)
+        self.assertIn("长期记忆", prompt)
+        self.assertNotIn("MERGED legacy context", prompt)
+
+        fallback_messages = tutor._build_messages(
+            question="解释 Layer Norm",
+            course_name="深度学习",
+            context="MERGED legacy context",
+            context_sections={},
+            allowed_tools=[],
+            history=[],
+        )
+        fallback_prompt = fallback_messages[-1]["content"]
+        self.assertIn("MERGED legacy context", fallback_prompt)
+
+    def test_quizmaster_prompt_prefers_split_context_and_falls_back_to_legacy(self):
+        os.environ["ENABLE_STRUCTURED_OUTPUTS_QUIZ"] = "0"
+        qm = QuizMasterAgent()
+        qm._plan_quiz = lambda **_kwargs: {
+            "topic": "Layer Norm",
+            "num_questions": 1,
+            "difficulty": "medium",
+            "question_type": "综合题",
+            "focus_points": [],
+        }
+        qm._build_external_ctx = lambda _query: ""
+        valid_quiz = json.dumps(
+            {
+                "question": "请说明 Layer Norm 的核心作用。",
+                "standard_answer": "Layer Norm 对单样本特征做归一化。",
+                "rubric": "答到归一化对象与作用即可。",
+                "difficulty": "medium",
+                "chapter": "Transformer",
+                "concept": "Layer Norm",
+            },
+            ensure_ascii=False,
+        )
+        fake_llm = _FakeLLM([valid_quiz, valid_quiz])
+        qm.llm = fake_llm
+
+        qm.generate_quiz(
+            course_name="course",
+            topic="Layer Norm",
+            difficulty="medium",
+            context="MERGED legacy context",
+            rag_context="RAG 证据",
+            history_context="历史摘要",
+            memory_context="长期记忆",
+        )
+        first_prompt = fake_llm.calls[0]["messages"][1]["content"]
+        self.assertIn("RAG 证据", first_prompt)
+        self.assertIn("历史摘要", first_prompt)
+        self.assertIn("长期记忆", first_prompt)
+        self.assertNotIn("MERGED legacy context", first_prompt)
+
+        qm.generate_quiz(
+            course_name="course",
+            topic="Layer Norm",
+            difficulty="medium",
+            context="MERGED legacy context",
+        )
+        second_prompt = fake_llm.calls[1]["messages"][1]["content"]
+        self.assertIn("MERGED legacy context", second_prompt)
+
+    def test_runner_dedupes_grading_history_when_artifact_is_repeated(self):
+        runner = OrchestrationRunner()
+        artifact = (
+            "## 练习题\n\n"
+            "1. 请解释 Layer Norm 的核心作用。\n\n"
+            "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。"
+        )
+        history_ctx = (
+            "## 练习题\n\n"
+            "1. 请解释 Layer Norm 的核心作用。\n\n"
+            "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。\n\n"
+            "【补充提醒】注意它与 Batch Norm 的归一化维度不同。"
+        )
+        deduped = runner._dedupe_grading_history_ctx(history_ctx, artifact)
+        self.assertNotIn("请解释 Layer Norm 的核心作用", deduped)
+        self.assertIn("Batch Norm", deduped)
 
     def test_quiz_fallback_does_not_expose_raw_json(self):
         os.environ["ENABLE_STRUCTURED_OUTPUTS_QUIZ"] = "0"
@@ -657,7 +755,7 @@ class ContractFixTests(unittest.TestCase):
     def test_tool_hub_permission_and_idempotency(self):
         hub = ToolHub()
         original_ctx = dict(MCPTools._context)
-        MCPTools._context = {"session_id": "sess-tool-1", "taskgraph_step": "run_tutor"}
+        MCPTools.set_request_context({"session_id": "sess-tool-1", "taskgraph_step": "run_tutor"})
         with mock.patch("core.services.tool_hub.MCPTools.call_tool", return_value={"success": True, "result": 4, "via": "mcp_stdio"}):
             with self.assertRaises(Exception):
                 hub.invoke(
@@ -687,16 +785,17 @@ class ContractFixTests(unittest.TestCase):
             self.assertTrue(decision.allowed)
             self.assertTrue(decision.idempotency_key.startswith("calculator:"))
             self.assertTrue(result["success"])
-        MCPTools._context = original_ctx
+        MCPTools.clear_request_context()
+        MCPTools.set_request_context(original_ctx)
 
     def test_tool_hub_enforces_total_and_per_tool_caps(self):
         hub = ToolHub()
         original_ctx = dict(MCPTools._context)
-        MCPTools._context = {
+        MCPTools.set_request_context({
             "session_id": "sess-cap-1",
             "taskgraph_step": "run_tutor",
             "tool_budget": {"per_request_total": 1, "per_round": 1, "calculator": 1},
-        }
+        })
         try:
             with mock.patch("core.services.tool_hub.MCPTools.call_tool", return_value={"success": True, "result": 4, "via": "mcp_stdio"}):
                 hub.invoke(
@@ -725,7 +824,8 @@ class ContractFixTests(unittest.TestCase):
                         tool_round=1,
                     )
         finally:
-            MCPTools._context = original_ctx
+            MCPTools.clear_request_context()
+            MCPTools.set_request_context(original_ctx)
 
     def test_event_bus_hidden_event_shapes_are_compatible(self):
         bus = EventBus()

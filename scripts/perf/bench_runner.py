@@ -539,6 +539,21 @@ def _write_summary_markdown(path: Path, profile: str, summary: Dict[str, Any]) -
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _gate_failures(summary: Dict[str, Any]) -> List[str]:
+    failures: List[str] = []
+    hard_checks = {
+        "error_rate": 0.0,
+        "fallback_rate": 0.0,
+        "trace_contract_error_rate": 0.0,
+        "taskgraph_step_status_coverage": 1.0,
+    }
+    for key, expected in hard_checks.items():
+        actual = float(summary.get(key, 0.0) or 0.0)
+        if abs(actual - expected) > 1e-9:
+            failures.append(f"{key}={actual:.4f} expected={expected:.4f}")
+    return failures
+
+
 def _case_repeat_key(case_id: str, repeat: int) -> str:
     return f"{case_id}#{repeat}"
 
@@ -776,6 +791,7 @@ def main() -> int:
     parser.add_argument("--recompute-only", action="store_true")
     parser.add_argument("--gold-min-coverage", type=float, default=0.5)
     parser.add_argument("--gold-mismatch-policy", choices=["warn", "fail"], default="fail")
+    parser.add_argument("--gate-policy", choices=["warn", "fail", "off"], default="fail")
     args = parser.parse_args()
 
     cases_path = Path(args.cases)
@@ -887,6 +903,17 @@ def main() -> int:
 
     summary_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     _write_summary_markdown(summary_md_path, args.profile, summary)
+    gate_failures = _gate_failures(summary)
+    if gate_failures:
+        summary["gate_failures"] = gate_failures
+        summary_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_summary_markdown(summary_md_path, args.profile, summary)
+        gate_msg = "[bench] gate failures: " + "; ".join(gate_failures)
+        if args.gate_policy == "fail":
+            print(gate_msg)
+            return 3
+        if args.gate_policy == "warn":
+            print(f"[bench][warn] {gate_msg}")
 
     checkpoint = {
         "profile": args.profile,

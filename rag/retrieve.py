@@ -11,6 +11,7 @@ import re
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 from rag.lexical import BM25Index
+from rag.rerank import get_reranker_model
 from backend.schemas import RetrievedChunk
 from core.metrics import add_event
 
@@ -70,6 +71,26 @@ class Retriever:
         return self.store.search(query_embedding, top_k)
 
     @staticmethod
+    def _rerank_enabled(request_mode: str) -> bool:
+        if request_mode not in {"learn", "practice"}:
+            return False
+        raw = str(os.getenv("RERANK_ENABLED", "1")).strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _rerank_candidate_limit(request_mode: str, top_k: int) -> int:
+        if request_mode in {"learn", "practice"}:
+            return max(top_k, Retriever._env_int("RERANK_CANDIDATES_LEARN_PRACTICE", 12))
+        return top_k
+
+    @staticmethod
+    def _score_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
     def _keywords(query: str) -> List[str]:
         q = (query or "").lower()
         kws = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", q)
@@ -108,31 +129,71 @@ class Retriever:
         self,
         dense_results: List[Tuple[Dict[str, Any], float]],
         bm25_results: List[Tuple[Dict[str, Any], float]],
-        top_k: int,
-    ) -> List[Tuple[Dict[str, Any], float]]:
+        limit: int | None = None,
+    ) -> List[Dict[str, Any]]:
         rrf_k = self._env_int("HYBRID_RRF_K", 60)
         dense_weight = self._env_float("HYBRID_DENSE_WEIGHT", 1.0)
         bm25_weight = self._env_float("HYBRID_BM25_WEIGHT", 1.0)
 
         fused_scores: Dict[str, float] = {}
         chunk_ref: Dict[str, Dict[str, Any]] = {}
+        dense_score_map: Dict[str, float] = {}
+        bm25_score_map: Dict[str, float] = {}
 
         for rank, (chunk, _) in enumerate(dense_results, start=1):
             key = self._chunk_key(chunk)
             fused_scores[key] = fused_scores.get(key, 0.0) + dense_weight / (rrf_k + rank)
             chunk_ref[key] = chunk
+            dense_score_map[key] = self._score_float(_)
+            bm25_score_map.setdefault(key, None)
 
         for rank, (chunk, _) in enumerate(bm25_results, start=1):
             key = self._chunk_key(chunk)
             fused_scores[key] = fused_scores.get(key, 0.0) + bm25_weight / (rrf_k + rank)
             chunk_ref[key] = chunk
+            bm25_score_map[key] = self._score_float(_)
+            dense_score_map.setdefault(key, None)
 
         ranked = sorted(
             ((key, score) for key, score in fused_scores.items()),
             key=lambda x: x[1],
             reverse=True,
         )
-        return [(chunk_ref[key], float(score)) for key, score in ranked[:top_k]]
+        fused: List[Dict[str, Any]] = []
+        selected = ranked if limit is None else ranked[: max(1, int(limit))]
+        for rank, (key, score) in enumerate(selected, start=1):
+            fused.append(
+                {
+                    "chunk": chunk_ref[key],
+                    "score": float(score),
+                    "rrf_score": float(score),
+                    "dense_score": dense_score_map.get(key),
+                    "bm25_score": bm25_score_map.get(key),
+                    "rank": rank,
+                }
+            )
+        return fused
+
+    def _rerank_candidates(
+        self,
+        *,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        reranker = get_reranker_model()
+        texts = [str(item.get("chunk", {}).get("text", "") or "") for item in candidates]
+        scores = reranker.rerank(query=query, texts=texts)
+        reranked: List[Dict[str, Any]] = []
+        for item, rerank_score in zip(candidates, scores):
+            updated = dict(item)
+            updated["score"] = float(rerank_score)
+            updated["rerank_score"] = float(rerank_score)
+            reranked.append(updated)
+        reranked.sort(key=lambda x: float(x.get("rerank_score", x.get("score", 0.0)) or 0.0), reverse=True)
+        for rank, item in enumerate(reranked, start=1):
+            item["rank"] = rank
+        return reranked[: max(1, int(top_k))]
     
 
     """retrieve: 根据查询执行检索，支持 dense、bm25 和 hybrid 三种模式。根据环境变量配置选择模式和参数，"""
@@ -141,6 +202,8 @@ class Retriever:
         query: str,
         top_k: int = None,
         mode: str = "",
+        query_source: str = "",
+        rewrite_fallback_triggered: bool = False,
     ) -> List[RetrievedChunk]:
         """根据查询召回相关文本片段。"""
         t0 = perf_counter()
@@ -148,6 +211,12 @@ class Retriever:
         request_mode = str(mode or "").strip().lower()
         candidate_count = 0
         success = True
+        rerank_enabled = self._rerank_enabled(request_mode)
+        rerank_applied = False
+        rerank_candidate_count = 0
+        rerank_returned_count = 0
+        rerank_ms = 0.0
+        rerank_error = ""
         if top_k is None:
             top_k = self._env_int("TOP_K_RESULTS", 3)
         else:
@@ -161,9 +230,31 @@ class Retriever:
             if search_mode == "dense":
                 results = self._dense_search(query, top_k)
                 candidate_count = len(results)
+                scored_results = [
+                    {
+                        "chunk": chunk,
+                        "score": float(score),
+                        "dense_score": float(score),
+                        "bm25_score": None,
+                        "rrf_score": None,
+                        "rank": rank,
+                    }
+                    for rank, (chunk, score) in enumerate(results, start=1)
+                ]
             elif search_mode == "bm25":
                 results = self.lexical_index.search(query, top_k)
                 candidate_count = len(results)
+                scored_results = [
+                    {
+                        "chunk": chunk,
+                        "score": float(score),
+                        "dense_score": None,
+                        "bm25_score": float(score),
+                        "rrf_score": None,
+                        "rank": rank,
+                    }
+                    for rank, (chunk, score) in enumerate(results, start=1)
+                ]
             else:
                 if request_mode in {"learn", "practice"}:
                     dense_k = max(top_k, 10)
@@ -179,7 +270,25 @@ class Retriever:
                 dense_results = self._dense_search(query, dense_k)
                 bm25_results = self.lexical_index.search(query, bm25_k)
                 candidate_count = len(dense_results) + len(bm25_results)
-                results = self._fuse_with_rrf(dense_results, bm25_results, top_k)
+                fused_limit = self._rerank_candidate_limit(request_mode, top_k) if rerank_enabled else top_k
+                fused_results = self._fuse_with_rrf(dense_results, bm25_results, limit=fused_limit)
+                scored_results = fused_results[:top_k]
+                if rerank_enabled and fused_results:
+                    rerank_candidate_count = len(fused_results)
+                    rerank_t0 = perf_counter()
+                    try:
+                        scored_results = self._rerank_candidates(
+                            query=query,
+                            candidates=fused_results,
+                            top_k=top_k,
+                        )
+                        rerank_applied = True
+                        rerank_returned_count = len(scored_results)
+                    except Exception as ex:
+                        rerank_error = f"{type(ex).__name__}: {ex}"
+                        scored_results = fused_results[:top_k]
+                    finally:
+                        rerank_ms = (perf_counter() - rerank_t0) * 1000.0
         except Exception:
             success = False
             raise
@@ -187,7 +296,9 @@ class Retriever:
         compression_mode = self._rag_compression_mode()
         sentence_compress_applied = compression_mode == "always"
         retrieved = []
-        for chunk, score in results:
+        for item in scored_results:
+            chunk = item["chunk"]
+            score = float(item["score"])
             if compression_mode == "always":
                 # 明确开启时，检索层直接句级压缩。
                 comp_text = self._compress_chunk_text(query=query, chunk_text=chunk["text"])
@@ -199,7 +310,11 @@ class Retriever:
                 doc_id=chunk["doc_id"],
                 page=chunk.get("page"),
                 chunk_id=chunk.get("chunk_id"),
-                score=float(score)
+                score=score,
+                dense_score=self._score_float(item.get("dense_score")),
+                bm25_score=self._score_float(item.get("bm25_score")),
+                rrf_score=self._score_float(item.get("rrf_score")),
+                rerank_score=self._score_float(item.get("rerank_score")),
             ))
 
         add_event(
@@ -210,8 +325,18 @@ class Retriever:
             top_k=top_k,
             candidate_count=candidate_count,
             returned_count=len(retrieved),
+            effective_query=query,
+            query_source=query_source or None,
+            rewrite_fallback_triggered=bool(rewrite_fallback_triggered),
             rag_compression_mode=compression_mode,
             rag_sentence_compress_applied=sentence_compress_applied,
+            rerank_enabled=rerank_enabled if search_mode == "hybrid" else False,
+            rerank_applied=rerank_applied,
+            rerank_ms=rerank_ms if rerank_applied or rerank_error else None,
+            rerank_candidate_count=rerank_candidate_count if rerank_enabled else None,
+            rerank_returned_count=rerank_returned_count if rerank_applied else None,
+            rerank_error=rerank_error or None,
+            rerank_fallback=bool(rerank_error),
             success=success,
         )
         return retrieved

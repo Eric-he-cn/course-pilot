@@ -71,4 +71,7 @@ __pycache__/
 tmp/
 temp/
 tmp*/
+tests/_tmp/
+tests/_tmp*/
+artifacts/local/
 

@@ -136,7 +136,7 @@
 ### 5.1 跑 full30（首次）
 
 ```bash
-python scripts/perf/bench_runner.py \
+py -3.11 scripts/perf/bench_runner.py \
   --cases benchmarks/cases_v1.jsonl \
   --gold benchmarks/rag_gold_v1.jsonl \
   --output-dir data/perf_runs/round2_full30 \
@@ -147,7 +147,7 @@ python scripts/perf/bench_runner.py \
 ### 5.2 已有 raw 离线重算 RAG 指标（不重跑模型）
 
 ```bash
-python scripts/perf/bench_runner.py \
+py -3.11 scripts/perf/bench_runner.py \
   --cases benchmarks/cases_v1.jsonl \
   --gold benchmarks/rag_gold_v1.jsonl \
   --output-dir data/perf_runs/round2_full30 \
@@ -196,6 +196,8 @@ python scripts/eval/review_runner.py \
 - `ONLINE_EVAL_POLL_SEC`
 - `ONLINE_EVAL_RUN_JUDGE_REVIEW`
 - `ONLINE_EVAL_PYTHON_BIN`
+- `CONTEXT_LLM_COMPRESSION_THRESHOLD`
+- `MCP_INPROCESS_FASTPATH`
 
 ---
 

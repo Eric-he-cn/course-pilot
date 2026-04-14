@@ -7,10 +7,12 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import json
+import os
 import re
 from typing import Dict, Any
 from backend.schemas import AgentContextV1, Plan, PlanPlusV1, SessionStateV1
 from core.agents.base import BaseAgent
+from core.metrics import add_event
 from core.orchestration.prompts import (
     ROUTER_PROMPT,
     ROUTER_SYSTEM_PROMPT,
@@ -29,6 +31,71 @@ class RouterAgent(BaseAgent):
     def __init__(self, **services: Any):
         super().__init__(agent_name="router", **services)
 
+    _STYLE_VALUES = {"step_by_step", "hint_first", "direct"}
+    _OUTPUT_FORMAT_VALUES = {"answer", "quiz", "exam", "report"}
+    _WORKFLOW_TEMPLATE_VALUES = {
+        "learn_only",
+        "practice_only",
+        "exam_only",
+        "learn_then_practice",
+        "practice_then_review",
+        "exam_then_review",
+    }
+    _ACTION_KIND_VALUES = {
+        "learn_explain",
+        "practice_generate",
+        "practice_grade",
+        "exam_generate",
+        "exam_grade",
+        "learn_then_practice",
+    }
+    _ARTIFACT_KIND_VALUES = {"none", "practice", "exam"}
+
+    _ROUTER_PLAN_SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "need_rag": {"type": "boolean"},
+            "style": {"type": "string", "enum": sorted(list(_STYLE_VALUES))},
+            "output_format": {"type": "string", "enum": sorted(list(_OUTPUT_FORMAT_VALUES))},
+            "question_raw": {"type": "string"},
+            "user_intent": {"type": "string"},
+            "retrieval_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "retrieval_query": {"type": "string"},
+            "memory_query": {"type": "string"},
+            "workflow_template": {"type": "string", "enum": sorted(list(_WORKFLOW_TEMPLATE_VALUES))},
+            "action_kind": {"type": "string", "enum": sorted(list(_ACTION_KIND_VALUES))},
+            "route_confidence": {"type": "number"},
+            "route_reason": {"type": "string"},
+            "required_artifact_kind": {"type": "string", "enum": sorted(list(_ARTIFACT_KIND_VALUES))},
+            "tool_budget": {"type": "object"},
+            "allowed_tool_groups": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "need_rag",
+            "style",
+            "output_format",
+            "question_raw",
+            "user_intent",
+            "retrieval_keywords",
+            "retrieval_query",
+            "memory_query",
+            "workflow_template",
+            "action_kind",
+            "route_confidence",
+            "route_reason",
+            "required_artifact_kind",
+            "tool_budget",
+            "allowed_tool_groups",
+        ],
+    }
+
     """提示词与解析辅助。"""
 
     """构建用户薄弱点上下文（供 Router 提示词注入）。失败时返回空字符串，不影响主流程。"""
@@ -43,13 +110,220 @@ class RouterAgent(BaseAgent):
     """从模型输出中提取 JSON 对象，兼容 ```json```、`````` 和纯 JSON 形态。"""
     @staticmethod
     def _extract_json_payload(response_text: str) -> Dict[str, Any]:
-        if "```json" in response_text:
-            json_str = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            json_str = response_text.split("```")[1].split("```")[0].strip()
-        else:
-            json_str = response_text.strip()
-        return json.loads(json_str)
+        raw = str(response_text or "")
+        candidates = []
+        if "```json" in raw:
+            try:
+                candidates.append(raw.split("```json", 1)[1].split("```", 1)[0].strip())
+            except Exception:
+                pass
+        if "```" in raw and not candidates:
+            try:
+                candidates.append(raw.split("```", 1)[1].split("```", 1)[0].strip())
+            except Exception:
+                pass
+        candidates.append(raw.strip())
+        first = raw.find("{")
+        last = raw.rfind("}")
+        if first >= 0 and last > first:
+            candidates.append(raw[first:last + 1].strip())
+
+        seen = set()
+        for candidate in candidates:
+            payload = str(candidate or "").strip()
+            if not payload or payload in seen:
+                continue
+            seen.add(payload)
+            try:
+                obj = json.loads(payload)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+        raise ValueError("invalid_json_payload")
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _structured_chat_json(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        schema_name: str,
+        schema: Dict[str, Any],
+        temperature: float,
+        max_tokens: int,
+        flag_env: str,
+    ) -> Dict[str, Any]:
+        if not self._env_bool(flag_env, True):
+            return {}
+        try:
+            response = self.llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+            )
+            payload = self._extract_json_payload(response)
+            add_event(
+                "structured_output",
+                target=schema_name,
+                feature_flag=flag_env,
+                success=True,
+                fallback=False,
+            )
+            return payload if isinstance(payload, dict) else {}
+        except Exception as ex:
+            add_event(
+                "structured_output",
+                target=schema_name,
+                feature_flag=flag_env,
+                success=False,
+                fallback=True,
+                error=str(ex),
+            )
+            self.logger.warning("[router.structured] schema=%s failed err=%s", schema_name, str(ex))
+            return {}
+
+    @classmethod
+    def _validate_router_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid_payload_type")
+        plan_dict = dict(payload)
+        required_text_fields = ("question_raw", "retrieval_query", "memory_query")
+        for field in required_text_fields:
+            value = str(plan_dict.get(field, "") or "").strip()
+            if not value:
+                raise ValueError(f"missing_required: {field}")
+            plan_dict[field] = value
+
+        enum_fields = {
+            "style": cls._STYLE_VALUES,
+            "output_format": cls._OUTPUT_FORMAT_VALUES,
+            "workflow_template": cls._WORKFLOW_TEMPLATE_VALUES,
+            "action_kind": cls._ACTION_KIND_VALUES,
+            "required_artifact_kind": cls._ARTIFACT_KIND_VALUES,
+        }
+        for field, allowed in enum_fields.items():
+            raw = str(plan_dict.get(field, "") or "").strip()
+            if raw and raw not in allowed:
+                raise ValueError(f"invalid_enum: {field}")
+        try:
+            route_confidence = float(plan_dict.get("route_confidence", 0.85))
+        except Exception as ex:
+            raise ValueError("invalid_route_confidence") from ex
+        plan_dict["route_confidence"] = max(0.0, min(1.0, route_confidence))
+        return plan_dict
+
+    @staticmethod
+    def _retry_prompt(original_prompt: str, failure_reason: str) -> str:
+        return (
+            f"{original_prompt}\n\n"
+            "上一次输出未通过格式校验，请只修复结构，不要改变用户意图。\n"
+            f"失败原因: {failure_reason}\n\n"
+            "重试要求：\n"
+            "1. 仅输出 JSON，不要 markdown，不要解释。\n"
+            "2. question_raw / retrieval_query / memory_query 不能为空。\n"
+            "3. style / output_format / workflow_template / action_kind / required_artifact_kind 必须使用允许值。\n"
+            "4. route_confidence 必须是 0~1 之间的小数。\n"
+        )
+
+    def _generate_plan_payload(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        fallback_builder,
+        normalize_args: tuple[Any, ...],
+        schema_name: str,
+        retry_prompt_builder,
+        temperature: float,
+        max_tokens: int,
+    ) -> PlanPlusV1:
+        output_mode = "plain_json"
+        failure_reason = ""
+        payload: Dict[str, Any] = {}
+
+        try:
+            payload = self._structured_chat_json(
+                messages=messages,
+                schema_name=schema_name,
+                schema=self._ROUTER_PLAN_SCHEMA,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                flag_env="ENABLE_STRUCTURED_OUTPUTS_ROUTER",
+            )
+            if payload:
+                output_mode = "strict_schema"
+                validated = self._validate_router_payload(payload)
+                add_event("router_plan_output_mode", schema_name=schema_name, output_mode=output_mode)
+                return self._normalize_plan(validated, *normalize_args)
+            response = self.invoke_llm(messages, temperature=temperature, max_tokens=max_tokens)
+            payload = self._extract_json_payload(response)
+            validated = self._validate_router_payload(payload)
+            add_event("router_plan_output_mode", schema_name=schema_name, output_mode=output_mode)
+            return self._normalize_plan(validated, *normalize_args)
+        except Exception as ex:
+            failure_reason = str(ex) or "invalid_json_payload"
+            add_event(
+                "router_plan_parse_failed",
+                schema_name=schema_name,
+                output_mode=output_mode,
+                error=failure_reason,
+            )
+
+        if self._env_bool("ROUTER_PLAN_RETRY_ON_PARSE_FAIL", True):
+            add_event(
+                "router_plan_retry",
+                schema_name=schema_name,
+                previous_output_mode=output_mode,
+                reason=failure_reason,
+            )
+            retry_messages = retry_prompt_builder(failure_reason)
+            try:
+                retry_payload = self._structured_chat_json(
+                    messages=retry_messages,
+                    schema_name=f"{schema_name}_retry",
+                    schema=self._ROUTER_PLAN_SCHEMA,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    flag_env="ENABLE_STRUCTURED_OUTPUTS_ROUTER",
+                )
+                if retry_payload:
+                    validated = self._validate_router_payload(retry_payload)
+                    add_event("router_plan_output_mode", schema_name=schema_name, output_mode="retry_fixed")
+                    return self._normalize_plan(validated, *normalize_args)
+                retry_response = self.invoke_llm(retry_messages, temperature=0.0, max_tokens=max_tokens)
+                retry_payload = self._extract_json_payload(retry_response)
+                validated = self._validate_router_payload(retry_payload)
+                add_event("router_plan_output_mode", schema_name=schema_name, output_mode="retry_fixed")
+                return self._normalize_plan(validated, *normalize_args)
+            except Exception as retry_ex:
+                failure_reason = str(retry_ex) or failure_reason
+                add_event(
+                    "router_plan_parse_failed",
+                    schema_name=f"{schema_name}_retry",
+                    output_mode="retry",
+                    error=failure_reason,
+                )
+
+        add_event(
+            "router_plan_fallback_default",
+            schema_name=schema_name,
+            output_mode="fallback_default",
+            error=failure_reason,
+        )
+        add_event("router_plan_output_mode", schema_name=schema_name, output_mode="fallback_default")
+        self.logger.warning("[router] fallback schema=%s reason=%s", schema_name, failure_reason)
+        return self._normalize_plan(fallback_builder(), *normalize_args)
 
     """解析失败时的兜底计划，保证编排链路继续执行。"""
     @staticmethod
@@ -419,15 +693,18 @@ class RouterAgent(BaseAgent):
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
-        response = self.invoke_llm(messages, temperature=0.3)
-        
-        # 4) 解析模型输出并规范化字段
-        try:
-            plan_dict = self._extract_json_payload(response)
-            return self._normalize_plan(plan_dict, mode, user_message, session_state)
-        except Exception as e:
-            print(f"Error parsing plan: {e}, using defaults")
-            return self._normalize_plan(self._build_default_plan(mode).model_dump(), mode, user_message, session_state)
+        return self._generate_plan_payload(
+            messages=messages,
+            fallback_builder=lambda: self._build_default_plan(mode).model_dump(),
+            normalize_args=(mode, user_message, session_state),
+            schema_name="router_plan_v1",
+            retry_prompt_builder=lambda reason: [
+                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                {"role": "user", "content": self._retry_prompt(prompt, reason)},
+            ],
+            temperature=0.3,
+            max_tokens=900,
+        )
 
     """重规划入口：当执行阶段发现质量/工具/检索异常时，基于失败原因生成一次替代计划。"""
     def replan(
@@ -451,18 +728,23 @@ class RouterAgent(BaseAgent):
             {"role": "system", "content": ROUTER_REPLAN_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        try:
-            response = self.invoke_llm(messages, temperature=0.2)
-            plan_dict = self._extract_json_payload(response)
-            bootstrap_state = SessionStateV1(
-                session_id="replan",
-                course_name=course_name,
-                requested_mode_hint=self._normalize_mode(mode, "learn"),  # type: ignore[arg-type]
-                resolved_mode=self._normalize_mode(mode, "learn"),  # type: ignore[arg-type]
-                task_full_text=user_message,
-                task_summary=user_message[:120],
-            )
-            return self._normalize_plan(plan_dict, mode, user_message, bootstrap_state)
-        except Exception as e:
-            print(f"Error replanning: {e}, fallback to previous plan")
-            return previous_plan
+        bootstrap_state = SessionStateV1(
+            session_id="replan",
+            course_name=course_name,
+            requested_mode_hint=self._normalize_mode(mode, "learn"),  # type: ignore[arg-type]
+            resolved_mode=self._normalize_mode(mode, "learn"),  # type: ignore[arg-type]
+            task_full_text=user_message,
+            task_summary=user_message[:120],
+        )
+        return self._generate_plan_payload(
+            messages=messages,
+            fallback_builder=lambda: previous_plan.model_dump(),
+            normalize_args=(mode, user_message, bootstrap_state),
+            schema_name="router_replan_v1",
+            retry_prompt_builder=lambda failure_reason: [
+                {"role": "system", "content": ROUTER_REPLAN_SYSTEM_PROMPT},
+                {"role": "user", "content": self._retry_prompt(prompt, failure_reason)},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )

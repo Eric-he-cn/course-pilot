@@ -30,6 +30,11 @@ class RetrievedChunk(BaseModel):
     page: Optional[int] = None
     chunk_id: Optional[str] = None
     score: float
+    dense_score: Optional[float] = None
+    bm25_score: Optional[float] = None
+    rrf_score: Optional[float] = None
+    rerank_score: Optional[float] = None
+    evidence_passed: Optional[bool] = None
 
 
 class Plan(BaseModel):

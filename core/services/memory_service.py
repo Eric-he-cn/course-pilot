@@ -16,8 +16,52 @@ from mcp_tools.client import MCPTools
 class MemoryService:
     """Handles profile access, prefetch, and learn/practice/exam memory writes."""
 
-    def __init__(self):
-        self._request_cache: Dict[str, Dict[str, Any]] = {}
+    @staticmethod
+    def _should_prefetch(query: str, *, mode: str = "", phase: str = "") -> bool:
+        text = str(query or "").strip().lower()
+        if not text:
+            return False
+        direct_signals = (
+            "之前",
+            "历史",
+            "错题",
+            "记忆",
+            "复习",
+            "回顾",
+            "总结",
+            "薄弱点",
+            "薄弱",
+            "弱项",
+            "易错",
+            "上次",
+            "以前",
+            "再来",
+            "巩固",
+            "past",
+            "history",
+            "mistake",
+            "review",
+            "weak point",
+            "weakness",
+        )
+        if any(sig in text for sig in direct_signals):
+            return True
+        if str(phase or "").strip().lower() == "grade":
+            grading_signals = ("按我之前", "结合我之前", "结合历史", "针对薄弱点", "针对错题")
+            return any(sig in str(query or "") for sig in grading_signals)
+        if str(mode or "").strip().lower() in {"practice", "exam"}:
+            practice_signals = ("针对", "强化", "查漏补缺", "易错点", "薄弱环节")
+            return any(sig in str(query or "") for sig in practice_signals)
+        return False
+
+    @staticmethod
+    def _request_cache() -> Dict[str, Dict[str, Any]]:
+        ctx = MCPTools.get_request_context()
+        cache = ctx.get("_memory_service_cache")
+        if not isinstance(cache, dict):
+            cache = {}
+            ctx.set("_memory_service_cache", cache)
+        return cache
 
     @staticmethod
     def get_profile_context(course_name: str | None) -> str:
@@ -47,11 +91,11 @@ class MemoryService:
                 snippets.append(text[: max(20, item_max_chars)])
         if not snippets:
             return ""
-        title = "【该知识点历史错题参考】"
+        title = "【相关历史记录参考】"
         if phase == "grade":
-            title = "【该知识点历史错题参考（评分时请特别关注相同薄弱点）】"
+            title = "【历史薄弱点与作答记录参考（评分时请特别关注相同问题）】"
         elif phase == "generate":
-            title = "【该知识点历史错题参考（出题时请优先覆盖薄弱点）】"
+            title = "【历史薄弱点与练习记录参考（出题时请优先覆盖薄弱点）】"
         return f"\n\n{title}\n" + "\n".join(f"- {item}" for item in snippets)
 
     def prefetch_history_ctx(
@@ -65,35 +109,105 @@ class MemoryService:
     ) -> str:
         t0 = perf_counter()
         cache_hit = False
+        if not self._should_prefetch(query, mode=mode, phase=phase):
+            add_event(
+                "memory_prefetch",
+                query=query,
+                course_name=course_name,
+                mode=mode or None,
+                agent=agent or None,
+                phase=phase or None,
+                cache_hit=False,
+                success=True,
+                skipped=True,
+                skip_reason="intent_not_matched",
+                results_count=0,
+                returned_chars=0,
+                memory_prefetch_ms=(perf_counter() - t0) * 1000.0,
+            )
+            return ""
         try:
             top_k = int(os.getenv("CB_MEMORY_TOPK", "2"))
-            key_payload = {
-                "tool": "memory_search",
-                "query": query,
-                "course_name": course_name,
-                "event_types": ["mistake", "practice", "exam", "qa_summary"],
-                "mode": mode or None,
-                "agent": agent or None,
-                "phase": phase or None,
-                "top_k": top_k,
-            }
-            cache_key = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
-            if cache_key in self._request_cache:
-                mem = self._request_cache[cache_key]
-                cache_hit = True
-            else:
-                mem = MCPTools.call_tool(
-                    "memory_search",
+            request_cache = self._request_cache()
+            attempts = [
+                {
+                    "event_types": ["mistake", "practice", "exam", "qa_summary", "qa"],
+                    "mode": mode or None,
+                    "agent": agent or None,
+                    "phase": phase or None,
+                    "fallback_level": "strict",
+                },
+                {
+                    "event_types": ["mistake", "practice", "exam", "qa_summary", "qa"],
+                    "mode": mode or None,
+                    "agent": None,
+                    "phase": None,
+                    "fallback_level": "relaxed_metadata",
+                },
+                {
+                    "event_types": ["mistake", "practice", "exam", "qa_summary", "qa"],
+                    "mode": None,
+                    "agent": None,
+                    "phase": None,
+                    "fallback_level": "relaxed_mode",
+                },
+            ]
+            mem: Dict[str, Any] | None = None
+            selected_attempt = attempts[-1]
+            failure_result: Dict[str, Any] | None = None
+            for attempt in attempts:
+                key_payload = {
+                    "tool": "memory_search",
+                    "query": query,
+                    "course_name": course_name,
+                    "event_types": attempt["event_types"],
+                    "mode": attempt["mode"],
+                    "agent": attempt["agent"],
+                    "phase": attempt["phase"],
+                    "top_k": top_k,
+                }
+                cache_key = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
+                if cache_key in request_cache:
+                    mem = request_cache[cache_key]
+                    cache_hit = True
+                else:
+                    mem = MCPTools.call_tool(
+                        "memory_search",
+                        query=query,
+                        course_name=course_name,
+                        event_types=attempt["event_types"],
+                        mode=attempt["mode"],
+                        agent=attempt["agent"],
+                        phase=attempt["phase"],
+                        top_k=top_k,
+                    )
+                    if isinstance(mem, dict):
+                        request_cache[cache_key] = dict(mem)
+                selected_attempt = attempt
+                if isinstance(mem, dict) and not mem.get("success", False):
+                    failure_result = dict(mem)
+                    break
+                if isinstance(mem, dict) and mem.get("success") and mem.get("results"):
+                    break
+            if failure_result is not None:
+                add_event(
+                    "memory_prefetch",
                     query=query,
                     course_name=course_name,
-                    event_types=["mistake", "practice", "exam", "qa_summary"],
                     mode=mode or None,
                     agent=agent or None,
                     phase=phase or None,
-                    top_k=top_k,
+                    cache_hit=cache_hit,
+                    success=False,
+                    skipped=False,
+                    fallback_level=str(selected_attempt.get("fallback_level", "") or "strict"),
+                    failure_class=str(failure_result.get("failure_class", "") or "fatal_error"),
+                    error=str(failure_result.get("error", "") or "memory_search_failed"),
+                    results_count=0,
+                    returned_chars=0,
+                    memory_prefetch_ms=(perf_counter() - t0) * 1000.0,
                 )
-                if isinstance(mem, dict):
-                    self._request_cache[cache_key] = dict(mem)
+                return ""
             context = self._build_memory_ctx(mem if isinstance(mem, dict) else {}, phase=phase)
             add_event(
                 "memory_prefetch",
@@ -106,6 +220,7 @@ class MemoryService:
                 success=True,
                 results_count=len((mem or {}).get("results", [])) if isinstance(mem, dict) else 0,
                 returned_chars=len(context),
+                fallback_level=str(selected_attempt.get("fallback_level", "") or "strict"),
                 memory_prefetch_ms=(perf_counter() - t0) * 1000.0,
             )
             return context

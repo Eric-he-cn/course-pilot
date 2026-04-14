@@ -1,60 +1,39 @@
-# CoursePilot — 大学课程学习 Agent（Multi-Agent + RAG + MCP）
+# CoursePilot
 
-CoursePilot 是一个面向大学课程学习场景的多 Agent 学习系统，目标是把“教材证据 + 练习/考试闭环 + 评测可验证”落成可持续演进的工程化系统。
+面向大学课程学习场景的 Multi-Agent + RAG + MCP 系统，强调教材证据可追溯、练习/考试闭环，以及可复现的评测与治理能力。
 
-本仓库体现的是 v3 架构：`Router` 负责规划模板，`ExecutionRuntime + TaskGraph` 负责白名单执行，`SessionState` 负责全局短期状态真源，`ToolHub` 统一工具治理，`bench -> judge -> review` 形成动态评测闭环。
+CoursePilot 不是一个“套了教材检索的聊天机器人”。它更像一个可持续演进的学习系统：
 
----
+- 外部仍是 `learn / practice / exam` 三种模式
+- 内部通过 `workflow_template` 控制执行路径，避免自由编排失控
+- 练习和考试走 `artifact-first`，先生成结构化题目，再评分与落档
+- 工具调用经过 `ToolHub` 做权限、预算、去重、幂等和审计
+- 评测支持 `bench -> judge -> review` 全链路闭环
 
-## 核心能力
+![CoursePilot UI](docs/images/启动界面.png)
 
-- 课程级 RAG：教材入库、分块、混合检索、引用来源可追溯
-- 多 Agent 编排：Router + Tutor + QuizMaster + Grader 的职责链
-- 工作流模板化：仅允许受支持的 `workflow_template`，避免自由图失控
-- artifact-first：练习/考试先生成结构化 artifact，再渲染展示与评分
-- 工具治理：ToolHub 统一权限、预算、去重、幂等、审计
-- 会话真源：SessionState JSON 持久化，跨轮恢复与回写
-- 生命周期治理：Session TTL 自动清理 + 手动会话清理 API
-- 在线影子评测：前端会话级开关，异步写队列并后台评测
-- 动态评测：bench -> judge -> review 全链路可复现评估
+## Why This Project
 
----
+- 教材证据可追溯：检索结果带来源和页码，回答不是“黑盒生成”。
+- 学习闭环完整：从概念讲解，到练习、考试、评分、记录沉淀都在同一系统内完成。
+- 多 Agent 但不失控：`Router + Tutor + QuizMaster + Grader` 分工明确，同时由模板和运行时收口。
+- 工具治理完整：不是简单 function calling，而是带预算、权限、审计和失败处理的工具链。
+- 会话状态有真源：`SessionState` 持久化为服务端短期状态，不靠 history 硬猜。
+- 动态评测可复现：支持 benchmark、judge、review 三段式回归，而不只看主观回答效果。
 
-## 系统架构概览
+## Quick Start
 
-```
-User
-  ↓
-API /chat
-  ↓
-OrchestrationRunner（兼容入口）
-  ↓
-ExecutionRuntime + TaskGraph（模板执行器）
-  ├─ RouterAgent -> PlanPlusV1（workflow_template + action_kind）
-  ├─ RAGService / MemoryService 预取
-  ├─ Agent.build_context() 选择并组织上下文
-  ├─ Tutor / QuizMaster / Grader 执行
-  ├─ ToolHub -> MCP stdio 工具调用
-  └─ WorkspaceStore / SessionState / Memory 持久化
-```
+### 1. 安装依赖
 
-更详细说明请见 `docs/guides/architecture.md`。
-
----
-
-## 快速开始
-
-### 1) 安装依赖
+推荐使用 Python `3.11`。
 
 ```bash
-pip install -r requirements.txt
+py -3.11 -m pip install -r requirements.txt
 ```
 
-建议在 Python 3.11 环境中运行本项目。若系统默认 `python` 不是 3.11，请先激活对应的 `conda`/`venv`，或在 Windows 上使用 `py -3.11 -m pip install -r requirements.txt`。
+### 2. 配置 `.env`
 
-### 2) 配置环境变量
-
-在项目根目录创建 `.env`，至少包含：
+在项目根目录创建 `.env`，最少需要：
 
 ```bash
 OPENAI_API_KEY=...
@@ -62,151 +41,92 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 DEFAULT_MODEL=gpt-4o-mini
 ```
 
-可选：评测用 Judge 配置（与主模型解耦）
+如果需要 judge 模型、运行治理参数或完整环境变量说明，请看 [配置总览](docs/guides/config-overview.md)。
+
+### 3. 启动系统
 
 ```bash
-EVAL_JUDGE_API_KEY=...
-EVAL_JUDGE_BASE_URL=https://api.deepseek.com
-EVAL_JUDGE_MODEL=deepseek-chat
-EVAL_JUDGE_TEMPERATURE=0
-```
+# 终端 1：后端
+py -3.11 -m backend.api
 
-可选：v3 运行治理参数
-
-```bash
-RAG_COMPRESSION_MODE=adaptive   # adaptive|always|off
-SESSION_TTL_DAYS=30
-MEMORY_EPISODES_SOFT_CAP=2000
-MEMORY_EVICT_BATCH_SIZE=200
-ONLINE_EVAL_WORKER_ENABLED=0    # 默认关闭；需要在线影子评测时再显式开启
-API_RELOAD=0                    # 开发时可设为 1 开启 uvicorn reload
-```
-
-### 3) 启动后端与前端
-
-```bash
-python -m backend.api
-```
-
-```bash
+# 终端 2：前端
 streamlit run frontend/streamlit_app.py
 ```
 
 默认后端端口 `8000`，前端端口 `8501`。
 
-如果你在 Windows 上没有把 Python 3.11 设为默认解释器，可使用 `py -3.11 -m backend.api` 启动后端。
+### 4. 上传教材并构建索引
 
----
+推荐直接通过前端完成：
 
-## 数据准备
+1. 创建或选择课程
+2. 上传教材文件
+3. 点击“构建索引”
+4. 开始学习 / 练习 / 考试
 
-推荐通过前端完成流程：
-
-1. 创建/选择课程
-2. 上传教材文件（PDF/TXT/MD/DOCX/PPTX/PPT）
-3. 点击构建索引
-
-命令行方式可使用：
+如果你需要批量重建所有课程索引：
 
 ```bash
-python rebuild_indexes.py
+py -3.11 scripts/rebuild_indexes.py
 ```
 
----
+## How It Works
 
-## 模式与工作流模板
+对外，CoursePilot 提供三种学习模式：
 
-对外兼容的模式仍为 `learn/practice/exam`，但内部以 `workflow_template` 执行：
+- `learn`：解释概念、回答问题、引用教材
+- `practice`：生成练习题并评分讲评
+- `exam`：生成试卷并完成一次性评卷
 
-- `learn_only`
-- `practice_only`
-- `exam_only`
-- `learn_then_practice`
-- `practice_then_review`
-- `exam_then_review`
+对内，系统不会直接把模式映射到单一函数，而是先由 `Router` 生成计划，再进入受控模板执行。当前核心执行思路是：
 
-`Router` 只能在模板集合中选择，`ExecutionRuntime` 校验模板前置条件并编译 `TaskGraph`。
+- `workflow_template`：决定本轮是“只讲解”、“只出题”还是“出题后评分”等路径
+- `ExecutionRuntime + TaskGraph`：把计划编译成可观测、可回退的执行步骤
+- `RAGService + MemoryService`：负责教材证据和历史记忆预取
+- `ToolHub`：统一工具门控与审计
 
-练习与考试采用 artifact-first：
+更详细的执行链路见 [架构文档](docs/guides/architecture.md)。
 
-- QuizMaster 生成 `PracticeArtifactV1/ExamArtifactV1`
-- validator 通过后才渲染题面
-- Grader 只消费 artifact，不再从 history 反推题目
+## Repository Layout
 
----
-
-## 测试与评测
-
-基础测试：
-
-```bash
-py -3.11 -m unittest discover -s tests -p "test*.py"
-py -3.11 tests/test_basic.py
+```text
+backend/       FastAPI API 层
+core/          编排、运行时、Agent、服务层
+frontend/      Streamlit UI
+rag/           文档解析、切块、检索与索引
+memory/        长期记忆与画像
+mcp_tools/     MCP 工具客户端与本地工具
+scripts/       索引、评测与辅助脚本
+benchmarks/    基准数据与 gold
+docs/          架构、配置、使用、评测与内部资料
+data/          本地工作区、索引和运行产物
 ```
 
-若已激活 Python 3.11 虚拟环境，也可以继续使用 `python ...`。
+脚本入口说明见 [scripts/README.md](scripts/README.md)。  
+如果你想看一个轻量演示入口，可以看 [docs/examples/demo.py](docs/examples/demo.py)。
 
-动态评测建议顺序：
+## Read More
 
-```bash
-python scripts/perf/bench_runner.py --cases benchmarks/smoke_contract.jsonl --gold benchmarks/rag_gold_v2.jsonl --output-dir data/perf_runs/smoke
-python scripts/eval/judge_runner.py --raw data/perf_runs/smoke/baseline_raw.jsonl --cases benchmarks/smoke_contract.jsonl --output-dir data/perf_runs/smoke_judge
-python scripts/eval/review_runner.py --benchmark-summary data/perf_runs/smoke/baseline_summary.json --benchmark-raw data/perf_runs/smoke/baseline_raw.jsonl --judge-summary data/perf_runs/smoke_judge/judge_summary.json --judge-raw data/perf_runs/smoke_judge/judge_raw.jsonl --output-dir data/perf_runs/smoke_review
-```
+- [架构说明](docs/guides/architecture.md)
+- [配置总览](docs/guides/config-overview.md)
+- [使用手册](docs/guides/usage.md)
+- [评测手册](docs/guides/evaluation.md)
+- [贡献说明](docs/guides/contributing.md)
 
-完整说明见 `docs/guides/evaluation.md`。
+## FAQ
 
----
+### 它和普通 RAG 问答项目有什么不同？
 
-## 目录结构
+重点不只是“把文档喂给模型”，而是把教材证据、练习/考试链路、状态管理、工具治理和动态评测放进同一个工程体系里。
 
-```
-backend/           # FastAPI API 层
-core/              # 编排、运行时、Agent、服务层
-rag/               # 文档解析、切块、检索与索引
-memory/            # 长期记忆与画像
-mcp_tools/         # MCP 客户端/服务端与本地工具
-frontend/          # Streamlit UI
-scripts/           # bench/judge/review 与辅助脚本
-benchmarks/        # 测试集与 gold
-data/              # 运行时数据与评测产物（本地）
-docs/              # 架构、评测、配置与评审记录
-```
+### 为什么内部还有 `workflow_template`？
 
----
+因为它能把外部简单模式映射成受控执行模板，让多 Agent 系统更稳定、可测、可演进。
 
-## 常见问题
+### 可以只把它当教材问答系统来用吗？
 
-1. 为什么 `general` 不再是正式模式？
-`general` 仅作为旧输入兼容字段保留，内部会被归一化为 6 个模板之一。
-
-2. 为什么 practice/exam 不直接评分？
-评分需要稳定结构，artifact-first 可以避免坏 JSON 与空试卷导致的链路不稳定。
-
-4. 有会话清理能力吗？
-有。后端提供：
-- `DELETE /workspaces/{course_name}/sessions/{session_id}`
-- `POST /workspaces/{course_name}/sessions/cleanup`
-
-前端也提供“清理过期会话”和“删除当前会话”入口。
-
-5. 在线影子评测会不会影响主响应？
-不会。影子评测是异步队列模式，主链路仅追加队列写入，不阻塞 `/chat` 与 `/chat/stream`。
-
-3. Judge 可以不用 DeepSeek 吗？
-可以。Judge 与主模型解耦，只需配置 `EVAL_JUDGE_*` 环境变量。
-
----
-
-## 开发说明
-
-- 架构与数据流详见 `docs/guides/architecture.md`
-- 配置总览详见 `docs/guides/config-overview.md`
-- 评测手册详见 `docs/guides/evaluation.md`
-- 贡献流程详见 `docs/guides/contributing.md`
-
----
+可以。你完全可以只用 `learn` 模式；练习、考试和评测链路是增量能力，不强制依赖。
 
 ## License
 
-MIT License
+MIT

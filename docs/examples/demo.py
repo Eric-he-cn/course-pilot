@@ -2,7 +2,7 @@
 【模块说明】
 - 主要作用：提供命令行版项目使用演示，帮助快速了解端到端流程。
 - 核心函数：demo_workflow、show_api_examples、show_architecture。
-- 使用方式：python examples/demo.py [--api] [--arch]
+- 使用方式：python docs/examples/demo.py [--api] [--arch]
 - 阅读建议：先看模块说明，再看类/函数头部注释和关键步骤注释。
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """

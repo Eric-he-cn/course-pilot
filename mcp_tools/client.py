@@ -19,6 +19,13 @@ import time
 import requests
 from typing import Any, Dict, List, Optional
 
+from core.runtime.request_context import (
+    RequestContext,
+    clear_request_context,
+    get_request_context,
+    set_request_context,
+)
+
 
 # ── OpenAI Function Calling Schema 定义 ─────────────────────────────────────
 """定义一组工具的 schema，符合 OpenAI function calling 的规范。每个工具包含名称、描述和输入参数的 JSON Schema。"""
@@ -559,6 +566,41 @@ class MCPTools:
     _context: Dict[str, Any] = {}
 
     @staticmethod
+    def set_request_context(payload: RequestContext | Dict[str, Any]) -> RequestContext:
+        ctx = set_request_context(payload)
+        # 保留 legacy 入口，方便旧测试与诊断逻辑读取。
+        MCPTools._context = ctx.to_dict()
+        return ctx
+
+    @staticmethod
+    def get_request_context() -> RequestContext:
+        ctx = get_request_context()
+        if ctx is not None:
+            return ctx
+        if isinstance(MCPTools._context, dict) and MCPTools._context:
+            ctx = RequestContext.from_mapping(MCPTools._context)
+            set_request_context(ctx)
+            MCPTools._context = ctx.to_dict()
+            return ctx
+        ctx = RequestContext.from_mapping({})
+        set_request_context(ctx)
+        MCPTools._context = ctx.to_dict()
+        return ctx
+
+    @staticmethod
+    def get_context() -> Dict[str, Any]:
+        return MCPTools.get_request_context().to_dict()
+
+    @staticmethod
+    def get_context_value(key: str, default: Any = None) -> Any:
+        return MCPTools.get_request_context().get(key, default)
+
+    @staticmethod
+    def clear_request_context() -> None:
+        clear_request_context()
+        MCPTools._context = {}
+
+    @staticmethod
     def calculator(expression: str) -> Dict[str, Any]:
         """安全地计算数学表达式，支持统计、组合数学、三角等扩展函数。"""
         try:
@@ -829,7 +871,7 @@ class MCPTools:
         try:
             from memory.manager import get_memory_manager
             if not query:
-                query = str(MCPTools._context.get("memory_query", "")).strip()
+                query = str(MCPTools.get_context_value("memory_query", "")).strip()
             if event_types is None:
                 event_types = ["mistake", "practice", "exam", "qa_summary"]
             mgr = get_memory_manager()
@@ -904,7 +946,7 @@ class MCPTools:
         elif tool_name == "get_datetime":
             return MCPTools.get_datetime(kwargs.get("timezone"))
         elif tool_name == "filewriter":
-            notes_dir = kwargs.get("notes_dir") or MCPTools._context.get("notes_dir", "./data/notes")
+            notes_dir = kwargs.get("notes_dir") or MCPTools.get_context_value("notes_dir", "./data/notes")
             return MCPTools.filewriter(
                 filename=kwargs.get("filename", "note.md"),
                 content=kwargs.get("content", ""),
@@ -925,9 +967,32 @@ class MCPTools:
             _add_event("tool_progress", tool_name=tool_name, stage="start")
         except Exception:
             pass
+        if str(os.getenv("MCP_INPROCESS_FASTPATH", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            if tool_name in {"calculator", "get_datetime", "memory_search"}:
+                result = MCPTools._call_tool_local(tool_name, **payload)
+                result = dict(result) if isinstance(result, dict) else {"tool": tool_name, "result": result}
+                result.setdefault("tool", tool_name)
+                result.setdefault("via", "inprocess")
+                success = bool(result.get("success", False))
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                logger.info("[mcp] tool=%s success=%s elapsed_ms=%.1f fastpath=1", tool_name, success, elapsed_ms)
+                try:
+                    from core.metrics import add_event as _add_event
+
+                    _add_event(
+                        "tool_call",
+                        tool_name=tool_name,
+                        tool_ms=elapsed_ms,
+                        tool_success=success,
+                        success=success,
+                    )
+                    _add_event("tool_progress", tool_name=tool_name, stage="done")
+                except Exception:
+                    pass
+                return result
         # filewriter 的 notes_dir 由 runner 注入上下文；通过 MCP 参数透传给子进程。
         if tool_name == "filewriter" and "notes_dir" not in payload:
-            payload["notes_dir"] = MCPTools._context.get("notes_dir", "./data/notes")
+            payload["notes_dir"] = MCPTools.get_context_value("notes_dir", "./data/notes")
 
         result: Dict[str, Any]
         try:
