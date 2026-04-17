@@ -1,6 +1,6 @@
 # CoursePilot 关键配置总览
 
-更新时间：2026-04-12  
+更新时间：2026-04-17  
 适用范围：当前主干代码（`core/`, `rag/`, `memory/`, `mcp_tools/`, `backend/`, `frontend/`, `scripts/`）  
 说明：本清单按“模块 -> 参数 -> 默认值/行为”整理，便于定位配置归属与运行行为。密钥类信息不写明文。
 
@@ -72,6 +72,7 @@
 | `CTX_SAFETY_MARGIN` | `256` | 安全余量 |
 | `CB_HISTORY_RECENT_TURNS` | `5` | 最近保留的原文对话轮数 |
 | `CB_RECENT_RAW_TURNS` | `5` | 原文保留轮数（配合摘要） |
+| `CB_HISTORY_RECENT_RAW_TURNS` | 回退到 `CB_HISTORY_RECENT_TURNS` | Runner 侧会话滚动摘要保留的最近原文轮数；未单独设置时沿用历史轮数配置 |
 | `CB_HISTORY_SUMMARY_MAX_TOKENS` | `2000` | 历史摘要预算 |
 | `CB_RAG_MAX_TOKENS` | `1800` | RAG 段预算 |
 | `CB_MEMORY_MAX_TOKENS` | `450` | memory 段预算 |
@@ -282,6 +283,11 @@
 
 ## 11. 评测脚本参数（`scripts/perf/bench_runner.py`）
 
+补充说明：
+- 当前根目录 `benchmarks/` 默认只保留 active canonical 集与 gold 流水线文件：`cases_v1.jsonl`、`rag_gold_v1.jsonl`、`gold_candidates.jsonl`、`gold_manual_fix.jsonl`、`gold_rejected.jsonl`、`gold_label_sessions.jsonl`。
+- 历史广覆盖 benchmark / gold 套件已归档到 `benchmarks/archive/20260415_legacy_reset/`。
+- 因此，`bench_runner.py` 的默认参数仍然指向 canonical 集；如果要做覆盖率 lint 或历史大回归，需要显式指向 archive 目录或自建 case 集。
+
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--cases` | `benchmarks/cases_v1.jsonl` | 用例集 |
@@ -314,9 +320,11 @@ RAG 命中判定策略（按优先级）：
 - `gold_case_total/gold_case_matched/gold_case_coverage`
 
 补充脚本：
-- `python scripts/eval/dataset_lint.py --path benchmarks`
-- `python scripts/eval/judge_runner.py --raw data/perf_runs/<profile>/baseline_raw.jsonl --cases benchmarks/core_e2e.jsonl`
+- `python scripts/eval/dataset_lint.py --path benchmarks/archive/20260415_legacy_reset`
+- `python scripts/eval/judge_runner.py --raw data/perf_runs/<profile>/baseline_raw.jsonl --cases benchmarks/cases_v1.jsonl`
 - `python scripts/eval/review_runner.py --benchmark-summary ... --benchmark-raw ... --judge-summary ... --judge-raw ...`
+- `python scripts/eval/build_gold_candidates.py --run-all-suggestions --count 30`
+- `python scripts/eval/review_gold_candidates.py`
 
 Judge 独立配置：
 - `EVAL_JUDGE_API_KEY`
@@ -324,6 +332,14 @@ Judge 独立配置：
 - `EVAL_JUDGE_MODEL`
 - `EVAL_JUDGE_TIMEOUT_MS`
 - `EVAL_JUDGE_TEMPERATURE`
+
+Gold-screen judge 独立配置：
+- `GOLD_SCREEN_API_KEY`
+- `GOLD_SCREEN_BASE_URL`
+- `GOLD_SCREEN_MODEL`
+
+默认回退：
+- 未单独设置 `GOLD_SCREEN_*` 时，会回退到 `OPENAI_API_KEY / OPENAI_BASE_URL / DEFAULT_MODEL_THINKING / DEFAULT_MODEL`
 
 ---
 
