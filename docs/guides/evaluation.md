@@ -24,9 +24,18 @@
 
 ---
 
-## 2. 评测数据格式
+## 2. 评测数据与 Gold 生产
 
-### 2.1 cases 文件（示例）
+### 2.1 active benchmark 文件
+
+当前 active 入口只保留两份正式文件：
+
+- `benchmarks/cases_v1.jsonl`
+- `benchmarks/rag_gold_v1.jsonl`
+
+历史 benchmark / gold JSONL 已迁入 `benchmarks/archive/<timestamp>_legacy_reset/`，不再作为默认评测入口。
+
+### 2.2 cases 文件（示例）
 
 每行一个 JSON：
 
@@ -42,7 +51,7 @@
 - `history`（可选）: 历史轮次
 - `need_rag` / `requires_citations`（可选）: trace contract 校验开关
 
-### 2.2 gold 文件（支持扩展）
+### 2.3 gold 文件（支持扩展）
 
 每行一个 JSON，`case_id` 必须与 cases 对齐。
 
@@ -71,6 +80,30 @@
 - `gold_chunk_ids`: chunk 级命中目标
 - `gold_keywords`: 关键词兜底目标
 - `should_retrieve`: 若为 `false`，该 case 不计 RAG 命中
+
+### 2.4 gold 候选生产流水线
+
+当前 canonical gold 不再直接由 LLM 自动写入正式 `rag_gold_v1.jsonl`，而是走四段式流程：
+
+1. `build_gold_candidates.py`
+- 直接调用 `OrchestrationRunner.run()` 跑真实 `learn + requires_citations` 主链路
+- 只从已建立索引的正式课程中生成建议题目
+- 采样回答、plan、citations、session_state、trace 摘要
+
+2. `gold_screen_judge.py`
+- 使用 DeepSeek 兼容 OpenAI API 做专用首筛
+- 目标不是回答质量，而是判断“证据是否足够进入 gold 候选池”
+
+3. 中间产物文件
+- `benchmarks/gold_candidates.jsonl`: judge 通过、待人工确认
+- `benchmarks/gold_manual_fix.jsonl`: 部分可用、待人工修订
+- `benchmarks/gold_rejected.jsonl`: 失败样本
+- `benchmarks/gold_label_sessions.jsonl`: 全流程审计日志
+
+4. `review_gold_candidates.py`
+- 人工复查 `gold_candidates.jsonl`
+- 通过后再写入正式 `cases_v1.jsonl + rag_gold_v1.jsonl`
+- `gold_chunk_ids` 只能来自真实 citations，不允许模型凭空生成
 
 ---
 
@@ -121,17 +154,16 @@
 
 ## 5. 常用命令
 
-### 5.0 推荐数据集分层
+### 5.0 当前数据分层
 
 | 数据集 | 目标 | 说明 |
 |---|---|---|
-| `benchmarks/smoke_contract.jsonl` | 快速回归 | 覆盖基本路由与引用形状 |
-| `benchmarks/cases_v1_top5.jsonl` | 小样本质量 | 便于 PR 级验证 |
-| `benchmarks/cases_v1.jsonl` | 全量基线 | 30 cases 基线对比 |
-| `benchmarks/core_e2e.jsonl` | 端到端质量 | 用于 judge/review |
-| `benchmarks/multi_turn_sessions.jsonl` | 多轮与续聊 | SessionState 恢复验证 |
-| `benchmarks/tooling_and_permissions.jsonl` | 工具治理 | 权限/预算/幂等验证 |
-| `benchmarks/dynamic_review_queue.jsonl` | 难例回归 | 来自历史回归队列 |
+| `benchmarks/cases_v1.jsonl` | active canonical cases | 仅保留人工复查通过的正式样本 |
+| `benchmarks/rag_gold_v1.jsonl` | active canonical gold | 与 `cases_v1.jsonl` 一一对齐 |
+| `benchmarks/gold_candidates.jsonl` | 候选池 | LLM 首筛通过，待人工复查 |
+| `benchmarks/gold_manual_fix.jsonl` | 待修池 | 回答或证据部分可用，需要人工修 |
+| `benchmarks/gold_rejected.jsonl` | 拒绝池 | 无效或明显错误样本 |
+| `benchmarks/archive/*` | 历史数据 | 旧 benchmark/gold 归档，不参与默认评测 |
 
 ### 5.1 跑 full30（首次）
 
@@ -167,7 +199,25 @@ python scripts/eval/judge_runner.py \
 
 说明：v2 基线没有 LLM judge 是允许的，review 会将 baseline judge 记为 `N/A`。
 
-### 5.4 生成动态复评报告
+### 5.4 生成 gold 候选
+
+```bash
+python scripts/eval/build_gold_candidates.py --run-all-suggestions --count 30
+```
+
+如需手工指定课程与问题：
+
+```bash
+python scripts/eval/build_gold_candidates.py --course 矩阵理论 --question "请结合教材解释矩阵的秩，并给出教材依据。"
+```
+
+### 5.5 人工复查候选并正式入库
+
+```bash
+python scripts/eval/review_gold_candidates.py
+```
+
+### 5.6 生成动态复评报告
 
 ```bash
 python scripts/eval/review_runner.py \
@@ -180,7 +230,7 @@ python scripts/eval/review_runner.py \
   --output-dir data/perf_runs/round2_full30_review
 ```
 
-### 5.5 在线影子评测（异步，不阻塞主链路）
+### 5.7 在线影子评测（异步，不阻塞主链路）
 
 1. 前端开启 `🧪 开启影子评测`（会话级）
 2. 正常对话时，后端会把样本写入：
@@ -230,6 +280,11 @@ review gate：
 - 检查 `.env` 或环境变量中的 `OPENAI_API_KEY` / `EVAL_JUDGE_API_KEY`
 - `judge_runner.py` 已支持自动加载项目根目录 `.env`
 
+3. `gold_candidates.jsonl` 长期为空
+- 先检查 `build_gold_candidates.py` 是否真的跑到了有索引课程
+- 再检查 `gold_screen_judge.py` 的 API 配置和 `selected_citation_indexes` 是否始终为空
+- 如果模型回答看起来不错但始终进不了候选池，优先复查 citation 质量而不是直接降阈值
+
 3. baseline judge 为空
 - v2 历史 baseline 无 judge 是正常现象
 - review 中 baseline judge 会显示 `N/A`
@@ -238,8 +293,8 @@ review gate：
 
 ## 8. 收官清单
 
-1. 跑完 smoke/top5/full30/strict smoke
-2. full30 通过 gold 覆盖校验（非 0 且达到阈值）
-3. judge 运行成功（或明确标注 fallback）
-4. review 生成并输出回归队列
-5. 文档更新：README + config-overview + 本文档
+1. `cases_v1.jsonl + rag_gold_v1.jsonl` 保持一一对齐
+2. 新 gold 先进入 `gold_candidates.jsonl`，人工复查后再入正式集合
+3. benchmark 先过 gold 覆盖校验，再看 RAG 命中 headline
+4. `judge_runner.py` 与 `gold_screen_judge.py` 口径明确区分
+5. 文档更新：architecture + config-overview + 本文档

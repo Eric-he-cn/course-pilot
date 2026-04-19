@@ -73,7 +73,7 @@ git push origin feature/your-feature-name
 
 ```bash
 py -3.11 scripts/eval/dataset_lint.py --path benchmarks --output-dir data/perf_runs/_lint
-py -3.11 scripts/perf/bench_runner.py --cases benchmarks/smoke_contract.jsonl --gold benchmarks/rag_gold_v2.jsonl --output-dir data/perf_runs/smoke
+py -3.11 scripts/perf/bench_runner.py --cases benchmarks/cases_v1.jsonl --gold benchmarks/rag_gold_v1.jsonl --output-dir data/perf_runs/smoke
 ```
 
 ---
@@ -95,8 +95,8 @@ py -3.11 scripts/perf/bench_runner.py --cases benchmarks/smoke_contract.jsonl --
 
 ### 新增评测集
 
-1. 在 `benchmarks/` 添加用例与 gold
-2. 运行 `dataset_lint.py` 校验格式
+1. 先用 `build_gold_candidates.py` 生成候选，再通过 `review_gold_candidates.py` 正式入库
+2. 运行 `dataset_lint.py` 校验 active benchmark 结构
 3. 更新 `docs/guides/evaluation.md`
 
 ---
