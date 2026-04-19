@@ -33,7 +33,16 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def _iter_case_files(path: Path) -> Iterable[Path]:
-    legacy_skip = {"cases_v1.jsonl", "cases_v1_top5.jsonl", "cases_v1_smoke3.jsonl", "cases_smoke.jsonl"}
+    legacy_skip = {
+        "cases_v1.jsonl",
+        "cases_v1_top5.jsonl",
+        "cases_v1_smoke3.jsonl",
+        "cases_smoke.jsonl",
+        "gold_candidates.jsonl",
+        "gold_manual_fix.jsonl",
+        "gold_rejected.jsonl",
+        "gold_label_sessions.jsonl",
+    }
     if path.is_file():
         yield path
         return

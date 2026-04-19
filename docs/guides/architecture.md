@@ -618,6 +618,25 @@ flowchart LR
 | 归一化 | `normalize_embeddings=True` |
 | 预热 | `EMBEDDING_PRELOAD_ON_STARTUP=1` 时，服务启动即预热 |
 
+FAISS 当前配置：
+
+| 项目 | 当前实现 |
+|---|---|
+| 索引实现 | `faiss.IndexFlatL2` |
+| 检索方式 | 精确最近邻（exact search / brute-force） |
+| 距离度量 | L2 distance |
+| 向量维度 | 由实际 embedding 输出维度自动决定（`embeddings.shape[1]`） |
+| 索引训练 | 不需要训练，直接 `add()` 全量向量 |
+| 持久化文件 | `workspace/index/faiss_index.faiss` + `workspace/index/faiss_index.pkl` |
+| dense 展示分数 | `1 / (1 + distance)`，用于可读展示，不是原始 cosine 分数 |
+
+实现取舍说明：
+
+- 当前没有采用 IVF / PQ / HNSW 这类近似 ANN 索引，而是保留 `IndexFlatL2`，优先保证实现简单、行为稳定、无需额外训练索引。
+- 由于嵌入阶段统一做了 `normalize_embeddings=True`，L2 距离在排序意义上可近似理解为归一化向量上的相似度差异；但系统最终对外展示的是经过映射后的 `dense_score`，因此不能直接把它解释为原始向量相似度。
+- 这种配置更适合当前课程级语料规模：构建与重建链路简单、结果可预测；但如果后续课程库规模继续扩大，FAISS exact search 的吞吐和尾延迟会比近似索引更早成为瓶颈。
+- Windows 下的 save/load 还做了 Unicode 路径兼容处理：当前实现会在受控锁内临时切换工作目录，避免底层 C++ 文件接口在中文路径上失败。
+
 Rerank 当前实现：
 
 | 项目 | 当前实现 |
@@ -845,6 +864,73 @@ sequenceDiagram
 - 默认不做本地 fallback
 
 只有当 `MCP_INPROCESS_FASTPATH=1` 时，对少量低风险本地工具开放进程内快路径；默认值是关闭。
+
+一个典型的 `tools/call` JSON-RPC 例子如下。实际传输走的是 `Content-Length` framing，但逻辑负载本质上就是一条标准 JSON-RPC 请求：
+
+请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "memory_search",
+    "arguments": {
+      "course_name": "LLM基础",
+      "query": "LayerNorm 归一化",
+      "top_k": 5
+    }
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"tool\":\"memory_search\",\"query\":\"LayerNorm 归一化\",\"results\":[],\"message\":\"未找到相关历史记录\",\"success\":true}"
+      }
+    ],
+    "isError": false
+  }
+}
+```
+
+这里要注意两点：
+
+- MCP server 按协议返回的是 `result.content[].text`，也就是一段 JSON 字符串，而不是直接把 Python 对象跨进程传回来。
+- client 收到响应后，会先在 `mcp_tools/client.py::_StdioMCPClient.call_tool()` 中把 `content[].text` 反序列化为普通 `dict`，补齐 `tool / success / via` 等字段，再交给 ToolHub 和上层 Agent 使用。
+
+MCP 工具结果的“精简”当前分成两层：
+
+1. **工具实现层的结果裁剪**
+   - 发生在 `mcp_tools/client.py::MCPTools.*`
+   - 例如：
+     - `websearch` 只保留 `title / snippet / link`
+     - `memory_search` 会为每条 episode 额外生成 `summary`，并限制摘要长度
+     - `mindmap_generator` 返回的是 `mermaid_code + message`，而不是中间推理过程
+   - 这一层的目标是让跨进程返回值保持结构化、可序列化、避免无关细节过多。
+
+2. **喂给 LLM 前的摘要化**
+   - 发生在 `core/llm/openai_compat.py::_summarize_tool_result()`
+   - 这里不会把完整工具返回原样塞回下一轮模型上下文，而是压成更短的 `tool summary`：
+     - `memory_search` 只保留 `result_count + snippets`
+     - `calculator` 只保留 `value`
+     - 其他工具通常只保留 `result / content / message` 中的一项，并做长度裁剪
+   - 这一层的目标是控制 prompt token，避免工具结果本身把上下文撑爆。
+
+因此，如果问“**MCP 工具调用返回的结果，是在那个地方完成的精简？**”，更准确的回答是：
+
+- **协议结果解析与标准化**：在 `mcp_tools/client.py::_StdioMCPClient.call_tool()`
+- **工具返回值的第一层裁剪**：在各个 `MCPTools` 本地工具实现里
+- **真正供 LLM 使用的摘要化精简**：在 `core/llm/openai_compat.py::_summarize_tool_result()`
 
 ### 10.4 ToolHub 治理
 
