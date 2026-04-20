@@ -20,6 +20,8 @@ jobs:
       - name: Dataset lint
         run: python -m scripts.eval.dataset_lint --path benchmarks --output-dir data/perf_runs/ci_smoke_dataset_lint
       - name: Contract smoke tests
+        env:
+          OPENAI_API_KEY: dummy
         run: |
           python -m unittest tests.test_contract_fixes
           python -m unittest tests.test_v3_priority_plan
