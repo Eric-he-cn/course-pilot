@@ -71,6 +71,8 @@ class RouterAgent(BaseAgent):
             "route_confidence": {"type": "number"},
             "route_reason": {"type": "string"},
             "required_artifact_kind": {"type": "string", "enum": sorted(list(_ARTIFACT_KIND_VALUES))},
+            "tool_policy_profile": {"type": "string"},
+            "context_budget_profile": {"type": "string"},
             "tool_budget": {"type": "object"},
             "allowed_tool_groups": {
                 "type": "array",
@@ -91,6 +93,8 @@ class RouterAgent(BaseAgent):
             "route_confidence",
             "route_reason",
             "required_artifact_kind",
+            "tool_policy_profile",
+            "context_budget_profile",
             "tool_budget",
             "allowed_tool_groups",
         ],
@@ -478,6 +482,26 @@ class RouterAgent(BaseAgent):
             return ["teaching", "generation", "rag", "memory"]
         return ["teaching", "rag", "memory"]
 
+    @staticmethod
+    def _default_tool_policy_profile(template: str, resolved_mode: str) -> str:
+        if template == "practice_then_review":
+            return "grading_restricted"
+        if template == "exam_then_review" or resolved_mode == "exam":
+            return "exam_locked"
+        if template in {"practice_only", "learn_then_practice"} or resolved_mode == "practice":
+            return "practice_generate"
+        return "learn_readonly"
+
+    @staticmethod
+    def _default_context_budget_profile(template: str, resolved_mode: str) -> str:
+        if template in {"practice_then_review", "exam_then_review"}:
+            return "grading_compact"
+        if resolved_mode == "exam":
+            return "exam_standard"
+        if template == "learn_then_practice":
+            return "learn_then_practice"
+        return "learn_standard" if resolved_mode == "learn" else "practice_standard"
+
     @classmethod
     def _infer_resolved_mode(cls, plan_dict: Dict[str, Any], mode: str, user_message: str) -> str:
         explicit = cls._normalize_mode(plan_dict.get("resolved_mode"), "")
@@ -602,6 +626,12 @@ class RouterAgent(BaseAgent):
         plan_dict["required_artifact_kind"] = (
             required_artifact_kind if required_artifact_kind in {"none", "practice", "exam"} else "none"
         )
+        plan_dict["tool_policy_profile"] = str(
+            plan_dict.get("tool_policy_profile", "") or RouterAgent._default_tool_policy_profile(workflow_template, resolved_mode)
+        ).strip()
+        plan_dict["context_budget_profile"] = str(
+            plan_dict.get("context_budget_profile", "") or RouterAgent._default_context_budget_profile(workflow_template, resolved_mode)
+        ).strip()
         capabilities = plan_dict.get("capabilities")
         if isinstance(capabilities, list):
             normalized_capabilities = [str(x).strip() for x in capabilities if str(x).strip()]

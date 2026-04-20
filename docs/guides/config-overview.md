@@ -1,6 +1,6 @@
 # CoursePilot 关键配置总览
 
-更新时间：2026-04-17  
+更新时间：2026-04-19
 适用范围：当前主干代码（`core/`, `rag/`, `memory/`, `mcp_tools/`, `backend/`, `frontend/`, `scripts/`）  
 说明：本清单按“模块 -> 参数 -> 默认值/行为”整理，便于定位配置归属与运行行为。密钥类信息不写明文。
 
@@ -18,12 +18,16 @@
 | `SSE_HEARTBEAT_SEC` | `8` | `/chat/stream` 心跳状态推送间隔 |
 | `CONTEXT_BUDGET_EVENT_TIMEOUT_SEC` | `3.0` | 前端预算事件超时提示阈值 |
 | `SESSION_TTL_DAYS` | `30` | SessionState 过期清理天数 |
-| `SESSION_CLEANUP_ENABLED` | `1` | 是否启用后台会话清理线程 |
-| `SESSION_CLEANUP_INTERVAL_SEC` | `900` | 会话清理扫描间隔（秒） |
+| `SESSION_CLEANUP_ENABLED` | `1` | 独立 session cleanup worker 是否执行清理逻辑 |
+| `SESSION_CLEANUP_INTERVAL_SEC` | `900` | session cleanup worker 扫描间隔（秒） |
 | `EMBEDDING_PRELOAD_ON_STARTUP` | `1` | 后端启动时主动预热 embedding 模型，减少首个请求冷启动 |
 
 补充：
 - 推荐统一使用 Python `3.11` 作为开发、测试与评测解释器。
+- 当前 API 进程启动时只做 `workspace restore + embedding/rerank preload`，不再自动拉起后台 worker。
+- 独立 worker 入口：
+  - `python -m scripts.workers.session_cleanup_worker`
+  - `python -m scripts.workers.shadow_eval_worker`
 
 ---
 
@@ -242,20 +246,43 @@
 - `required_artifact_kind`
 - `tool_budget`
 - `allowed_tool_groups`
+- `tool_policy_profile`
+- `context_budget_profile`
 
 执行语义：`ExecutionRuntime` 优先根据 `workflow_template + action_kind` 编译 `TaskGraphV1`，`task_type` 保留为兼容字段。
+
+当前默认 profile 映射：
+
+- `learn_only` -> `tool_policy_profile=learn_readonly`，`context_budget_profile=learn_standard`
+- `practice_only` -> `practice_generate`，`practice_standard`
+- `learn_then_practice` -> `practice_generate`，`learn_then_practice`
+- `practice_then_review` -> `grading_restricted`，`grading_compact`
+- `exam_only` -> `exam_locked`，`exam_standard`
+- `exam_then_review` -> `exam_locked`，`grading_compact`
 
 ### 9.2 ToolHub 硬限制参数
 
 | 参数 | 默认值 | 作用 |
 |---|---|---|
-| `ACT_MAX_TOOLS_PER_REQUEST` | 未设置（由 plan.tool_budget 优先） | 单请求工具调用总上限 |
-| `ACT_MAX_TOOLS_PER_ROUND` | 未设置（由 plan.tool_budget 优先） | 单轮工具调用上限 |
+| `ACT_MAX_TOOLS_PER_REQUEST` | 未设置（profile / plan 未给出时兜底） | 单请求工具调用总上限 |
+| `ACT_MAX_TOOLS_PER_ROUND` | 未设置（profile / plan 未给出时兜底） | 单轮工具调用上限 |
 
 补充：
-- `per_tool` 上限优先来自 `plan.tool_budget.per_tool`（按工具名）。
+- `tool_policy_profile` 内置的 `tool_budget` 是 ToolHub 硬上限。
+- `plan.tool_budget` 只能在 profile 上限内进一步收紧，不能把 `per_request_total / per_round / per_tool` 抬高。
+- `per_tool` 合并规则是：profile 已声明的工具取 profile 与 plan 的更严格值；profile 未声明的工具可由 plan 补充限制。
+- `ACT_MAX_TOOLS_PER_REQUEST / ACT_MAX_TOOLS_PER_ROUND` 主要用于无 profile 或历史兼容路径的兜底，不应突破 profile 硬上限。
 - 命中上限会在 trace 中打点：`tool_total_cap_hit_count / per_tool_cap_hit_count / tool_round_cap_hit_count`。
 - ToolHub 仍保留 `permission_mode + phase gate + dedup + idempotency + audit`。
+- ToolHub 当前内置 profile：
+  - `learn_readonly`
+  - `practice_generate`
+  - `grading_restricted`
+  - `exam_locked`
+- 工具拒绝会返回统一字段：
+  - `success=false`
+  - `failure_class=denied`
+  - `denied_reason=<具体原因>`
 
 ### 9.3 Memory LRU-like 行为
 
@@ -286,7 +313,9 @@
 补充说明：
 - 当前根目录 `benchmarks/` 默认只保留 active canonical 集与 gold 流水线文件：`cases_v1.jsonl`、`rag_gold_v1.jsonl`、`gold_candidates.jsonl`、`gold_manual_fix.jsonl`、`gold_rejected.jsonl`、`gold_label_sessions.jsonl`。
 - 历史广覆盖 benchmark / gold 套件已归档到 `benchmarks/archive/20260415_legacy_reset/`。
-- 因此，`bench_runner.py` 的默认参数仍然指向 canonical 集；如果要做覆盖率 lint 或历史大回归，需要显式指向 archive 目录或自建 case 集。
+- `bench_runner.py` 的默认参数仍然指向 canonical 集；如果要做覆盖率 lint 或历史大回归，需要显式指向 archive 目录或自建 case 集。
+- 推荐使用 `python -m scripts.eval.run smoke/full/review` 作为统一入口。该入口会优先使用非空 active 文件；当 root active 文件为空时，会回退到 `benchmarks/archive/20260415_legacy_reset/` 的对应 canonical / smoke 基线。
+- `dataset_lint --path benchmarks` 当前用于 broad lint 口径；若根目录没有可 lint 的 active case，会回退到归档 `v3_expanded_84.jsonl`，不要把它解读为 canonical RAG headline。
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
@@ -320,7 +349,9 @@ RAG 命中判定策略（按优先级）：
 - `gold_case_total/gold_case_matched/gold_case_coverage`
 
 补充脚本：
-- `python scripts/eval/dataset_lint.py --path benchmarks/archive/20260415_legacy_reset`
+- `python -m scripts.eval.run smoke`
+- `python -m scripts.eval.run full`
+- `python scripts/eval/dataset_lint.py --path benchmarks`
 - `python scripts/eval/judge_runner.py --raw data/perf_runs/<profile>/baseline_raw.jsonl --cases benchmarks/cases_v1.jsonl`
 - `python scripts/eval/review_runner.py --benchmark-summary ... --benchmark-raw ... --judge-summary ... --judge-raw ...`
 - `python scripts/eval/build_gold_candidates.py --run-all-suggestions --count 30`

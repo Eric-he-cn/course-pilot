@@ -123,6 +123,7 @@ class OnlineShadowEvalService:
     @staticmethod
     def _to_benchmark_row(item: Dict[str, Any]) -> Dict[str, Any]:
         citations = item.get("citations") if isinstance(item.get("citations"), list) else []
+        tool_calls = item.get("tool_calls") if isinstance(item.get("tool_calls"), list) else []
         response_text = str(item.get("response_text", "") or "")
         e2e_latency = float(item.get("e2e_latency_ms", 0.0) or 0.0)
         first_token = item.get("first_token_latency_ms")
@@ -130,6 +131,16 @@ class OnlineShadowEvalService:
             first_token_latency = float(first_token) if first_token is not None else 0.0
         except Exception:
             first_token_latency = 0.0
+        tool_success_count = 0.0
+        tool_call_count = 0.0
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            if str(tool_call.get("type", "")).strip() == "internal_meta":
+                continue
+            tool_call_count += 1.0
+            if bool(tool_call.get("success", False)):
+                tool_success_count += 1.0
         return {
             "case_id": str(item.get("case_id", "") or "").strip(),
             "mode": str(item.get("mode", "learn") or "learn"),
@@ -154,6 +165,9 @@ class OnlineShadowEvalService:
             "e2e_latency_ms": e2e_latency,
             "latency_budget_met_case": 1.0,
             "case_error": bool(item.get("case_error", False)),
+            "tool_call_count": tool_call_count,
+            "tool_success_count": tool_success_count,
+            "session_store_hit_rate_case": float(item.get("session_store_hit_rate_case", 0.0) or 0.0),
         }
 
     @staticmethod
@@ -184,14 +198,20 @@ class OnlineShadowEvalService:
             return float(sorted_vals[idx])
 
         return {
+            "num_rows": len(rows),
             "total_cases": len(rows),
             "p50_e2e_latency_ms": float(median(e2e)),
             "p95_e2e_latency_ms": _p95(e2e),
             "p50_first_token_latency_ms": float(median(ttft)),
             "p95_first_token_latency_ms": _p95(ttft),
+            "error_rate": float(sum(1 for r in rows if bool(r.get("case_error", False)))) / float(len(rows)),
             "fallback_rate": float(sum(1 for r in rows if float(r.get("fallback_rate_case", 0.0) or 0.0) > 0.0)) / float(len(rows)),
             "trace_contract_error_rate": 0.0,
             "taskgraph_step_status_coverage": 1.0,
+            "tool_success_rate": (
+                float(sum(float(r.get("tool_success_count", 0.0) or 0.0) for r in rows))
+                / float(sum(float(r.get("tool_call_count", 0.0) or 0.0) for r in rows))
+            ) if sum(float(r.get("tool_call_count", 0.0) or 0.0) for r in rows) > 0 else 1.0,
         }
 
     def _process_date_dir(self, date_dir: Path, state: Dict[str, int]) -> None:
@@ -285,6 +305,12 @@ class OnlineShadowEvalService:
                 pass
             time.sleep(self._poll_sec())
 
+    def run_worker_forever(self) -> None:
+        """Standalone worker entrypoint for single-process deployments."""
+        if not self._env_bool("ONLINE_EVAL_WORKER_ENABLED", False):
+            return
+        self._worker_loop()
+
     def start_worker(self) -> None:
         if self._worker_started:
             return
@@ -300,4 +326,3 @@ _DEFAULT_ONLINE_SHADOW_EVAL = OnlineShadowEvalService(base_dir="./data/perf_runs
 
 def get_default_online_shadow_eval() -> OnlineShadowEvalService:
     return _DEFAULT_ONLINE_SHADOW_EVAL
-

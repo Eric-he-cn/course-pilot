@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import json
 import shutil
 import uuid
@@ -15,6 +16,7 @@ import backend.api as backend_api
 from backend.schemas import RetrievedChunk, SessionStateV1, ToolDecision
 from core.agents.router import RouterAgent
 from core.errors import ToolDeniedError
+from core.llm import openai_compat
 from core.orchestration.context_budgeter import ContextBudgeter
 from core.services.memory_service import MemoryService
 from core.services.rag_service import RAGService
@@ -25,6 +27,8 @@ from rag.retrieve import Retriever
 from mcp_tools.client import MCPTools
 from memory.manager import MemoryManager
 from memory.store import SQLiteMemoryStore
+from scripts.eval import dataset_lint as dataset_lint_module
+from scripts.eval import run as eval_run
 
 
 class V3PriorityPlanTests(unittest.TestCase):
@@ -387,6 +391,160 @@ class V3PriorityPlanTests(unittest.TestCase):
         self.assertEqual([], result.get("results"))
         MCPTools.clear_request_context()
 
+    def test_toolhub_profile_blocks_exam_websearch(self) -> None:
+        hub = ToolHub()
+        MCPTools.set_request_context(
+            {
+                "mode": "exam",
+                "tool_policy_profile": "exam_locked",
+                "allowed_tool_groups": ["generation", "memory"],
+                "tool_budget": {"per_request_total": 4, "per_round": 2},
+                "tool_audit": [],
+            }
+        )
+        with self.assertRaises(ToolDeniedError):
+            hub.invoke(
+                tool_name="websearch",
+                tool_args={"query": "attention 最新进展"},
+                mode="exam",
+                phase="act",
+                permission_mode="standard",
+                original_user_content="联网搜一下",
+                tool_cache={},
+                last_exec_ms={},
+                tool_retry_max=0,
+                tool_round=1,
+            )
+        self.assertTrue(MCPTools.get_request_context().tool_audit)
+        audit_tail = MCPTools.get_request_context().tool_audit[-1]
+        self.assertEqual("network_denied", audit_tail.get("denied_reason"))
+        self.assertEqual("denied", audit_tail.get("failure_class"))
+        MCPTools.clear_request_context()
+
+    def test_toolhub_profile_blocks_filewriter_in_learn_readonly(self) -> None:
+        hub = ToolHub()
+        MCPTools.set_request_context(
+            {
+                "mode": "learn",
+                "tool_policy_profile": "learn_readonly",
+                "notes_dir": os.path.abspath("./data/workspaces/demo/notes"),
+                "allowed_tool_groups": ["teaching", "rag", "memory", "utility"],
+                "tool_budget": {"per_request_total": 6, "per_round": 3},
+                "tool_audit": [],
+            }
+        )
+        with self.assertRaises(ToolDeniedError):
+            hub.invoke(
+                tool_name="filewriter",
+                tool_args={"filename": "note.md", "content": "test"},
+                mode="learn",
+                phase="act",
+                permission_mode="elevated",
+                original_user_content="帮我保存笔记",
+                tool_cache={},
+                last_exec_ms={},
+                tool_retry_max=0,
+                tool_round=1,
+            )
+        audit_tail = MCPTools.get_request_context().tool_audit[-1]
+        self.assertEqual("filesystem_scope_denied", audit_tail.get("denied_reason"))
+        self.assertEqual("denied", audit_tail.get("failure_class"))
+        MCPTools.clear_request_context()
+
+    def test_toolhub_profile_budget_cannot_be_raised_by_plan(self) -> None:
+        hub = ToolHub()
+        MCPTools.set_request_context(
+            {
+                "mode": "exam",
+                "tool_policy_profile": "exam_locked",
+                "allowed_tool_groups": ["memory"],
+                "tool_budget": {"per_request_total": 99, "per_round": 99, "per_tool": {"memory_search": 99}},
+                "tool_audit": [],
+            }
+        )
+        tool_args = {"query": "矩阵秩", "course_name": "线代"}
+        with mock.patch(
+            "core.services.tool_hub.MCPTools.call_tool",
+            return_value={"tool": "memory_search", "success": True, "results": [], "via": "mcp_stdio"},
+        ):
+            first_decision, first_result = hub.invoke(
+                tool_name="memory_search",
+                tool_args=tool_args,
+                mode="exam",
+                phase="act",
+                permission_mode="standard",
+                original_user_content="查一下历史错题",
+                tool_cache={},
+                last_exec_ms={},
+                tool_retry_max=0,
+                tool_round=1,
+            )
+            self.assertTrue(first_decision.allowed)
+            self.assertTrue(first_result.get("success"))
+            with self.assertRaises(ToolDeniedError) as cm:
+                hub.invoke(
+                    tool_name="memory_search",
+                    tool_args={**tool_args, "query": "线性相关"},
+                    mode="exam",
+                    phase="act",
+                    permission_mode="standard",
+                    original_user_content="再查一下历史错题",
+                    tool_cache={},
+                    last_exec_ms={},
+                    tool_retry_max=0,
+                    tool_round=1,
+                )
+        self.assertEqual("tool_per_tool_cap", str(cm.exception))
+        audit_tail = MCPTools.get_request_context().tool_audit[-1]
+        self.assertEqual("tool_per_tool_cap", audit_tail.get("denied_reason"))
+        self.assertEqual("denied", audit_tail.get("failure_class"))
+        MCPTools.clear_request_context()
+
+    def test_tool_call_via_hub_preserves_group_denied_reason(self) -> None:
+        MCPTools.set_request_context(
+            {
+                "mode": "learn",
+                "tool_policy_profile": "learn_readonly",
+                "allowed_tool_groups": ["memory"],
+                "tool_audit": [],
+            }
+        )
+        allowed, reason, _, _, result = openai_compat._tool_call_via_hub(
+            tool_name="websearch",
+            tool_args={"query": "Transformer news"},
+            phase="act",
+            original_user_content="联网搜一下 Transformer",
+            tool_cache={},
+            last_exec_ms={},
+            tool_retry_max=0,
+            tool_round=1,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual("tool_group_denied", reason)
+        self.assertEqual("denied", result.get("failure_class"))
+        self.assertEqual("tool_group_denied", result.get("denied_reason"))
+        MCPTools.clear_request_context()
+
+    def test_startup_bootstrap_only_preloads_models(self) -> None:
+        async def _run() -> None:
+            with mock.patch.object(backend_api, "load_workspaces_from_disk") as load_ws, mock.patch.object(
+                backend_api, "_preload_embedding_model"
+            ) as preload_embed, mock.patch.object(
+                backend_api, "_preload_reranker_model"
+            ) as preload_rerank, mock.patch.object(
+                backend_api, "_start_session_cleanup_worker"
+            ) as cleanup_start, mock.patch.object(
+                backend_api.online_shadow_eval, "start_worker"
+            ) as shadow_start:
+                await backend_api._startup_bootstrap()
+                load_ws.assert_called_once()
+                preload_embed.assert_called_once()
+                preload_rerank.assert_called_once()
+                cleanup_start.assert_not_called()
+                shadow_start.assert_not_called()
+
+        asyncio.run(_run())
+
     def test_rag_service_cache_reuses_until_index_changes(self) -> None:
         td = self._local_tmpdir("rag_cache_")
         try:
@@ -691,6 +849,8 @@ class V3PriorityPlanTests(unittest.TestCase):
         self.assertEqual("learn_only", plan.workflow_template)
         self.assertEqual("learn", plan.resolved_mode)
         self.assertEqual("介绍一下 Layer Norm", plan.question_raw)
+        self.assertEqual("learn_readonly", plan.tool_policy_profile)
+        self.assertEqual("learn_standard", plan.context_budget_profile)
 
     def test_router_retries_once_before_default_fallback(self) -> None:
         router = RouterAgent()
@@ -752,6 +912,33 @@ class V3PriorityPlanTests(unittest.TestCase):
             plan = router.plan("帮我出一道题", "practice", "深度学习", session_state=session_state)
         self.assertEqual("practice", plan.resolved_mode)
         self.assertEqual("practice_only", plan.workflow_template)
+
+    def test_dataset_lint_defaults_to_archived_broad_suite_when_active_empty(self) -> None:
+        files = list(dataset_lint_module._iter_case_files(Path("benchmarks")))
+        self.assertTrue(files)
+        self.assertTrue(any(path.name == "v3_expanded_84.jsonl" for path in files))
+        rows = []
+        for path in files:
+            rows.extend(dataset_lint_module.load_jsonl(path))
+        report = dataset_lint_module.lint_cases(
+            rows,
+            min_courses=4,
+            min_multi_turn_ratio=0.25,
+            min_session_ratio=0.15,
+            min_tool_ratio=0.15,
+            min_fallback_ratio=0.10,
+        )
+        self.assertTrue(report["ok"], report)
+
+    def test_eval_run_resolves_nonempty_smoke_and_canonical_paths(self) -> None:
+        smoke_cases = eval_run._smoke_cases()
+        canonical_cases = eval_run._canonical_cases()
+        canonical_gold = eval_run._canonical_gold()
+        lint_path = eval_run._lint_dataset_path()
+        self.assertTrue(smoke_cases.exists() and smoke_cases.stat().st_size > 0)
+        self.assertTrue(canonical_cases.exists() and canonical_cases.stat().st_size > 0)
+        self.assertTrue(canonical_gold.exists() and canonical_gold.stat().st_size > 0)
+        self.assertTrue(lint_path.exists() and lint_path.stat().st_size > 0)
 
     def test_embedding_preload_runs_on_startup_when_enabled(self) -> None:
         with mock.patch.dict(os.environ, {"EMBEDDING_PRELOAD_ON_STARTUP": "1"}, clear=False), mock.patch(

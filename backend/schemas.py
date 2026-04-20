@@ -80,6 +80,8 @@ class PlanPlusV1(Plan):
     route_confidence: float = 0.7
     route_reason: str = ""
     required_artifact_kind: Literal["none", "practice", "exam"] = "none"
+    tool_policy_profile: str = ""
+    context_budget_profile: str = ""
     tool_budget: Dict[str, Any] = Field(default_factory=dict)
     allowed_tool_groups: List[str] = Field(default_factory=list)
 
@@ -327,6 +329,7 @@ class ToolAuditRecord(BaseModel):
     dedup_reason: str = ""
     idempotency_key: str = ""
     failure_class: str = ""
+    denied_reason: str = ""
     via: str = ""
     elapsed_ms: float = 0.0
     metadata: Dict[str, Any] = Field(default_factory=dict)

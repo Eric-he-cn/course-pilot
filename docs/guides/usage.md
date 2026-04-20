@@ -71,12 +71,25 @@ streamlit run frontend/streamlit_app.py
 后端启动时会做几件事：
 
 1. 恢复已有课程工作区
-2. 启动会话清理 worker
-3. 启动在线 shadow eval worker
-4. 如果 `EMBEDDING_PRELOAD_ON_STARTUP=1`，预热嵌入模型
+2. 如果 `EMBEDDING_PRELOAD_ON_STARTUP=1`，预热嵌入模型
+3. 如果启用了 rerank，并且配置允许预热，则预热 reranker
 
 这意味着当前版本的嵌入模型冷启动已经尽量前移到服务启动阶段，而不是等第一个检索请求才加载。  
 如果预热失败，服务仍然会继续启动；只是第一次真正触发检索时，可能会再经历一次模型加载等待。
+
+如果你需要后台维护能力，可以单独启动 worker：
+
+```bash
+# 可选：会话清理 worker
+conda activate study_agent
+python -m scripts.workers.session_cleanup_worker
+
+# 可选：在线 shadow eval worker
+conda activate study_agent
+python -m scripts.workers.shadow_eval_worker
+```
+
+默认使用场景下，只启动后端和前端也可以正常对话、检索和生成练习/考试内容；worker 更偏向后台维护和持续评测。
 
 ### 2.4 常见启动提示
 

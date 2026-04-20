@@ -438,6 +438,9 @@ def _active_mode() -> str:
 def _tool_failure_class(tool_result: Dict[str, Any]) -> str:
     if not isinstance(tool_result, dict):
         return "fatal_error"
+    explicit = str(tool_result.get("failure_class", "") or "").strip().lower()
+    if explicit in {"success", "retryable_error", "fatal_error", "denied"}:
+        return explicit
     if bool(tool_result.get("success", False)):
         return "success"
     err = str(tool_result.get("error", "")).lower()
@@ -554,32 +557,27 @@ def _tool_call_via_hub(
         if tool_name == "memory_search" and isinstance(tool_result, dict):
             _request_cache_put(decision.signature, tool_result)
         return True, "allowed", capability, decision.signature, dict(tool_result or {})
-    except ToolDeniedError:
-        decision = hub.decide(
-            tool_name=tool_name,
-            tool_args=tool_args,
-            mode=mode,
-            phase=phase,
-            permission_mode=permission_mode,
-            original_user_content=original_user_content,
-        )
+    except ToolDeniedError as ex:
+        reason = str(ex).strip() or "tool_denied"
+        signature = ToolPolicy.normalized_tool_signature(tool_name, tool_args)
         add_event(
             "tool_skip",
             tool_name=tool_name,
-            tool_skip_reason=decision.reason,
-            tool_signature=decision.signature,
+            tool_skip_reason=reason,
+            tool_signature=signature,
             tool_round=tool_round,
         )
         return (
             False,
-            decision.reason,
+            reason,
             capability,
-            decision.signature,
+            signature,
             {
                 "tool": tool_name,
                 "success": False,
-                "error": f"tool gated: {decision.reason}",
-                "failure_class": "fatal_error",
+                "error": f"tool gated: {reason}",
+                "failure_class": "denied",
+                "denied_reason": reason,
             },
         )
 
@@ -782,15 +780,7 @@ class LLMClient:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": json.dumps(
-                                {
-                                    "tool": tool_name,
-                                    "success": False,
-                                    "error": f"tool gated: {gate_reason}",
-                                    "failure_class": "fatal_error",
-                                },
-                                ensure_ascii=False,
-                            ),
+                            "content": _summarize_tool_result(tool_name, tool_result),
                         })
                         continue
 
@@ -1107,15 +1097,7 @@ class LLMClient:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": json.dumps(
-                                {
-                                    "tool": tool_name,
-                                    "success": False,
-                                    "error": f"tool gated: {gate_reason}",
-                                    "failure_class": "fatal_error",
-                                },
-                                ensure_ascii=False,
-                            ),
+                            "content": _summarize_tool_result(tool_name, tool_result),
                         })
                         continue
 

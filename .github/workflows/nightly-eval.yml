@@ -1,0 +1,31 @@
+name: nightly-eval
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+jobs:
+  nightly-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Dataset lint
+        run: python -m scripts.eval.dataset_lint --path benchmarks --output-dir data/perf_runs/ci_nightly_dataset_lint
+      - name: Full eval pipeline
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ] && [ -z "${DEEPSEEK_API_KEY}" ]; then
+            echo "Skipping full eval: missing provider secret"
+            exit 0
+          fi
+          python -m scripts.eval.run full
