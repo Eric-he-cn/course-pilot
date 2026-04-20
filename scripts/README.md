@@ -7,7 +7,9 @@
 - `perf/`
   性能基准、追踪与差异分析脚本。
 - `eval/`
-  judge、review、dataset lint 等评测脚本。
+  bench、judge、review、dataset lint 等评测脚本。
+- `workers/`
+  独立后台 worker 入口，例如会话清理和在线 shadow eval。
 
 推荐命令：
 
@@ -15,4 +17,6 @@
 py -3.11 scripts/rebuild_indexes.py
 py -3.11 scripts/perf/bench_runner.py --help
 py -3.11 scripts/eval/judge_runner.py --help
+py -3.11 -m scripts.eval.run smoke
+py -3.11 -m scripts.workers.session_cleanup_worker
 ```

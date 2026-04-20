@@ -18,6 +18,9 @@ from mcp_tools.client import MCPTools
 def _tool_failure_class(tool_result: Dict[str, Any]) -> str:
     if not isinstance(tool_result, dict):
         return "fatal_error"
+    explicit = str(tool_result.get("failure_class", "") or "").strip().lower()
+    if explicit in {"success", "retryable_error", "fatal_error", "denied"}:
+        return explicit
     if bool(tool_result.get("success", False)):
         return "success"
     err = str(tool_result.get("error", "")).lower()
@@ -57,6 +60,36 @@ class ToolHub:
         "websearch": {"rag", "teaching", "generation"},
         "filewriter": {"teaching", "generation", "grading"},
     }
+    TOOL_POLICY_PROFILES = {
+        "learn_readonly": {
+            "allowed_tools": {"calculator", "get_datetime", "memory_search", "mindmap_generator", "websearch"},
+            "allowed_tool_groups": {"teaching", "rag", "memory", "utility", "calculator"},
+            "network_permission": True,
+            "filesystem_write_scope": "deny",
+            "tool_budget": {"per_request_total": 6, "per_round": 3, "per_tool": {"websearch": 1, "memory_search": 2}},
+        },
+        "practice_generate": {
+            "allowed_tools": {"calculator", "get_datetime", "memory_search", "mindmap_generator", "filewriter"},
+            "allowed_tool_groups": {"generation", "teaching", "rag", "memory", "utility"},
+            "network_permission": False,
+            "filesystem_write_scope": "notes_only",
+            "tool_budget": {"per_request_total": 6, "per_round": 3, "per_tool": {"filewriter": 1, "memory_search": 2}},
+        },
+        "grading_restricted": {
+            "allowed_tools": {"calculator", "get_datetime", "memory_search", "filewriter"},
+            "allowed_tool_groups": {"grading", "calculator", "memory", "utility"},
+            "network_permission": False,
+            "filesystem_write_scope": "notes_only",
+            "tool_budget": {"per_request_total": 4, "per_round": 2, "per_tool": {"calculator": 4, "memory_search": 1, "filewriter": 1, "websearch": 0}},
+        },
+        "exam_locked": {
+            "allowed_tools": {"calculator", "get_datetime", "memory_search", "mindmap_generator", "filewriter"},
+            "allowed_tool_groups": {"generation", "grading", "calculator", "memory", "utility"},
+            "network_permission": False,
+            "filesystem_write_scope": "notes_only",
+            "tool_budget": {"per_request_total": 4, "per_round": 2, "per_tool": {"calculator": 4, "memory_search": 1, "websearch": 0, "filewriter": 1}},
+        },
+    }
 
     @classmethod
     def _permission_allows(cls, tool_name: str, permission_mode: str) -> bool:
@@ -89,10 +122,94 @@ class ToolHub:
         return MCPTools.get_request_context()
 
     @classmethod
+    def _tool_policy_profile(cls) -> str:
+        ctx = cls._runtime_context()
+        profile = str(ctx.tool_policy_profile or ctx.get("tool_policy_profile", "") or "").strip()
+        if profile in cls.TOOL_POLICY_PROFILES:
+            return profile
+        mode = str(ctx.mode or ctx.get("mode", "") or "learn").strip().lower()
+        return {
+            "practice": "practice_generate",
+            "exam": "exam_locked",
+        }.get(mode, "learn_readonly")
+
+    @classmethod
+    def _profile_config(cls) -> Dict[str, Any]:
+        return dict(cls.TOOL_POLICY_PROFILES.get(cls._tool_policy_profile(), cls.TOOL_POLICY_PROFILES["learn_readonly"]))
+
+    @classmethod
+    def _profile_denied_reason(cls, tool_name: str) -> str:
+        profile = cls._tool_policy_profile()
+        if tool_name == "websearch" and profile in {"grading_restricted", "exam_locked", "practice_generate"}:
+            return "network_denied"
+        if tool_name == "filewriter":
+            return "filesystem_scope_denied"
+        return "tool_policy_denied"
+
+    @classmethod
+    def _profile_allows(cls, tool_name: str) -> bool:
+        config = cls._profile_config()
+        allowed_tools = {str(x).strip() for x in config.get("allowed_tools", set())}
+        if allowed_tools and tool_name not in allowed_tools:
+            return False
+        if tool_name == "websearch" and not bool(config.get("network_permission", False)):
+            return False
+        return True
+
+    @classmethod
+    def _notes_only_allows(cls, tool_args: Dict[str, Any]) -> bool:
+        notes_dir = os.path.abspath(str(cls._runtime_context().get("notes_dir", "./data/notes") or "./data/notes"))
+        filename = os.path.basename(str(tool_args.get("filename", "") or "").strip())
+        if not filename:
+            return False
+        try:
+            target_path = os.path.abspath(os.path.join(notes_dir, filename))
+            common = os.path.commonpath([notes_dir, target_path])
+        except Exception:
+            return False
+        return common == notes_dir
+
+    @classmethod
+    def _filesystem_scope_allows(cls, tool_name: str, tool_args: Dict[str, Any]) -> bool:
+        if tool_name != "filewriter":
+            return True
+        scope = str(cls._profile_config().get("filesystem_write_scope", "deny")).strip().lower()
+        if scope == "notes_only":
+            return cls._notes_only_allows(tool_args)
+        return False
+
+    @classmethod
     def _budget_limits(cls, tool_name: str) -> Dict[str, Optional[int]]:
         ctx = cls._runtime_context()
         raw_budget = ctx.get("tool_budget", {})
         budget = raw_budget if isinstance(raw_budget, dict) else {}
+        profile_budget = cls._profile_config().get("tool_budget", {})
+        if isinstance(profile_budget, dict):
+            merged_budget = dict(profile_budget)
+            if isinstance(budget, dict):
+                for key, value in budget.items():
+                    if key == "per_tool":
+                        continue
+                    if key in profile_budget:
+                        try:
+                            merged_budget[key] = min(int(profile_budget[key]), int(value))
+                        except Exception:
+                            merged_budget[key] = profile_budget[key]
+                    else:
+                        merged_budget[key] = value
+                profile_per_tool = profile_budget.get("per_tool") if isinstance(profile_budget.get("per_tool"), dict) else {}
+                request_per_tool = budget.get("per_tool") if isinstance(budget.get("per_tool"), dict) else {}
+                merged_per_tool = dict(profile_per_tool)
+                for name, value in request_per_tool.items():
+                    if name in profile_per_tool:
+                        try:
+                            merged_per_tool[name] = min(int(profile_per_tool[name]), int(value))
+                        except Exception:
+                            merged_per_tool[name] = profile_per_tool[name]
+                    else:
+                        merged_per_tool[name] = value
+                merged_budget["per_tool"] = merged_per_tool
+            budget = merged_budget
 
         def _int_or_none(value: Any) -> Optional[int]:
             try:
@@ -133,6 +250,9 @@ class ToolHub:
         ctx = cls._runtime_context()
         raw = ctx.get("allowed_tool_groups", [])
         allowed = {str(x).strip().lower() for x in raw if str(x).strip()} if isinstance(raw, list) else set()
+        profile_groups = cls._profile_config().get("allowed_tool_groups", set())
+        if isinstance(profile_groups, (list, set, tuple)):
+            allowed = allowed.intersection({str(x).strip().lower() for x in profile_groups if str(x).strip()}) if allowed else {str(x).strip().lower() for x in profile_groups if str(x).strip()}
         if not allowed:
             return True
         tool_groups = {str(x).strip().lower() for x in cls.TOOL_GROUPS.get(tool_name, set())}
@@ -233,6 +353,26 @@ class ToolHub:
                 permission_mode=permission_mode,  # type: ignore[arg-type]
                 idempotency_key=self._idempotency_key(tool_name, signature),
             )
+        if not self._profile_allows(tool_name):
+            signature = ToolPolicy.normalized_tool_signature(tool_name, tool_args)
+            return ToolDecision(
+                tool_name=tool_name,
+                allowed=False,
+                reason=self._profile_denied_reason(tool_name),
+                signature=signature,
+                permission_mode=permission_mode,  # type: ignore[arg-type]
+                idempotency_key=self._idempotency_key(tool_name, signature),
+            )
+        if not self._filesystem_scope_allows(tool_name, tool_args):
+            signature = ToolPolicy.normalized_tool_signature(tool_name, tool_args)
+            return ToolDecision(
+                tool_name=tool_name,
+                allowed=False,
+                reason="filesystem_scope_denied",
+                signature=signature,
+                permission_mode=permission_mode,  # type: ignore[arg-type]
+                idempotency_key=self._idempotency_key(tool_name, signature),
+            )
         allowed, reason, _, signature = ToolPolicy.tool_preflight(
             tool_name=tool_name,
             tool_args=tool_args,
@@ -263,6 +403,11 @@ class ToolHub:
         tool_retry_max: int,
         tool_round: int,
     ) -> Tuple[ToolDecision, Dict[str, Any]]:
+        ctx = self._runtime_context()
+        if not str(ctx.mode or "").strip():
+            ctx.mode = str(mode or "").strip()
+        if not str(ctx.get("permission_mode", "") or "").strip():
+            ctx.set("permission_mode", permission_mode)
         decision = self.decide(
             tool_name=tool_name,
             tool_args=tool_args,
@@ -272,6 +417,30 @@ class ToolHub:
             original_user_content=original_user_content,
         )
         budget_snapshot = self.budget_snapshot(tool_round=tool_round)
+        if not decision.allowed:
+            add_event(
+                "tool_skip",
+                tool_name=tool_name,
+                tool_skip_reason=decision.reason,
+                tool_signature=decision.signature,
+                tool_round=tool_round,
+            )
+            record = ToolAuditRecord(
+                tool_name=tool_name,
+                signature=decision.signature,
+                permission_mode=permission_mode,  # type: ignore[arg-type]
+                allowed=False,
+                reason=decision.reason,
+                idempotency_key=decision.idempotency_key,
+                failure_class="denied",
+                denied_reason=decision.reason,
+                metadata={
+                    "tool_policy_profile": self._tool_policy_profile(),
+                    "tool_budget_snapshot": budget_snapshot,
+                },
+            )
+            self._append_audit(record)
+            raise ToolDeniedError(decision.reason)
         if decision.allowed and not self._group_allows(tool_name):
             add_event("tool_group_denied_count", tool_name=tool_name, tool_round=tool_round)
             denied = decision.model_copy(update={"allowed": False, "reason": "tool_group_denied"})
@@ -283,6 +452,8 @@ class ToolHub:
                     allowed=False,
                     reason="tool_group_denied",
                     idempotency_key=denied.idempotency_key,
+                    failure_class="denied",
+                    denied_reason="tool_group_denied",
                     metadata={
                         "tool_round": tool_round,
                         "allowed_tool_groups": list(self._runtime_context().get("allowed_tool_groups", []) or []),
@@ -324,6 +495,8 @@ class ToolHub:
                     allowed=False,
                     reason=cap_reason,
                     idempotency_key=denied.idempotency_key,
+                    failure_class="denied",
+                    denied_reason=cap_reason,
                     metadata={
                         "tool_round": tool_round,
                         "current_total": current_total,
@@ -340,28 +513,10 @@ class ToolHub:
             tool_name=tool_name,
             phase=phase,
             tool_gate_decision=decision.allowed,
-            tool_skip_reason=None if decision.allowed else decision.reason,
+            tool_skip_reason=None,
             tool_signature=decision.signature,
             tool_round=tool_round,
         )
-        if not decision.allowed:
-            add_event(
-                "tool_skip",
-                tool_name=tool_name,
-                tool_skip_reason=decision.reason,
-                tool_signature=decision.signature,
-                tool_round=tool_round,
-            )
-            record = ToolAuditRecord(
-                tool_name=tool_name,
-                signature=decision.signature,
-                permission_mode=permission_mode,  # type: ignore[arg-type]
-                allowed=False,
-                reason=decision.reason,
-                idempotency_key=decision.idempotency_key,
-            )
-            self._append_audit(record)
-            raise ToolDeniedError(decision.reason)
 
         dedup_reason = ""
         now_ms = perf_counter() * 1000.0
@@ -386,6 +541,7 @@ class ToolHub:
                     "message": "memory_search deduped by min interval",
                     "via": "toolhub_dedup",
                     "failure_class": "success",
+                    "denied_reason": "",
                 }
             else:
                 result = dict(tool_cache.get(decision.signature, {}))
@@ -418,6 +574,7 @@ class ToolHub:
                     tool_round=tool_round,
                 )
             result.setdefault("failure_class", failure_class)
+            result.setdefault("denied_reason", "")
             tool_cache[decision.signature] = dict(result)
             last_exec_ms[decision.signature] = perf_counter() * 1000.0
             add_event(
@@ -447,12 +604,14 @@ class ToolHub:
             dedup_reason=decision.dedup_reason,
             idempotency_key=decision.idempotency_key,
             failure_class=str(result.get("failure_class", "")) if isinstance(result, dict) else "",
+            denied_reason=str(result.get("denied_reason", "")) if isinstance(result, dict) else "",
             via=via,
             elapsed_ms=(perf_counter() - start) * 1000.0,
             metadata={
                 "args": ToolPolicy.normalized_tool_args(tool_name, tool_args),
                 "session_id": str(self._runtime_context().get("session_id", "") or ""),
                 "taskgraph_step": str(self._runtime_context().get("taskgraph_step", "") or ""),
+                "tool_policy_profile": self._tool_policy_profile(),
                 "tool_budget_snapshot": budget_snapshot,
             },
         )

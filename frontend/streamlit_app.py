@@ -87,6 +87,34 @@ def format_citation_metrics(citation: dict) -> str:
     return ("  " + " · ".join(items)) if items else ""
 
 
+def _build_history_payload() -> list[dict]:
+    """构造发送给后端的历史窗口：仅做轻量安全上限，不承担语义裁剪。"""
+    history = st.session_state.chat_history[:-1] if st.session_state.chat_history else []
+    max_messages = 80
+    max_chars = 200_000
+    if len(history) > max_messages:
+        history = history[-max_messages:]
+    total_chars = 0
+    trimmed: list[dict] = []
+    for message in reversed(history):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = str(message.get("content", "") or "")
+        if role == "assistant":
+            content = strip_source_markers(content)
+        message_chars = len(content)
+        if trimmed and (total_chars + message_chars) > max_chars:
+            break
+        payload = {"role": role, "content": content}
+        if role == "assistant" and message.get("tool_calls"):
+            payload["tool_calls"] = message.get("tool_calls")
+        trimmed.append(payload)
+        total_chars += message_chars
+    trimmed.reverse()
+    return trimmed
+
+
 def render_mermaid(mermaid_code: str, idx: int = 0, height: int = 520) -> None:
     """使用 Mermaid CDN + components.html 渲染思维导图，并提供 SVG/PNG 下载按钮。"""
     import streamlit.components.v1 as components
@@ -464,8 +492,8 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
     history_line = f"{history_len} msgs"
     if history_turns_est > 0:
         history_line += f" (~{history_turns_est} turns)"
-    if history_len >= 20:
-        history_line += " · 前端发送窗口已封顶"
+    if history_len >= 80:
+        history_line += " · 前端安全窗口已封顶"
 
     html_block = f"""
 <style>
@@ -597,19 +625,7 @@ def render_context_badge(payload: dict, placeholder=None) -> None:
 def send_message(course_name: str, mode: str, message: str):
     """发送非流式对话请求，并携带裁剪后的历史。"""
     try:
-        # 取当前消息之前的最多 20 条历史（[-21:-1] 排除最后一条刚 append 的用户消息，避免重复）
-        history = st.session_state.chat_history[-21:-1] if st.session_state.chat_history else []
-        # 只保留 role 和 content 字段
-        history_payload = []
-        for m in history:
-            role = m["role"]
-            content = m["content"]
-            if role == "assistant":
-                content = strip_source_markers(content)
-            payload = {"role": role, "content": content}
-            if role == "assistant" and m.get("tool_calls"):
-                payload["tool_calls"] = m.get("tool_calls")
-            history_payload.append(payload)
+        history_payload = _build_history_payload()
         response = requests.post(
             f"{API_BASE}/chat",
             json={
@@ -640,18 +656,7 @@ def send_message(course_name: str, mode: str, message: str):
 def stream_chat(course_name: str, mode: str, message: str):
     """流式发送消息，返回文本 chunk 生成器（供 st.write_stream 使用）。"""
     import json as _json
-    # 取当前消息之前的最多 20 条历史（[-21:-1] 排除最后一条刚 append 的用户消息，避免重复）
-    history = st.session_state.chat_history[-21:-1] if st.session_state.chat_history else []
-    history_payload = []
-    for m in history:
-        role = m["role"]
-        content = m["content"]
-        if role == "assistant":
-            content = strip_source_markers(content)
-        payload_item = {"role": role, "content": content}
-        if role == "assistant" and m.get("tool_calls"):
-            payload_item["tool_calls"] = m.get("tool_calls")
-        history_payload.append(payload_item)
+    history_payload = _build_history_payload()
     payload = {
         "course_name": course_name,
         "mode": mode,

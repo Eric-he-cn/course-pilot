@@ -34,6 +34,7 @@ from core.agents.tutor import TutorAgent
 from core.agents.quizmaster import QuizMasterAgent
 from core.agents.grader import GraderAgent
 from core.orchestration.context_budgeter import ContextBudgeter
+from core.orchestration.session_state_adapter import SessionStateAdapter
 from core.runtime import ExecutionRuntime
 from core.services import (
     MemoryService,
@@ -432,111 +433,18 @@ class OrchestrationRunner:
                 )
             self.telemetry_service.add_event("session_store_lookup", source="workspace", hit=False)
 
-        payload = self._extract_internal_meta(history or [], "session_state")
-        if isinstance(payload, dict):
-            try:
-                restored = SessionStateV1.model_validate(payload)
-                if session_id and restored.session_id != session_id:
-                    restored = restored.model_copy(update={"session_id": session_id})
-                return restored.model_copy(
-                    update={
-                        "course_name": course_name,
-                        "requested_mode_hint": mode_hint,
-                        "task_full_text": user_message or restored.task_full_text,
-                        "task_summary": self._summarize_task_text(user_message or restored.task_full_text),
-                    }
-                )
-            except Exception:
-                pass
-
-        legacy_history_summary_state = self._extract_history_summary_state(history or [])
-        legacy_last_quiz = self._extract_internal_meta(history or [], "quiz_meta")
-        legacy_last_exam = self._extract_internal_meta(history or [], "exam_meta")
-        active_practice = None
-        active_exam = None
-        if isinstance(legacy_last_quiz, dict):
-            active_practice = {
-                "kind": "practice",
-                "title": "练习题",
-                "instructions": "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。",
-                "questions": [
-                    {
-                        "id": 1,
-                        "type": "综合题",
-                        "question": str(legacy_last_quiz.get("question", "") or ""),
-                        "options": [],
-                        "score": 100,
-                        "standard_answer": str(legacy_last_quiz.get("standard_answer", "") or ""),
-                        "rubric": str(legacy_last_quiz.get("rubric", "") or ""),
-                        "chapter": str(legacy_last_quiz.get("chapter", "") or ""),
-                        "concept": str(legacy_last_quiz.get("concept", "") or ""),
-                        "difficulty": str(legacy_last_quiz.get("difficulty", "") or "medium"),
-                    }
-                ],
-                "total_score": 100,
-            }
-        if isinstance(legacy_last_exam, dict):
-            active_exam = {
-                "kind": "exam",
-                "title": "模拟考试试卷",
-                "instructions": "请将各题答案统一整理后一次性提交。",
-                "questions": list(legacy_last_exam.get("answer_sheet", []) or []),
-                "total_score": int(legacy_last_exam.get("total_score", 0) or 0),
-                "content": "",
-            }
-        if active_practice is None and mode_hint == "practice":
-            inferred_practice = self._extract_quiz_from_history(history or [])
-            if inferred_practice and not inferred_practice.startswith("（未能"):
-                active_practice = {
-                    "kind": "practice",
-                    "title": "练习题",
-                    "instructions": "请回答上述题目，回答完毕后我会为你评分并给出详细讲解。",
-                    "questions": [
-                        {
-                            "id": 1,
-                            "type": "综合题",
-                            "question": inferred_practice,
-                            "options": [],
-                            "score": 100,
-                            "standard_answer": "",
-                            "rubric": "",
-                            "chapter": "",
-                            "concept": "",
-                            "difficulty": "medium",
-                        }
-                    ],
-                    "total_score": 100,
-                    "content": inferred_practice,
-                }
-        if active_exam is None and mode_hint == "exam":
-            inferred_exam = self._extract_exam_from_history(history or [])
-            if inferred_exam and not inferred_exam.startswith("（未能"):
-                active_exam = {
-                    "kind": "exam",
-                    "title": "模拟考试试卷",
-                    "instructions": "请将各题答案统一整理后一次性提交。",
-                    "questions": [],
-                    "total_score": 0,
-                    "content": inferred_exam,
-                }
-        return SessionStateV1(
-            session_id=session_id or uuid.uuid4().hex,
+        return SessionStateAdapter.restore_from_inputs(
+            history=history,
             course_name=course_name,
-            requested_mode_hint=mode_hint,  # type: ignore[arg-type]
-            resolved_mode=mode_hint,  # type: ignore[arg-type]
-            task_full_text=user_message,
-            task_summary=self._summarize_task_text(user_message),
-            question_raw=user_message,
-            user_intent=user_message,
-            retrieval_query=user_message,
-            memory_query=user_message,
-            current_stage="router_planned",
-            current_step_index=0,
-            history_summary_state=legacy_history_summary_state,
-            last_quiz=legacy_last_quiz,
-            last_exam=legacy_last_exam,
-            active_practice=active_practice,
-            active_exam=active_exam,
+            mode_hint=mode_hint,
+            user_message=user_message,
+            state=state,
+            empty_history_summary_state=self._empty_history_summary_state,
+            normalize_history_summary_state=self._normalize_history_summary_state,
+            extract_internal_meta=self._extract_internal_meta,
+            extract_quiz_from_history=self._extract_quiz_from_history,
+            extract_exam_from_history=self._extract_exam_from_history,
+            summarize_task_text=self._summarize_task_text,
         )
 
     @staticmethod
@@ -592,6 +500,8 @@ class OrchestrationRunner:
             "tool_budget": dict(session_state.metadata.get("tool_budget", {}) or {}),
             "allowed_tool_groups": list(session_state.metadata.get("allowed_tool_groups", []) or []),
             "workflow_template": str(session_state.metadata.get("workflow_template", "") or ""),
+            "tool_policy_profile": str(session_state.metadata.get("tool_policy_profile", "") or ""),
+            "context_budget_profile": str(session_state.metadata.get("context_budget_profile", "") or ""),
             }
         )
 

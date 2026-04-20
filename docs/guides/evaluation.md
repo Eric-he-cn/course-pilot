@@ -33,7 +33,15 @@
 - `benchmarks/cases_v1.jsonl`
 - `benchmarks/rag_gold_v1.jsonl`
 
-历史 benchmark / gold JSONL 已迁入 `benchmarks/archive/<timestamp>_legacy_reset/`，不再作为默认评测入口。
+这两份文件是人工复查通过后的 canonical gold 主源，但当前根目录 active 文件可能处于“待补齐 / 空文件”状态。为了避免 CI 或本地 smoke 因空 active 集直接失效，统一评测入口 `python -m scripts.eval.run` 会按“非空 active 优先，否则回退归档基线”的规则解析路径。
+
+当前固定回退口径：
+
+- `scripts.eval.run smoke`：优先 `benchmarks/cases_v1_smoke3.jsonl`，否则回退 `benchmarks/archive/20260415_legacy_reset/cases_v1_smoke3.jsonl`
+- `scripts.eval.run full`：优先非空 `benchmarks/cases_v1.jsonl + benchmarks/rag_gold_v1.jsonl`，否则回退 `benchmarks/archive/20260415_legacy_reset/cases_v1.jsonl + rag_gold_v1.jsonl`
+- `dataset_lint --path benchmarks`：若根目录没有可 lint 的 active case，会回退到 `benchmarks/archive/20260415_legacy_reset/v3_expanded_84.jsonl`
+
+历史 benchmark / gold JSONL 已迁入 `benchmarks/archive/<timestamp>_legacy_reset/`。它们不作为人工 gold 维护主源，但可以作为 fallback baseline、smoke 回退和 broad lint 数据源。
 
 ### 2.2 cases 文件（示例）
 
@@ -163,9 +171,22 @@
 | `benchmarks/gold_candidates.jsonl` | 候选池 | LLM 首筛通过，待人工复查 |
 | `benchmarks/gold_manual_fix.jsonl` | 待修池 | 回答或证据部分可用，需要人工修 |
 | `benchmarks/gold_rejected.jsonl` | 拒绝池 | 无效或明显错误样本 |
-| `benchmarks/archive/*` | 历史数据 | 旧 benchmark/gold 归档，不参与默认评测 |
+| `benchmarks/archive/*` | 历史数据 | 旧 benchmark/gold 归档；不作为人工 gold 主源，但可作为 fallback baseline / broad lint 数据源 |
 
-### 5.1 跑 full30（首次）
+### 5.1 推荐统一入口
+
+```bash
+py -3.11 -m scripts.eval.run smoke
+py -3.11 -m scripts.eval.run full
+py -3.11 -m scripts.eval.run review --benchmark-dir <dir> --judge-dir <dir>
+```
+
+说明：
+
+- `smoke/full` 会自动选择非空 active 文件；active 为空时回退到 `benchmarks/archive/20260415_legacy_reset/` 的对应基线。
+- `dataset_lint --path benchmarks` 当前输出的是 broad lint 口径；当 active 广覆盖集不可用时，会使用归档 `v3_expanded_84.jsonl`，不要把这个结果当作 canonical RAG headline。
+
+### 5.2 跑 full30（显式 canonical 路径）
 
 ```bash
 py -3.11 scripts/perf/bench_runner.py \
@@ -176,7 +197,9 @@ py -3.11 scripts/perf/bench_runner.py \
   --repeats 1
 ```
 
-### 5.2 已有 raw 离线重算 RAG 指标（不重跑模型）
+如果根目录 active 文件为空，请优先使用 `py -3.11 -m scripts.eval.run full`，或者显式指向 `benchmarks/archive/20260415_legacy_reset/cases_v1.jsonl` 与对应 gold。
+
+### 5.3 已有 raw 离线重算 RAG 指标（不重跑模型）
 
 ```bash
 py -3.11 scripts/perf/bench_runner.py \
@@ -187,7 +210,7 @@ py -3.11 scripts/perf/bench_runner.py \
   --recompute-only
 ```
 
-### 5.3 跑候选侧 judge
+### 5.4 跑候选侧 judge
 
 ```bash
 python scripts/eval/judge_runner.py \
@@ -199,7 +222,7 @@ python scripts/eval/judge_runner.py \
 
 说明：v2 基线没有 LLM judge 是允许的，review 会将 baseline judge 记为 `N/A`。
 
-### 5.4 生成 gold 候选
+### 5.5 生成 gold 候选
 
 ```bash
 python scripts/eval/build_gold_candidates.py --run-all-suggestions --count 30
@@ -211,13 +234,13 @@ python scripts/eval/build_gold_candidates.py --run-all-suggestions --count 30
 python scripts/eval/build_gold_candidates.py --course 矩阵理论 --question "请结合教材解释矩阵的秩，并给出教材依据。"
 ```
 
-### 5.5 人工复查候选并正式入库
+### 5.6 人工复查候选并正式入库
 
 ```bash
 python scripts/eval/review_gold_candidates.py
 ```
 
-### 5.6 生成动态复评报告
+### 5.7 生成动态复评报告
 
 ```bash
 python scripts/eval/review_runner.py \
@@ -230,7 +253,7 @@ python scripts/eval/review_runner.py \
   --output-dir data/perf_runs/round2_full30_review
 ```
 
-### 5.7 在线影子评测（异步，不阻塞主链路）
+### 5.8 在线影子评测（异步，不阻塞主链路）
 
 1. 前端开启 `🧪 开启影子评测`（会话级）
 2. 正常对话时，后端会把样本写入：

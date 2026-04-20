@@ -16,6 +16,8 @@ _FIXED_FIELDS = {
     "budget_state",
     "tool_audit",
     "idempotency_namespace",
+    "tool_policy_profile",
+    "context_budget_profile",
 }
 
 
@@ -31,6 +33,8 @@ class RequestContext:
     budget_state: Dict[str, Any] = field(default_factory=dict)
     tool_audit: List[Dict[str, Any]] = field(default_factory=list)
     idempotency_namespace: str = ""
+    tool_policy_profile: str = ""
+    context_budget_profile: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -48,6 +52,8 @@ class RequestContext:
             "budget_state": dict(budget_state) if isinstance(budget_state, Mapping) else {},
             "tool_audit": [dict(x) for x in tool_audit if isinstance(x, Mapping)] if isinstance(tool_audit, list) else [],
             "idempotency_namespace": str(data.pop("idempotency_namespace", "") or "").strip(),
+            "tool_policy_profile": str(data.pop("tool_policy_profile", "") or "").strip(),
+            "context_budget_profile": str(data.pop("context_budget_profile", "") or "").strip(),
         }
         if isinstance(legacy_tool_usage, Mapping):
             fixed["budget_state"]["tool_usage"] = dict(legacy_tool_usage)
@@ -63,6 +69,8 @@ class RequestContext:
             "budget_state": self.budget_state,
             "tool_audit": self.tool_audit,
             "idempotency_namespace": self.idempotency_namespace,
+            "tool_policy_profile": self.tool_policy_profile,
+            "context_budget_profile": self.context_budget_profile,
         }
         payload.update(self.metadata)
         return payload

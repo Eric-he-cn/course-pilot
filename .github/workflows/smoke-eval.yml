@@ -1,0 +1,27 @@
+name: smoke-eval
+
+on:
+  push:
+    branches: ["main", "v3/architecture-upgrade"]
+  pull_request:
+
+jobs:
+  smoke-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Dataset lint
+        run: python -m scripts.eval.dataset_lint --path benchmarks --output-dir data/perf_runs/ci_smoke_dataset_lint
+      - name: Contract smoke tests
+        env:
+          OPENAI_API_KEY: dummy
+        run: |
+          python -m unittest tests.test_contract_fixes
+          python -m unittest tests.test_v3_priority_plan

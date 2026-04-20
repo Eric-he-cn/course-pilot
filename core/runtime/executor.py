@@ -89,6 +89,8 @@ class ExecutionRuntime:
                 **dict(session_state.metadata or {}),
                 "workflow_template": str(getattr(plan, "workflow_template", "") or ""),
                 "action_kind": str(getattr(plan, "action_kind", "") or ""),
+                "tool_policy_profile": str(getattr(plan, "tool_policy_profile", "") or ""),
+                "context_budget_profile": str(getattr(plan, "context_budget_profile", "") or ""),
                 "tool_budget": dict(getattr(plan, "tool_budget", {}) or {}),
                 "allowed_tool_groups": list(getattr(plan, "allowed_tool_groups", []) or []),
                 "route_reason": str(getattr(plan, "route_reason", "") or ""),
@@ -220,7 +222,12 @@ class ExecutionRuntime:
                     phase="execute",
                     stream=stream,
                     side_effect=execute["step_name"] == "run_grade",
-                    metadata={"owner_mode": execute["owner_mode"], "workflow_template": template},
+                    metadata={
+                        "owner_mode": execute["owner_mode"],
+                        "workflow_template": template,
+                        "tool_policy_profile": str(getattr(plan, "tool_policy_profile", "") or ""),
+                        "context_budget_profile": str(getattr(plan, "context_budget_profile", "") or ""),
+                    },
                 )
             )
         steps.append(TaskGraphStepV1(step_name="persist_session_state", phase="persist", side_effect=True, stream=stream))

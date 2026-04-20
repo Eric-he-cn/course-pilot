@@ -199,6 +199,32 @@ def _start_session_cleanup_worker() -> None:
     Thread(target=_worker, daemon=True, name="session-cleanup-worker").start()
 
 
+def run_session_cleanup_forever() -> None:
+    """独立 session cleanup worker 入口。"""
+    if str(os.getenv("SESSION_CLEANUP_ENABLED", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+        logger.info("[session.cleanup] disabled")
+        return
+    load_workspaces_from_disk()
+    logger.info("[session.cleanup] worker.start ttl_days=%d interval_sec=%.1f", _session_ttl_days(), _session_cleanup_interval_sec())
+    while True:
+        ttl_days = _session_ttl_days()
+        try:
+            for course_name in list(workspaces.keys()):
+                summary = runner.workspace_store.cleanup_session_states(course_name, ttl_days=ttl_days)
+                removed_count = int(summary.get("removed_count", 0) or 0)
+                if removed_count > 0:
+                    logger.info(
+                        "[session.cleanup] course=%s ttl_days=%d removed=%d scanned=%d",
+                        course_name,
+                        ttl_days,
+                        removed_count,
+                        int(summary.get("scanned", 0) or 0),
+                    )
+        except Exception as ex:
+            logger.warning("[session.cleanup] worker_error=%s", str(ex))
+        time.sleep(_session_cleanup_interval_sec())
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
@@ -234,10 +260,8 @@ async def _preload_reranker_model() -> None:
 
 @app.on_event("startup")
 async def _startup_bootstrap() -> None:
-    """应用启动时恢复 workspace 并启动后台维护任务。"""
+    """应用启动时恢复 workspace，并预热必要模型。"""
     load_workspaces_from_disk()
-    _start_session_cleanup_worker()
-    online_shadow_eval.start_worker()
     await _preload_embedding_model()
     await _preload_reranker_model()
 

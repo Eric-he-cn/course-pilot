@@ -46,10 +46,19 @@ def _iter_case_files(path: Path) -> Iterable[Path]:
     if path.is_file():
         yield path
         return
+    yielded = False
     for child in sorted(path.glob("*.jsonl")):
         if "rag_gold" in child.name or child.name in legacy_skip:
             continue
+        if child.stat().st_size <= 0:
+            continue
+        yielded = True
         yield child
+    if yielded:
+        return
+    fallback = path / "archive" / "20260415_legacy_reset" / "v3_expanded_84.jsonl"
+    if path.name == "benchmarks" and fallback.exists() and fallback.stat().st_size > 0:
+        yield fallback
 
 
 def _is_session_case(row: Dict[str, Any]) -> bool:
