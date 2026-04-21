@@ -1,8 +1,15 @@
 # CoursePilot v3 动态测评指南
 
-更新时间：2026-04-12
+更新时间：2026-04-21
 
 本文档面向开发与评测同学，说明 v3 动态测评链路、数据格式、命中判定策略与常见排障方式。
+
+当前评测系统已经从“手工脚本集合”收敛为“统一入口 + CI smoke + 夜间 full eval”的形态：
+
+- 本地推荐统一入口：`py -3.11 -m scripts.eval.run smoke/full/review`
+- CI smoke：`.github/workflows/smoke-eval.yml`
+- 夜间回归：`.github/workflows/nightly-eval.yml`
+- active canonical 文件仍保留在 `benchmarks/` 根目录；若 active 文件为空，统一入口会回退到 `benchmarks/archive/20260415_legacy_reset/`
 
 ---
 
@@ -185,6 +192,27 @@ py -3.11 -m scripts.eval.run review --benchmark-dir <dir> --judge-dir <dir>
 
 - `smoke/full` 会自动选择非空 active 文件；active 为空时回退到 `benchmarks/archive/20260415_legacy_reset/` 的对应基线。
 - `dataset_lint --path benchmarks` 当前输出的是 broad lint 口径；当 active 广覆盖集不可用时，会使用归档 `v3_expanded_84.jsonl`，不要把这个结果当作 canonical RAG headline。
+- `scripts.eval.run` 默认使用当前解释器；如需指定解释器，可设置 `EVAL_PYTHON_BIN`。
+
+### 5.1.1 CI 工作流
+
+当前仓库内置两条 GitHub Actions：
+
+1. `smoke-eval`
+- 文件：`.github/workflows/smoke-eval.yml`
+- 触发：push 到 `main` / `v3/architecture-upgrade`，以及 pull request
+- 步骤：安装依赖 -> `dataset_lint --path benchmarks` -> `tests.test_contract_fixes` + `tests.test_v3_priority_plan`
+- 测试阶段设置 `OPENAI_API_KEY=dummy`，因为 smoke tests 只验证契约与导入路径，不应真实调用模型服务
+
+2. `nightly-eval`
+- 文件：`.github/workflows/nightly-eval.yml`
+- 触发：每日定时或手动触发
+- 步骤：安装依赖 -> dataset lint -> `python -m scripts.eval.run full`
+- 若未配置 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` secret，会跳过 full eval，避免夜间任务因缺少 provider secret 假失败
+
+CI 依赖注意事项：
+- `python-multipart` 是 FastAPI 上传接口的必需依赖；缺失时导入 `backend.api` 会失败
+- `pywin32` 仅适用于 Windows，`requirements.txt` 中必须带平台 marker，避免 Linux CI 安装失败
 
 ### 5.2 跑 full30（显式 canonical 路径）
 
@@ -312,6 +340,19 @@ review gate：
 - v2 历史 baseline 无 judge 是正常现象
 - review 中 baseline judge 会显示 `N/A`
 
+4. CI `smoke-eval` 在 Contract smoke tests 阶段提示缺少 `OPENAI_API_KEY`
+- smoke tests 不应真实调用模型；CI 中应使用 `OPENAI_API_KEY=dummy`
+- 如果本地复现，可临时运行：`$env:OPENAI_API_KEY='dummy'`
+- 若仍真实访问 provider，说明测试没有正确 mock 或隔离模型调用，需要修测试而不是使用真实密钥
+
+5. CI 或本地导入 `backend.api` 时提示缺少 `python-multipart`
+- 上传接口使用 `UploadFile` / form data，FastAPI 在路由注册时会检查该依赖
+- 解决方式：确认 `requirements.txt` 包含 `python-multipart>=0.0.9`，并重新安装依赖
+
+6. `dataset_lint --path benchmarks` 输出 `total=84`
+- 这通常表示 active 根目录没有可 lint 的广覆盖 case，lint 已回退到归档 `v3_expanded_84.jsonl`
+- 该结果用于 broad dataset lint，不等同于 canonical RAG benchmark headline
+
 ---
 
 ## 8. 收官清单
@@ -320,4 +361,5 @@ review gate：
 2. 新 gold 先进入 `gold_candidates.jsonl`，人工复查后再入正式集合
 3. benchmark 先过 gold 覆盖校验，再看 RAG 命中 headline
 4. `judge_runner.py` 与 `gold_screen_judge.py` 口径明确区分
-5. 文档更新：architecture + config-overview + 本文档
+5. CI smoke 至少保持 `dataset_lint + contract tests` 通过
+6. 文档更新：architecture + config-overview + 本文档
