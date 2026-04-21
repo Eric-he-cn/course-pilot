@@ -1,4 +1,6 @@
-# CoursePilot
+# CoursePilot-面向大学课程学习场景的智能体学习平台
+
+![Python](https://img.shields.io/badge/Python-3.11-blue.svg) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg) ![Streamlit](https://img.shields.io/badge/Streamlit-1.31-red.svg) ![RAG](https://img.shields.io/badge/RAG-FAISS%20%2B%20BM25-orange.svg) ![Embedding](https://img.shields.io/badge/Embedding-BGE--base--zh--v1.5-green.svg) ![MCP](https://img.shields.io/badge/Tools-MCP-blueviolet.svg) ![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)
 
 CoursePilot 是一个面向大学课程学习场景的智能体学习平台，目标是把“教材接入 -> 概念讲解 -> 练习生成 -> 考试评卷 -> 错题记忆”做成一条可追踪、可评测的学习闭环。
 
