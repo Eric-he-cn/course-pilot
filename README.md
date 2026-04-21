@@ -119,10 +119,9 @@ course-pilot/
 README 文档只是一个快速启动和项目概览，更多细节和设计思路请看这些文档：
 
 - [架构说明](docs/guides/architecture.md)
-- [Prompt 设计](docs/guides/prompt-design.md)
 - [配置总览](docs/guides/config-overview.md)
+- [Prompt 设计](docs/guides/prompt-design.md)
 - [使用手册](docs/guides/usage.md)
-- [评测手册](docs/guides/evaluation.md)
 - [贡献说明](docs/guides/contributing.md)
 
 ## FAQ
