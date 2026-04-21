@@ -1,25 +1,19 @@
 # CoursePilot
 
-面向大学课程学习场景的 Multi-Agent + RAG + MCP 系统，强调教材证据可追溯、练习/考试闭环，以及可复现的评测与治理能力。
+CoursePilot 是一个面向大学课程学习场景的智能体学习平台，目标是把“教材接入 -> 概念讲解 -> 练习生成 -> 考试评卷 -> 错题记忆”做成一条可追踪、可评测的学习闭环。
 
-CoursePilot 不是一个“套了教材检索的聊天机器人”。它更像一个可持续演进的学习系统：
-
-- 外部仍是 `learn / practice / exam` 三种模式
-- 内部通过 `workflow_template` 控制执行路径，避免自由编排失控
-- 练习和考试走 `artifact-first`，先生成结构化题目，再评分与落档
-- 工具调用经过 `ToolHub` 做权限、预算、去重、幂等和审计
-- 评测支持 `bench -> judge -> review` 全链路闭环
+通用 Chat 应用通常擅长回答单个问题，但很难稳定处理课程材料引用、多轮学习状态、练习/考试、工具权限和质量回归。CoursePilot 将多 Agent 编排、教材级 RAG、长短期记忆、MCP 工具治理组合在一起，让系统既能围绕教材回答问题，也能持续跟踪学习过程，并用可追溯证据约束回答质量。
 
 ![CoursePilot UI](docs/images/启动界面.png)
 
-## Why This Project
+## Core Capabilities
 
-- 教材证据可追溯：检索结果带来源和页码，回答不是“黑盒生成”。
-- 学习闭环完整：从概念讲解，到练习、考试、评分、记录沉淀都在同一系统内完成。
-- 多 Agent 但不失控：`Router + Tutor + QuizMaster + Grader` 分工明确，同时由模板和运行时收口。
-- 工具治理完整：不是简单 function calling，而是带预算、权限、审计和失败处理的工具链。
-- 会话状态有真源：`SessionState` 持久化为服务端短期状态，不靠 history 硬猜。
-- 动态评测可复现：支持 benchmark、judge、review 三段式回归，而不只看主观回答效果。
+- 多 Agent 协作：Router 理解意图并制定计划，Tutor 负责讲解，QuizMaster 负责出题，Grader 负责评分与反馈。
+- 教材 RAG：支持课程材料解析、切块、向量索引、BM25 + dense 混合检索，并在回答中展示来源页码和证据片段。
+- 学习闭环：覆盖 `learn / practice / exam` 三种模式，从讲解到练习、考试、评分、记录沉淀在同一系统内完成。
+- 记忆系统：服务端维护会话状态、用户画像和情景记忆，用于多轮学习连续性和个性化反馈。
+- 工具系统：通过 MCP 与 ToolHub 管理搜索、计算、文件写入等工具，统一做权限、预算、去重和失败处理。
+- 评测系统：内置 benchmark、LLM-as-a-Judge 和 review 队列，用客观指标与主观评分跟踪系统质量。
 
 ## Quick Start
 
@@ -90,22 +84,39 @@ py -3.11 scripts/rebuild_indexes.py
 ## Repository Layout
 
 ```text
-backend/       FastAPI API 层
-core/          编排、运行时、Agent、服务层
-frontend/      Streamlit UI
-rag/           文档解析、切块、检索与索引
-memory/        长期记忆与画像
-mcp_tools/     MCP 工具客户端与本地工具
-scripts/       索引、评测与辅助脚本
-benchmarks/    基准数据与 gold
-docs/          架构、配置、使用、评测与内部资料
-data/          本地工作区、索引和运行产物
+course-pilot/
+├─ backend/                  API 与 SSE
+├─ frontend/                 Streamlit UI
+├─ core/                     Agent 编排与运行时
+│  ├─ agents/                Router / Tutor / QuizMaster / Grader
+│  ├─ orchestration/         Runner、Plan、SessionState
+│  ├─ runtime/               ExecutionRuntime、TaskGraph
+│  ├─ services/              RAG、Memory、ToolHub
+│  ├─ llm/                   LLM client 与工具轮
+│  └─ metrics/               运行指标
+├─ rag/                      解析、切块、索引、检索
+├─ memory/                   长期记忆与用户画像
+├─ mcp_tools/                MCP 与工具实现
+├─ scripts/                  索引、评测、worker 脚本
+│  ├─ eval/                  bench / judge / review
+│  ├─ perf/                  性能脚本
+│  └─ workers/               后台 worker
+├─ benchmarks/               benchmark 与 gold 数据
+│  └─ archive/               历史数据集
+├─ tests/                    回归测试
+├─ docs/                     项目文档
+│  ├─ guides/                指南文档
+│  ├─ examples/              示例
+│  ├─ reviews/               审阅报告
+│  ├─ internal/              内部资料
+│  └─ archive/               历史归档
+├─ data/                     本地运行产物
+└─ artifacts/                本地实验材料
 ```
 
-脚本入口说明见 [scripts/README.md](scripts/README.md)。  
-如果你想看一个轻量演示入口，可以看 [docs/examples/demo.py](docs/examples/demo.py)。
-
 ## Read More
+
+README 文档只是一个快速启动和项目概览，更多细节和设计思路请看这些文档：
 
 - [架构说明](docs/guides/architecture.md)
 - [Prompt 设计](docs/guides/prompt-design.md)
@@ -119,10 +130,6 @@ data/          本地工作区、索引和运行产物
 ### 它和普通 RAG 问答项目有什么不同？
 
 重点不只是“把文档喂给模型”，而是把教材证据、练习/考试链路、状态管理、工具治理和动态评测放进同一个工程体系里。
-
-### 为什么内部还有 `workflow_template`？
-
-因为它能把外部简单模式映射成受控执行模板，让多 Agent 系统更稳定、可测、可演进。
 
 ### 可以只把它当教材问答系统来用吗？
 
