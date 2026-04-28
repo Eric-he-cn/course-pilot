@@ -614,9 +614,9 @@ CoursePilot 的 prompt 上下文来自多处：
 
 | 来源 | 进入位置 | 作用 |
 |---|---|---|
-| `history_context` | Agent user prompt | 保持多轮连续性 |
-| `rag_context` | Agent user prompt | 教材证据与引用来源 |
-| `memory_context` | Agent user prompt | 个性化辅导、错题和历史事件 |
+| `history_context` | Agent prompt（Tutor 主要在 user，Grader 某些链路会进 system） | 保持多轮连续性 |
+| `rag_context` | Agent prompt（Tutor 主要在 user；Grader 会以评分依据形式进入 prompt） | 教材证据与引用来源 |
+| `memory_context` | Agent prompt（Tutor 主要在 user；Grader 某些链路会转成 system 约束或画像提示） | 个性化辅导、错题和历史事件 |
 | `profile_context` | Agent system prompt | 用户画像、弱点、偏好 |
 | active artifact | Quiz / Grader prompt | 当前练习题、试卷、答案 |
 | tool result summary | `role=tool` message | 工具调用后的可控摘要 |
@@ -694,21 +694,21 @@ RAG 压缩责任有两种：
 工具轮最容易膨胀，因为它会不断追加 `assistant(tool_calls)` 和 `tool` 消息。当前压缩策略在 `openai_compat.py`：
 
 - `_compact_messages_for_tool_round()`：第二轮以后压缩 user content
-- `[TOOL_BUDGET]`：作为 system hint 注入当前工具预算
+- `[TOOL_BUDGET]`：首轮可能追加为 system hint；压缩轮通常会并入 user content
 - `TOOL_ROUND_KEEP_LAST_TOOL_MSGS`：只保留最近工具消息片段
 - `_summarize_tool_result()`：把完整工具结果压成短 JSON
 - `_rehydrate_messages_for_final()`：最终 Synthesize 前按 `summary/full` 回灌上下文
 
-压缩前的工具轮 messages 可能是：
+在追加到 messages 历史前，工具原始返回会先经过 `_summarize_tool_result()` 压成 `role=tool` 摘要。因此“压缩前”的 messages 更接近下面这样：
 
 ```json
 [
   {"role": "system", "content": "Tutor 工具规则..."},
   {"role": "user", "content": "完整 Tutor prompt，含 RAG、history、memory"},
   {"role": "assistant", "tool_calls": [{"id": "call_001", "function": {"name": "memory_search"}}]},
-  {"role": "tool", "tool_call_id": "call_001", "content": "完整 memory_search 返回结果"},
+  {"role": "tool", "tool_call_id": "call_001", "content": "{\"tool\":\"memory_search\",\"success\":true,\"results\":[...]}"},
   {"role": "assistant", "tool_calls": [{"id": "call_002", "function": {"name": "mindmap_generator"}}]},
-  {"role": "tool", "tool_call_id": "call_002", "content": "完整 mindmap_generator 返回结果"}
+  {"role": "tool", "tool_call_id": "call_002", "content": "{\"tool\":\"mindmap_generator\",\"success\":true,\"message\":\"已生成思维导图。\"}"}
 ]
 ```
 
