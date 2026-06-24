@@ -7,6 +7,13 @@
 - 注释策略：每个相对独立代码块都使用“目的 + 实现方式”进行说明。
 """
 import os
+import sys
+
+# macOS (Apple Silicon) 兼容：禁用 tokenizer 多进程 fork，避免 semaphore 泄漏导致崩溃
+if sys.platform == "darwin":
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
 import logging
 import shutil
 import uuid

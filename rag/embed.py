@@ -32,8 +32,9 @@ def _select_device() -> str:
     """自动选择计算设备。
 
     优先读取 EMBEDDING_DEVICE 环境变量：
-      - "auto" (默认) → 有 CUDA 用 cuda:0，否则 cpu
-      - "cuda" / "cuda:0" → 强制使用 GPU
+      - "auto" (默认) → CUDA > MPS(Apple Silicon) > CPU
+      - "cuda" / "cuda:0" → 强制使用 NVIDIA GPU
+      - "mps"             → 强制使用 Apple Silicon GPU
       - "cpu"             → 强制使用 CPU
     """
     env = os.getenv("EMBEDDING_DEVICE", "auto").strip().lower()
@@ -43,7 +44,10 @@ def _select_device() -> str:
         gpu_name = torch.cuda.get_device_name(0)
         print(f"[Embed] 使用 GPU: {gpu_name}")
         return "cuda"
-    print("[Embed] 未检测到 CUDA，使用 CPU")
+    if torch.backends.mps.is_available():
+        print("[Embed] 使用 Apple Silicon GPU (MPS)")
+        return "mps"
+    print("[Embed] 未检测到 GPU，使用 CPU")
     return "cpu"
 
 
@@ -58,7 +62,7 @@ class EmbeddingModel:
         self.model = SentenceTransformer(model_name, device=self._device)
         self._query_prefix = _get_bge_query_prefix(model_name)
         # GPU 单次可处理更大 batch；CPU 保持默认 32
-        _default_bs = "256" if "cuda" in self._device else "32"
+        _default_bs = "256" if self._device in ("cuda", "mps") else "32"
         self._batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", _default_bs))
         print(f"[Embed] 模型={model_name}  设备={self._device}  batch_size={self._batch_size}")
 

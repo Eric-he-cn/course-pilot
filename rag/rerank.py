@@ -16,7 +16,7 @@ from sentence_transformers import CrossEncoder
 
 
 def _select_device() -> str:
-    """自动选择 reranker 设备。"""
+    """自动选择 reranker 设备（CUDA > MPS > CPU）。"""
     env = os.getenv("RERANK_DEVICE", "auto").strip().lower()
     if env != "auto":
         return env
@@ -24,7 +24,10 @@ def _select_device() -> str:
         gpu_name = torch.cuda.get_device_name(0)
         print(f"[Rerank] 使用 GPU: {gpu_name}")
         return "cuda"
-    print("[Rerank] 未检测到 CUDA，使用 CPU")
+    if torch.backends.mps.is_available():
+        print("[Rerank] 使用 Apple Silicon GPU (MPS)")
+        return "mps"
+    print("[Rerank] 未检测到 GPU，使用 CPU")
     return "cpu"
 
 
@@ -37,7 +40,7 @@ class RerankerModel:
         self.model_name = model_name
         self._device = _select_device()
         self.model = CrossEncoder(model_name, device=self._device)
-        default_bs = "32" if "cuda" in self._device else "8"
+        default_bs = "32" if self._device in ("cuda", "mps") else "8"
         self._batch_size = max(1, int(os.getenv("RERANK_BATCH_SIZE", default_bs)))
         print(f"[Rerank] 模型={model_name}  设备={self._device}  batch_size={self._batch_size}")
 
