@@ -81,7 +81,9 @@ export const api = {
           const payload = JSON.parse(data) as { status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null }
           if (payload.error) throw new ApiError(payload.error)
           if (eventName === 'turn_failed') {
-            const message = payload.error_code === 'session_busy' ? '该会话正在生成回答，请稍后重试。' : '本次回答未能完成，请重试。'
+            const message = payload.error_code === 'session_busy' ? '该会话正在生成回答，请稍后重试。'
+              : payload.error_code === 'stream_interrupted' ? '回答在生成中被中断，已生成的内容已保留。'
+              : '本次回答未能完成，请重试。'
             throw new ApiError(message)
           }
           onEvent({ ...payload, event: eventName, type: eventName })

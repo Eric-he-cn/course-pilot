@@ -58,9 +58,12 @@ class TurnService:
             )
             citations: list[dict] = []
             response: TutorResponse | None = None
+            seq = 0
             if context.status != "resolved" or context.course_id is None:
                 answer = "我还不能确定要使用哪门课程的资料。请在问题中说明课程名称，或先进入具体课程工作区。"
                 finish_reason, responder_mode, provider, model, usage = "course_unresolved", "local_guardrail", "system", "none", {}
+                seq += 1
+                yield self._event("text_delta", seq=seq, text=answer)
             else:
                 hits = self._knowledge.search(
                     scope=ResolvedKnowledgeScope(turn_id=turn.id, course_id=context.course_id, resolver_version=context.resolver_version),
@@ -89,9 +92,29 @@ class TurnService:
                             for index, hit in enumerate(hits, start=1)
                         ),
                     )
+                    partial: list[str] = []
                     try:
-                        response = self._responder.respond(request)
+                        for item in self._responder.respond(request):
+                            if isinstance(item, TutorResponse):
+                                response = item
+                                break
+                            partial.append(item.text)
+                            seq += 1
+                            yield self._event("text_delta", seq=seq, text=item.text)
+                        if response is None:
+                            raise LLMProviderError("invalid_response", "供应商流结束但没有终态响应", retryable=False)
                     except LLMProviderError as error:
+                        if partial:
+                            # 已输出增量：保留部分内容并如实标记中断，不静默换供应商重放。
+                            yield self._event("stream_interrupted", error_code=error.code, retryable=error.retryable)
+                            assistant = self._sessions.append_message(
+                                session_id=session_id, turn_id=turn.id, role="assistant",
+                                content="".join(partial), citations=citations, status="interrupted",
+                            )
+                            self._sessions.complete_turn(turn.id, status="failed")
+                            finalized = True
+                            yield self._event("turn_failed", error_code="stream_interrupted", retryable=False, message_id=assistant.id)
+                            return
                         yield self._event(
                             "provider_fallback",
                             provider=self._responder.provider,
@@ -99,14 +122,20 @@ class TurnService:
                             error_code=error.code,
                             retryable=error.retryable,
                         )
-                        response = self._fallback_responder.respond(request)
+                        for item in self._fallback_responder.respond(request):
+                            if isinstance(item, TutorResponse):
+                                response = item
+                                break
+                            seq += 1
+                            yield self._event("text_delta", seq=seq, text=item.text)
                     answer = response.text
                     finish_reason, responder_mode = response.finish_reason, response.mode
                     provider, model, usage = response.provider, response.model, response.usage
                 else:
                     answer = f"[Demo responder] 已确定课程为“{context.course_name}”，但本地资料库尚未找到可引用的内容。以下不是当前教材结论：请上传或索引相关资料后再检索。"
                     finish_reason, responder_mode, provider, model, usage = "no_evidence", "local_guardrail", "system", "none", {}
-            yield self._event("text_delta", seq=1, text=answer)
+                    seq += 1
+                    yield self._event("text_delta", seq=seq, text=answer)
             assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations)
             self._sessions.complete_turn(turn.id, status="completed")
             finalized = True

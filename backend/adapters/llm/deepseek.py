@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
-from typing import Any
+from collections.abc import Iterator
 
 import httpx
 
-from contracts.llm import LLMProviderError, TutorRequest, TutorResponse
+from contracts.llm import LLMProviderError, TutorDelta, TutorRequest, TutorResponse
 
 
 _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师。回答必须以提供的教材证据为依据。
@@ -59,7 +60,7 @@ class DeepSeekTutorResponder:
     def model(self) -> str:
         return self._model
 
-    def respond(self, request: TutorRequest) -> TutorResponse:
+    def respond(self, request: TutorRequest) -> Iterator[TutorDelta | TutorResponse]:
         payload = {
             "model": self._model,
             "messages": [
@@ -70,29 +71,76 @@ class DeepSeekTutorResponder:
             # lower-latency non-thinking path unless a future policy opts in.
             "thinking": {"type": "disabled"},
             "max_tokens": self._max_output_tokens,
-            "stream": False,
+            "stream": True,
         }
-        response = self._post_with_retry(payload)
-        try:
-            body = response.json()
-            choice = body["choices"][0]
-            content = choice["message"]["content"]
-            if not isinstance(content, str) or not content.strip():
-                raise ValueError("empty content")
-            usage = self._usage(body.get("usage"))
-            result = TutorResponse(
-                text=content.strip(),
-                finish_reason=str(choice.get("finish_reason") or "stop"),
-                provider=self.provider,
-                model=self.model,
-                mode=self.mode,
-                usage=usage,
-            )
-        except (KeyError, IndexError, TypeError, ValueError) as error:
-            self._record_failure("invalid_response")
-            raise LLMProviderError("invalid_response", "DeepSeek 返回了无法解析的响应", retryable=False) from error
-        self._record_success()
-        return result
+        attempt = 0
+        while True:
+            emitted = False
+            try:
+                with self._client.stream("POST", self._endpoint, json=payload, headers=self._headers) as response:
+                    response.raise_for_status()
+                    parts: list[str] = []
+                    finish_reason, usage = "stop", {}
+                    for line in response.iter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if not data:
+                            continue
+                        if data == "[DONE]":
+                            break
+                        chunk = json.loads(data)
+                        usage.update(self._usage(chunk.get("usage")))
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        piece = (choices[0].get("delta") or {}).get("content")
+                        if isinstance(piece, str) and piece:
+                            emitted = True
+                            parts.append(piece)
+                            yield TutorDelta(piece)
+                        if choices[0].get("finish_reason"):
+                            finish_reason = str(choices[0]["finish_reason"])
+                    text = "".join(parts).strip()
+                    if not text:
+                        self._record_failure("invalid_response")
+                        raise LLMProviderError("invalid_response", "DeepSeek 返回了空回答", retryable=False)
+                    self._record_success()
+                    yield TutorResponse(
+                        text=text,
+                        finish_reason=finish_reason,
+                        provider=self.provider,
+                        model=self.model,
+                        mode=self.mode,
+                        usage=usage,
+                    )
+                    return
+            except httpx.HTTPStatusError as error:
+                # raise_for_status 在拿到任何 delta 之前触发，可以安全重试。
+                status = error.response.status_code
+                retryable = status == 429 or status >= 500
+                if retryable and attempt < self._max_retries:
+                    attempt += 1
+                    time.sleep(0.2 * (2 ** (attempt - 1)))
+                    continue
+                code = f"http_{status}"
+                self._record_failure(code)
+                raise LLMProviderError(code, f"DeepSeek 请求失败（HTTP {status}）", retryable=retryable) from error
+            except httpx.RequestError as error:
+                if emitted:
+                    # 已输出增量后不重放整轮，避免重复文本（架构 §5.8）。
+                    self._record_failure("stream_interrupted")
+                    raise LLMProviderError("stream_interrupted", "DeepSeek 流式响应中断", retryable=False) from error
+                if attempt < self._max_retries:
+                    attempt += 1
+                    time.sleep(0.2 * (2 ** (attempt - 1)))
+                    continue
+                self._record_failure("network_error")
+                raise LLMProviderError("network_error", "暂时无法连接 DeepSeek", retryable=True) from error
+            except json.JSONDecodeError as error:
+                code = "stream_interrupted" if emitted else "invalid_response"
+                self._record_failure(code)
+                raise LLMProviderError(code, "DeepSeek 返回了无法解析的流式数据", retryable=False) from error
 
     def health(self) -> dict[str, object]:
         with self._state_lock:
@@ -111,29 +159,6 @@ class DeepSeekTutorResponder:
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
-
-    def _post_with_retry(self, payload: dict[str, Any]) -> httpx.Response:
-        for attempt in range(self._max_retries + 1):
-            try:
-                response = self._client.post(self._endpoint, json=payload, headers=self._headers)
-                response.raise_for_status()
-                return response
-            except httpx.HTTPStatusError as error:
-                status = error.response.status_code
-                retryable = status == 429 or status >= 500
-                if retryable and attempt < self._max_retries:
-                    time.sleep(0.2 * (2**attempt))
-                    continue
-                code = f"http_{status}"
-                self._record_failure(code)
-                raise LLMProviderError(code, f"DeepSeek 请求失败（HTTP {status}）", retryable=retryable) from error
-            except httpx.RequestError as error:
-                if attempt < self._max_retries:
-                    time.sleep(0.2 * (2**attempt))
-                    continue
-                self._record_failure("network_error")
-                raise LLMProviderError("network_error", "暂时无法连接 DeepSeek", retryable=True) from error
-        raise AssertionError("unreachable")
 
     @staticmethod
     def _user_prompt(request: TutorRequest) -> str:

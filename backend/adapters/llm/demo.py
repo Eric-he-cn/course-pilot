@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from contracts.llm import TutorRequest, TutorResponse
+from collections.abc import Iterator
+
+from contracts.llm import TutorDelta, TutorRequest, TutorResponse
 
 
 class DemoTutorResponder:
@@ -18,13 +20,14 @@ class DemoTutorResponder:
     def model(self) -> str:
         return "evidence-template"
 
-    def respond(self, request: TutorRequest) -> TutorResponse:
+    def respond(self, request: TutorRequest) -> Iterator[TutorDelta | TutorResponse]:
         evidence = "\n\n".join(f"- [{item.citation_id}] {item.content[:360]}" for item in request.evidence[:3])
         text = (
             f"[Demo responder] 已在“{request.course_name}”的本地资料中检索到相关内容：\n"
             f"{evidence}\n\n以上是本地检索证据；可继续追问具体步骤。"
         )
-        return TutorResponse(
+        yield TutorDelta(text)
+        yield TutorResponse(
             text=text,
             finish_reason="demo_fallback",
             provider=self.provider,

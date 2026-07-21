@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Iterable, Protocol
 
 
 class LLMProviderError(RuntimeError):
@@ -30,6 +30,13 @@ class TutorRequest:
 
 
 @dataclass(frozen=True)
+class TutorDelta:
+    """An incremental piece of answer text emitted while the provider streams."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class TutorResponse:
     text: str
     finish_reason: str
@@ -49,7 +56,13 @@ class TutorResponderPort(Protocol):
     @property
     def model(self) -> str: ...
 
-    def respond(self, request: TutorRequest) -> TutorResponse: ...
+    def respond(self, request: TutorRequest) -> Iterable[TutorDelta | TutorResponse]:
+        """Yield zero or more deltas followed by exactly one terminal TutorResponse.
+
+        Raising LLMProviderError before the first delta means the whole call
+        failed; raising after deltas means the stream was interrupted.
+        """
+        ...
 
     def health(self) -> dict[str, object]: ...
 

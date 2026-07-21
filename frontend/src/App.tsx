@@ -129,7 +129,12 @@ export default function App() {
           const delta = payload.delta ?? payload.content ?? payload.text ?? ''
           if (delta) setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
         }); await loadMessages(targetSession.id); await loadSessions() }
-        catch (error) { setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '本次回答未能完成。', artifact: { kind: 'interrupted' } } : item)); setNotice(errorText(error)) }
+        catch (error) {
+          setNotice(errorText(error))
+          // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
+          try { await loadMessages(targetSession.id); await loadSessions() }
+          catch { setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '本次回答未能完成。', artifact: { kind: 'interrupted' } } : item)) }
+        }
         finally { setBusy(false) }
       }} busy={busy} />}
       {view === 'library' && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
@@ -157,7 +162,7 @@ function ChatView({ session, messages, workspaceName, turnResolution, onCitation
 
 function MessageCard({ message, onCitation }: { message: Message; onCitation: (citation: Citation) => void }) {
   if (message.role === 'user') return <article className="message user-message"><div>{message.content}</div></article>
-  const isInterrupted = message.artifact?.kind === 'interrupted'
+  const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   const resolution = message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span>CP</span><b>CoursePilot</b></div><div className="message-content">{message.content || <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations">{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}>资料 {item.material_name ?? index + 1}{item.page ? ` · p.${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }

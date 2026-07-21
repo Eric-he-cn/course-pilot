@@ -34,6 +34,7 @@ export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
+  status?: string
   created_at?: string
   citations?: Citation[]
   resolution_status?: 'resolved' | 'ambiguous' | 'unresolved' | null

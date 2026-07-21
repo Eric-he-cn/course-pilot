@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from core.settings import Settings
 from modules.sessions.api import SessionBusyError
-from contracts.llm import LLMProviderError
+from contracts.llm import LLMProviderError, TutorDelta
 
 
 def _settings(tmp_path) -> Settings:
@@ -224,6 +224,48 @@ def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
     }
     assert "Demo responder" in events[4][1]["text"]
     assert events[5][1]["responder_mode"] == "demo_fallback"
+
+
+def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(client):
+    class InterruptingResponder:
+        mode = "provider"
+        provider = "deepseek"
+        model = "deepseek-v4-flash"
+
+        def respond(self, _request):
+            yield TutorDelta("链式法则是复合函数")
+            raise LLMProviderError("stream_interrupted", "connection lost", retryable=False)
+
+        def health(self):
+            return {}
+
+        def close(self):
+            return None
+
+    course = client.post("/api/v2/courses", json={"name": "微积分"}).json()
+    material = client.post(
+        f"/api/v2/courses/{course['id']}/materials",
+        files={"file": ("chain.md", "链式法则：复合函数求导，先外层后内层。", "text/markdown")},
+    ).json()
+    _wait_for_job(client, client.post(f"/api/v2/materials/{material['id']}/index").json()["id"])
+    session = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()
+    client.app.state.application.turns._responder = InterruptingResponder()
+
+    response = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "drop-1", "message": "链式法则？"})
+    events = _events(response.text)
+    assert [name for name, _ in events] == [
+        "turn_started", "course_resolution", "citation", "text_delta", "stream_interrupted", "turn_failed",
+    ]
+    assert events[4][1] == {"error_code": "stream_interrupted", "retryable": False}
+    assert events[5][1]["error_code"] == "stream_interrupted"
+
+    messages = client.get(f"/api/v2/sessions/{session['id']}/messages").json()["messages"]
+    assert messages[-1]["content"] == "链式法则是复合函数"
+    assert messages[-1]["status"] == "interrupted"
+
+    # 中断后 turn 已落终态，会话立即可以继续
+    retry = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "drop-2", "message": "链式法则？"})
+    assert _events(retry.text)[0][0] == "turn_started"
 
 
 def test_client_disconnect_mid_stream_does_not_brick_the_session(client):
