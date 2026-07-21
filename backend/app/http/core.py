@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from functools import partial
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import Application
+from contracts.llm import LLMProviderError
+from modules.sessions.api import VisionFeatureDisabledError
 
 
 class CourseCreateRequest(BaseModel):
@@ -32,6 +36,7 @@ class SessionCreateRequest(BaseModel):
 class TurnRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     client_request_id: str = Field(default_factory=lambda: str(uuid4()))
+    attachment_ids: list[str] = Field(default_factory=list, max_length=4)
 
 
 def _not_found(error: Exception) -> HTTPException:
@@ -86,12 +91,37 @@ def create_core_router(application: Application) -> APIRouter:
             raise _not_found(exc) from exc
         return {"session": asdict(session) if session else None, "messages": [asdict(message) for message in messages]}
 
+    @router.post("/sessions/{session_id}/attachments", status_code=201)
+    async def upload_attachment(session_id: str, file: UploadFile = File(...)):
+        try:
+            content = await file.read()
+            attachment = await run_in_threadpool(
+                partial(
+                    application.sessions.create_attachment,
+                    session_id=session_id,
+                    filename=file.filename or "image",
+                    mime_type=file.content_type or "application/octet-stream",
+                    content=content,
+                )
+            )
+            return asdict(attachment)
+        except VisionFeatureDisabledError as exc:
+            raise HTTPException(status_code=409, detail={"code": "feature_disabled", "message": str(exc)}) from exc
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+        except LLMProviderError as exc:
+            raise HTTPException(status_code=502, detail={"error": {"code": exc.code, "message": str(exc), "retryable": exc.retryable}}) from exc
+        finally:
+            await file.close()
+
     @router.post("/sessions/{session_id}/turns")
     def turn(session_id: str, request: TurnRequest):
         if application.sessions.get_session(session_id) is None:
             raise _not_found(LookupError("会话不存在"))
         def stream():
-            for payload in application.turns.run(session_id=session_id, message=request.message, client_request_id=request.client_request_id):
+            for payload in application.turns.run(session_id=session_id, message=request.message, client_request_id=request.client_request_id, attachment_ids=request.attachment_ids):
                 yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], ensure_ascii=False)}\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

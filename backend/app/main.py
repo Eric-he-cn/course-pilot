@@ -26,6 +26,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         finally:
             application.knowledge_jobs.shutdown()
             application.llm.close()
+            if application.vision is not None:
+                application.vision.close()
 
     app = FastAPI(title="CoursePilot 2.0 Demo", version="2.0.0", lifespan=lifespan)
 
@@ -45,6 +47,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             jobs=application.knowledge_jobs,
             courses=application.courses,
             llm_health=application.llm_health,
+            vision_health=application.vision_health,
         )
     )
     app.include_router(build_study_router(learning=application.learning, planning=application.planning, courses=application.courses))

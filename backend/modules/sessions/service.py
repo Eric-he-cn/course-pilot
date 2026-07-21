@@ -1,14 +1,18 @@
 from __future__ import annotations
 import json
 import sqlite3
+from contracts.llm import VisionTranscriberPort
 from core.common import new_id, utc_now
 from modules.courses.api import CourseCatalogPort
-from .api import CourseResolverPort, SessionBusyError
-from .models import Message, ResolvedCourseContext, SessionSummary, Turn
+from .api import CourseResolverPort, SessionBusyError, VisionFeatureDisabledError
+from .images import process_image
+from .models import Attachment, Message, ResolvedCourseContext, SessionSummary, Turn
 from .repository import SessionRepository
 class SessionService:
     DEFAULT_TITLE = "新学习对话"
-    def __init__(self, repository: SessionRepository, courses: CourseCatalogPort, resolver: CourseResolverPort) -> None: self._repository, self._courses, self._resolver = repository, courses, resolver
+    def __init__(self, repository: SessionRepository, courses: CourseCatalogPort, resolver: CourseResolverPort, *, vision: VisionTranscriberPort | None = None, attachment_max_bytes: int = 10 * 1024 * 1024, attachment_max_pixels: int = 12_000_000) -> None:
+        self._repository, self._courses, self._resolver = repository, courses, resolver
+        self._vision, self._attachment_max_bytes, self._attachment_max_pixels = vision, attachment_max_bytes, attachment_max_pixels
     def _summary(self, row) -> SessionSummary:
         projected_id = row["course_id"] or row["last_resolved_course_id"]; course = self._courses.get_course(projected_id) if projected_id else None
         return SessionSummary(row["id"], row["title"], row["scope_mode"], row["course_id"], row["last_resolved_course_id"], course.name if course else None, course.color if course else None, row["source"], row["updated_at"])
@@ -61,6 +65,18 @@ class SessionService:
             # 仍是默认标题的会话用首条用户消息命名，会话列表可辨认。
             if derived: self._repository.set_title_if_default(session_id=session_id, title=derived, default=self.DEFAULT_TITLE, timestamp=timestamp)
         return Message(message_id, turn_id, role, content, safe, status, timestamp)
+    def create_attachment(self, *, session_id: str, filename: str, mime_type: str, content: bytes) -> Attachment:
+        if not self.get_session(session_id): raise LookupError("会话不存在")
+        if self._vision is None: raise VisionFeatureDisabledError("图片转录未启用：请配置 VISION_* 环境变量")
+        processed = process_image(content=content, mime_type=mime_type, max_bytes=self._attachment_max_bytes, max_pixels=self._attachment_max_pixels)
+        transcription = self._vision.transcribe(content=processed.content, mime_type=processed.mime_type)
+        attachment = Attachment(new_id("attachment"), session_id, filename.strip()[:120] or "image", processed.mime_type, len(processed.content), processed.width, processed.height, transcription.plain_text, transcription.needs_confirmation, transcription.provider, transcription.model, utc_now())
+        self._repository.insert_attachment(attachment_id=attachment.id, session_id=session_id, filename=attachment.filename, mime_type=attachment.mime_type, byte_size=attachment.byte_size, width=attachment.width, height=attachment.height, transcription=attachment.transcription, needs_confirmation=attachment.needs_confirmation, provider=attachment.provider, model=attachment.model, timestamp=attachment.created_at)
+        return attachment
+    def get_attachments(self, *, session_id: str, attachment_ids: list[str]) -> list[Attachment]:
+        rows = self._repository.get_attachment_rows(session_id=session_id, attachment_ids=attachment_ids) if attachment_ids else []
+        if len(rows) != len(set(attachment_ids)): raise LookupError("附件不存在或不属于当前会话")
+        return [Attachment(row["id"], row["session_id"], row["filename"], row["mime_type"], row["byte_size"], row["width"], row["height"], row["transcription"], bool(row["needs_confirmation"]), row["provider"], row["model"], row["created_at"]) for row in rows]
     def complete_turn(self, turn_id: str, *, status: str) -> None: self._repository.finish_turn(turn_id=turn_id, status=status, timestamp=utc_now())
     def recover_stale_turns(self) -> int:
         """进程崩溃遗留的 running turn 会永久占用会话锁，启动时统一落为 failed。"""

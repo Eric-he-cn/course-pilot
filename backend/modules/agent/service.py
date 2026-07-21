@@ -32,7 +32,7 @@ class TurnService:
     def _event(name: str, **data: object) -> dict[str, object]:
         return {"event": name, "data": data}
 
-    def run(self, *, session_id: str, message: str, client_request_id: str) -> Iterator[dict[str, object]]:
+    def run(self, *, session_id: str, message: str, client_request_id: str, attachment_ids: list[str] | None = None) -> Iterator[dict[str, object]]:
         session = self._sessions.get_session(session_id)
         if session is None:
             raise LookupError("会话不存在")
@@ -43,6 +43,15 @@ class TurnService:
         turn = None
         finalized = False
         try:
+            if attachment_ids:
+                try:
+                    attachments = self._sessions.get_attachments(session_id=session_id, attachment_ids=attachment_ids)
+                except LookupError:
+                    yield self._event("turn_failed", error_code="attachment_not_found", retryable=False)
+                    return
+                # 转录并入用户消息：检索、提示词与历史记录看到的是同一份内容。
+                blocks = "\n\n".join(f"[图片转录：{a.filename}]\n{a.transcription}" for a in attachments)
+                message = f"{message}\n\n{blocks}"
             turn, created = self._sessions.start_turn(session_id=session_id, client_request_id=client_request_id)
             yield self._event("turn_started", request_id=turn.id, session_id=session_id, scope_mode=session.scope_mode)
             if not created:

@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import base64
+import threading
+import time
+
+import httpx
+
+from contracts.llm import LLMProviderError, VisionTranscription
+
+# qwen-vl-ocr 的约定提示词：换成自定义中文提示词会返回坐标而不是文字。
+_OCR_PROMPT = "Read all the text in the image."
+
+
+class QwenOcrTranscriber:
+    """DashScope OpenAI-compatible 协议的 Qwen-OCR 适配器（vision 槽位）。"""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        connect_timeout_seconds: float = 10,
+        total_timeout_seconds: float = 180,
+        max_retries: int = 2,
+        client: httpx.Client | None = None,
+    ) -> None:
+        if not api_key or not base_url or not model:
+            raise ValueError("Qwen-OCR adapter requires api_key, base_url and model")
+        self._model = model
+        self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
+        self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        self._max_retries = max(0, max_retries)
+        self._owns_client = client is None
+        timeout = httpx.Timeout(total_timeout_seconds, connect=connect_timeout_seconds)
+        self._client = client or httpx.Client(timeout=timeout)
+        self._state_lock = threading.Lock()
+        self._last_call_ok: bool | None = None
+        self._last_error_code: str | None = None
+
+    @property
+    def provider(self) -> str:
+        return "dashscope"
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def transcribe(self, *, content: bytes, mime_type: str) -> VisionTranscription:
+        image = base64.b64encode(content).decode("ascii")
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image}"}},
+                        {"type": "text", "text": _OCR_PROMPT},
+                    ],
+                }
+            ],
+        }
+        attempt = 0
+        while True:
+            try:
+                response = self._client.post(self._endpoint, json=payload, headers=self._headers)
+                response.raise_for_status()
+                data = response.json()
+                text = str(((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                usage = {k: v for k, v in (data.get("usage") or {}).items() if isinstance(v, int)}
+                self._record_success()
+                return VisionTranscription(
+                    plain_text=text,
+                    provider=self.provider,
+                    model=self.model,
+                    # 空转录视为不可信，按架构 §5.7 交给用户确认，不直接进入讲解。
+                    needs_confirmation=not text,
+                    usage=usage,
+                )
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                retryable = status == 429 or status >= 500
+                if retryable and attempt < self._max_retries:
+                    attempt += 1
+                    time.sleep(0.2 * (2 ** (attempt - 1)))
+                    continue
+                code = f"http_{status}"
+                self._record_failure(code)
+                raise LLMProviderError(code, f"Qwen-OCR 请求失败（HTTP {status}）", retryable=retryable) from error
+            except httpx.RequestError as error:
+                if attempt < self._max_retries:
+                    attempt += 1
+                    time.sleep(0.2 * (2 ** (attempt - 1)))
+                    continue
+                self._record_failure("network_error")
+                raise LLMProviderError("network_error", "暂时无法连接 Qwen-OCR", retryable=True) from error
+            except ValueError as error:
+                self._record_failure("invalid_response")
+                raise LLMProviderError("invalid_response", "Qwen-OCR 返回了无法解析的响应", retryable=False) from error
+
+    def health(self) -> dict[str, object]:
+        with self._state_lock:
+            last_call_ok, last_error_code = self._last_call_ok, self._last_error_code
+        return {
+            "configured": True,
+            "enabled": True,
+            "adapter_available": True,
+            "provider": self.provider,
+            "model": self.model,
+            "last_call_ok": last_call_ok,
+            "last_error_code": last_error_code,
+        }
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def _record_success(self) -> None:
+        with self._state_lock:
+            self._last_call_ok = True
+            self._last_error_code = None
+
+    def _record_failure(self, code: str) -> None:
+        with self._state_lock:
+            self._last_call_ok = False
+            self._last_error_code = code

@@ -15,6 +15,10 @@ class Message:
     resolved_course_color: str | None = None
     resolution_reason: str | None = None
 @dataclass(frozen=True)
+class Attachment:
+    id: str; session_id: str; filename: str; mime_type: str; byte_size: int; width: int; height: int
+    transcription: str; needs_confirmation: bool; provider: str; model: str; created_at: str
+@dataclass(frozen=True)
 class Turn:
     id: str; session_id: str; status: str; client_request_id: str; created_at: str
 @dataclass(frozen=True)

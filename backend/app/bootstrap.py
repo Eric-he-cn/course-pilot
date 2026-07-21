@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from adapters.embedding import BgeEmbedder
-from adapters.llm import DeepSeekTutorResponder, DemoTutorResponder
-from contracts.llm import TutorResponderPort
+from adapters.llm import DeepSeekTutorResponder, DemoTutorResponder, QwenOcrTranscriber
+from contracts.llm import TutorResponderPort, VisionTranscriberPort
 from modules.agent.service import TurnService
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
@@ -35,6 +35,7 @@ class Application:
     turns: TurnService
     learning: LearningService
     planning: PlanningService
+    vision: VisionTranscriberPort | None = None
 
     def llm_health(self) -> dict[str, object]:
         status = self.llm.health()
@@ -46,6 +47,15 @@ class Application:
             requested_provider=self.settings.text_provider,
         )
         return status
+
+    def vision_health(self) -> dict[str, object]:
+        if self.vision is None:
+            return {
+                "configured": self.settings.vision_configured,
+                "enabled": False,
+                "requested_provider": self.settings.vision_provider,
+            }
+        return {**self.vision.health(), "requested_provider": self.settings.vision_provider}
 
 
 def build_application(settings: Settings) -> Application:
@@ -60,6 +70,16 @@ def build_application(settings: Settings) -> Application:
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=settings.llm_total_timeout_seconds,
             max_output_tokens=settings.agent_max_output_tokens,
+            max_retries=settings.llm_max_retries,
+        )
+    vision: VisionTranscriberPort | None = None
+    if settings.enable_remote_llm and settings.vision_configured and settings.vision_provider.lower() == "dashscope":
+        vision = QwenOcrTranscriber(
+            api_key=settings.vision_api_key,
+            base_url=settings.vision_base_url,
+            model=settings.vision_model,
+            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+            total_timeout_seconds=settings.llm_total_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
     store = SQLiteStore(settings.database_path)
@@ -77,7 +97,12 @@ def build_application(settings: Settings) -> Application:
         embedder=embedder,
     )
     resolver = CourseResolver(courses)
-    sessions = SessionService(SessionRepository(store), courses, resolver)
+    sessions = SessionService(
+        SessionRepository(store), courses, resolver,
+        vision=vision,
+        attachment_max_bytes=settings.attachment_max_bytes,
+        attachment_max_pixels=settings.attachment_max_pixels,
+    )
     jobs = KnowledgeJobWorker(
         knowledge,
         workers=settings.background_job_workers,
@@ -88,4 +113,5 @@ def build_application(settings: Settings) -> Application:
         TurnService(sessions, knowledge, llm, fallback),
         LearningService(LearningRepository(store)),
         PlanningService(PlanningRepository(store)),
+        vision,
     )

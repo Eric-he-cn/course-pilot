@@ -59,6 +59,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
     """),
     # 语义检索：chunk 级 float32 向量，缺失时该 chunk 只参与词面检索。
     (8, "ALTER TABLE chunks ADD COLUMN embedding BLOB;"),
+    # 会话图片附件：只保留转录与元数据，处理后的图片不落盘。
+    (9, """
+        CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+            filename TEXT NOT NULL, mime_type TEXT NOT NULL, byte_size INTEGER NOT NULL,
+            width INTEGER NOT NULL, height INTEGER NOT NULL,
+            transcription TEXT NOT NULL, needs_confirmation INTEGER NOT NULL DEFAULT 0,
+            provider TEXT NOT NULL, model TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id, created_at);
+    """),
 )
 
 class SQLiteStore:

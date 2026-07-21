@@ -48,6 +48,34 @@ class TutorResponse:
     usage: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class VisionTranscription:
+    """架构 §5.7 的 vision_transcription_v1；首版只做整图文字转录，不含坐标与 LaTeX 块。"""
+
+    plain_text: str
+    provider: str
+    model: str
+    needs_confirmation: bool
+    schema_version: str = "vision_transcription_v1"
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+class VisionTranscriberPort(Protocol):
+    @property
+    def provider(self) -> str: ...
+
+    @property
+    def model(self) -> str: ...
+
+    def transcribe(self, *, content: bytes, mime_type: str) -> VisionTranscription:
+        """Raise LLMProviderError on provider failure."""
+        ...
+
+    def health(self) -> dict[str, object]: ...
+
+    def close(self) -> None: ...
+
+
 class TutorResponderPort(Protocol):
     @property
     def mode(self) -> str: ...

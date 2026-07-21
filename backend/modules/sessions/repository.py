@@ -33,6 +33,11 @@ class SessionRepository:
     def update_last_resolved_course(self, *, session_id: str, course_id: str | None) -> None:
         if course_id is not None:
             with self._store.write() as c: c.execute("UPDATE sessions SET last_resolved_course_id = ? WHERE id = ?", (course_id, session_id))
+    def insert_attachment(self, *, attachment_id: str, session_id: str, filename: str, mime_type: str, byte_size: int, width: int, height: int, transcription: str, needs_confirmation: bool, provider: str, model: str, timestamp: str) -> None:
+        with self._store.write() as c: c.execute("INSERT INTO attachments(id, session_id, filename, mime_type, byte_size, width, height, transcription, needs_confirmation, provider, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (attachment_id, session_id, filename, mime_type, byte_size, width, height, transcription, int(needs_confirmation), provider, model, timestamp))
+    def get_attachment_rows(self, *, session_id: str, attachment_ids: list[str]):
+        placeholders = ",".join("?" for _ in attachment_ids)
+        with self._store.read() as c: return c.execute(f"SELECT * FROM attachments WHERE session_id = ? AND id IN ({placeholders}) ORDER BY created_at ASC", [session_id, *attachment_ids]).fetchall()
     def finish_turn(self, *, turn_id: str, status: str, timestamp: str) -> None:
         with self._store.write() as c: c.execute("UPDATE turn_requests SET status = ?, completed_at = ? WHERE id = ?", (status, timestamp, turn_id))
     def fail_running_turns(self, *, timestamp: str) -> int:

@@ -44,10 +44,21 @@ class Settings:
     rag_embedding_model: str = ""
     rag_embedding_device: str = "auto"
     rag_embedding_batch_size: int = 256
+    # vision 槽位（OCR）：未配置时附件上传返回 feature_disabled。
+    vision_provider: str = ""
+    vision_base_url: str = ""
+    vision_api_key: str = ""
+    vision_model: str = ""
+    attachment_max_bytes: int = 10 * 1024 * 1024
+    attachment_max_pixels: int = 12_000_000
 
     @property
     def remote_llm_configured(self) -> bool:
         return bool(self.text_api_key and self.text_base_url and self.text_model)
+
+    @property
+    def vision_configured(self) -> bool:
+        return bool(self.vision_api_key and self.vision_base_url and self.vision_model)
 
     @classmethod
     def from_environment(cls, project_root: Path | None = None) -> "Settings":
@@ -75,4 +86,10 @@ class Settings:
             value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"),
             value("RAG_EMBEDDING_DEVICE", "auto"),
             max(1, int(value("RAG_EMBEDDING_BATCH_SIZE", "256"))),
+            value("VISION_PROVIDER"),
+            value("VISION_BASE_URL"),
+            value("VISION_API_KEY"),
+            value("VISION_MODEL"),
+            max(1, int(value("ATTACHMENT_MAX_BYTES", str(10 * 1024 * 1024)))),
+            max(1, int(value("ATTACHMENT_MAX_PIXELS", "12000000"))),
         )
