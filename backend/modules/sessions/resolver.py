@@ -1,0 +1,17 @@
+from __future__ import annotations
+from modules.courses.api import CourseCatalogPort
+from .models import ResolvedCourseContext, SessionSummary
+class CourseResolver:
+    version = "course_resolver_v1"
+    def __init__(self, courses: CourseCatalogPort) -> None: self._courses = courses
+    def resolve(self, *, turn_id: str, session: SessionSummary, message: str) -> ResolvedCourseContext:
+        if session.scope_mode == "course" and session.course_id:
+            course = self._courses.get_course(session.course_id); return ResolvedCourseContext(turn_id, "resolved", session.course_id, course.name if course else None, course.color if course else None, "course_session", self.version)
+        normalized = message.casefold(); candidates = [course for course in self._courses.list_courses() if course.name.casefold() in normalized]
+        if len(candidates) == 1:
+            course = candidates[0]; return ResolvedCourseContext(turn_id, "resolved", course.id, course.name, course.color, "explicit_course_name", self.version)
+        if len(candidates) > 1: return ResolvedCourseContext(turn_id, "ambiguous", None, None, None, "multiple_course_names", self.version)
+        courses = self._courses.list_courses()
+        if len(courses) == 1:
+            course = courses[0]; return ResolvedCourseContext(turn_id, "resolved", course.id, course.name, course.color, "only_available_course", self.version)
+        return ResolvedCourseContext(turn_id, "unresolved", None, None, None, "course_not_identified", self.version)

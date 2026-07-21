@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from typing import Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.bootstrap import Application
+
+
+class CourseCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    color: Optional[str] = None
+
+
+class CourseUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    wiki_enabled: Optional[bool] = None
+
+
+class SessionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope_mode: str
+    course_id: Optional[str] = None
+    title: Optional[str] = None
+
+
+class TurnRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+    client_request_id: str = Field(default_factory=lambda: str(uuid4()))
+
+
+def _not_found(error: Exception) -> HTTPException:
+    return HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(error), "retryable": False}})
+
+
+def create_core_router(application: Application) -> APIRouter:
+    router = APIRouter(prefix="/api/v2", tags=["core"])
+
+    @router.get("/courses")
+    def list_courses():
+        return [asdict(course) for course in application.courses.list_courses()]
+
+    @router.post("/courses", status_code=201)
+    def create_course(request: CourseCreateRequest):
+        try:
+            return asdict(application.courses.create_course(name=request.name, color=request.color))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+
+    @router.patch("/courses/{course_id}")
+    def update_course(course_id: str, request: CourseUpdateRequest):
+        try:
+            course = application.courses.update_course(course_id, name=request.name, wiki_enabled=request.wiki_enabled)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+        if not course:
+            raise _not_found(LookupError("课程不存在"))
+        return asdict(course)
+
+    @router.get("/sessions")
+    def list_sessions(scope_mode: Optional[str] = None, course_id: Optional[str] = None):
+        return [asdict(session) for session in application.sessions.list_sessions(scope_mode=scope_mode, course_id=course_id)]
+
+    @router.post("/sessions", status_code=201)
+    def create_session(request: SessionCreateRequest):
+        try:
+            # HTTP is the Web channel.  Channel adapters call the use case
+            # directly, so a browser cannot impersonate the Feishu source.
+            return asdict(application.sessions.create_session(scope_mode=request.scope_mode, course_id=request.course_id, title=request.title, source="web"))
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+
+    @router.get("/sessions/{session_id}/messages")
+    def list_messages(session_id: str):
+        try:
+            session = application.sessions.get_session(session_id)
+            messages = application.sessions.list_messages(session_id)
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+        return {"session": asdict(session) if session else None, "messages": [asdict(message) for message in messages]}
+
+    @router.post("/sessions/{session_id}/turns")
+    def turn(session_id: str, request: TurnRequest):
+        if application.sessions.get_session(session_id) is None:
+            raise _not_found(LookupError("会话不存在"))
+        def stream():
+            for payload in application.turns.run(session_id=session_id, message=request.message, client_request_id=request.client_request_id):
+                yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], ensure_ascii=False)}\n\n"
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    return router
