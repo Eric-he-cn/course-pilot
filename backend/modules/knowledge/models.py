@@ -13,6 +13,9 @@ class Material:
     index_status: str
     created_at: str
     updated_at: str
+    # 索引产物计数：embedded_count < chunk_count 表示语义向量缺失或不完整。
+    chunk_count: int = 0
+    embedded_count: int = 0
 
 
 @dataclass(frozen=True)

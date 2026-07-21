@@ -55,6 +55,8 @@ export interface Material {
   index_status?: string
   indexed_at?: string | null
   error?: string | null
+  chunk_count?: number
+  embedded_count?: number
 }
 
 export interface Job {

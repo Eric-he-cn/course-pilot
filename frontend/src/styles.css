@@ -9,6 +9,29 @@
 .message-resolution.resolved { background:var(--primary-soft); color:var(--primary-hover) }
 .sidebar-backdrop { display:none }
 
+.context-course { display:inline-flex; align-items:center; gap:6px; color:var(--text); font-weight:650 }
+.context-course i { display:inline-block; width:8px; height:8px; border-radius:50% }
+.suggestion-row { display:flex; flex-wrap:wrap; gap:8px }
+.suggestion-chip { border:1px solid var(--border); border-radius:999px; padding:7px 13px; background:var(--surface); color:var(--text); font-size:13px }
+.suggestion-chip:hover { border-color:#B9D4CB; background:var(--primary-soft) }
+.course-heading { display:flex; align-items:center; gap:10px }
+.course-heading i { display:inline-block; flex:0 0 auto; width:12px; height:12px; border-radius:50% }
+.backend-badge { display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; background:var(--primary-soft); color:var(--primary-hover); font-size:11px; font-weight:700; white-space:nowrap }
+.material-row { grid-template-columns:40px minmax(0,1fr) auto auto }
+.pipeline { display:flex; gap:5px; margin-top:5px }
+.pipeline-step { padding:2px 8px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:10px }
+.pipeline-step.done { border-color:#B9D4CB; background:var(--primary-soft); color:var(--primary-hover) }
+.pipeline-step.current { border-color:var(--primary); background:var(--primary); color:#fff }
+.picker-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:10px; max-width:640px; margin:22px auto 0; text-align:left }
+.picker-card { display:flex; align-items:center; gap:9px; padding:13px 14px; border:1px solid var(--border); border-radius:12px; background:var(--surface) }
+.picker-card:hover { border-color:#B9D4CB; background:var(--primary-soft) }
+.picker-card i { display:inline-block; flex:0 0 auto; width:9px; height:9px; border-radius:50% }
+.picker-card b { overflow:hidden; white-space:nowrap; text-overflow:ellipsis }
+.picker-card em { margin-left:auto; font-style:normal; color:var(--primary); font-size:11px }
+.picker-create { justify-content:center; color:var(--primary); font-weight:650 }
+.health-card details { margin-top:8px }
+.health-card summary { color:var(--muted); font-size:12px; cursor:pointer }
+
 @media (max-width:959px) {
   .sidebar-backdrop { position:fixed; z-index:2; inset:0; display:block; border:0; background:rgb(23 32 29 / 35%); cursor:default }
 }

@@ -10,11 +10,20 @@ from contracts.knowledge import Citation, KnowledgeHit
 from .models import Chunk, Job, Material
 
 
+_MATERIAL_SELECT = """
+    SELECT m.*,
+        (SELECT count(*) FROM chunks c WHERE c.material_id = m.id) AS chunk_count,
+        (SELECT count(*) FROM chunks c WHERE c.material_id = m.id AND c.embedding IS NOT NULL) AS embedded_count
+    FROM materials m
+"""
+
+
 def _material(row: object) -> Material:
     return Material(
         id=row["id"], course_id=row["course_id"], filename=row["filename"],
         mime_type=row["mime_type"], byte_size=row["byte_size"], index_status=row["index_status"],
         created_at=row["created_at"], updated_at=row["updated_at"],
+        chunk_count=row["chunk_count"], embedded_count=row["embedded_count"],
     )
 
 
@@ -51,7 +60,7 @@ class KnowledgeRepository:
 
     def get_material(self, material_id: str) -> Material | None:
         with self._store.read() as conn:
-            row = conn.execute("SELECT * FROM materials WHERE id = ?", (material_id,)).fetchone()
+            row = conn.execute(f"{_MATERIAL_SELECT} WHERE m.id = ?", (material_id,)).fetchone()
         return _material(row) if row else None
 
     def material_storage_path(self, material_id: str) -> Path | None:
@@ -61,7 +70,7 @@ class KnowledgeRepository:
 
     def list_materials(self, *, course_id: str) -> list[Material]:
         with self._store.read() as conn:
-            rows = conn.execute("SELECT * FROM materials WHERE course_id = ? ORDER BY created_at DESC", (course_id,)).fetchall()
+            rows = conn.execute(f"{_MATERIAL_SELECT} WHERE m.course_id = ? ORDER BY m.created_at DESC", (course_id,)).fetchall()
         return [_material(row) for row in rows]
 
     def set_material_status(self, material_id: str, status: str) -> None:
