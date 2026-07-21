@@ -91,6 +91,37 @@ def test_general_turn_resolves_per_turn_and_uses_course_scoped_evidence(client):
     assert stored["course_id"] is None
 
 
+def test_general_follow_up_reuses_recent_resolution_and_fresh_session_stays_unresolved(client):
+    calculus = client.post("/api/v2/courses", json={"name": "高等数学 II"}).json()
+    client.post("/api/v2/courses", json={"name": "大学物理"})
+
+    session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+    first = _events(client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "r-1", "message": "高等数学 II 的链式法则怎么用？"}).text)
+    assert first[1][1]["status"] == "resolved"
+
+    follow_up = _events(client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "r-2", "message": "那乘积法则呢？"}).text)
+    assert follow_up[1][1]["status"] == "resolved"
+    assert follow_up[1][1]["resolved_course_id"] == calculus["id"]
+    assert follow_up[1][1]["reason"] == "recent_resolution"
+
+    fresh = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+    vague = _events(client.post(f"/api/v2/sessions/{fresh['id']}/turns", json={"client_request_id": "r-3", "message": "那乘积法则呢？"}).text)
+    assert vague[1][1]["status"] == "unresolved"
+
+
+def test_default_titled_session_is_named_by_first_user_message(client):
+    session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+    assert session["title"] == "新学习对话"
+    client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "t-1", "message": "极限的 ε-δ 定义到底怎么理解？我总是记不住量词顺序"})
+    titled = client.get(f"/api/v2/sessions/{session['id']}/messages").json()["session"]
+    assert titled["title"] == "极限的 ε-δ 定义到底怎么理解？我总是记不住量词顺序"[:30]
+
+    named = client.post("/api/v2/sessions", json={"scope_mode": "general", "title": "求导问题"}).json()
+    client.post(f"/api/v2/sessions/{named['id']}/turns", json={"client_request_id": "t-2", "message": "链式法则"})
+    kept = client.get(f"/api/v2/sessions/{named['id']}/messages").json()["session"]
+    assert kept["title"] == "求导问题"
+
+
 def test_course_session_is_immutable_and_invalid_general_course_binding_is_rejected(client):
     course = client.post("/api/v2/courses", json={"name": "线性代数"}).json()
     invalid = client.post("/api/v2/sessions", json={"scope_mode": "general", "course_id": course["id"]})

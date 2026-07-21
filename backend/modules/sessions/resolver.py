@@ -11,6 +11,10 @@ class CourseResolver:
         if len(candidates) == 1:
             course = candidates[0]; return ResolvedCourseContext(turn_id, "resolved", course.id, course.name, course.color, "explicit_course_name", self.version)
         if len(candidates) > 1: return ResolvedCourseContext(turn_id, "ambiguous", None, None, None, "multiple_course_names", self.version)
+        if session.resolved_course_id:
+            # 通用会话沿用最近一次可靠解析，用户追问不必每轮重复课程名。
+            course = self._courses.get_course(session.resolved_course_id)
+            if course: return ResolvedCourseContext(turn_id, "resolved", course.id, course.name, course.color, "recent_resolution", self.version)
         courses = self._courses.list_courses()
         if len(courses) == 1:
             course = courses[0]; return ResolvedCourseContext(turn_id, "resolved", course.id, course.name, course.color, "only_available_course", self.version)

@@ -26,7 +26,10 @@ class SessionRepository:
             if existing: return existing, False
             c.execute("INSERT INTO turn_requests(id, session_id, client_request_id, status, created_at) VALUES (?, ?, ?, 'running', ?)", (turn_id, session_id, client_request_id, timestamp)); return c.execute("SELECT * FROM turn_requests WHERE id = ?", (turn_id,)).fetchone(), True
     def save_course_context(self, *, turn_id: str, resolution_status: str, resolved_course_id: str | None, resolver_version: str, reason: str, timestamp: str) -> None:
-        with self._store.write() as c: c.execute("INSERT OR REPLACE INTO turn_course_context(turn_id, resolution_status, resolved_course_id, resolver_version, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)", (turn_id, resolution_status, resolved_course_id, resolver_version, reason, timestamp))
+        # 纯 INSERT：turn_course_context 是不可变记录，重复写入应当报错而不是覆盖。
+        with self._store.write() as c: c.execute("INSERT INTO turn_course_context(turn_id, resolution_status, resolved_course_id, resolver_version, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)", (turn_id, resolution_status, resolved_course_id, resolver_version, reason, timestamp))
+    def set_title_if_default(self, *, session_id: str, title: str, default: str, timestamp: str) -> None:
+        with self._store.write() as c: c.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND title = ?", (title, timestamp, session_id, default))
     def update_last_resolved_course(self, *, session_id: str, course_id: str | None) -> None:
         if course_id is not None:
             with self._store.write() as c: c.execute("UPDATE sessions SET last_resolved_course_id = ? WHERE id = ?", (course_id, session_id))

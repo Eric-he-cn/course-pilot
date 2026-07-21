@@ -7,6 +7,7 @@ from .api import CourseResolverPort, SessionBusyError
 from .models import Message, ResolvedCourseContext, SessionSummary, Turn
 from .repository import SessionRepository
 class SessionService:
+    DEFAULT_TITLE = "新学习对话"
     def __init__(self, repository: SessionRepository, courses: CourseCatalogPort, resolver: CourseResolverPort) -> None: self._repository, self._courses, self._resolver = repository, courses, resolver
     def _summary(self, row) -> SessionSummary:
         projected_id = row["course_id"] or row["last_resolved_course_id"]; course = self._courses.get_course(projected_id) if projected_id else None
@@ -27,7 +28,7 @@ class SessionService:
             if existing: return self._summary(existing)
         session_id, timestamp = new_id("session"), utc_now()
         try:
-            self._repository.insert_session(session_id=session_id, title=(title or "新学习对话").strip()[:120] or "新学习对话", scope_mode=scope_mode, course_id=course_id, source=source, owner_id=owner_id, timestamp=timestamp)
+            self._repository.insert_session(session_id=session_id, title=(title or self.DEFAULT_TITLE).strip()[:120] or self.DEFAULT_TITLE, scope_mode=scope_mode, course_id=course_id, source=source, owner_id=owner_id, timestamp=timestamp)
         except sqlite3.IntegrityError:
             # The Feishu uniqueness index resolves a concurrent first delivery.
             existing = self._repository.get_source_session_row(source="feishu", scope_mode="general", owner_id=owner_id)
@@ -54,7 +55,12 @@ class SessionService:
         if not session: raise LookupError("会话不存在")
         context = self._resolver.resolve(turn_id=turn.id, session=session, message=message); self._repository.save_course_context(turn_id=turn.id, resolution_status=context.status, resolved_course_id=context.course_id, resolver_version=context.resolver_version, reason=context.reason, timestamp=utc_now()); self._repository.update_last_resolved_course(session_id=turn.session_id, course_id=context.course_id); return context
     def append_message(self, *, session_id: str, turn_id: str | None, role: str, content: str, citations: list[dict] | None = None, status: str = "complete") -> Message:
-        message_id, timestamp = new_id("message"), utc_now(); safe = citations or []; self._repository.insert_message(message_id=message_id, session_id=session_id, turn_id=turn_id, role=role, content=content, citations=safe, status=status, timestamp=timestamp); return Message(message_id, turn_id, role, content, safe, status, timestamp)
+        message_id, timestamp = new_id("message"), utc_now(); safe = citations or []; self._repository.insert_message(message_id=message_id, session_id=session_id, turn_id=turn_id, role=role, content=content, citations=safe, status=status, timestamp=timestamp)
+        if role == "user":
+            derived = " ".join(content.split())[:30]
+            # 仍是默认标题的会话用首条用户消息命名，会话列表可辨认。
+            if derived: self._repository.set_title_if_default(session_id=session_id, title=derived, default=self.DEFAULT_TITLE, timestamp=timestamp)
+        return Message(message_id, turn_id, role, content, safe, status, timestamp)
     def complete_turn(self, turn_id: str, *, status: str) -> None: self._repository.finish_turn(turn_id=turn_id, status=status, timestamp=utc_now())
     def recover_stale_turns(self) -> int:
         """进程崩溃遗留的 running turn 会永久占用会话锁，启动时统一落为 failed。"""
