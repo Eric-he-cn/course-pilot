@@ -225,7 +225,7 @@ APP_LOG_LEVEL=INFO
 
 截至 2026-07-20，正式模型名是 `deepseek-v4-flash / deepseek-v4-pro`；`deepseek-chat / deepseek-reasoner` 仅是 Flash 非思考/思考模式的兼容别名，并将在 2026-07-24 23:59（北京时间）下线。首版固定 `deepseek-v4-flash`，不再保留两个旧模型名。官方模型支持 1M context，但 API 没有“把窗口改成 128K”的独立参数；CoursePilot 通过上下文组装器限制发送的 token 数。[DeepSeek 模型与价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)、[Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)。
 
-当前实现状态（2026-07-21）：`contracts/llm.py` 定义供应商无关的 Tutor 请求/响应，`adapters/llm/deepseek.py` 实现真实 Chat Completions，`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；供应商错误通过类型化错误回到 Demo Adapter，SSE 会显式发出 fallback 事件。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
+当前实现状态（2026-07-21）：`contracts/llm.py` 定义供应商无关的 Tutor 增量流协议（deltas + 终态摘要），`adapters/llm/deepseek.py` 实现流式 Chat Completions（重试仅发生在首个增量之前），`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
 
 128K 软窗口分配如下，超过任一分区先裁剪该分区，不借用 output/reserve：
 

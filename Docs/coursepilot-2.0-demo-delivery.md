@@ -63,6 +63,8 @@ HTTP / SSE / Web / Feishu adapters
 | `POST` | `/api/v2/courses/{course_id}/knowledge/search` | 知识仓库中对用户明确选定的课程做检索验证；通用对话不调用此自由接口 |
 | `PATCH` | `/api/v2/courses/{id}` | 修改 `wiki_enabled` 等课程设置 |
 | `POST` | `/api/v2/materials/{id}/wiki` | 用户显式触发 Wiki Demo job |
+| `GET` | `/api/v2/courses/{id}/plan` | 只读计划骨架：返回持久化计划或 `null`，写接口随规划功能开放 |
+| `GET` | `/api/v2/courses/{id}/archive` | 只读档案骨架：返回证据事件计数与最近事件 |
 | `GET` | `/api/v2/health` | 返回 DB、LLM 配置和 Demo fallback 状态 |
 
 `SessionSummary` 最少包含：
@@ -98,9 +100,11 @@ SSE 稳定顺序为：
 ```text
 turn_started      {request_id, session_id, scope_mode}
 course_resolution {status, resolved_course_id?, course_name?, course_color?, reason}
-citation/text_delta/usage...
+citation/text_delta（流式增量）...
 turn_completed | turn_failed
 ```
+
+供应商在输出任何增量前失败时发 `provider_fallback` 并切换本地 responder；已输出增量后中断则发 `stream_interrupted`，部分回答以 `interrupted` 状态持久化，随后以 `turn_failed` 结束，不静默重放。
 
 只有 `course_resolution.status=resolved` 后才允许执行课程 RAG/Wiki/档案工具；`ambiguous/unresolved` 直接产生澄清回复。
 
