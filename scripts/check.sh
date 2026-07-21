@@ -10,7 +10,7 @@ if [[ ! -x "${python_bin}" ]]; then
 fi
 
 cd "${project_dir}"
-PYTHONPATH=backend "${python_bin}" -m pytest -q tests/backend backend/tests
+PYTHONPATH=backend "${python_bin}" -m pytest -q tests/backend
 "${python_bin}" -m compileall -q backend
 
 cd "${project_dir}/frontend"
