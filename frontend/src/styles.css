@@ -32,6 +32,22 @@
 .health-card details { margin-top:8px }
 .health-card summary { color:var(--muted); font-size:12px; cursor:pointer }
 
+/* 助手消息的 Markdown 正文 */
+.message-content { white-space:normal }
+.message-content>*:first-child { margin-top:0 }
+.message-content>*:last-child { margin-bottom:0 }
+.message-content p { margin:0 0 12px }
+.message-content ul,.message-content ol { margin:0 0 12px; padding-left:22px }
+.message-content li { margin:4px 0 }
+.message-content h1,.message-content h2,.message-content h3,.message-content h4 { margin:18px 0 8px; font-size:16px }
+.message-content code { padding:1px 5px; border-radius:5px; background:#EEF1EC; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:13px }
+.message-content pre { overflow-x:auto; margin:0 0 12px; padding:12px; border-radius:9px; background:#F0F2EE }
+.message-content pre code { padding:0; background:transparent; font-size:12px }
+.message-content blockquote { margin:0 0 12px; padding-left:12px; border-left:2px solid #B7C9C2; color:#44504B }
+.message-content table { margin:0 0 12px; border-collapse:collapse; font-size:13px }
+.message-content th,.message-content td { padding:6px 10px; border:1px solid var(--border); text-align:left }
+.message-content a { color:var(--primary) }
+
 @media (max-width:959px) {
   .sidebar-backdrop { position:fixed; z-index:2; inset:0; display:block; border:0; background:rgb(23 32 29 / 35%); cursor:default }
 }
