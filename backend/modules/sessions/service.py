@@ -56,3 +56,6 @@ class SessionService:
     def append_message(self, *, session_id: str, turn_id: str | None, role: str, content: str, citations: list[dict] | None = None, status: str = "complete") -> Message:
         message_id, timestamp = new_id("message"), utc_now(); safe = citations or []; self._repository.insert_message(message_id=message_id, session_id=session_id, turn_id=turn_id, role=role, content=content, citations=safe, status=status, timestamp=timestamp); return Message(message_id, turn_id, role, content, safe, status, timestamp)
     def complete_turn(self, turn_id: str, *, status: str) -> None: self._repository.finish_turn(turn_id=turn_id, status=status, timestamp=utc_now())
+    def recover_stale_turns(self) -> int:
+        """进程崩溃遗留的 running turn 会永久占用会话锁，启动时统一落为 failed。"""
+        return self._repository.fail_running_turns(timestamp=utc_now())

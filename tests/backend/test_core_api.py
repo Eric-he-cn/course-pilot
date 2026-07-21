@@ -195,6 +195,40 @@ def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
     assert events[5][1]["responder_mode"] == "demo_fallback"
 
 
+def test_client_disconnect_mid_stream_does_not_brick_the_session(client):
+    client.post("/api/v2/courses", json={"name": "高等数学"})
+    session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+    turns = client.app.state.application.turns
+
+    generator = turns.run(session_id=session["id"], message="链式法则", client_request_id="disconnect-1")
+    first = next(generator)
+    assert first["event"] == "turn_started"
+    generator.close()  # 模拟客户端断连：在 yield 处抛 GeneratorExit
+
+    with client.app.state.application.store.read() as connection:
+        row = connection.execute("SELECT status FROM turn_requests WHERE client_request_id = 'disconnect-1'").fetchone()
+    assert row["status"] == "failed"
+
+    retry = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "disconnect-2", "message": "继续讲"})
+    events = _events(retry.text)
+    assert events[-1][0] == "turn_completed"
+
+
+def test_startup_recovers_stale_running_turns(tmp_path):
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings=settings)) as first:
+        session = first.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+        turn, created = first.app.state.application.sessions.start_turn(session_id=session["id"], client_request_id="crash-1")
+        assert created is True
+        # 不 complete，模拟进程在 turn 进行中崩溃
+
+    with TestClient(create_app(settings=settings)) as second:
+        recovered_sessions = second.app.state.application.sessions
+        next_turn, created = recovered_sessions.start_turn(session_id=session["id"], client_request_id="crash-2")
+        assert created is True
+        recovered_sessions.complete_turn(next_turn.id, status="completed")
+
+
 def test_health_reports_enabled_deepseek_adapter_without_exposing_key(tmp_path):
     settings = replace(_settings(tmp_path), text_api_key="test-secret", enable_remote_llm=True)
     with TestClient(create_app(settings=settings)) as remote_client:

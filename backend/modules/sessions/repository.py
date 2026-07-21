@@ -32,3 +32,5 @@ class SessionRepository:
             with self._store.write() as c: c.execute("UPDATE sessions SET last_resolved_course_id = ? WHERE id = ?", (course_id, session_id))
     def finish_turn(self, *, turn_id: str, status: str, timestamp: str) -> None:
         with self._store.write() as c: c.execute("UPDATE turn_requests SET status = ?, completed_at = ? WHERE id = ?", (status, timestamp, turn_id))
+    def fail_running_turns(self, *, timestamp: str) -> int:
+        with self._store.write() as c: return c.execute("UPDATE turn_requests SET status = 'failed', completed_at = ? WHERE status = 'running'", (timestamp,)).rowcount

@@ -40,10 +40,14 @@ class TurnService:
         if not lock.acquire(blocking=False):
             yield self._event("turn_failed", error_code="session_busy", retryable=True)
             return
+        turn = None
+        finalized = False
         try:
             turn, created = self._sessions.start_turn(session_id=session_id, client_request_id=client_request_id)
             yield self._event("turn_started", request_id=turn.id, session_id=session_id, scope_mode=session.scope_mode)
             if not created:
+                # 重放的 turn 已有终态，不能在 finally 里改写它。
+                finalized = True
                 yield self._event("turn_completed", message_id=None, finish_reason="idempotent_replay")
                 return
             self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="user", content=message)
@@ -105,6 +109,7 @@ class TurnService:
             yield self._event("text_delta", seq=1, text=answer)
             assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations)
             self._sessions.complete_turn(turn.id, status="completed")
+            finalized = True
             yield self._event(
                 "turn_completed",
                 message_id=assistant.id,
@@ -117,11 +122,13 @@ class TurnService:
         except SessionBusyError:
             yield self._event("turn_failed", error_code="session_busy", retryable=True)
         except Exception:
-            # A terminal status prevents a stale running turn after an application error.
-            try:
-                self._sessions.complete_turn(turn.id, status="failed")  # type: ignore[name-defined]
-            except Exception:
-                pass
             yield self._event("turn_failed", error_code="turn_failed", retryable=False)
         finally:
+            # finally 对 GeneratorExit（客户端断连）也生效：任何未走到终态的 turn
+            # 在这里落为 failed，避免 running 残留把会话永久锁死。
+            if turn is not None and not finalized:
+                try:
+                    self._sessions.complete_turn(turn.id, status="failed")
+                except Exception:
+                    pass
             lock.release()
