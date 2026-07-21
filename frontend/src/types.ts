@@ -72,3 +72,34 @@ export interface SearchResult extends Citation {
   course_id?: string
   course_name?: string
 }
+
+export interface PlanItem {
+  id: string
+  due_date: string
+  title: string
+  status: string
+  concept_id?: string | null
+}
+
+export interface Plan {
+  id: string
+  course_id: string
+  status: string
+  version: number
+  items: PlanItem[]
+}
+
+export interface EvidenceEvent {
+  id: string
+  kind: string
+  concept_id?: string | null
+  attribution_status?: string
+  topic_hint?: string | null
+  created_at: string
+}
+
+export interface ArchiveSummary {
+  course_id: string
+  evidence_count: number
+  events: EvidenceEvent[]
+}

@@ -35,6 +35,28 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
     """),
     (6, "ALTER TABLE turn_course_context ADD COLUMN created_at TEXT;"),
+    # 学习档案与计划的存储骨架：读接口先行，写链路随掌握度/规划功能落地。
+    (7, """
+        CREATE TABLE IF NOT EXISTS evidence_events (
+            id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(id),
+            concept_id TEXT, attribution_status TEXT NOT NULL DEFAULT 'unattributed',
+            topic_hint TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_course_created ON evidence_events(course_id, created_at);
+        CREATE TABLE IF NOT EXISTS plans (
+            id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(id),
+            status TEXT NOT NULL DEFAULT 'active', version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_active_plan_per_course ON plans(course_id) WHERE status = 'active';
+        CREATE TABLE IF NOT EXISTS plan_items (
+            id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES plans(id),
+            due_date TEXT NOT NULL, title TEXT NOT NULL, concept_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_items_plan ON plan_items(plan_id, due_date);
+    """),
 )
 
 class SQLiteStore:

@@ -10,6 +10,10 @@ from modules.courses.service import CourseService
 from modules.knowledge.repository import KnowledgeRepository
 from modules.knowledge.service import KnowledgeService
 from modules.knowledge.worker import KnowledgeJobWorker
+from modules.learning.repository import LearningRepository
+from modules.learning.service import LearningService
+from modules.planning.repository import PlanningRepository
+from modules.planning.service import PlanningService
 from modules.sessions.resolver import CourseResolver
 from modules.sessions.repository import SessionRepository
 from modules.sessions.service import SessionService
@@ -28,6 +32,8 @@ class Application:
     sessions: SessionService
     llm: TutorResponderPort
     turns: TurnService
+    learning: LearningService
+    planning: PlanningService
 
     def llm_health(self) -> dict[str, object]:
         status = self.llm.health()
@@ -70,4 +76,9 @@ def build_application(settings: Settings) -> Application:
         workers=settings.background_job_workers,
         queue_capacity=settings.background_job_queue_capacity,
     )
-    return Application(settings, store, courses, knowledge, jobs, sessions, llm, TurnService(sessions, knowledge, llm, fallback))
+    return Application(
+        settings, store, courses, knowledge, jobs, sessions, llm,
+        TurnService(sessions, knowledge, llm, fallback),
+        LearningService(LearningRepository(store)),
+        PlanningService(PlanningRepository(store)),
+    )

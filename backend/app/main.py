@@ -14,6 +14,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     from app.http.core import create_core_router
     from app.http.errors import error_response, normalize_http_detail
     from app.http.knowledge import build_knowledge_router
+    from app.http.study import build_study_router
     application = build_application(settings or Settings.from_environment())
 
     @asynccontextmanager
@@ -46,6 +47,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             llm_health=application.llm_health,
         )
     )
+    app.include_router(build_study_router(learning=application.learning, planning=application.planning, courses=application.courses))
     return app
 
 

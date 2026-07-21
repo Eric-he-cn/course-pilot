@@ -162,6 +162,20 @@ def test_wiki_job_requires_explicit_flag_and_completed_index(client):
     assert not_indexed.json()["error"]["code"] == "material_not_indexed"
 
 
+def test_plan_and_archive_read_skeletons_return_persisted_empty_state(client):
+    assert client.get("/api/v2/courses/no-such-course/plan").status_code == 404
+    assert client.get("/api/v2/courses/no-such-course/archive").status_code == 404
+
+    course = client.post("/api/v2/courses", json={"name": "常微分方程"}).json()
+    plan = client.get(f"/api/v2/courses/{course['id']}/plan")
+    assert plan.status_code == 200
+    assert plan.json() == {"plan": None}
+
+    archive = client.get(f"/api/v2/courses/{course['id']}/archive")
+    assert archive.status_code == 200
+    assert archive.json() == {"course_id": course["id"], "evidence_count": 0, "events": []}
+
+
 def test_errors_use_a_stable_envelope(client):
     response = client.get("/api/v2/jobs/not-a-job")
     assert response.status_code == 404
