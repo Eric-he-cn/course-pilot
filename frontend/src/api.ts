@@ -1,4 +1,4 @@
-import type { ArchiveSummary, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode } from './types'
+import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 type BackendCitation = Citation & { citation_id?: string; document?: string; snippet?: string }
@@ -51,16 +51,20 @@ export const api = {
     const body = new FormData(); body.set('file', file)
     return request<Material>(`/courses/${courseId}/materials`, { method: 'POST', body })
   },
+  uploadAttachment: (sessionId: string, file: File) => {
+    const body = new FormData(); body.set('file', file)
+    return request<Attachment>(`/sessions/${sessionId}/attachments`, { method: 'POST', body })
+  },
   indexMaterial: (materialId: string) => request<Job>(`/materials/${materialId}/index`, json('POST')),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   buildWiki: (materialId: string) => request<Job>(`/materials/${materialId}/wiki`, json('POST')),
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),
   plan: (courseId: string) => request<{ plan: Plan | null }>(`/courses/${courseId}/plan`),
   archive: (courseId: string) => request<ArchiveSummary>(`/courses/${courseId}/archive`),
-  async turn(sessionId: string, content: string, onEvent: (payload: { type?: string; event?: string; status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null }) => void): Promise<void> {
+  async turn(sessionId: string, content: string, onEvent: (payload: { type?: string; event?: string; status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null }) => void, attachmentIds: string[] = []): Promise<void> {
     let response: Response
     try {
-      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, json('POST', { message: content }))
+      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, json('POST', { message: content, attachment_ids: attachmentIds }))
     } catch { throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。') }
     if (!response.ok || !response.body) {
       let detail = ''
@@ -85,6 +89,7 @@ export const api = {
           if (eventName === 'turn_failed') {
             const message = payload.error_code === 'session_busy' ? '该会话正在生成回答，请稍后重试。'
               : payload.error_code === 'stream_interrupted' ? '回答在生成中被中断，已生成的内容已保留。'
+              : payload.error_code === 'attachment_not_found' ? '图片附件无效或不属于当前会话，请重新上传。'
               : '本次回答未能完成，请重试。'
             throw new ApiError(message)
           }

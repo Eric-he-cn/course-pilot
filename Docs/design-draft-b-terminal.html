@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>方案 B · Terminal — 极客工具风</title>
+<style>
+:root {
+  --bg:#FFFFFF; --panel:#FAFAFA; --text:#18181B; --muted:#71717A;
+  --border:#E4E4E7; --accent:#059669; --accent-soft:#ECFDF5;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue","PingFang SC","Noto Sans SC",sans-serif;
+  color:var(--text); background:var(--bg); font-size:14px;
+  -webkit-font-smoothing:antialiased;
+}
+* { box-sizing:border-box; margin:0 }
+body { display:grid; grid-template-columns:252px 1fr; grid-template-rows:1fr 28px; height:100vh; overflow:hidden }
+svg { flex:0 0 auto }
+.mono { font-family:var(--mono) }
+
+/* sidebar */
+aside { grid-row:1/3; display:flex; flex-direction:column; padding:16px 10px 12px; border-right:1px solid var(--border); background:var(--panel); overflow:hidden }
+.brand { display:flex; align-items:center; gap:9px; padding:0 8px 18px }
+.brand-glyph { display:grid; place-items:center; width:28px; height:28px; border-radius:7px; background:var(--text); color:#fff; font-family:var(--mono); font-size:13px; font-weight:700 }
+.brand b { font-size:14px; font-weight:650; letter-spacing:-.01em }
+.ver { margin-left:2px; padding:1px 5px; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--muted); font-family:var(--mono); font-size:10px }
+.section { padding:14px 8px 5px; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.1em }
+.item { display:flex; align-items:center; gap:9px; width:100%; padding:6.5px 8px; border:1px solid transparent; border-radius:6px; background:transparent; color:var(--text); font-size:13px; text-align:left; cursor:pointer }
+.item:hover { background:var(--bg); border-color:var(--border) }
+.item.active { background:var(--bg); border-color:var(--border); box-shadow:0 1px 2px rgba(0,0,0,.04) }
+.item .ico { display:grid; place-items:center; width:18px; color:var(--muted) }
+.item.active .ico { color:var(--accent) }
+.item .num { width:18px; color:var(--muted); font-family:var(--mono); font-size:10.5px }
+.item.active .num { color:var(--accent) }
+.dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto }
+.item small { margin-left:auto; color:var(--muted); font-family:var(--mono); font-size:10px }
+.sessions { overflow-y:auto; min-height:0 }
+.session-title { overflow:hidden; white-space:nowrap; text-overflow:ellipsis }
+.foot { margin-top:auto; padding-top:10px; border-top:1px solid var(--border) }
+
+/* main */
+main { display:flex; flex-direction:column; min-width:0 }
+header { display:flex; align-items:center; gap:12px; flex:0 0 46px; padding:0 16px; border-bottom:1px solid var(--border) }
+.crumb { display:flex; align-items:center; gap:7px; font-family:var(--mono); font-size:12px; color:var(--muted) }
+.crumb b { color:var(--text); font-weight:600 }
+.crumb .dot { background:#176B5B }
+.kbd { display:inline-flex; align-items:center; gap:5px; margin-left:auto; padding:3px 8px; border:1px solid var(--border); border-radius:6px; color:var(--muted); font-family:var(--mono); font-size:11px; background:var(--bg) }
+
+.messages { flex:1; overflow-y:auto; padding:28px max(20px, calc((100% - 720px)/2)) }
+.turn-q { display:flex; justify-content:flex-end; margin-bottom:24px }
+.turn-q>div { max-width:72%; padding:9px 13px; border:1px solid var(--border); border-radius:8px; background:var(--panel); line-height:1.6 }
+.turn-a { max-width:720px; margin-bottom:30px }
+.a-head { display:flex; align-items:center; gap:7px; margin-bottom:10px; font-family:var(--mono); font-size:11px; color:var(--muted) }
+.a-head .prompt { color:var(--accent); font-weight:700 }
+.turn-a p { margin:0 0 12px; line-height:1.75; font-size:14px }
+.turn-a p:last-of-type { margin-bottom:0 }
+.refs { display:flex; flex-wrap:wrap; gap:5px 14px; margin-top:14px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--panel) }
+.refs-label { flex:0 0 100%; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.08em }
+.ref { display:inline-flex; align-items:center; gap:5px; border:0; background:none; padding:0; color:var(--text); font-family:var(--mono); font-size:11.5px; cursor:pointer }
+.ref:hover { color:var(--accent) }
+.ref i { font-style:normal; color:var(--accent) }
+
+.composer-wrap { padding:12px max(20px, calc((100% - 720px)/2)) 14px }
+.composer { display:flex; align-items:center; gap:10px; padding:11px 12px; border:1px solid var(--border); border-radius:8px; background:var(--bg); box-shadow:0 1px 2px rgba(0,0,0,.04) }
+.composer:hover { border-color:#D4D4D8 }
+.composer .prompt { color:var(--accent); font-family:var(--mono); font-weight:700 }
+.composer span { flex:1; color:var(--muted) }
+.send { display:grid; place-items:center; width:28px; height:28px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--muted); cursor:pointer }
+.send:hover { color:var(--accent); border-color:var(--accent) }
+
+/* status bar */
+.statusbar { grid-column:2; display:flex; align-items:center; gap:16px; padding:0 14px; border-top:1px solid var(--border); background:var(--panel); color:var(--muted); font-family:var(--mono); font-size:10.5px }
+.statusbar .ok { color:var(--accent) }
+.statusbar .right { margin-left:auto }
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="brand">
+    <div class="brand-glyph">&gt;_</div>
+    <b>CoursePilot</b><span class="ver">v2.0</span>
+  </div>
+
+  <div class="section">WORKSPACE</div>
+  <button class="item active">
+    <span class="ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18" opacity=".35"/></svg></span>
+    通用模式
+  </button>
+  <button class="item"><span class="dot" style="background:#176B5B"></span>LLM</button>
+
+  <div class="section">NAV</div>
+  <button class="item"><span class="num">01</span>对话</button>
+  <button class="item"><span class="num">02</span>知识仓库</button>
+  <button class="item"><span class="num">03</span>学习计划</button>
+  <button class="item"><span class="num">04</span>学习档案</button>
+
+  <div class="section">SESSIONS</div>
+  <div class="sessions">
+    <button class="item active"><span class="dot" style="background:#176B5B"></span><span class="session-title">注意力机制是什么？</span><small>15:41</small></button>
+    <button class="item"><span class="dot" style="background:#D4D4D8"></span><span class="session-title">新学习对话</span><small>16:01</small></button>
+    <button class="item"><span class="dot" style="background:#176B5B"></span><span class="session-title">Transformer 结构梳理</span><small>07-20</small></button>
+  </div>
+
+  <div class="foot">
+    <button class="item">
+      <span class="ico"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></span>
+      管理与设置
+    </button>
+  </div>
+</aside>
+
+<main>
+  <header>
+    <div class="crumb"><span class="dot"></span><span>LLM</span><span>/</span><b>注意力机制是什么？</b></div>
+    <span class="kbd">⌘K 搜索</span>
+  </header>
+
+  <div class="messages">
+    <div class="turn-q"><div>注意力机制是什么？</div></div>
+
+    <div class="turn-a">
+      <div class="a-head"><span class="prompt">❯</span> coursepilot · deepseek-v4-flash</div>
+      <p>根据课程资料，注意力机制的核心思想是：不再将整个输入序列压缩成一个固定长度的向量，而是让解码器（decoder）在生成每一个输出时，能够动态地重新“回顾”输入序列中的不同部分。这样，模型可以更灵活地选择哪些输入信息对当前输出更重要。</p>
+      <p>最初，注意力被用作增强编码器-解码器循环神经网络（RNN）的一种方式，但后来发现它的重要性远不止于此。2017 年提出的 Transformer 架构完全摒弃了循环连接，纯粹基于注意力机制，这也标志着它成为现代深度学习模型的核心组件。</p>
+      <div class="refs">
+        <span class="refs-label">SOURCES · 3</span>
+        <button class="ref"><i>[1]</i>d2l-en.pdf:409</button>
+        <button class="ref"><i>[2]</i>d2l-en.pdf:450</button>
+        <button class="ref"><i>[3]</i>d2l-en.pdf:42</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="composer-wrap">
+    <div class="composer">
+      <span class="prompt">❯</span>
+      <span>写下你的思路，或继续提问…</span>
+      <button class="send">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+  </div>
+</main>
+
+<div class="statusbar">
+  <span><span class="ok">●</span> connected</span>
+  <span>deepseek-v4-flash</span>
+  <span>retrieval: hybrid_bge</span>
+  <span class="right">session 4f2a · tokens 1.2k</span>
+</div>
+
+</body>
+</html>

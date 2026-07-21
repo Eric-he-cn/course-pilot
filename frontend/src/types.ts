@@ -44,6 +44,16 @@ export interface Message {
   artifact?: { kind: string; visibility?: string; payload?: unknown }
 }
 
+export interface Attachment {
+  id: string
+  session_id: string
+  filename: string
+  transcription: string
+  needs_confirmation: boolean
+  provider?: string
+  model?: string
+}
+
 export interface Material {
   id: string
   filename?: string

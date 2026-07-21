@@ -2,15 +2,15 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 're
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ApiError, api } from './api'
-import type { ArchiveSummary, Citation, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings'
 type Workspace = { scope: ScopeMode; courseId?: string }
 type TurnResolution = { sessionId: string; status: string; courseId: string | null; courseName: string | null }
 
 const viewNames: Record<View, string> = { chat: '对话', library: '知识仓库', plan: '学习计划', archive: '学习档案', settings: '管理与设置' }
-const nav: { id: View; icon: string }[] = [
-  { id: 'chat', icon: '◌' }, { id: 'library', icon: '▤' }, { id: 'plan', icon: '□' }, { id: 'archive', icon: '◫' },
+const nav: { id: View; num: string }[] = [
+  { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
 
@@ -29,6 +29,7 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [apiOnline, setApiOnline] = useState<boolean | null>(null)
+  const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [citation, setCitation] = useState<Citation | null>(null)
   const [turnResolution, setTurnResolution] = useState<TurnResolution | null>(null)
 
@@ -37,7 +38,7 @@ export default function App() {
 
   useEffect(() => { localStorage.setItem('cp-sidebar-collapsed', String(sidebarCollapsed)) }, [sidebarCollapsed])
   useEffect(() => {
-    api.health().then(() => setApiOnline(true)).catch(() => setApiOnline(false))
+    api.health().then(payload => { setApiOnline(true); setHealth(payload) }).catch(() => setApiOnline(false))
     api.courses().then(setCourses).catch(error => setNotice(errorText(error)))
   }, [])
   useEffect(() => { void loadSessions() }, [workspace.scope, workspace.courseId])
@@ -71,28 +72,31 @@ export default function App() {
   }
 
   const workspaceName = workspace.scope === 'general' ? '通用模式' : course?.name ?? '课程工作区'
+  const healthLlm = (health?.llm ?? null) as Record<string, unknown> | null
+  const healthRag = (health?.rag ?? null) as Record<string, unknown> | null
   return <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
     {sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label="课程与会话">
-      <div className="brand"><div className="brandmark">CP</div><div className="brand-copy"><strong>CoursePilot</strong><span>Personal tutor</span></div></div>
+      <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
+      <div className="side-label">WORKSPACE</div>
       <button className={`workspace-card ${workspace.scope === 'general' ? 'selected' : ''}`} onClick={() => switchWorkspace({ scope: 'general' })}>
-        <span className="general-icon">✦</span><span className="workspace-copy"><b>通用模式</b><small>每轮按问题解析课程</small></span>
+        <span className="general-icon" aria-hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M12 3v18M3 12h18" opacity=".35" /></svg></span>
+        <span className="workspace-copy"><b>通用模式</b><small>每轮按问题解析课程</small></span>
       </button>
       <div className="course-switcher">
-        <div className="side-label">课程工作区</div>
         {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id} onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
           <i style={{ backgroundColor: item.color }} /><span>{item.name}</span>{item.wiki_enabled && <em>Wiki</em>}
         </button>)}
         <button className="text-button add-course" onClick={createCourse} disabled={busy}>＋ 新建课程</button>
       </div>
+      <div className="side-label">NAV</div>
       <nav className="main-nav" aria-label="学习导航">
-        {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false) }}><span aria-hidden>{item.icon}</span><b>{viewNames[item.id]}</b></button>)}
+        {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false) }}><span aria-hidden>{item.num}</span><b>{viewNames[item.id]}</b></button>)}
       </nav>
-      <div className="sessions-head"><span>会话</span><button aria-label="新建会话" onClick={newSession} disabled={busy}>＋</button></div>
+      <div className="sessions-head"><span>SESSIONS</span><button aria-label="新建会话" onClick={newSession} disabled={busy}>＋</button></div>
       <div className="session-list">
         {sessions.length ? sessions.map(session => <button className={`session ${session.id === activeSession?.id ? 'active' : ''}`} key={session.id} onClick={() => { setActiveSession(session); setView('chat'); setSidebarOpen(false) }}>
-          <span className="session-marker" title={session.scope_mode === 'general' ? '通用会话' : '课程会话'}>{session.scope_mode === 'general' ? '✦' : '●'}</span>
-          <i style={{ backgroundColor: session.course_color ?? '#99A19D' }} /><span className="session-text"><b>{session.title || '未命名会话'}</b><small>{timeLabel(session.updated_at)}</small></span>
+          <i title={session.scope_mode === 'general' ? '通用会话' : '课程会话'} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || '未命名会话'}</b><small>{timeLabel(session.updated_at)}</small></span>
         </button>) : <p className="mini-empty">此工作区还没有会话。</p>}
       </div>
       <button className="new-session" onClick={newSession} disabled={busy}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
@@ -102,11 +106,19 @@ export default function App() {
       <header className="topbar">
         <button className="icon-button mobile-only" aria-label="打开导航" onClick={() => setSidebarOpen(true)}>☰</button>
         <button className="icon-button collapse-only" aria-label="折叠侧栏" onClick={() => setSidebarCollapsed(value => !value)}>☷</button>
-        <div className="title-area"><b>{heading}</b><span className="crumb"><i style={{ backgroundColor: course?.color ?? '#7B8881' }} /> {workspaceName}</span></div>
-        <div className="connection"><i className={apiOnline ? 'online' : 'offline'} /> <span>{apiOnline ? '服务已连接' : '服务未连接'}</span></div>
+        <div className="title-area"><b>{heading}</b><span className="crumb"><i style={{ backgroundColor: course?.color ?? '#D4D4D8' }} /> {workspaceName}</span></div>
       </header>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label="关闭错误提示" onClick={() => setNotice('')}>×</button></div>}
-      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} onCitation={setCitation} onSend={async content => {
+      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} onCitation={setCitation} onUpload={async file => {
+        try {
+          let targetSession = activeSession
+          if (!targetSession) {
+            targetSession = await api.createSession(workspace.scope, workspace.courseId)
+            setSessions(current => [targetSession!, ...current]); setActiveSession(targetSession); setMessages([])
+          }
+          return await api.uploadAttachment(targetSession.id, file)
+        } catch (error) { setNotice(errorText(error)); throw error }
+      }} onSend={async (content, attachmentIds) => {
         let targetSession = activeSession
         if (!targetSession) {
           setBusy(true)
@@ -129,7 +141,7 @@ export default function App() {
           }
           const delta = payload.delta ?? payload.content ?? payload.text ?? ''
           if (delta) setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
-        }); await loadMessages(targetSession.id); await loadSessions() }
+        }, attachmentIds); await loadMessages(targetSession.id); await loadSessions() }
         catch (error) {
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
@@ -143,15 +155,38 @@ export default function App() {
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
       {view === 'archive' && course && <ArchiveView course={course} onError={setNotice} />}
       {view === 'settings' && <SettingsView courses={courses} onError={setNotice} />}
+      <footer className="statusbar">
+        <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
+        {healthLlm && <span>{String(healthLlm.provider)}/{String(healthLlm.model)}{healthLlm.enabled ? '' : ' · local demo'}</span>}
+        {healthRag && <span>retrieval: {String(healthRag.backend)}</span>}
+        <span className="right">CoursePilot v2.0</span>
+      </footer>
     </main>
     {citation && <CitationDrawer citation={citation} onClose={() => setCitation(null)} />}
   </div>
 }
 
-function ChatView({ session, messages, workspaceName, scope, turnResolution, onCitation, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; onCitation: (citation: Citation) => void; onSend: (content: string) => Promise<void>; busy: boolean }) {
+function ChatView({ session, messages, workspaceName, scope, turnResolution, onCitation, onUpload, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
   const [draft, setDraft] = useState(''); const composer = useRef<HTMLTextAreaElement>(null)
+  const [attachments, setAttachments] = useState<Attachment[]>([]); const [uploading, setUploading] = useState(false)
+  const fileInput = useRef<HTMLInputElement>(null)
   const isCourseScope = session ? session.scope_mode === 'course' : scope === 'course'
-  async function submit(event?: { preventDefault(): void }) { event?.preventDefault(); const text = draft.trim(); if (!text || busy) return; setDraft(''); await onSend(text) }
+  // 切换会话时丢弃不属于新会话的附件；上传自动建会话的场景附件归属一致，不受影响。
+  useEffect(() => { setAttachments(current => current.filter(item => item.session_id === session?.id)) }, [session?.id])
+  async function pickFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]; event.target.value = ''
+    if (!file) return
+    setUploading(true)
+    try { const attachment = await onUpload(file); setAttachments(current => [...current, attachment]) }
+    catch { /* 错误提示由上层统一展示 */ }
+    finally { setUploading(false) }
+  }
+  async function submit(event?: { preventDefault(): void }) {
+    event?.preventDefault(); const text = draft.trim()
+    if (!text || busy || uploading) return
+    const ids = attachments.map(item => item.id)
+    setDraft(''); setAttachments([]); await onSend(text, ids)
+  }
   return <section className="chat-view">
     <div className="session-context">
       <span className="scope-pill">{session?.scope_mode === 'course' ? '课程会话' : '通用会话'}</span>
@@ -161,10 +196,21 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, onC
       {!session && <span>发送第一条消息会自动创建会话。</span>}
     </div>
     <div className="messages" aria-live="polite">
-      {!messages.length && <div className="welcome"><span>{isCourseScope ? '●' : '✦'}</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式会按每轮问题解析课程；直接提到课程名（如某门课的某个概念）解析最可靠。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
+      {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式会按每轮问题解析课程；直接提到课程名（如某门课的某个概念）解析最可靠。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
       {messages.filter(item => item.role !== 'system').map(message => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope} />)}
     </div>
-    <form className="composer-wrap" onSubmit={submit}><div className="composer"><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} disabled={busy} aria-label="输入消息" rows={2} /><div className="composer-row"><span>Enter 发送 · Shift+Enter 换行 · 图片 ≤ 10 MiB</span><button className="send-button" type="submit" disabled={!draft.trim() || busy} aria-label="发送消息">{busy ? '…' : '↑'}</button></div></div><p>回答优先依据当前课程的可检索资料；没有命中教材时会明确标注“以下不是当前教材结论”。</p></form>
+    <form className="composer-wrap" onSubmit={submit}>
+      {(attachments.length > 0 || uploading) && <div className="attach-list">
+        {attachments.map(item => <div className={item.needs_confirmation ? 'attach-chip warn' : 'attach-chip'} key={item.id}>
+          <span className="attach-name">IMG · {item.filename}</span>
+          <span className="attach-preview">{item.needs_confirmation ? '未识别出文字，发送前请在消息里补充说明' : item.transcription}</span>
+          <button type="button" aria-label={`移除图片 ${item.filename}`} onClick={() => setAttachments(current => current.filter(other => other.id !== item.id))}>×</button>
+        </div>)}
+        {uploading && <div className="attach-chip pending"><span className="attach-name">IMG</span><span className="attach-preview">正在转录图片文字…</span></div>}
+      </div>}
+      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} disabled={busy} aria-label="输入消息" rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label="上传图片提问"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>图片</button><span>Enter 发送 · Shift+Enter 换行 · 图片 ≤ 10 MiB</span><button className="send-button" type="submit" disabled={!draft.trim() || busy || uploading} aria-label="发送消息">{busy ? '…' : '↑'}</button></div></div>
+      <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={pickFile} />
+      <p>回答优先依据当前课程的可检索资料；没有命中教材时会明确标注“以下不是当前教材结论”。</p></form>
   </section>
 }
 
@@ -173,7 +219,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
-  return <article className="message assistant-message"><div className="agent-label"><span>CP</span><b>CoursePilot</b></div><div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations">{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}>资料 {item.material_name ?? index + 1}{item.page ? ` · p.${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div><div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
@@ -263,7 +309,7 @@ function SettingsView({ courses, onError }: { courses: Course[]; onError: (messa
   </dl><details><summary>原始 JSON</summary><pre>{JSON.stringify(health, null, 2)}</pre></details></> : <p>点击“检查服务”查看模型与检索的真实状态。</p>}</article></div></div></section>
 }
 function CoursePickerState({ view, courses, onPick, onCreate }: { view: View; courses: Course[]; onPick: (courseId: string) => void; onCreate: () => void }) {
-  return <section className="page"><div className="page-inner empty-course"><span>▤</span><h1>先选择一个课程</h1><p>{viewNames[view]}以课程为边界。选择后左栏也会切换到该课程工作区。</p>
+  return <section className="page"><div className="page-inner empty-course"><span aria-hidden>❯</span><h1>先选择一个课程</h1><p>{viewNames[view]}以课程为边界。选择后左栏也会切换到该课程工作区。</p>
     <div className="picker-grid">{courses.map(item => <button className="picker-card" key={item.id} onClick={() => onPick(item.id)}><i style={{ backgroundColor: item.color }} /><b>{item.name}</b>{item.wiki_enabled && <em>Wiki</em>}</button>)}<button className="picker-card picker-create" onClick={onCreate}>＋ 新建课程</button></div>
   </div></section>
 }
