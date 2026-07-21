@@ -136,9 +136,9 @@ class KnowledgeService:
             path = self._repository.material_storage_path(material.id)
             if path is None or not path.is_file():
                 raise ValueError("教材文件不存在")
-            text = self._extract_text(path, material.filename)
+            segments = self._extract_pages(path, material.filename)
             self._repository.update_job(job.id, status="running", stage="chunking", progress=45)
-            chunks = self._chunk(text)
+            chunks = [(page, piece) for page, text in segments for piece in self._chunk(text)]
             if not chunks:
                 raise ValueError("未能从教材中提取可检索文本")
             self._repository.update_job(job.id, status="running", stage="indexing", progress=75)
@@ -149,17 +149,20 @@ class KnowledgeService:
             self._repository.set_material_status(material.id, "failed")
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error), retrieval_backend="sqlite_fts")
 
-    def _extract_text(self, path: Path, filename: str) -> str:
+    def _extract_pages(self, path: Path, filename: str) -> list[tuple[int | None, str]]:
+        """Extract text segments with their page numbers; page is None when unknown."""
         raw = path.read_bytes()
         if Path(filename).suffix.lower() in {".txt", ".md"}:
-            return raw.decode("utf-8", errors="replace").strip()
+            return [(None, raw.decode("utf-8", errors="replace").strip())]
         try:
             # Avoid asking pypdf to parse clearly incomplete data: besides being
             # noisy, it cannot improve on the fallback below.
             if b"%%EOF" not in raw:
                 raise ValueError("incomplete PDF")
             from pypdf import PdfReader  # Optional at unit-test time; declared runtime dependency.
-            return "\n".join((page.extract_text() or "") for page in PdfReader(str(path)).pages).strip()
+            pages = [(number, (page.extract_text() or "").strip()) for number, page in enumerate(PdfReader(str(path)).pages, start=1)]
+            if any(text for _, text in pages):
+                return pages
         except Exception:
             # Some valid PDFs are image-only or use unsupported encodings.  Fall
             # through to the small local fallback before reporting extraction
@@ -167,12 +170,12 @@ class KnowledgeService:
             pass
         # Dependency-free PDF fallback: support common literal-string text operators.
         fragments = re.findall(rb"\(([^()]*)\)\s*(?:Tj|TJ)", raw)
-        return "\n".join(fragment.decode("latin-1", errors="replace") for fragment in fragments).strip()
+        return [(None, "\n".join(fragment.decode("latin-1", errors="replace") for fragment in fragments).strip())]
 
-    def _chunk(self, text: str) -> list[tuple[int | None, str]]:
+    def _chunk(self, text: str) -> list[str]:
         normalized = re.sub(r"\r\n?", "\n", text).strip()
         size, overlap = self._settings.chunk_size, min(self._settings.chunk_overlap, self._settings.chunk_size - 1)
-        chunks: list[tuple[int | None, str]] = []
+        chunks: list[str] = []
         start = 0
         while start < len(normalized):
             end = min(len(normalized), start + size)
@@ -182,7 +185,7 @@ class KnowledgeService:
                     end = split
             value = normalized[start:end].strip()
             if value:
-                chunks.append((None, value))
+                chunks.append(value)
             if end >= len(normalized):
                 break
             start = max(end - overlap, start + 1)

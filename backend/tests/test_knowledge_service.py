@@ -1,9 +1,40 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import time
 import unittest
 from pathlib import Path
+
+
+def _pdf_with_pages(page_texts: list[str]) -> bytes:
+    """Build a minimal PDF with one text content stream per page."""
+    objects: list[bytes] = []
+    kids = " ".join(f"{3 + index * 2} 0 R" for index in range(len(page_texts)))
+    font_ref = 3 + len(page_texts) * 2
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {len(page_texts)} >>".encode())
+    for index, text in enumerate(page_texts):
+        content = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {4 + index * 2} 0 R "
+            f"/Resources << /Font << /F1 {font_ref} 0 R >> >> >>".encode()
+        )
+        objects.append(b"<< /Length %d >> stream\n%s\nendstream" % (len(content), content))
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    buffer = io.BytesIO()
+    buffer.write(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(buffer.tell())
+        buffer.write(f"{number} 0 obj ".encode() + body + b" endobj\n")
+    xref_at = buffer.tell()
+    buffer.write(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    for offset in offsets:
+        buffer.write(f"{offset:010d} 00000 n \n".encode())
+    buffer.write(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode())
+    return buffer.getvalue()
 
 from core.settings import Settings
 from core.store import SQLiteStore
@@ -88,6 +119,19 @@ class KnowledgeServiceTests(unittest.TestCase):
         job = self.enqueue_and_wait(self.service.enqueue_wiki_build(material_id=material.id).id)
         self.assertEqual((job.type, job.status, job.stage), ("wiki", "completed", "wiki_completed"))
         self.assertTrue((self.settings.data_dir / "wiki" / self.math.id / f"{material.id}.md").is_file())
+
+    def test_pdf_chunks_keep_their_page_numbers_in_citations(self) -> None:
+        material = self.service.upload_material(
+            course_id=self.math.id, filename="rules.pdf", mime_type="application/pdf",
+            content=_pdf_with_pages(["The chain rule lives on page one", "The product rule lives on page two"]),
+        )
+        job = self.enqueue_and_wait(self.service.enqueue_index(material_id=material.id).id)
+        self.assertEqual(job.status, "completed")
+
+        chain = self.service.search_course(course_id=self.math.id, query="chain rule")
+        self.assertEqual(chain[0].citation.page, 1)
+        product = self.service.search_course(course_id=self.math.id, query="product rule")
+        self.assertEqual(product[0].citation.page, 2)
 
     def test_invalid_pdf_is_a_failed_job_not_a_crash(self) -> None:
         material = self.service.upload_material(
