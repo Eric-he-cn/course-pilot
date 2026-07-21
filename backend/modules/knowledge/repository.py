@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.common import new_id, utc_now
-from app.store import SQLiteStore
+from core.common import new_id, utc_now
+from core.store import SQLiteStore
 from contracts.knowledge import Citation, KnowledgeHit
 
 from .models import Chunk, Job, Material

@@ -7,7 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.bootstrap import build_application
-from app.settings import Settings
+from core.settings import Settings
 
 
 def create_app(*, settings: Settings | None = None) -> FastAPI:

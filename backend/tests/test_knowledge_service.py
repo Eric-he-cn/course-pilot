@@ -5,8 +5,8 @@ import time
 import unittest
 from pathlib import Path
 
-from app.settings import Settings
-from app.store import SQLiteStore
+from core.settings import Settings
+from core.store import SQLiteStore
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
 from modules.knowledge.api import KnowledgeFeatureDisabledError

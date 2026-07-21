@@ -9,7 +9,7 @@ class KnowledgeHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         from fastapi.testclient import TestClient
         from app.main import create_app
-        from app.settings import Settings
+        from core.settings import Settings
 
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)

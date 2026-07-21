@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import sqlite3
-from app.store import SQLiteStore
+from core.store import SQLiteStore
 class SessionRepository:
     def __init__(self, store: SQLiteStore) -> None: self._store = store
     def list_session_rows(self, *, scope_mode: str | None, course_id: str | None):

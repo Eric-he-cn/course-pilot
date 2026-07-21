@@ -1,5 +1,5 @@
 from __future__ import annotations
-from app.common import new_id, utc_now
+from core.common import new_id, utc_now
 from .models import Course
 from .repository import CourseRepository
 _COLORS = ("#B56E3D", "#176B5B", "#365F91", "#8C5B96", "#9A650D", "#B23A36")

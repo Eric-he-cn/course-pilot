@@ -4,8 +4,8 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from app.common import new_id
-from app.settings import Settings
+from core.common import new_id
+from core.settings import Settings
 from contracts.knowledge import KnowledgeHit, ResolvedKnowledgeScope
 
 from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from app.store import SQLiteStore
+from core.store import SQLiteStore
 class CourseRepository:
     def __init__(self, store: SQLiteStore) -> None: self._store = store
     def list_rows(self):

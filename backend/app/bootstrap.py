@@ -14,8 +14,8 @@ from modules.sessions.resolver import CourseResolver
 from modules.sessions.repository import SessionRepository
 from modules.sessions.service import SessionService
 
-from .settings import Settings
-from .store import SQLiteStore
+from core.settings import Settings
+from core.store import SQLiteStore
 
 
 @dataclass(frozen=True)
