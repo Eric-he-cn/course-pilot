@@ -57,6 +57,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
         CREATE INDEX IF NOT EXISTS idx_plan_items_plan ON plan_items(plan_id, due_date);
     """),
+    # 语义检索：chunk 级 float32 向量，缺失时该 chunk 只参与词面检索。
+    (8, "ALTER TABLE chunks ADD COLUMN embedding BLOB;"),
 )
 
 class SQLiteStore:

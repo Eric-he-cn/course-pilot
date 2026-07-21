@@ -4,3 +4,5 @@ python-multipart>=0.0.9
 pypdf>=4.0
 pytest>=8.0
 httpx>=0.27
+# 语义检索（BGE 向量）；缺失或加载失败时自动退回纯词面检索
+sentence-transformers>=3.0

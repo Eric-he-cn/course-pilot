@@ -115,7 +115,7 @@ class KnowledgeRepository:
             )
         return self.get_job(job_id)  # type: ignore[return-value]
 
-    def replace_chunks(self, *, material_id: str, course_id: str, chunks: list[tuple[int | None, str]]) -> None:
+    def replace_chunks(self, *, material_id: str, course_id: str, chunks: list[tuple[int | None, str]], embeddings: list[bytes] | None = None) -> None:
         with self._store.write() as conn:
             old_ids = [row["id"] for row in conn.execute("SELECT id FROM chunks WHERE material_id = ?", (material_id,))]
             if old_ids:
@@ -124,17 +124,49 @@ class KnowledgeRepository:
             for ordinal, (page, content) in enumerate(chunks):
                 chunk_id = new_id("chunk")
                 conn.execute(
-                    "INSERT INTO chunks(id, material_id, course_id, ordinal, page, content) VALUES (?, ?, ?, ?, ?, ?)",
-                    (chunk_id, material_id, course_id, ordinal, page, content),
+                    "INSERT INTO chunks(id, material_id, course_id, ordinal, page, content, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (chunk_id, material_id, course_id, ordinal, page, content, embeddings[ordinal] if embeddings else None),
                 )
                 conn.execute("INSERT INTO chunks_fts(chunk_id, course_id, content) VALUES (?, ?, ?)", (chunk_id, course_id, content))
 
+    def load_course_embeddings(self, *, course_id: str) -> list[tuple[str, bytes]]:
+        with self._store.read() as conn:
+            rows = conn.execute("SELECT id, embedding FROM chunks WHERE course_id = ? AND embedding IS NOT NULL ORDER BY rowid", (course_id,)).fetchall()
+        return [(row["id"], row["embedding"]) for row in rows]
+
+    def hits_by_chunk_ids(self, *, scored: list[tuple[str, float]]) -> list[KnowledgeHit]:
+        if not scored:
+            return []
+        ids = [chunk_id for chunk_id, _ in scored]
+        placeholders = ",".join("?" * len(ids))
+        with self._store.read() as conn:
+            rows = {
+                row["id"]: row
+                for row in conn.execute(
+                    f"SELECT c.*, m.filename FROM chunks c JOIN materials m ON m.id = c.material_id WHERE c.id IN ({placeholders})", ids
+                )
+            }
+        hits = []
+        for chunk_id, score in scored:
+            row = rows.get(chunk_id)
+            if row is not None:
+                hits.append(
+                    KnowledgeHit(
+                        citation=Citation(material_id=row["material_id"], document=row["filename"], page=row["page"], chunk_id=row["id"], snippet=row["content"][:280], score=score),
+                        content=row["content"],
+                    )
+                )
+        return hits
+
     def search(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:
-        tokens = [token for token in re.findall(r"[^\W_]+", query, flags=re.UNICODE) if token]
+        # 中英混排必须在文种边界切开（"你有没有Deep"≠一个词），否则英文词
+        # 永远无法命中英文教材。
+        tokens = [token for token in re.findall(r"[^\W_一-鿿]+|[一-鿿]+", query, flags=re.UNICODE) if token]
         if not tokens:
             return []
         # Quote tokens to avoid FTS syntax injection.  FTS is an optimization; LIKE remains the deterministic fallback.
-        fts_query = " AND ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
+        # OR + bm25：混合语言查询里注定缺席的词（如中文串之于英文书）不应否决整次检索。
+        fts_query = " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
         with self._store.read() as conn:
             try:
                 rows = conn.execute(

@@ -27,6 +27,8 @@ class TutorRequest:
     course_name: str
     question: str
     evidence: tuple[TutorEvidence, ...]
+    # 资料库文件名清单：让模型知道课程里有什么教材，能回答"有没有 X 资料"。
+    materials: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

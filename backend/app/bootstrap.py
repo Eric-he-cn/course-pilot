@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from adapters.embedding import BgeEmbedder
 from adapters.llm import DeepSeekTutorResponder, DemoTutorResponder
 from contracts.llm import TutorResponderPort
 from modules.agent.service import TurnService
@@ -64,10 +65,16 @@ def build_application(settings: Settings) -> Application:
     store = SQLiteStore(settings.database_path)
     store.migrate()
     courses = CourseService(CourseRepository(store))
+    embedder = (
+        BgeEmbedder(model_name=settings.rag_embedding_model, device=settings.rag_embedding_device, batch_size=settings.rag_embedding_batch_size)
+        if settings.rag_embedding_model
+        else None
+    )
     knowledge = KnowledgeService(
         repository=KnowledgeRepository(store),
         settings=settings,
         wiki_is_enabled=lambda course_id: bool((course := courses.get_course(course_id)) and course.wiki_enabled),
+        embedder=embedder,
     )
     resolver = CourseResolver(courses)
     sessions = SessionService(SessionRepository(store), courses, resolver)

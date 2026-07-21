@@ -112,7 +112,7 @@ turn_completed | turn_failed
 
 - Backend：Python 3.11+、FastAPI、标准库 SQLite、显式 migration、模块化目录、SSE。
 - Frontend：React + TypeScript + Vite；服务端是语义真源，前端只维护 UI 状态。
-- RAG Demo：支持 PDF/TXT/MD 上传、文本提取、切块和可检索索引；优先通过 adapter 复用 1.0，依赖不可用时使用 SQLite FTS/词项检索 fallback，并在 UI 明确标注。
+- RAG Demo：支持 PDF/TXT/MD 上传、文本提取、切块和可检索索引。检索为混合召回：BGE 语义向量（`sentence-transformers`，与 1.0 相同的模型与查询前缀约定）+ SQLite FTS/词项，RRF 融合；embedding 依赖或模型不可用时自动退回纯词面检索，health 与 job 的 `retrieval_backend` 如实标注。
 - LLM：已实现独立内部合约、DeepSeek V4 Adapter 与本地 Demo Adapter。远端开关启用且 RAG 命中时调用 `deepseek-v4-flash` 的 Chat Completions，并关闭 thinking；未启用、课程未解析、没有证据或供应商失败时不伪造远端结果，health/SSE 明确报告 `provider`、`local_guardrail` 或 `demo_fallback`。provider 失败会发出 `provider_fallback` 事件后完成本轮，不暴露 Key 或供应商响应正文。
 - Wiki、Skill、掌握度和计划在 Demo 中覆盖主交互与接口骨架；不会为了展示效果写跨模块捷径。
 

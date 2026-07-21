@@ -40,6 +40,10 @@ class Settings:
     llm_total_timeout_seconds: float = 180
     llm_max_retries: int = 2
     agent_max_output_tokens: int = 8192
+    # 空字符串表示关闭语义检索（测试默认关闭，避免加载模型）。
+    rag_embedding_model: str = ""
+    rag_embedding_device: str = "auto"
+    rag_embedding_batch_size: int = 256
 
     @property
     def remote_llm_configured(self) -> bool:
@@ -68,4 +72,7 @@ class Settings:
             max(1.0, float(value("LLM_TOTAL_TIMEOUT_SECONDS", "180"))),
             max(0, int(value("LLM_MAX_RETRIES", "2"))),
             max(256, int(value("AGENT_MAX_OUTPUT_TOKENS", "8192"))),
+            value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"),
+            value("RAG_EMBEDDING_DEVICE", "auto"),
+            max(1, int(value("RAG_EMBEDDING_BATCH_SIZE", "256"))),
         )

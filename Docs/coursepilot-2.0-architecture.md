@@ -23,7 +23,7 @@
 | 结构化存储 | SQLite（WAL 模式），单文件 `data/coursepilot.db` | 存放事件流、会话、计划、调度任务；零运维，量级远够 |
 | SQLite 访问层 | 标准库 `sqlite3` + typed repository + 显式 migration | 单文件不需要 ORM；阻塞调用统一放入 worker thread，写事务在 Store 层串行化 |
 | 记忆/Wiki 存储 | Markdown 文件 + git（GitPython） | user.md / memory.md / wiki 页面；版本、diff、回滚免费；人类可读可编辑 |
-| 向量检索 | FAISS + BM25（沿用 1.0 `rag/`） | 原位复用已验证资产，先通过 `rag_search` adapter 接入新 Agent |
+| 向量检索 | BGE 向量（sentence-transformers）+ SQLite FTS 词面，RRF 融合 | 沿用 1.0 的模型与融合策略；万级 chunk 用 numpy 暴力点积即可，FAISS 与 rerank 留待规模需要 |
 | 复习排期 | py-fsrs | FSRS 官方 Python 实现，不自研排期算法 |
 | BKT | 自实现（约 30 行贝叶斯更新） | 固定参数的经典四参数 BKT 就是几行公式，pyBKT 是为拟合大数据集设计的，用不上 |
 | 定时调度 | APScheduler 单一 interval tick（无持久化 job store） | 每分钟扫描到期条目，计划变更不需要增删大量 job；SQLite 中的计划与 delivery 才是真源 |

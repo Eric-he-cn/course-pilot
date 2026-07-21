@@ -95,11 +95,12 @@ def test_empty_evidence_request_marks_the_gap_and_instructs_labeled_answer():
         return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "通用回答"}, "finish_reason": "stop"}]}))
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        empty = TutorRequest(course_name="LLM", question="你好", evidence=())
+        empty = TutorRequest(course_name="LLM", question="你好", evidence=(), materials=("d2l-en.pdf",))
         items = list(_adapter(client).respond(empty))
     body = captured["body"]
     assert isinstance(body, dict)
     assert "（本轮未检索到相关教材内容）" in body["messages"][1]["content"]
+    assert "课程资料库文件：d2l-en.pdf" in body["messages"][1]["content"]
     assert "以下不是当前教材结论" in body["messages"][0]["content"]
     assert items[-1].text == "通用回答"
 

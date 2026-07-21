@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
 from core.common import new_id
 from core.settings import Settings
+from contracts.embedding import EmbedderPort
 from contracts.knowledge import KnowledgeHit, ResolvedKnowledgeScope
 
 from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
@@ -28,10 +30,12 @@ class KnowledgeService:
         repository: KnowledgeRepository,
         settings: Settings,
         wiki_is_enabled: Callable[[str], bool] | None = None,
+        embedder: EmbedderPort | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._wiki_is_enabled = wiki_is_enabled or (lambda _course_id: False)
+        self._embedder = embedder
 
     def upload_material(self, *, course_id: str, filename: str, mime_type: str, content: bytes) -> Material:
         safe_name = Path(filename).name
@@ -112,11 +116,47 @@ class KnowledgeService:
         """Agent-only search: the course is a server-issued resolver result."""
         return self.search_course(course_id=scope.course_id, query=query, limit=limit)
 
+    def material_names(self, *, scope: ResolvedKnowledgeScope) -> list[str]:
+        return [material.filename for material in self.list_materials(course_id=scope.course_id)]
+
     def search_course(self, *, course_id: str, query: str, limit: int = 6) -> list[KnowledgeHit]:
-        """Explicit, course-scoped HTTP search use case."""
+        """Explicit, course-scoped HTTP search use case: 词面 + 语义混合召回，RRF 融合。"""
         if not query.strip():
             return []
-        return self._repository.search(course_id=course_id, query=query, limit=max(1, min(limit, 20)))
+        limit = max(1, min(limit, 20))
+        lexical = self._repository.search(course_id=course_id, query=query, limit=limit)
+        dense = self._dense_search(course_id=course_id, query=query, limit=limit)
+        if not dense:
+            return lexical
+        return self._fuse_rrf(dense, lexical, limit=limit)
+
+    def _dense_search(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:
+        if self._embedder is None:
+            return []
+        rows = self._repository.load_course_embeddings(course_id=course_id)
+        if not rows:
+            return []
+        try:
+            ranked = self._embedder.rank(query=query, vectors=[vector for _, vector in rows], top_k=limit)
+        except Exception:
+            # 向量维度不一致（换过模型）等异常不应打断检索，退回词面结果。
+            return []
+        return self._repository.hits_by_chunk_ids(scored=[(rows[index][0], score) for index, score in ranked])
+
+    @staticmethod
+    def _fuse_rrf(dense: list[KnowledgeHit], lexical: list[KnowledgeHit], *, limit: int, k: int = 60) -> list[KnowledgeHit]:
+        scores: dict[str, float] = {}
+        first_seen: dict[str, KnowledgeHit] = {}
+        for results in (dense, lexical):
+            for rank, hit in enumerate(results, start=1):
+                key = hit.citation.chunk_id
+                scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+                first_seen.setdefault(key, hit)
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
+        return [
+            replace(first_seen[key], citation=replace(first_seen[key].citation, score=round(score, 6)))
+            for key, score in ordered
+        ]
 
     def health(self) -> dict[str, object]:
         try:
@@ -124,10 +164,11 @@ class KnowledgeService:
             database: dict[str, object] = {"ok": True, "migration_version": migration_version}
         except Exception as error:
             database = {"ok": False, "error": str(error)}
-        return {
-            "database": database,
-            "rag": {"ok": bool(database["ok"]), "backend": "sqlite_fts_fallback"},
-        }
+        rag: dict[str, object] = {"ok": bool(database["ok"]), "backend": "sqlite_fts_fallback"}
+        if self._embedder is not None:
+            rag["backend"] = "hybrid_bge"
+            rag["embedding"] = self._embedder.status()
+        return {"database": database, "rag": rag}
 
     def _run_index(self, job: Job, material: Material) -> Job:
         try:
@@ -137,14 +178,20 @@ class KnowledgeService:
             if path is None or not path.is_file():
                 raise ValueError("教材文件不存在")
             segments = self._extract_pages(path, material.filename)
-            self._repository.update_job(job.id, status="running", stage="chunking", progress=45)
+            self._repository.update_job(job.id, status="running", stage="chunking", progress=40)
             chunks = [(page, piece) for page, text in segments for piece in self._chunk(text)]
             if not chunks:
                 raise ValueError("未能从教材中提取可检索文本")
-            self._repository.update_job(job.id, status="running", stage="indexing", progress=75)
-            self._repository.replace_chunks(material_id=material.id, course_id=material.course_id, chunks=chunks)
+            embeddings = None
+            if self._embedder is not None:
+                self._repository.update_job(job.id, status="running", stage="embedding", progress=55)
+                # 模型不可用时返回 None，教材仍以纯词面方式完成索引。
+                embeddings = self._embedder.embed_documents([content for _page, content in chunks])
+            backend = "hybrid_bge" if embeddings else "sqlite_fts"
+            self._repository.update_job(job.id, status="running", stage="indexing", progress=85)
+            self._repository.replace_chunks(material_id=material.id, course_id=material.course_id, chunks=chunks, embeddings=embeddings)
             self._repository.set_material_status(material.id, "indexed")
-            return self._repository.update_job(job.id, status="completed", stage="completed", progress=100, retrieval_backend="sqlite_fts")
+            return self._repository.update_job(job.id, status="completed", stage="completed", progress=100, retrieval_backend=backend)
         except Exception as error:
             self._repository.set_material_status(material.id, "failed")
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error), retrieval_backend="sqlite_fts")

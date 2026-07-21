@@ -28,8 +28,9 @@ class DemoTutorResponder:
                 f"{evidence}\n\n以上是本地检索证据；可继续追问具体步骤。"
             )
         else:
+            library = f"资料库中已有：{'、'.join(request.materials)}，但本问题未命中其内容。" if request.materials else "该课程还没有上传教材。"
             text = (
-                f"[Demo responder] 在“{request.course_name}”的资料库中没有检索到与本问题相关的内容。\n"
+                f"[Demo responder] 在“{request.course_name}”的资料库中没有检索到与本问题相关的内容。{library}\n"
                 "以下不是当前教材结论：本地演示模式没有通用知识能力。启用远端模型后，"
                 "这里会在说明缺少教材依据的前提下给出通用回答。"
             )

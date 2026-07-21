@@ -172,6 +172,7 @@ class DeepSeekTutorResponder:
             )
         return (
             f"课程：{request.course_name}\n"
+            f"课程资料库文件：{'、'.join(request.materials) or '（尚未上传教材）'}\n"
             f"问题：{request.question}\n\n"
             "<evidence>\n"
             + ("\n\n".join(evidence) or "（本轮未检索到相关教材内容）")

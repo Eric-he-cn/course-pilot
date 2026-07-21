@@ -65,11 +65,8 @@ class TurnService:
                 seq += 1
                 yield self._event("text_delta", seq=seq, text=answer)
             else:
-                hits = self._knowledge.search(
-                    scope=ResolvedKnowledgeScope(turn_id=turn.id, course_id=context.course_id, resolver_version=context.resolver_version),
-                    query=message,
-                    limit=6,
-                )
+                scope = ResolvedKnowledgeScope(turn_id=turn.id, course_id=context.course_id, resolver_version=context.resolver_version)
+                hits = self._knowledge.search(scope=scope, query=message, limit=6)
                 for index, hit in enumerate(hits, start=1):
                     citation = {
                         "citation_id": f"citation_{index}", "material_id": hit.citation.material_id, "document": hit.citation.document,
@@ -92,6 +89,7 @@ class TurnService:
                         )
                         for index, hit in enumerate(hits, start=1)
                     ),
+                    materials=tuple(self._knowledge.material_names(scope=scope)),
                 )
                 partial: list[str] = []
                 try:

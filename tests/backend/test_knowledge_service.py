@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+import struct
 import time
 from dataclasses import dataclass, replace
 
 import pytest
 
+from contracts.knowledge import ResolvedKnowledgeScope
 from core.settings import Settings
 from core.store import SQLiteStore
 from modules.courses.models import Course
@@ -143,6 +145,83 @@ def test_pdf_chunks_keep_their_page_numbers_in_citations(env):
     assert chain[0].citation.page == 1
     product = env.service.search_course(course_id=env.math.id, query="product rule")
     assert product[0].citation.page == 2
+
+
+class FakeEmbedder:
+    """双语关键词特征向量：让"注意力"与 attention 落在同一维度，模拟跨语言语义。"""
+
+    name = "fake-embedder"
+    unavailable = False
+
+    def status(self):
+        return {"model": self.name, "loaded": True, "error": None}
+
+    @staticmethod
+    def _vector(text: str) -> bytes:
+        lowered = text.lower()
+        return struct.pack(
+            "2f",
+            1.0 if ("attention" in lowered or "注意力" in lowered) else 0.0,
+            1.0 if ("gradient" in lowered or "梯度" in lowered) else 0.0,
+        )
+
+    def embed_documents(self, texts):
+        if self.unavailable:
+            return None
+        return [self._vector(text) for text in texts]
+
+    def rank(self, *, query, vectors, top_k):
+        query_vector = struct.unpack("2f", self._vector(query))
+        scored = [
+            (index, sum(a * b for a, b in zip(query_vector, struct.unpack("2f", vector))))
+            for index, vector in enumerate(vectors)
+        ]
+        return sorted([(i, s) for i, s in scored if s > 0], key=lambda x: -x[1])[:top_k]
+
+
+def test_semantic_leg_matches_cross_language_without_lexical_overlap(env):
+    service = KnowledgeService(
+        repository=KnowledgeRepository(env.store), settings=env.settings,
+        embedder=FakeEmbedder(),
+    )
+    material = service.upload_material(
+        course_id=env.math.id, filename="attention.md", mime_type="text/markdown",
+        content=b"The attention mechanism weighs token relevance.",
+    )
+    job = service.run_job(job_id=service.enqueue_index(material_id=material.id).id)
+    assert job.retrieval_backend == "hybrid_bge"
+
+    # 中文语义查询与英文内容零词面交集，只有语义腿能命中。
+    hits = service.search_course(course_id=env.math.id, query="注意力机制", limit=6)
+    assert hits
+    assert hits[0].citation.document == "attention.md"
+    assert service.health()["rag"]["backend"] == "hybrid_bge"
+
+
+def test_embedder_unavailable_degrades_to_lexical_indexing(env):
+    broken = FakeEmbedder()
+    broken.unavailable = True
+    service = KnowledgeService(repository=KnowledgeRepository(env.store), settings=env.settings, embedder=broken)
+    material = service.upload_material(
+        course_id=env.math.id, filename="plain.md", mime_type="text/markdown", content=b"gradient descent updates weights",
+    )
+    job = service.run_job(job_id=service.enqueue_index(material_id=material.id).id)
+    assert job.status == "completed"
+    assert job.retrieval_backend == "sqlite_fts"
+    assert service.search_course(course_id=env.math.id, query="gradient descent")
+
+
+def test_mixed_language_query_matches_english_material(env):
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="dl-notes.md", mime_type="text/markdown",
+        content=b"Deep learning uses attention and transformers to model sequences.",
+    )
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    hits = env.service.search_course(course_id=env.math.id, query="你有没有Deep Learning相关的英文教材？我上传的")
+    assert hits
+    assert hits[0].citation.document == "dl-notes.md"
+    scope = ResolvedKnowledgeScope(turn_id="turn-x", course_id=env.math.id, resolver_version="v1")
+    assert "dl-notes.md" in env.service.material_names(scope=scope)
 
 
 def test_invalid_pdf_is_a_failed_job_not_a_crash(env):
