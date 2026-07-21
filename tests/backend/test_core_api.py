@@ -240,6 +240,18 @@ def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
     assert events[5][1]["responder_mode"] == "demo_fallback"
 
 
+def test_no_evidence_turn_still_answers_with_explicit_label(client):
+    course = client.post("/api/v2/courses", json={"name": "编译原理"}).json()
+    session = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()
+    response = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "hello-1", "message": "你好"})
+    events = _events(response.text)
+    assert [name for name, _ in events] == ["turn_started", "course_resolution", "text_delta", "turn_completed"]
+    answer = events[2][1]["text"]
+    assert "没有检索到" in answer
+    assert "以下不是当前教材结论" in answer
+    assert events[3][1]["responder_mode"] == "demo_fallback"
+
+
 def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(client):
     class InterruptingResponder:
         mode = "provider"

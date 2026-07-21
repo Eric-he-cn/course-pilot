@@ -13,6 +13,15 @@ if ! command -v pnpm >/dev/null 2>&1; then
   exit 1
 fi
 
+# 端口被占用时必须失败：残留的旧后端会静默接管请求，让人误以为在测新代码。
+for port in 8000 5173; do
+  if lsof -ti "tcp:${port}" >/dev/null 2>&1; then
+    echo "端口 ${port} 已被占用（可能是残留的旧服务进程）。" >&2
+    echo "先停掉它再启动：lsof -ti tcp:${port} | xargs kill" >&2
+    exit 1
+  fi
+done
+
 "${python_bin}" -m uvicorn app.main:app --app-dir "${project_dir}/backend" --host 127.0.0.1 --port 8000 &
 backend_pid=$!
 cleanup() {

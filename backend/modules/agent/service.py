@@ -77,65 +77,61 @@ class TurnService:
                     }
                     citations.append(citation)
                     yield self._event("citation", **citation)
-                if hits:
-                    request = TutorRequest(
-                        course_name=context.course_name or "当前课程",
-                        question=message,
-                        evidence=tuple(
-                            TutorEvidence(
-                                citation_id=str(index),
-                                document=hit.citation.document,
-                                page=hit.citation.page,
-                                chunk_id=hit.citation.chunk_id,
-                                content=hit.content,
-                            )
-                            for index, hit in enumerate(hits, start=1)
-                        ),
-                    )
-                    partial: list[str] = []
-                    try:
-                        for item in self._responder.respond(request):
-                            if isinstance(item, TutorResponse):
-                                response = item
-                                break
-                            partial.append(item.text)
-                            seq += 1
-                            yield self._event("text_delta", seq=seq, text=item.text)
-                        if response is None:
-                            raise LLMProviderError("invalid_response", "供应商流结束但没有终态响应", retryable=False)
-                    except LLMProviderError as error:
-                        if partial:
-                            # 已输出增量：保留部分内容并如实标记中断，不静默换供应商重放。
-                            yield self._event("stream_interrupted", error_code=error.code, retryable=error.retryable)
-                            assistant = self._sessions.append_message(
-                                session_id=session_id, turn_id=turn.id, role="assistant",
-                                content="".join(partial), citations=citations, status="interrupted",
-                            )
-                            self._sessions.complete_turn(turn.id, status="failed")
-                            finalized = True
-                            yield self._event("turn_failed", error_code="stream_interrupted", retryable=False, message_id=assistant.id)
-                            return
-                        yield self._event(
-                            "provider_fallback",
-                            provider=self._responder.provider,
-                            model=self._responder.model,
-                            error_code=error.code,
-                            retryable=error.retryable,
+                # 无检索命中也交给 responder：Tutor 合约要求先说明教材没有相关
+                # 内容，再以"以下不是当前教材结论"标注给出通用回答，而不是拒答。
+                request = TutorRequest(
+                    course_name=context.course_name or "当前课程",
+                    question=message,
+                    evidence=tuple(
+                        TutorEvidence(
+                            citation_id=str(index),
+                            document=hit.citation.document,
+                            page=hit.citation.page,
+                            chunk_id=hit.citation.chunk_id,
+                            content=hit.content,
                         )
-                        for item in self._fallback_responder.respond(request):
-                            if isinstance(item, TutorResponse):
-                                response = item
-                                break
-                            seq += 1
-                            yield self._event("text_delta", seq=seq, text=item.text)
-                    answer = response.text
-                    finish_reason, responder_mode = response.finish_reason, response.mode
-                    provider, model, usage = response.provider, response.model, response.usage
-                else:
-                    answer = f"[Demo responder] 已确定课程为“{context.course_name}”，但本地资料库尚未找到可引用的内容。以下不是当前教材结论：请上传或索引相关资料后再检索。"
-                    finish_reason, responder_mode, provider, model, usage = "no_evidence", "local_guardrail", "system", "none", {}
-                    seq += 1
-                    yield self._event("text_delta", seq=seq, text=answer)
+                        for index, hit in enumerate(hits, start=1)
+                    ),
+                )
+                partial: list[str] = []
+                try:
+                    for item in self._responder.respond(request):
+                        if isinstance(item, TutorResponse):
+                            response = item
+                            break
+                        partial.append(item.text)
+                        seq += 1
+                        yield self._event("text_delta", seq=seq, text=item.text)
+                    if response is None:
+                        raise LLMProviderError("invalid_response", "供应商流结束但没有终态响应", retryable=False)
+                except LLMProviderError as error:
+                    if partial:
+                        # 已输出增量：保留部分内容并如实标记中断，不静默换供应商重放。
+                        yield self._event("stream_interrupted", error_code=error.code, retryable=error.retryable)
+                        assistant = self._sessions.append_message(
+                            session_id=session_id, turn_id=turn.id, role="assistant",
+                            content="".join(partial), citations=citations, status="interrupted",
+                        )
+                        self._sessions.complete_turn(turn.id, status="failed")
+                        finalized = True
+                        yield self._event("turn_failed", error_code="stream_interrupted", retryable=False, message_id=assistant.id)
+                        return
+                    yield self._event(
+                        "provider_fallback",
+                        provider=self._responder.provider,
+                        model=self._responder.model,
+                        error_code=error.code,
+                        retryable=error.retryable,
+                    )
+                    for item in self._fallback_responder.respond(request):
+                        if isinstance(item, TutorResponse):
+                            response = item
+                            break
+                        seq += 1
+                        yield self._event("text_delta", seq=seq, text=item.text)
+                answer = response.text
+                finish_reason, responder_mode = response.finish_reason, response.mode
+                provider, model, usage = response.provider, response.model, response.usage
             assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations)
             self._sessions.complete_turn(turn.id, status="completed")
             finalized = True

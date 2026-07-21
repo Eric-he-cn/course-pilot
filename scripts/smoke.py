@@ -59,6 +59,9 @@ def main() -> None:
         messages = require(client.get(f"{BASE_URL}/sessions/{session['id']}/messages"))
         if not isinstance(messages, dict) or len(messages["messages"]) != 2:
             raise RuntimeError("messages were not persisted")
+        expected_title = f"{course_name} 的链式法则怎么用？"[:30]
+        if messages["session"]["title"] != expected_title:
+            raise RuntimeError("会话标题未由首条消息生成——8000 端口上可能运行着旧代码的后端进程")
 
         print(
             json.dumps(

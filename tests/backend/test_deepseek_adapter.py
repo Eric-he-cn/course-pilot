@@ -87,6 +87,23 @@ def test_streams_official_chat_completion_and_parses_deltas():
         assert adapter.health()["last_call_ok"] is True
 
 
+def test_empty_evidence_request_marks_the_gap_and_instructs_labeled_answer():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "通用回答"}, "finish_reason": "stop"}]}))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        empty = TutorRequest(course_name="LLM", question="你好", evidence=())
+        items = list(_adapter(client).respond(empty))
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert "（本轮未检索到相关教材内容）" in body["messages"][1]["content"]
+    assert "以下不是当前教材结论" in body["messages"][0]["content"]
+    assert items[-1].text == "通用回答"
+
+
 def test_retries_before_first_delta_then_succeeds():
     calls: list[int] = []
 
