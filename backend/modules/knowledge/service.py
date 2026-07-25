@@ -8,9 +8,10 @@ from typing import Callable
 from core.common import new_id
 from core.settings import Settings
 from contracts.embedding import EmbedderPort
-from contracts.knowledge import KnowledgeHit, ResolvedKnowledgeScope
+from contracts.knowledge import ConceptRef, KnowledgeHit, ResolvedKnowledgeScope
 
 from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
+from .concepts import extract_candidates
 from .models import Job, Material
 from .repository import KnowledgeRepository
 
@@ -120,6 +121,12 @@ class KnowledgeService:
     def material_names(self, *, scope: ResolvedKnowledgeScope) -> list[str]:
         return [material.filename for material in self.list_materials(course_id=scope.course_id)]
 
+    def concepts(self, *, scope: ResolvedKnowledgeScope, limit: int = 60) -> list[ConceptRef]:
+        return self.list_course_concepts(course_id=scope.course_id, limit=limit)
+
+    def list_course_concepts(self, *, course_id: str, limit: int = 60) -> list[ConceptRef]:
+        return [ConceptRef(row["id"], row["name"], row["page"]) for row in self._repository.list_concepts(course_id=course_id, limit=limit)]
+
     def search_course(self, *, course_id: str, query: str, limit: int = 6) -> list[KnowledgeHit]:
         """Explicit, course-scoped HTTP search use case: 词面 + 语义混合召回，RRF 融合。"""
         if not query.strip():
@@ -193,6 +200,12 @@ class KnowledgeService:
             backend = "hybrid_bge" if embeddings else "sqlite_fts"
             self._repository.update_job(job.id, status="running", stage="indexing", progress=85)
             self._repository.replace_chunks(material_id=material.id, course_id=material.course_id, chunks=chunks, embeddings=embeddings)
+            # 概念目录是归因的 ID 真源，每次索引完都按同一份文本重跑一次（§8.1）。
+            self._repository.update_job(job.id, status="running", stage="concepts", progress=95)
+            self._repository.replace_material_concepts(
+                course_id=material.course_id, material_id=material.id,
+                candidates=extract_candidates([(page, content) for page, content in chunks]),
+            )
             self._repository.set_material_status(material.id, "indexed")
             return self._repository.update_job(job.id, status="completed", stage="completed", progress=100, retrieval_backend=backend)
         except Exception as error:

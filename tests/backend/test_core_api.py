@@ -206,7 +206,7 @@ def test_plan_and_archive_read_skeletons_return_persisted_empty_state(client):
 
     archive = client.get(f"/api/v2/courses/{course['id']}/archive")
     assert archive.status_code == 200
-    assert archive.json() == {"course_id": course["id"], "evidence_count": 0, "events": []}
+    assert archive.json() == {"course_id": course["id"], "evidence_count": 0, "events": [], "mastery": [], "unattributed": []}
 
 
 def test_errors_use_a_stable_envelope(client):

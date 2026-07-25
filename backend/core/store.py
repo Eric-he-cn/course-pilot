@@ -74,6 +74,44 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
     (10, "ALTER TABLE messages ADD COLUMN activity_json TEXT;"),
     # turn 心跳：客户端断开后生成器可能一直挂着，靠心跳判定失活并让新一轮接管会话。
     (11, "ALTER TABLE turn_requests ADD COLUMN heartbeat_at TEXT;"),
+    # 概念目录：证据归因的 ID 真源。由教材索引后的确定性任务产出，可重放且不改已有 id。
+    (12, """
+        CREATE TABLE IF NOT EXISTS concepts (
+            id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(id),
+            name TEXT NOT NULL, chapter TEXT, material_id TEXT REFERENCES materials(id),
+            page INTEGER, mention_count INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_name_per_course ON concepts(course_id, name);
+        CREATE INDEX IF NOT EXISTS idx_concepts_course ON concepts(course_id, mention_count DESC);
+        CREATE TABLE IF NOT EXISTS concept_aliases (
+            concept_id TEXT NOT NULL REFERENCES concepts(id), alias TEXT NOT NULL,
+            PRIMARY KEY (concept_id, alias)
+        );
+    """),
+    # 练习等跨轮产物：envelope 由服务端硬校验，payload 由 skill 自行约定。
+    (13, """
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(id),
+            session_id TEXT NOT NULL REFERENCES sessions(id), kind TEXT NOT NULL,
+            visibility TEXT NOT NULL CHECK(visibility IN ('user_visible', 'model_private')),
+            payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_course_kind ON artifacts(course_id, kind, created_at DESC);
+    """),
+    # 掌握度投影：唯一真源是 evidence_events，这张表可以随时从事件流全量重建。
+    (14, """
+        CREATE TABLE IF NOT EXISTS concept_mastery (
+            concept_id TEXT PRIMARY KEY REFERENCES concepts(id),
+            course_id TEXT NOT NULL REFERENCES courses(id),
+            bkt_p REAL NOT NULL, fsrs_stability REAL NOT NULL, fsrs_difficulty REAL NOT NULL,
+            objective_events INTEGER NOT NULL DEFAULT 0,
+            last_reviewed_at TEXT, due_at TEXT,
+            algorithm_version TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mastery_course ON concept_mastery(course_id, bkt_p);
+        CREATE INDEX IF NOT EXISTS idx_mastery_due ON concept_mastery(course_id, due_at);
+    """),
 )
 
 class SQLiteStore:

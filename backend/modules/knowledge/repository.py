@@ -7,6 +7,7 @@ from core.common import new_id, utc_now
 from core.store import SQLiteStore
 from contracts.knowledge import Citation, KnowledgeHit
 
+from .concepts import concept_id_for
 from .models import Chunk, Job, Material
 
 
@@ -137,6 +138,29 @@ class KnowledgeRepository:
                     (chunk_id, material_id, course_id, ordinal, page, content, embeddings[ordinal] if embeddings else None),
                 )
                 conn.execute("INSERT INTO chunks_fts(chunk_id, course_id, content) VALUES (?, ?, ?)", (chunk_id, course_id, content))
+
+    def replace_material_concepts(self, *, course_id: str, material_id: str, candidates: list[dict]) -> int:
+        """重建本教材的概念，已存在的同名概念保持原 id 与原归属教材不动（§8.1）。"""
+        now = utc_now()
+        with self._store.write() as conn:
+            conn.execute("DELETE FROM concepts WHERE course_id = ? AND material_id = ?", (course_id, material_id))
+            for candidate in candidates:
+                conn.execute(
+                    "INSERT INTO concepts(id, course_id, name, chapter, material_id, page, mention_count, created_at)"
+                    " VALUES (?, ?, ?, NULL, ?, ?, ?, ?)"
+                    " ON CONFLICT(course_id, name) DO UPDATE SET mention_count = MAX(mention_count, excluded.mention_count)",
+                    (concept_id_for(course_id, candidate["name"]), course_id, candidate["name"], material_id,
+                     candidate.get("page"), candidate.get("mention_count", 1), now),
+                )
+            return int(conn.execute("SELECT count(*) FROM concepts WHERE course_id = ?", (course_id,)).fetchone()[0])
+
+    def list_concepts(self, *, course_id: str, limit: int = 60) -> list[dict]:
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT id, name, page, mention_count FROM concepts WHERE course_id = ? ORDER BY mention_count DESC, name LIMIT ?",
+                (course_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def load_course_embeddings(self, *, course_id: str) -> list[tuple[str, bytes]]:
         with self._store.read() as conn:
