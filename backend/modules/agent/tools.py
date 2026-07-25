@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope
@@ -57,6 +58,7 @@ class CitationRegistry:
         self.citations.append(
             {
                 "citation_id": f"citation_{number}",
+                "number": number,
                 "material_id": hit.citation.material_id,
                 "document": hit.citation.document,
                 "page": hit.citation.page,
@@ -66,6 +68,15 @@ class CitationRegistry:
             }
         )
         return number, True
+
+
+_CITATION_MARK = re.compile(r"\[(\d+)\]")
+
+
+def cited_only(answer: str, citations: list[dict]) -> list[dict]:
+    """引用列表只保留回答里真正标注过的编号：检索到但没用上的片段不算依据。"""
+    used = {int(number) for number in _CITATION_MARK.findall(answer)}
+    return [citation for citation in citations if citation["number"] in used]
 
 
 @dataclass(frozen=True)

@@ -22,6 +22,8 @@ export interface SessionSummary {
 
 export interface Citation {
   id?: string
+  // 服务端给出的引用编号，与回答正文里的 [n] 对应
+  number?: number
   material_id?: string
   material_name?: string
   page?: number | null

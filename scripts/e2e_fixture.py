@@ -125,6 +125,10 @@ def main() -> None:
     assert image.stat().st_size > 20_000, "图片过小，OCR 可能读不出文字"
     print(f"\nOCR 图片：{image.name}（{IMAGE_FROM[0]} 第 {IMAGE_FROM[1]} 页，{image.stat().st_size // 1024} KB）")
 
+    # 浏览器里没有文件选择器可用，改由页面 fetch 再注入 input；
+    # vite.config.ts 的 server.fs.allow 已放开这个目录。
+    print(f"\n页面取文件用：/@fs{out}/<文件名>")
+
     data_dir = Path(args.data_dir)
     shutil.rmtree(data_dir, ignore_errors=True)
     print(f"已清空 e2e 数据目录：{data_dir}")

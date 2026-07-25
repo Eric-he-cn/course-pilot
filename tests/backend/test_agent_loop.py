@@ -88,6 +88,20 @@ def test_model_search_loops_and_reuses_citation_numbering(client):
     assert len(persisted[-1]["citations"]) == 1
 
 
+def test_only_cited_evidence_is_persisted(client):
+    text = "\n\n".join(f"第 {i} 节：向量范数用于衡量向量长度，编号 {i}。" for i in range(1, 6))
+    session_id = _indexed_course_session(client, name="数值分析", text=text)
+    scripted = ScriptedChat([[ChatDelta("只用了第一条证据。[1]"), ChatFinal("只用了第一条证据。[1]", "stop", "deepseek", "deepseek-v4-flash", "provider")]])
+    client.app.state.application.turns._responder = scripted
+
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "cite-1", "message": "向量范数是什么？"}).text)
+    retrieved = [name for name, _ in events].count("citation")
+    assert retrieved > 1  # 种子检索命中多段
+
+    citations = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"][-1]["citations"]
+    assert [citation["number"] for citation in citations] == [1]
+
+
 def test_prior_messages_are_injected_into_the_prompt(client):
     session_id = _indexed_course_session(client, name="线性代数", text="行列式衡量线性变换对体积的缩放系数。")
     # 第一轮用默认 demo responder，产生历史。

@@ -13,7 +13,7 @@ from modules.planning.api import PlanReaderPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 
 from .context import SEED_CALL_ID, assemble_messages
-from .tools import TOOL_SPECS, CitationRegistry, ToolExecutor
+from .tools import TOOL_SPECS, CitationRegistry, ToolExecutor, cited_only
 from .trace import TraceWriter
 
 
@@ -181,9 +181,10 @@ class TurnService:
                     if answer_parts:
                         # 已输出增量：保留部分内容并如实标记中断，不静默换供应商重放。
                         yield self._event("stream_interrupted", error_code=error.code, retryable=error.retryable)
+                        partial = "".join(answer_parts)
                         assistant = self._sessions.append_message(
                             session_id=session_id, turn_id=turn.id, role="assistant",
-                            content="".join(answer_parts), citations=registry.citations, status="interrupted",
+                            content=partial, citations=cited_only(partial, registry.citations), status="interrupted",
                         )
                         self._sessions.complete_turn(turn.id, status="failed")
                         finalized = True
@@ -211,10 +212,11 @@ class TurnService:
                 answer = "".join(answer_parts) or response.text
                 finish_reason, responder_mode = response.finish_reason, response.mode
                 provider, model = response.provider, response.model
-            assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=registry.citations)
+            citations = cited_only(answer, registry.citations)
+            assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations)
             self._sessions.complete_turn(turn.id, status="completed")
             finalized = True
-            trace_record.update(status="completed", answer_chars=len(answer), citations=len(registry.citations), responder={"mode": responder_mode, "provider": provider, "model": model}, usage=usage_total, tool_rounds=tool_rounds)
+            trace_record.update(status="completed", answer_chars=len(answer), citations=len(citations), citations_retrieved=len(registry.citations), responder={"mode": responder_mode, "provider": provider, "model": model}, usage=usage_total, tool_rounds=tool_rounds)
             yield self._event(
                 "turn_completed",
                 message_id=assistant.id,
