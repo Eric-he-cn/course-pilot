@@ -33,8 +33,19 @@ cd frontend && pnpm install && cd ..
 .venv/bin/python scripts/smoke.py
 ```
 
-浏览器端到端测试见 `Docs/coursepilot-2.0-e2e-browser-test.md`：教材取自开源教材的章节切片，
+浏览器端到端测试见 [端到端测试清单](Docs/coursepilot-2.0-e2e-browser-test.md)：教材取自开源教材的章节切片，
 用 `scripts/e2e_fixture.py` 准备，测试实例跑在独立数据目录 `data/e2e`，不影响开发库。
+
+## 文档
+
+| 文档 | 用途 |
+| --- | --- |
+| [项目介绍](Docs/项目介绍.md) | 总览：背景、能做什么、各模块的设计思路 |
+| [产品设计](Docs/coursepilot-2.0.md) | 定位、功能模块、分期规划、非目标 |
+| [技术架构](Docs/coursepilot-2.0-architecture.md) | 模块边界、LLM 接入、Skill 体系、存储、掌握度、评测分层 |
+| [前端设计](Docs/coursepilot-2.0-frontend-design.md) | 视觉方案、信息架构、核心页面、组件与状态 |
+| [开发中](Docs/开发中.md) | 当前进度、任务优先级、开发工作流、踩过的坑 |
+| [端到端测试](Docs/coursepilot-2.0-e2e-browser-test.md) | 浏览器回归清单 |
 
 ## 评测
 
