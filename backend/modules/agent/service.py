@@ -11,7 +11,7 @@ from modules.learning.api import ArchiveReaderPort
 from modules.planning.api import PlanReaderPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 
-from .context import SEED_CALL_ID, assemble_messages
+from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages
 from .tools import TOOL_SPECS, CitationRegistry, ToolExecutor, cited_only
 from .trace import TraceWriter
 
@@ -76,7 +76,7 @@ class TurnService:
         turn = None
         finalized = False
         started_monotonic = time.monotonic()
-        trace_record: dict[str, object] = {"kind": "turn", "started_at": utc_now(), "session_id": session_id, "scope_mode": session.scope_mode}
+        trace_record: dict[str, object] = {"kind": "turn", "started_at": utc_now(), "session_id": session_id, "scope_mode": session.scope_mode, "prompt_version": PROMPT_VERSION}
         trace_tools: list[dict[str, object]] = []
         # 面向用户的工具活动，与消息一同持久化，刷新后仍能看到本轮查了什么。
         activity: list[dict[str, object]] = []
@@ -244,9 +244,11 @@ class TurnService:
                 tool_rounds=tool_rounds,
             )
         except SessionBusyError:
+            trace_record.update(status="failed", error_code="session_busy")
             yield self._event("turn_failed", error_code="session_busy", retryable=True)
-        except Exception:
+        except Exception as error:
             trace_record.setdefault("status", "failed")
+            trace_record.setdefault("error_code", f"unhandled:{type(error).__name__}")
             yield self._event("turn_failed", error_code="turn_failed", retryable=False)
         finally:
             # 正常路径靠这里收尾；客户端断连时生成器可能一直挂在 yield 上不进 finally，
@@ -258,6 +260,9 @@ class TurnService:
                     pass
             if self._trace is not None and trace_record.get("turn_id"):
                 trace_record.setdefault("status", "failed" if not finalized else "completed")
+                if trace_record["status"] == "failed":
+                    # 未走到终态多半是客户端断连；排查时要能看出失败原因而不是只有 failed。
+                    trace_record.setdefault("error_code", "client_disconnected")
                 trace_record["tools"] = trace_tools
                 trace_record["duration_ms"] = int((time.monotonic() - started_monotonic) * 1000)
                 self._trace.write(trace_record)

@@ -38,7 +38,8 @@ class KnowledgeService:
         self._embedder = embedder
 
     def upload_material(self, *, course_id: str, filename: str, mime_type: str, content: bytes) -> Material:
-        safe_name = Path(filename).name
+        # 文件名会进提示词与界面：压掉空白、限长，避免换行伪造出新的提示词规则。
+        safe_name = re.sub(r"\s+", " ", Path(filename).name).strip()[:120]
         suffix = Path(safe_name).suffix.lower()
         if not safe_name or suffix not in self._ALLOWED_SUFFIXES:
             raise ValueError("仅支持 PDF、TXT 或 MD 教材")
