@@ -122,10 +122,12 @@ def test_nested_course_names_resolve_to_the_more_specific_course(client):
     assert specific[1][1]["status"] == "resolved"
     assert specific[1][1]["resolved_course_id"] == advanced["id"]
 
-    # 名字互不包含的两门课同时出现，仍然是真歧义。
+    # 名字互不包含的两门课同时出现，仍然是真歧义，澄清话术要列出候选课程。
     fresh = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
     both = _events(client.post(f"/api/v2/sessions/{fresh['id']}/turns", json={"client_request_id": "n-2", "message": "深度学习和线性代数哪门先学？"}).text)
     assert both[1][1]["status"] == "ambiguous"
+    reply = client.get(f"/api/v2/sessions/{fresh['id']}/messages").json()["messages"][-1]["content"]
+    assert "深度学习" in reply and "线性代数" in reply
 
 
 def test_default_titled_session_is_named_by_first_user_message(client):

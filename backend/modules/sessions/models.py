@@ -25,3 +25,5 @@ class Turn:
 @dataclass(frozen=True)
 class ResolvedCourseContext:
     turn_id: str; status: ResolutionStatus; course_id: str | None; course_name: str | None; course_color: str | None; reason: str; resolver_version: str = "course_resolver_v1"
+    # 歧义时问题命中的课程名，用于让澄清话术给出可选项
+    candidates: tuple[str, ...] = ()

@@ -115,7 +115,10 @@ class TurnService:
             tool_rounds = 0
             seq = 0
             if context.status != "resolved" or context.course_id is None:
-                answer = "我还不能确定要使用哪门课程的资料。请在问题中说明课程名称，或先进入具体课程工作区。"
+                if context.candidates:
+                    answer = "你的问题同时提到了" + "、".join(f"「{name}」" for name in context.candidates) + "，我不确定该用哪一门的资料。说明是哪一门，我就接着答。"
+                else:
+                    answer = "我还不能确定要使用哪门课程的资料。请在问题中说明课程名称，或先进入具体课程工作区。"
                 finish_reason, responder_mode, provider, model = "course_unresolved", "local_guardrail", "system", "none"
                 seq += 1
                 yield self._event("text_delta", seq=seq, text=answer)

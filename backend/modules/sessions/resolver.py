@@ -13,7 +13,7 @@ class CourseResolver:
             candidates = [course for course in candidates if not any(other.id != course.id and course.name.casefold() in other.name.casefold() for other in candidates)]
         if len(candidates) == 1:
             course = candidates[0]; return ResolvedCourseContext(turn_id, "resolved", course.id, course.name, course.color, "explicit_course_name", self.version)
-        if len(candidates) > 1: return ResolvedCourseContext(turn_id, "ambiguous", None, None, None, "multiple_course_names", self.version)
+        if len(candidates) > 1: return ResolvedCourseContext(turn_id, "ambiguous", None, None, None, "multiple_course_names", self.version, tuple(course.name for course in candidates))
         if session.resolved_course_id:
             # 通用会话沿用最近一次可靠解析，用户追问不必每轮重复课程名。
             course = self._courses.get_course(session.resolved_course_id)
