@@ -4,6 +4,8 @@ import threading
 
 # BGE 中文检索模型要求查询侧加指令前缀，文档侧不加；bge-m3 内置多语言指令无需前缀。
 _BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+# 单次持锁编码的条数上限：越小，索引期间的查询等待越短。
+_ENCODE_LOCK_STEP = 64
 
 
 class BgeEmbedder:
@@ -42,10 +44,15 @@ class BgeEmbedder:
             return None
         import numpy as np
 
-        # encode 加锁：索引 worker 与查询线程共享一个模型实例。
-        with self._lock:
-            vectors = model.encode(texts, batch_size=self._batch_size, normalize_embeddings=True, show_progress_bar=False)
-        return [np.asarray(vector, dtype=np.float32).tobytes() for vector in vectors]
+        # 索引 worker 与查询线程共享一个模型实例，encode 必须互斥；分段持锁，
+        # 否则索引一本大教材期间提问要排队等整批编码完成。
+        step = min(self._batch_size, _ENCODE_LOCK_STEP)
+        vectors: list[bytes] = []
+        for start in range(0, len(texts), step):
+            with self._lock:
+                encoded = model.encode(texts[start:start + step], batch_size=step, normalize_embeddings=True, show_progress_bar=False)
+            vectors.extend(np.asarray(vector, dtype=np.float32).tobytes() for vector in encoded)
+        return vectors
 
     def rank(self, *, query: str, vectors: list[bytes], top_k: int) -> list[tuple[int, float]]:
         model = self._load()

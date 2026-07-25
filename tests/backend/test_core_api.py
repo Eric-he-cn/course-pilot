@@ -112,6 +112,22 @@ def test_general_follow_up_reuses_recent_resolution_and_fresh_session_stays_unre
     assert vague[1][1]["status"] == "unresolved"
 
 
+def test_nested_course_names_resolve_to_the_more_specific_course(client):
+    client.post("/api/v2/courses", json={"name": "深度学习"})
+    advanced = client.post("/api/v2/courses", json={"name": "深度学习进阶"}).json()
+    client.post("/api/v2/courses", json={"name": "线性代数"})
+
+    session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+    specific = _events(client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "n-1", "message": "深度学习进阶这门课的重点是什么？"}).text)
+    assert specific[1][1]["status"] == "resolved"
+    assert specific[1][1]["resolved_course_id"] == advanced["id"]
+
+    # 名字互不包含的两门课同时出现，仍然是真歧义。
+    fresh = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
+    both = _events(client.post(f"/api/v2/sessions/{fresh['id']}/turns", json={"client_request_id": "n-2", "message": "深度学习和线性代数哪门先学？"}).text)
+    assert both[1][1]["status"] == "ambiguous"
+
+
 def test_default_titled_session_is_named_by_first_user_message(client):
     session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
     assert session["title"] == "新学习对话"

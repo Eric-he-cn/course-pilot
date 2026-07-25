@@ -166,8 +166,11 @@ class KnowledgeService:
             database = {"ok": False, "error": str(error)}
         rag: dict[str, object] = {"ok": bool(database["ok"]), "backend": "sqlite_fts_fallback"}
         if self._embedder is not None:
-            rag["backend"] = "hybrid_bge"
-            rag["embedding"] = self._embedder.status()
+            status = self._embedder.status()
+            rag["embedding"] = status
+            # 向量模型加载失败后只剩词面检索，backend 不能继续报混合。
+            if not status.get("error"):
+                rag["backend"] = "hybrid_bge"
         return {"database": database, "rag": rag}
 
     def _run_index(self, job: Job, material: Material) -> Job:
