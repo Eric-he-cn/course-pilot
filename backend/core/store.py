@@ -70,6 +70,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
         CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id, created_at);
     """),
+    # 本轮用了哪些工具：可解释性证据要跟着消息一起留存，刷新后仍能看到"查了什么"。
+    (10, "ALTER TABLE messages ADD COLUMN activity_json TEXT;"),
+    # turn 心跳：客户端断开后生成器可能一直挂着，靠心跳判定失活并让新一轮接管会话。
+    (11, "ALTER TABLE turn_requests ADD COLUMN heartbeat_at TEXT;"),
 )
 
 class SQLiteStore:

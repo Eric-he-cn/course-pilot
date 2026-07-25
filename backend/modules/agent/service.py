@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
 from collections.abc import Iterator
 
@@ -19,6 +18,9 @@ from .trace import TraceWriter
 
 class TurnService:
     """Agent loop：组装历史与种子证据，供模型带工具多轮推进，直到给出最终回答。"""
+
+    # 心跳写库的最小间隔，需明显小于 SessionService.STALE_TURN_SECONDS。
+    HEARTBEAT_SECONDS = 10
 
     def __init__(
         self,
@@ -40,16 +42,19 @@ class TurnService:
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
-
-    def _lock_for(self, session_id: str) -> threading.Lock:
-        with self._locks_guard:
-            return self._locks.setdefault(session_id, threading.Lock())
 
     @staticmethod
     def _event(event_name: str, **data: object) -> dict[str, object]:
         return {"event": event_name, "data": data}
+
+    def _heartbeat(self, turn_id: str, last: float) -> float:
+        """按 HEARTBEAT_SECONDS 节流续约：证明这一轮还活着，避免被下一轮当成失活抢占。"""
+        now = time.monotonic()
+        if now - last < self.HEARTBEAT_SECONDS:
+            return last
+        try: self._sessions.touch_turn(turn_id)
+        except Exception: pass  # 续约失败不该打断对话，最坏是本轮被后来者接管
+        return now
 
     @staticmethod
     def _merge_usage(total: dict[str, int], extra: dict[str, int]) -> None:
@@ -68,15 +73,14 @@ class TurnService:
         session = self._sessions.get_session(session_id)
         if session is None:
             raise LookupError("会话不存在")
-        lock = self._lock_for(session_id)
-        if not lock.acquire(blocking=False):
-            yield self._event("turn_failed", error_code="session_busy", retryable=True)
-            return
         turn = None
         finalized = False
         started_monotonic = time.monotonic()
         trace_record: dict[str, object] = {"kind": "turn", "started_at": utc_now(), "session_id": session_id, "scope_mode": session.scope_mode}
         trace_tools: list[dict[str, object]] = []
+        # 面向用户的工具活动，与消息一同持久化，刷新后仍能看到本轮查了什么。
+        activity: list[dict[str, object]] = []
+        last_heartbeat = time.monotonic()
         try:
             if attachment_ids:
                 try:
@@ -126,6 +130,7 @@ class TurnService:
                 for citation in seed.new_citations:
                     yield self._event("citation", **citation)
                 yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, summary=seed.summary)
+                activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, "summary": seed.summary})
                 trace_tools.append({"origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, "summary": seed.summary, "duration_ms": int((time.monotonic() - seed_started) * 1000)})
                 messages = assemble_messages(
                     course_name=context.course_name or "当前课程",
@@ -147,6 +152,7 @@ class TurnService:
                                 segment_parts.append(item.text)
                                 answer_parts.append(item.text)
                                 seq += 1
+                                last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
                                 yield self._event("text_delta", seq=seq, text=item.text)
                             else:
                                 outcome = item
@@ -173,6 +179,7 @@ class TurnService:
                                 for citation in result.new_citations:
                                     yield self._event("citation", **citation)
                                 yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, summary=result.summary)
+                                activity.append({"call_id": call.id, "name": call.name, "origin": "model", "ok": result.ok, "summary": result.summary})
                                 trace_tools.append({"origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, "summary": result.summary, "duration_ms": int((time.monotonic() - call_started) * 1000)})
                                 messages.append(ChatMessage(role="tool", content=result.text, tool_call_id=call.id))
                         else:
@@ -184,7 +191,7 @@ class TurnService:
                         partial = "".join(answer_parts)
                         assistant = self._sessions.append_message(
                             session_id=session_id, turn_id=turn.id, role="assistant",
-                            content=partial, citations=cited_only(partial, registry.citations), status="interrupted",
+                            content=partial, citations=cited_only(partial, registry.citations), status="interrupted", activity=activity,
                         )
                         self._sessions.complete_turn(turn.id, status="failed")
                         finalized = True
@@ -212,8 +219,14 @@ class TurnService:
                 answer = "".join(answer_parts) or response.text
                 finish_reason, responder_mode = response.finish_reason, response.mode
                 provider, model = response.provider, response.model
+            if not self._sessions.touch_turn(turn.id):
+                # 本轮已被判失活、会话被新一轮接管，不再写回答，避免消息错乱。
+                finalized = True
+                trace_record.update(status="failed", error_code="turn_superseded")
+                yield self._event("turn_failed", error_code="turn_superseded", retryable=False)
+                return
             citations = cited_only(answer, registry.citations)
-            assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations)
+            assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations, activity=activity)
             self._sessions.complete_turn(turn.id, status="completed")
             finalized = True
             trace_record.update(status="completed", answer_chars=len(answer), citations=len(citations), citations_retrieved=len(registry.citations), responder={"mode": responder_mode, "provider": provider, "model": model}, usage=usage_total, tool_rounds=tool_rounds)
@@ -233,8 +246,8 @@ class TurnService:
             trace_record.setdefault("status", "failed")
             yield self._event("turn_failed", error_code="turn_failed", retryable=False)
         finally:
-            # finally 对 GeneratorExit（客户端断连）也生效：任何未走到终态的 turn
-            # 在这里落为 failed，避免 running 残留把会话永久锁死。
+            # 正常路径靠这里收尾；客户端断连时生成器可能一直挂在 yield 上不进 finally，
+            # 那种失活 turn 由心跳超时让下一轮接管。
             if turn is not None and not finalized:
                 try:
                     self._sessions.complete_turn(turn.id, status="failed")
@@ -245,4 +258,3 @@ class TurnService:
                 trace_record["tools"] = trace_tools
                 trace_record["duration_ms"] = int((time.monotonic() - started_monotonic) * 1000)
                 self._trace.write(trace_record)
-            lock.release()

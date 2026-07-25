@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from contracts.llm import ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, ToolCallRequest
+from core.common import utc_shift
 from core.settings import Settings
 
 
@@ -86,6 +87,8 @@ def test_model_search_loops_and_reuses_citation_numbering(client):
 
     persisted = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"]
     assert len(persisted[-1]["citations"]) == 1
+    # 工具活动随消息持久化，刷新后仍能看到本轮查了什么。
+    assert [entry["origin"] for entry in persisted[-1]["activity"]] == ["seed", "model"]
 
 
 def test_only_cited_evidence_is_persisted(client):
@@ -129,6 +132,24 @@ def test_plan_and_archive_tools_report_empty_state(client):
     summaries = [data["summary"] for name, data in events if name == "tool_result"]
     assert "暂无计划" in summaries
     assert "档案为空" in summaries
+
+
+def test_stale_turn_does_not_lock_the_session_forever(client):
+    """客户端断连后 running turn 可能残留，心跳过期的 turn 必须让新一轮接管会话。"""
+    session_id = _indexed_course_session(client, name="信号与系统", text="卷积把冲激响应与输入序列结合起来。")
+    sessions = client.app.state.application.sessions
+    turn, _ = sessions.start_turn(session_id=session_id, client_request_id="orphan")
+
+    busy = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "blocked", "message": "卷积是什么？"}).text)
+    assert busy[-1][1]["error_code"] == "session_busy"
+
+    # 把心跳推回到失活阈值之前，等价于客户端已经断开一分钟。
+    sessions._repository.touch_turn(turn_id=turn.id, timestamp=utc_shift(-(sessions.STALE_TURN_SECONDS + 5)))
+    taken_over = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "after-stale", "message": "卷积是什么？"}).text)
+    assert taken_over[-1][0] == "turn_completed"
+
+    # 被抢占的 turn 不能再改写终态，也不能补写回答。
+    assert not sessions.touch_turn(turn.id)
 
 
 def test_tool_budget_is_bounded(client):

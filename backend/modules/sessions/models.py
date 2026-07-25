@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 ScopeMode = Literal["general", "course"]
 ResolutionStatus = Literal["resolved", "ambiguous", "unresolved"]
@@ -14,6 +14,7 @@ class Message:
     resolved_course_name: str | None = None
     resolved_course_color: str | None = None
     resolution_reason: str | None = None
+    activity: list[dict] = field(default_factory=list)
 @dataclass(frozen=True)
 class Attachment:
     id: str; session_id: str; filename: str; mime_type: str; byte_size: int; width: int; height: int

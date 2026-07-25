@@ -33,7 +33,7 @@ export interface Citation {
 }
 
 export interface ToolActivity {
-  callId: string
+  call_id: string
   name: string
   origin?: string
   summary?: string
@@ -51,7 +51,7 @@ export interface Message {
   resolved_course_id?: string | null
   resolved_course_name?: string | null
   resolved_course_color?: string | null
-  // 工具活动仅在流式生成期间用于可视化“查了什么”，不做服务端持久化。
+  // 本轮"查了什么"：流式期间来自 SSE，回读消息后来自服务端持久化记录。
   activity?: ToolActivity[]
   artifact?: { kind: string; visibility?: string; payload?: unknown }
 }

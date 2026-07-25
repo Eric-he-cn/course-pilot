@@ -1,6 +1,9 @@
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
 import { ApiError, api } from './api'
 import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, ToolActivity } from './types'
 
@@ -142,21 +145,18 @@ export default function App() {
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
           }
           if (payload.type === 'tool_call' && payload.call_id) {
-            activity.push({ callId: payload.call_id, name: payload.name ?? '工具', origin: payload.origin })
+            activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin })
             setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           if (payload.type === 'tool_result' && payload.call_id) {
-            const entry = activity.find(item => item.callId === payload.call_id)
+            const entry = activity.find(item => item.call_id === payload.call_id)
             if (entry) { entry.summary = payload.summary; entry.ok = payload.ok }
             setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           const delta = payload.delta ?? payload.content ?? payload.text ?? ''
           if (delta) setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
-        }, attachmentIds)
-          await loadMessages(targetSession.id); await loadSessions()
-          // 服务端不持久化工具活动，回读消息后贴回本轮，避免刚生成完就消失。
-          if (activity.length) setMessages(current => current.map((item, index) => index === current.length - 1 && item.role === 'assistant' ? { ...item, activity } : item))
-        }
+          if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice('回答达到长度上限，内容可能不完整。')
+        }, attachmentIds); await loadMessages(targetSession.id); await loadSessions() }
         catch (error) {
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
@@ -234,7 +234,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
-  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <span key={entry.callId} className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${entry.summary ? 'done' : 'pending'}`}><i aria-hidden>{entry.summary ? (entry.ok === false ? '×' : '✓') : '…'}</i>{TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}</span>)}</div>}<div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <span key={entry.call_id} className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${entry.summary ? 'done' : 'pending'}`}><i aria-hidden>{entry.summary ? (entry.ok === false ? '×' : '✓') : '…'}</i>{TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}</span>)}</div>}<div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
