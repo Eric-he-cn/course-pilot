@@ -309,7 +309,21 @@ function ArchiveView({ course, onError }: { course: Course; onError: (message: s
   }, [course.id])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习档案</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>掌握度由 append-only 证据事件流投影而来；此页展示服务端已持久化的事件。</p></div></div>
-    {!archive ? <p className="mini-empty">正在读取档案…</p> : <article className="card"><div className="card-heading"><div><h2>证据事件</h2><p>共 {archive.evidence_count} 条</p></div></div>{archive.events.length ? archive.events.map(event => <div className="material-row" key={event.id}><div className="file-mark">{event.kind.toUpperCase().slice(0, 4)}</div><div className="material-copy"><b>{event.concept_id ?? event.topic_hint ?? '未归因'}</b><small>{event.attribution_status} · {timeLabel(event.created_at)}</small></div></div>) : <div className="empty-inline">还没有证据事件。答题、小测与纠错发生后，这里会出现可追溯的记录。</div>}</article>}
+    {!archive ? <p className="mini-empty">正在读取档案…</p> : <>
+      <article className="card"><div className="card-heading"><div><h2>概念掌握度</h2><p>BKT 后验 × 遗忘曲线；证据不足的概念不给强弱判断</p></div></div>
+        {archive.mastery.length ? archive.mastery.map(item => <div className="material-row" key={item.concept_id}>
+          <div className="file-mark">{item.insufficient_evidence ? '—' : `${Math.round((item.score ?? 0) * 100)}`}</div>
+          <div className="material-copy"><b>{item.name}</b>
+            <small>{item.insufficient_evidence ? `数据不足（${item.objective_events} 条客观证据）` : `${item.objective_events} 条客观证据`}{item.due_at ? ` · 复习到期 ${item.due_at.slice(0, 10)}` : ''}</small>
+            {!item.insufficient_evidence && <div className="job-progress"><i style={{ width: `${Math.round((item.score ?? 0) * 100)}%` }} /></div>}
+          </div>
+        </div>) : <div className="empty-inline">还没有掌握度数据。做练习并提交作答后，这里会按概念出现掌握度。</div>}
+      </article>
+      <article className="card"><div className="card-heading"><div><h2>证据事件</h2><p>共 {archive.evidence_count} 条</p></div></div>{archive.events.length ? archive.events.map(event => <div className="material-row" key={event.id}><div className="file-mark">{event.kind.toUpperCase().slice(0, 4)}</div><div className="material-copy"><b>{event.concept_name ?? event.topic_hint ?? (event.concept_id ? "已归因概念" : "未归因")}</b><small>{event.attribution_status} · {timeLabel(event.created_at)}</small></div></div>) : <div className="empty-inline">还没有证据事件。答题、小测与纠错发生后，这里会出现可追溯的记录。</div>}</article>
+      {archive.unattributed.length > 0 && <article className="card"><div className="card-heading"><div><h2>未归因主题</h2><p>模型给不出概念时留下的线索，可人工补录到概念目录</p></div></div>
+        {archive.unattributed.map(item => <div className="material-row" key={item.topic_hint}><div className="file-mark">{item.hits}</div><div className="material-copy"><b>{item.topic_hint}</b><small>最近 {timeLabel(item.last_seen)}</small></div></div>)}
+      </article>}
+    </>}
   </div></section>
 }
 

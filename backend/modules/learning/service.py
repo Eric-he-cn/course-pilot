@@ -9,7 +9,7 @@ class LearningService:
     def __init__(self, repository: LearningRepository) -> None: self._repository = repository
     def get_archive(self, *, course_id: str, limit: int = 20) -> ArchiveSummary:
         events = [
-            EvidenceEvent(row["id"], row["course_id"], row["concept_id"], row["attribution_status"], row["topic_hint"], row["kind"], row["created_at"])
+            EvidenceEvent(row["id"], row["course_id"], row["concept_id"], row["attribution_status"], row["topic_hint"], row["kind"], row["created_at"], row["concept_name"])
             for row in self._repository.list_recent_event_rows(course_id=course_id, limit=limit)
         ]
         return ArchiveSummary(

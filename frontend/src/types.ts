@@ -114,6 +114,7 @@ export interface Plan {
 }
 
 export interface EvidenceEvent {
+  concept_name?: string | null
   id: string
   kind: string
   concept_id?: string | null
@@ -122,8 +123,27 @@ export interface EvidenceEvent {
   created_at: string
 }
 
+export interface ConceptMastery {
+  concept_id: string
+  name: string
+  // 服务端算出的复合掌握度；null 表示可归因客观证据不足，界面显示"数据不足"
+  score: number | null
+  objective_events: number
+  due_at?: string | null
+  insufficient_evidence: boolean
+  algorithm_version: string
+}
+
+export interface UnattributedTopic {
+  topic_hint: string
+  hits: number
+  last_seen: string
+}
+
 export interface ArchiveSummary {
   course_id: string
   evidence_count: number
   events: EvidenceEvent[]
+  mastery: ConceptMastery[]
+  unattributed: UnattributedTopic[]
 }

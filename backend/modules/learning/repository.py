@@ -6,7 +6,12 @@ class LearningRepository:
     def count_events(self, *, course_id: str) -> int:
         with self._store.read() as c: return int(c.execute("SELECT count(*) FROM evidence_events WHERE course_id = ?", (course_id,)).fetchone()[0])
     def list_recent_event_rows(self, *, course_id: str, limit: int):
-        with self._store.read() as c: return c.execute("SELECT * FROM evidence_events WHERE course_id = ? ORDER BY created_at DESC LIMIT ?", (course_id, limit)).fetchall()
+        with self._store.read() as c:
+            return c.execute(
+                "SELECT e.*, c.name AS concept_name FROM evidence_events e LEFT JOIN concepts c ON c.id = e.concept_id"
+                " WHERE e.course_id = ? ORDER BY e.created_at DESC LIMIT ?",
+                (course_id, limit),
+            ).fetchall()
     def concept_row(self, concept_id: str):
         with self._store.read() as c: return c.execute("SELECT id, course_id, name FROM concepts WHERE id = ?", (concept_id,)).fetchone()
     def insert_event(self, *, event_id: str, course_id: str, concept_id: str | None, attribution_status: str, topic_hint: str | None, kind: str, payload: dict, timestamp: str) -> None:

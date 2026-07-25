@@ -22,7 +22,8 @@ for port in 8000 5173; do
   fi
 done
 
-"${python_bin}" -m uvicorn app.main:app --app-dir "${project_dir}/backend" --host 127.0.0.1 --port 8000 &
+# --reload：后端改动自动生效，避免改完代码忘重启、对着旧进程调试。
+"${python_bin}" -m uvicorn app.main:app --app-dir "${project_dir}/backend" --host 127.0.0.1 --port 8000 --reload --reload-dir "${project_dir}/backend" &
 backend_pid=$!
 cleanup() {
   kill "${backend_pid}" 2>/dev/null || true
