@@ -95,6 +95,16 @@ def test_process_image_rejects_bad_mime_and_oversized_bytes():
         process_image(content=b"not-an-image", mime_type="image/png", max_bytes=10_000_000, max_pixels=12_000_000)
 
 
+def test_process_image_rejects_decompression_bomb_before_decoding():
+    """几百 KB 的图能解压成几亿像素；必须按 header 尺寸拒掉，而不是解码后才发现。"""
+    buffer = io.BytesIO()
+    Image.new("L", (20000, 20000), 255).save(buffer, format="PNG", optimize=True)
+    bomb = buffer.getvalue()
+    assert len(bomb) < 10_000_000  # 体积检查放不住它
+    with pytest.raises(ValueError):
+        process_image(content=bomb, mime_type="image/png", max_bytes=10_000_000, max_pixels=12_000_000)
+
+
 def test_process_image_downscales_and_strips_exif():
     source = Image.new("RGB", (400, 200), "white")
     exif = Image.Exif()
