@@ -193,3 +193,24 @@ def test_material_names_cannot_inject_prompt_rules():
     assert len(injected_line) == 1  # 换行被压掉，没有额外成行
     assert injected_line[0].startswith("- 「") and injected_line[0].endswith("」")
     assert len(injected_line[0]) < 100  # 超长文件名被截断
+
+
+def test_filler_segments_are_dropped_but_substance_is_kept():
+    from modules.agent.service import join_answer
+
+    # 工具调用之间的过场话不进最终回答。
+    assert join_answer(["我来查一下教材。", "证据齐全了，开始出题。", "## 批改\n第 1 题正确 [2]"]) == "## 批改\n第 1 题正确 [2]"
+    # 带引用、公式或列表的中间段是实质内容，必须保留。
+    kept = join_answer(["教材第 8 页给出结论 [5]。", "完整推导：$x^2$"])
+    assert "第 8 页" in kept and "x^2" in kept
+    assert join_answer([]) == ""
+    assert join_answer(["只有一段最终回答"]) == "只有一段最终回答"
+
+
+def test_provider_tool_call_markup_never_reaches_the_answer():
+    from modules.agent.service import _strip_provider_markup
+
+    leaked = "第 1 题正确。<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"artifact_append\">x"
+    cleaned, stripped = _strip_provider_markup(leaked)
+    assert cleaned == "第 1 题正确。" and stripped is True
+    assert _strip_provider_markup("正常回答") == ("正常回答", False)

@@ -8,7 +8,7 @@ from contracts.llm import ChatMessage, ToolCallRequest
 
 SEED_CALL_ID = "call_seed_search"
 # 提示词版本：改动系统提示词就要 +1，trace 里据此区分不同版本的效果。
-PROMPT_VERSION = "tutor_v2"
+PROMPT_VERSION = "tutor_v4"
 # ponytail: 字符数保守近似 token（1 字符 ≤ 1 token）；接入真实 tokenizer 前不做精确计数。
 # 单条消息上限，防止一条超长消息吃掉整个历史预算。
 MESSAGE_MAX_CHARS = 20_000
@@ -40,8 +40,10 @@ _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课�
 输出：
 8. 使用中文，先直接回答，再给必要的推导或例子；保持清晰、简洁。
 9. 数学公式一律用 $ 包裹：行内写 $x^2$，独立成行写 $$...$$，不要用 \\( 或 \\[。
-10. 出练习题时：题目基于教材内容并标注出处编号，默认 3 道由易到难；先只给题目，
-    用户作答或明确要答案之后再讲解，不要一次把题目和答案铺开。
+10. 讲解与规划直接做，不要加载 skill。以下情况必须先 use_skill 加载 practice 再按其规程执行：
+    用户要练题或要变式题；上面的练习状态显示有"尚未批改"的练习，而用户这轮内容像是在作答
+    （给出答案、算式、选项或"我觉得是…"）；用户要讲评某道题。批改练习不能凭记忆直接判，
+    必须走 practice 规程，否则作答结果不会进入学习档案。
 """
 
 
@@ -62,10 +64,16 @@ def assemble_messages(
     seed_query: str,
     seed_result_text: str,
     history_token_budget: int,
+    skill_summaries: str = "",
+    practice_digest: str = "",
 ) -> list[ChatMessage]:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
     与模型自己调 search_materials 得到的形态一致）。"""
-    system = _SYSTEM_PROMPT.format(course_name=course_name, materials=_material_lines(materials))
+    system = _SYSTEM_PROMPT.format(
+        course_name=course_name, materials=_material_lines(materials),
+        skills=skill_summaries or "（当前没有可加载的能力）",
+        practice_digest=practice_digest or "（本会话还没有练习记录）",
+    )
     seed_call = ToolCallRequest(id=SEED_CALL_ID, name="search_materials", arguments=json.dumps({"query": seed_query}, ensure_ascii=False))
     return [
         ChatMessage(role="system", content=system),

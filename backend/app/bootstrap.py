@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from adapters.embedding import BgeEmbedder
 from adapters.llm import DeepSeekAgentChat, DemoAgentChat, QwenOcrTranscriber
 from contracts.llm import AgentChatPort, VisionTranscriberPort
 from modules.agent.service import TurnService
+from modules.agent.skills import SkillRegistry
 from modules.agent.trace import TraceWriter
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
@@ -17,6 +19,7 @@ from modules.learning.service import LearningService
 from modules.planning.repository import PlanningRepository
 from modules.planning.service import PlanningService
 from modules.sessions.resolver import CourseResolver
+from modules.sessions.artifacts import ArtifactStore
 from modules.sessions.repository import SessionRepository
 from modules.sessions.service import SessionService
 
@@ -111,8 +114,11 @@ def build_application(settings: Settings) -> Application:
     )
     learning = LearningService(LearningRepository(store))
     planning = PlanningService(PlanningRepository(store))
+    # 内建 skill 目录随代码走（架构 §6）；用户导入的 skill 后续接同一形状。
+    skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
+        evidence=learning, artifacts=ArtifactStore(store), skills=skills,
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
     )

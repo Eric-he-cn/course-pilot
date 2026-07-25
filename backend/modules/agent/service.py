@@ -1,19 +1,51 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterator
 
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
-from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, LLMProviderError
+from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, LLMProviderError, ToolCallRequest
 from core.common import utc_now
-from modules.learning.api import ArchiveReaderPort
+from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.planning.api import PlanReaderPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
+from modules.sessions.artifacts import ArtifactStore
 
 from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages
-from .tools import TOOL_SPECS, CitationRegistry, ToolExecutor, cited_only
+from .skills import SkillRegistry
+from .tools import MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, specs_for
 from .trace import TraceWriter
+
+
+# 供应商偶尔会在工具预算耗尽后把 tool_call 当普通文本吐出来，这类内部标记不能进回答。
+_PROVIDER_MARKUP = re.compile(r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}.*", re.DOTALL)
+
+
+# 多轮工具调用之间模型爱写"我来查一下""证据齐全了"这类过场话，提示词压不住；
+# 短、无引用、无公式、无列表的中间段按过场话丢弃，有实质内容的段落一律保留。
+_SUBSTANCE = re.compile(r"\[\d+\]|\$|^\s*[-*\d]", re.MULTILINE)
+_FILLER_MAX_CHARS = 80
+
+
+def _is_filler(segment: str) -> bool:
+    text = segment.strip()
+    return bool(text) and len(text) <= _FILLER_MAX_CHARS and not _SUBSTANCE.search(text)
+
+
+def join_answer(segments: list[str]) -> str:
+    """最后一段是最终回答，之前的中间段只保留有实质内容的。"""
+    if not segments:
+        return ""
+    kept = [segment for segment in segments[:-1] if segment.strip() and not _is_filler(segment)]
+    kept.append(segments[-1])
+    return "\n\n".join(part.strip() for part in kept if part.strip())
+
+
+def _strip_provider_markup(answer: str) -> tuple[str, bool]:
+    cleaned = _PROVIDER_MARKUP.sub("", answer).rstrip()
+    return (cleaned or answer, cleaned != answer.rstrip())
 
 
 class TurnService:
@@ -21,6 +53,8 @@ class TurnService:
 
     # 心跳写库的最小间隔，需明显小于 SessionService.STALE_TURN_SECONDS。
     HEARTBEAT_SECONDS = 10
+    # skill 激活后的工具轮次上限：一次完整评分要读产物、查概念、逐题归因，6 轮不够。
+    SKILL_TOOL_ROUNDS = 12
 
     def __init__(
         self,
@@ -31,6 +65,9 @@ class TurnService:
         responder: AgentChatPort,
         fallback_responder: AgentChatPort,
         *,
+        evidence: EvidenceWriterPort,
+        artifacts: ArtifactStore,
+        skills: SkillRegistry,
         trace: TraceWriter | None = None,
         max_tool_rounds: int = 6,
         history_token_budget: int = 128_000,
@@ -38,7 +75,12 @@ class TurnService:
         self._sessions, self._knowledge = sessions, knowledge
         self._responder = responder
         self._fallback_responder = fallback_responder
-        self._executor = ToolExecutor(knowledge=knowledge, plans=plans, archive=archive)
+        self._skills = skills
+        self._artifacts = artifacts
+        self._executor = ToolExecutor(
+            knowledge=knowledge, plans=plans, archive=archive,
+            evidence=evidence, artifacts=artifacts, skills=skills,
+        )
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
@@ -111,6 +153,7 @@ class TurnService:
             registry = CitationRegistry()
             response: ChatFinal | None = None
             answer_parts: list[str] = []
+            answer_segments: list[str] = []
             usage_total: dict[str, int] = {}
             tool_rounds = 0
             seq = 0
@@ -129,7 +172,7 @@ class TurnService:
                 seed_args = json.dumps({"query": message}, ensure_ascii=False)
                 yield self._event("tool_call", call_id=SEED_CALL_ID, name="search_materials", arguments={"query": message}, origin="seed")
                 seed_started = time.monotonic()
-                seed = self._executor.execute(scope=scope, name="search_materials", arguments=seed_args, registry=registry)
+                seed = self._executor.execute(scope=scope, session_id=session_id, name="search_materials", arguments=seed_args, registry=registry, allowed=MAIN_PROFILE)
                 for citation in seed.new_citations:
                     yield self._event("citation", **citation)
                 yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, summary=seed.summary)
@@ -143,14 +186,34 @@ class TurnService:
                     seed_query=message,
                     seed_result_text=seed.text,
                     history_token_budget=self._history_token_budget,
+                    skill_summaries=self._skills.summaries(),
+                    practice_digest=self._artifacts.practice_digest(session_id=session_id),
                 )
                 responder = self._responder
+                allowed_tools = MAIN_PROFILE
+                active_skill: str | None = None
+                max_rounds = self._max_tool_rounds
+                # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
+                # 而漏批改意味着这次作答不进学习档案。加载后仍由规程自己判断本轮做什么。
+                pending = self._artifacts.latest_practice(session_id=session_id)
+                practice_skill = self._skills.get("practice")
+                if pending is not None and not pending[2] and practice_skill is not None:
+                    call_id = "call_auto_practice"
+                    yield self._event("tool_call", call_id=call_id, name="use_skill", arguments={"name": "practice"}, origin="auto")
+                    yield self._event("tool_result", call_id=call_id, name="use_skill", ok=True, summary=f"自动加载 practice（练习 {pending[0]} 待批改）")
+                    activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True, "summary": "自动加载 practice"})
+                    trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": {"name": "practice"}, "ok": True, "summary": "自动加载", "duration_ms": 0})
+                    messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps({"name": "practice"})),)))
+                    messages.append(ChatMessage(role="tool", content=f"# Skill: practice\n\n{practice_skill.body}", tool_call_id=call_id))
+                    active_skill, allowed_tools = "practice", practice_skill.allowed_tools
+                    max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
+                    trace_record["skill"] = {"name": "practice", "content_hash": practice_skill.content_hash, "activation": "auto"}
                 try:
                     while response is None:
-                        allow_tools = tool_rounds < self._max_tool_rounds
+                        allow_tools = tool_rounds < max_rounds
                         segment_parts: list[str] = []
                         outcome: ChatToolCalls | ChatFinal | None = None
-                        for item in responder.chat(messages=messages, tools=TOOL_SPECS if allow_tools else ()):
+                        for item in responder.chat(messages=messages, tools=specs_for(allowed_tools) if allow_tools else ()):
                             if isinstance(item, ChatDelta):
                                 segment_parts.append(item.text)
                                 answer_parts.append(item.text)
@@ -161,6 +224,7 @@ class TurnService:
                                 outcome = item
                                 break
                         if isinstance(outcome, ChatFinal):
+                            answer_segments.append("".join(segment_parts))
                             response = outcome
                             self._merge_usage(usage_total, outcome.usage)
                         elif isinstance(outcome, ChatToolCalls) and not allow_tools:
@@ -174,11 +238,19 @@ class TurnService:
                         elif isinstance(outcome, ChatToolCalls):
                             self._merge_usage(usage_total, outcome.usage)
                             tool_rounds += 1
+                            answer_segments.append("".join(segment_parts))
                             messages.append(ChatMessage(role="assistant", content="".join(segment_parts), tool_calls=outcome.calls))
                             for call in outcome.calls:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
-                                result = self._executor.execute(scope=scope, name=call.name, arguments=call.arguments, registry=registry)
+                                result = self._executor.execute(scope=scope, session_id=session_id, name=call.name, arguments=call.arguments, registry=registry, allowed=allowed_tools)
+                                if result.activated_skill and active_skill is None:
+                                    # 一轮只激活一个前台 skill，激活后工具集收窄到它声明的范围。
+                                    active_skill = result.activated_skill
+                                    skill = self._skills.get(active_skill)
+                                    allowed_tools = skill.allowed_tools if skill else allowed_tools
+                                    max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
+                                    trace_record["skill"] = {"name": active_skill, "content_hash": skill.content_hash if skill else None, "activation": "model"}
                                 for citation in result.new_citations:
                                     yield self._event("citation", **citation)
                                 yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, summary=result.summary)
@@ -219,7 +291,9 @@ class TurnService:
                             break
                     if response is None:
                         raise LLMProviderError("invalid_response", "本地 responder 没有给出终态响应", retryable=False)
-                answer = "".join(answer_parts) or response.text
+                answer, leaked = _strip_provider_markup(join_answer(answer_segments) or "".join(answer_parts) or response.text)
+                if leaked:
+                    trace_record["provider_markup_stripped"] = True
                 finish_reason, responder_mode = response.finish_reason, response.mode
                 provider, model = response.provider, response.model
             if not self._sessions.touch_turn(turn.id):

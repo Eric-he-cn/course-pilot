@@ -6,8 +6,11 @@ from dataclasses import dataclass, field
 
 from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope
 from contracts.llm import ToolSpec
-from modules.learning.api import ArchiveReaderPort
+from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.planning.api import PlanReaderPort
+from modules.sessions.artifacts import ArtifactStore
+
+from .skills import SkillRegistry
 
 SEARCH_LIMIT = 6
 
@@ -36,10 +39,83 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         name="get_archive",
-        description="读取当前课程学习档案中最近的证据事件，用于回答学习进度类问题。",
+        description="读取当前课程学习档案：最近的证据事件、各概念掌握度与弱项，用于回答学习进度类问题。",
         parameters={"type": "object", "properties": {}},
     ),
+    ToolSpec(
+        name="concept_search",
+        description=(
+            "列出当前课程概念目录里的概念及其 id。归因证据前必须先调用它——"
+            "concept_id 只能取自这里，目录外的概念一律用 topic_hint。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"keyword": {"type": "string", "description": "可选，按名称过滤"}},
+        },
+    ),
+    ToolSpec(
+        name="emit_evidence",
+        description=(
+            "把一次可判定的作答结果写成证据事件。掌握度数值由服务端的确定性算法更新，"
+            "不要在参数里给分数或掌握程度。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["attempt_correct", "attempt_incorrect", "follow_up", "user_override"]},
+                "concept_id": {"type": "string", "description": "必须来自 concept_search；拿不准就留空并给 topic_hint"},
+                "topic_hint": {"type": "string", "description": "无法归因时用自然语言写考点，进人工补录队列"},
+                "with_hint": {"type": "boolean", "description": "用户是在提示或重试后才答对"},
+            },
+            "required": ["kind"],
+        },
+    ),
+    ToolSpec(
+        name="artifact_read",
+        description="读取本会话最近的跨轮产物（如练习题目与私有答案要点）。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "description": "可选，按 kind 过滤，例如 practice"},
+                "limit": {"type": "integer", "description": "默认 5，最多 20"},
+            },
+        },
+    ),
+    ToolSpec(
+        name="artifact_append",
+        description=(
+            "写入一条跨轮产物。visibility=model_private 的内容不会展示给用户，"
+            "适合存标准答案与评分要点；payload 结构由本 skill 自行约定。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "visibility": {"type": "string", "enum": ["user_visible", "model_private"]},
+                "payload": {"type": "object", "description": "任意 JSON 对象"},
+            },
+            "required": ["kind", "visibility", "payload"],
+        },
+    ),
+    ToolSpec(
+        name="use_skill",
+        description="加载一个专项能力的操作规程。需要组织练习（出题/评分/讲评/变式题）时调用 practice。",
+        parameters={
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "skill 名称"}},
+            "required": ["name"],
+        },
+    ),
 )
+
+# 工具 profile（架构 §9.2）：skill 激活后切换到它的完整集合，而不是在主集合上做并集。
+# search_materials / get_plan / get_archive 是 rag_search / plan_read / archive_query 的历史名。
+MAIN_PROFILE = ("search_materials", "list_materials", "get_plan", "get_archive", "concept_search", "emit_evidence", "use_skill")
+_SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
+
+
+def specs_for(allowed: tuple[str, ...]) -> tuple[ToolSpec, ...]:
+    return tuple(_SPECS_BY_NAME[name] for name in allowed if name in _SPECS_BY_NAME)
 
 
 class CitationRegistry:
@@ -85,17 +161,27 @@ class ToolOutcome:
     ok: bool
     summary: str  # 面向用户的一句话结果，用于 SSE tool_result
     new_citations: list[dict] = field(default_factory=list)
+    activated_skill: str | None = None  # use_skill 成功时带回，用于当轮切换工具 profile
 
 
 class ToolExecutor:
     """工具只吃服务端解析出的课程 scope；模型无法指定 course_id。"""
 
-    def __init__(self, *, knowledge: KnowledgeSearchPort, plans: PlanReaderPort, archive: ArchiveReaderPort) -> None:
+    def __init__(
+        self, *, knowledge: KnowledgeSearchPort, plans: PlanReaderPort, archive: ArchiveReaderPort,
+        evidence: EvidenceWriterPort, artifacts: ArtifactStore, skills: SkillRegistry,
+    ) -> None:
         self._knowledge = knowledge
         self._plans = plans
         self._archive = archive
+        self._evidence = evidence
+        self._artifacts = artifacts
+        self._skills = skills
 
-    def execute(self, *, scope: ResolvedKnowledgeScope, name: str, arguments: str, registry: CitationRegistry) -> ToolOutcome:
+    def execute(self, *, scope: ResolvedKnowledgeScope, session_id: str, name: str, arguments: str, registry: CitationRegistry, allowed: tuple[str, ...]) -> ToolOutcome:
+        if name not in allowed:
+            # 当轮最小权限：skill 激活期间看不到的工具，即使模型硬调也要拒绝。
+            return ToolOutcome(text=f"当前不可使用工具 {name}。可用：" + "、".join(allowed), ok=False, summary="工具不可用")
         try:
             parsed = json.loads(arguments) if arguments.strip() else {}
             if not isinstance(parsed, dict):
@@ -112,9 +198,79 @@ class ToolExecutor:
                 return self._plan(scope)
             if name == "get_archive":
                 return self._archive_events(scope)
+            if name == "concept_search":
+                return self._concepts(scope, parsed)
+            if name == "emit_evidence":
+                return self._emit_evidence(scope, parsed)
+            if name == "artifact_read":
+                return self._artifact_read(session_id, parsed)
+            if name == "artifact_append":
+                return self._artifact_append(scope, session_id, parsed)
+            if name == "use_skill":
+                return self._use_skill(parsed)
+        except ValueError as error:
+            return ToolOutcome(text=f"参数无效：{error}", ok=False, summary="参数无效")
         except Exception:
             return ToolOutcome(text=f"工具 {name} 执行失败，请基于已有信息回答。", ok=False, summary="执行失败")
-        return ToolOutcome(text=f"没有名为 {name} 的工具。可用工具：" + "、".join(spec.name for spec in TOOL_SPECS), ok=False, summary="未知工具")
+        return ToolOutcome(text=f"没有名为 {name} 的工具。可用工具：" + "、".join(allowed), ok=False, summary="未知工具")
+
+    def _concepts(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
+        keyword = str(parsed.get("keyword") or "").strip().casefold()
+        concepts = self._knowledge.concepts(scope=scope)
+        if keyword:
+            concepts = [item for item in concepts if keyword in item.name.casefold()]
+        if not concepts:
+            return ToolOutcome(text="当前课程还没有概念目录（教材索引后自动生成）。", ok=True, summary="无概念")
+        lines = [f"- {item.id} | {item.name}" + (f"（第 {item.page} 页）" if item.page else "") for item in concepts[:40]]
+        return ToolOutcome(text="概念目录（归因只能用这些 id）：\n" + "\n".join(lines), ok=True, summary=f"{len(concepts)} 个概念")
+
+    def _emit_evidence(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
+        kind = str(parsed.get("kind") or "").strip()
+        concept_id = str(parsed.get("concept_id") or "").strip() or None
+        topic_hint = str(parsed.get("topic_hint") or "").strip() or None
+        payload = {"with_hint": bool(parsed.get("with_hint"))}
+        event = self._evidence.record_evidence(
+            course_id=scope.course_id, kind=kind, concept_id=concept_id, topic_hint=topic_hint, payload=payload,
+        )
+        if event.attribution_status == "attributed":
+            return ToolOutcome(text=f"已记录证据事件 {event.kind}（概念 {event.concept_id}），掌握度已更新。", ok=True, summary=f"证据 {kind}")
+        return ToolOutcome(
+            text=f"已记录为未归因证据（topic_hint={event.topic_hint}）：概念不在目录里，不更新掌握度。",
+            ok=True, summary=f"证据 {kind}（未归因）",
+        )
+
+    def _artifact_read(self, session_id: str, parsed: dict) -> ToolOutcome:
+        kind = str(parsed.get("kind") or "").strip() or None
+        limit = int(parsed.get("limit") or 5)
+        items = self._artifacts.recent(session_id=session_id, kind=kind, limit=limit)
+        if not items:
+            return ToolOutcome(text="本会话还没有相关产物。", ok=True, summary="无产物")
+        blocks = [
+            f"[{item.created_at}] id={item.id} kind={item.kind} visibility={item.visibility}\n{json.dumps(item.payload, ensure_ascii=False)}"
+            for item in items
+        ]
+        return ToolOutcome(text="\n\n".join(blocks), ok=True, summary=f"读到 {len(items)} 条产物")
+
+    def _artifact_append(self, scope: ResolvedKnowledgeScope, session_id: str, parsed: dict) -> ToolOutcome:
+        payload = parsed.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("payload 必须是 JSON 对象")
+        item = self._artifacts.append(
+            course_id=scope.course_id, session_id=session_id, kind=str(parsed.get("kind") or ""),
+            visibility=str(parsed.get("visibility") or ""), payload=payload,
+        )
+        return ToolOutcome(text=f"已保存产物 {item.id}（kind={item.kind}, visibility={item.visibility}）。", ok=True, summary=f"存 {item.kind}")
+
+    def _use_skill(self, parsed: dict) -> ToolOutcome:
+        name = str(parsed.get("name") or "").strip()
+        skill = self._skills.get(name)
+        if skill is None:
+            available = "、".join(self._skills.names()) or "（无）"
+            return ToolOutcome(text=f"没有名为 {name} 的 skill。可用：{available}", ok=False, summary="未知 skill")
+        return ToolOutcome(
+            text=f"# Skill: {skill.name}\n\n{skill.body}", ok=True, summary=f"加载 {skill.name}",
+            activated_skill=skill.name,
+        )
 
     def _search(self, scope: ResolvedKnowledgeScope, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
         query = str(parsed.get("query") or "").strip()
