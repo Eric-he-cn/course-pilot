@@ -19,6 +19,26 @@ from .tools import MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, spe
 from .trace import TraceWriter
 
 
+# practice 规程要求的副作用：漏一项就意味着这次练习断链（作答不进档案、
+# 或者题目没落盘导致下次无法批改）。服务端检查后补一轮提醒，只提醒一次。
+_PRACTICE_TODO = {
+    "emit_evidence": "为每道可判定的题各调用一次 emit_evidence（答对 attempt_correct，答错或用户说不会 attempt_incorrect，concept_id 取自概念目录）——漏掉这一步，作答不会进入学习档案",
+    "artifact_append": "把题目与答案要点写成 artifact（kind=practice 与 kind=practice_key），否则下一轮无法批改这些题",
+}
+
+
+def _practice_reminder(missing: list[str], question_count: int | None) -> str:
+    lines = "\n".join(f"- {_PRACTICE_TODO[item]}" for item in missing)
+    scope = f"本次练习共 {question_count} 道题。" if question_count else ""
+    return f"{scope}你还没有完成 practice 规程要求的这些步骤：\n{lines}\n现在只调用相应工具补上，不要重复输出正文。"
+
+
+# 明确要练题的说法：命中就直接注入 practice 规程。纯靠模型自觉调 use_skill 会漏，
+# 而漏加载意味着这次练习不落 artifact、后续作答也无从批改。误命中的代价很小——
+# 规程第一步就是判断本轮该做什么。
+_PRACTICE_INTENT = re.compile(r"出\s*(?:几|[一二三四五六1-9])?\s*道|出题|出几题|练练|练习题|做几道|来[一两]道|小测|测测我|考考我|练一练")
+
+
 # 供应商偶尔会在工具预算耗尽后把 tool_call 当普通文本吐出来，这类内部标记不能进回答。
 _PROVIDER_MARKUP = re.compile(r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}.*", re.DOTALL)
 
@@ -197,10 +217,16 @@ class TurnService:
                 # 而漏批改意味着这次作答不进学习档案。加载后仍由规程自己判断本轮做什么。
                 pending = self._artifacts.latest_practice(session_id=session_id)
                 practice_skill = self._skills.get("practice")
-                if pending is not None and not pending[2] and practice_skill is not None:
+                awaiting_grade = pending is not None and not pending[2]
+                evidence_emitted = False
+                artifact_written = False
+                practice_reminded = False
+                wants_practice = bool(_PRACTICE_INTENT.search(message))
+                if practice_skill is not None and (awaiting_grade or wants_practice):
                     call_id = "call_auto_practice"
                     yield self._event("tool_call", call_id=call_id, name="use_skill", arguments={"name": "practice"}, origin="auto")
-                    yield self._event("tool_result", call_id=call_id, name="use_skill", ok=True, summary=f"自动加载 practice（练习 {pending[0]} 待批改）")
+                    reason = f"练习 {pending[0]} 待批改" if awaiting_grade else "用户要练题"
+                    yield self._event("tool_result", call_id=call_id, name="use_skill", ok=True, summary=f"自动加载 practice（{reason}）")
                     activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True, "summary": "自动加载 practice"})
                     trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": {"name": "practice"}, "ok": True, "summary": "自动加载", "duration_ms": 0})
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps({"name": "practice"})),)))
@@ -225,6 +251,20 @@ class TurnService:
                                 break
                         if isinstance(outcome, ChatFinal):
                             answer_segments.append("".join(segment_parts))
+                            missing_steps = []
+                            if active_skill == "practice" and not practice_reminded and tool_rounds < max_rounds:
+                                if awaiting_grade and not evidence_emitted:
+                                    missing_steps.append("emit_evidence")
+                                if (wants_practice or awaiting_grade) and not artifact_written:
+                                    missing_steps.append("artifact_append")
+                            if missing_steps:
+                                # 规程有步骤没做完就补一轮，只补一次。
+                                practice_reminded = True
+                                self._merge_usage(usage_total, outcome.usage)
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, pending[1] if pending else None)))
+                                trace_record["practice_reminder"] = missing_steps
+                                continue
                             response = outcome
                             self._merge_usage(usage_total, outcome.usage)
                         elif isinstance(outcome, ChatToolCalls) and not allow_tools:
@@ -244,6 +284,10 @@ class TurnService:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
                                 result = self._executor.execute(scope=scope, session_id=session_id, name=call.name, arguments=call.arguments, registry=registry, allowed=allowed_tools)
+                                if call.name == "emit_evidence" and result.ok:
+                                    evidence_emitted = True
+                                if call.name == "artifact_append" and result.ok:
+                                    artifact_written = True
                                 if result.activated_skill and active_skill is None:
                                     # 一轮只激活一个前台 skill，激活后工具集收窄到它声明的范围。
                                     active_skill = result.activated_skill

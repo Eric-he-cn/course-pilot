@@ -35,3 +35,20 @@ cd frontend && pnpm install && cd ..
 
 浏览器端到端测试见 `Docs/coursepilot-2.0-e2e-browser-test.md`：教材取自开源教材的章节切片，
 用 `scripts/e2e_fixture.py` 准备，测试实例跑在独立数据目录 `data/e2e`，不影响开发库。
+
+## 评测
+
+三层，都需要一个已准备好教材与索引的实例在跑（远端模型开启）：
+
+```bash
+.venv/bin/python scripts/benchmark.py                     # 冒烟：固定用例跑真实链路，只断言结构化行为
+.venv/bin/python scripts/evaluate.py --data-dir data/e2e  # 抽样：judge 给忠实度/归因/有用性打分
+.venv/bin/python scripts/replay_mastery.py --data-dir data/e2e --save baseline.json
+```
+
+`benchmark.py` 覆盖 practice 的出题、单题作答、多题作答、讲评、变式题、作答对象歧义，
+外加取证引用、课程隔离与课程解析；断言的是 SSE 事件与档案增量，模型换措辞不会假失败。
+`evaluate.py` 的评分按 `prompt_version` 聚合，改提示词后新旧版本可分别对比。
+`replay_mastery.py` 在改掌握度算法前存基线、改完对比；事件数变化的概念会被标为"数据已变化，
+不可比"，只有相同事件流下的差异才算算法影响。跑 benchmark 或评测时不要同时改后端代码——
+dev.sh 的 `--reload` 会重启进程并切断正在进行的 SSE。
