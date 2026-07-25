@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol
+from typing import Iterable, Protocol, Sequence
 
 
 class LLMProviderError(RuntimeError):
@@ -14,32 +14,48 @@ class LLMProviderError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class TutorEvidence:
-    citation_id: str
-    document: str
-    page: int | None
-    chunk_id: str
+class ToolSpec:
+    """一个可供模型调用的工具；parameters 是 JSON Schema。"""
+
+    name: str
+    description: str
+    parameters: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ToolCallRequest:
+    """模型发起的一次工具调用；arguments 保留原始 JSON 文本，由执行方解析校验。"""
+
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    role: str  # system | user | assistant | tool
     content: str
+    tool_calls: tuple[ToolCallRequest, ...] = ()
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
-class TutorRequest:
-    course_name: str
-    question: str
-    evidence: tuple[TutorEvidence, ...]
-    # 资料库文件名清单：让模型知道课程里有什么教材，能回答"有没有 X 资料"。
-    materials: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class TutorDelta:
+class ChatDelta:
     """An incremental piece of answer text emitted while the provider streams."""
 
     text: str
 
 
 @dataclass(frozen=True)
-class TutorResponse:
+class ChatToolCalls:
+    """本次响应以工具调用结束；调用方执行后回填 tool 消息继续对话。"""
+
+    calls: tuple[ToolCallRequest, ...]
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ChatFinal:
     text: str
     finish_reason: str
     provider: str
@@ -76,7 +92,7 @@ class VisionTranscriberPort(Protocol):
     def close(self) -> None: ...
 
 
-class TutorResponderPort(Protocol):
+class AgentChatPort(Protocol):
     @property
     def mode(self) -> str: ...
 
@@ -86,8 +102,8 @@ class TutorResponderPort(Protocol):
     @property
     def model(self) -> str: ...
 
-    def respond(self, request: TutorRequest) -> Iterable[TutorDelta | TutorResponse]:
-        """Yield zero or more deltas followed by exactly one terminal TutorResponse.
+    def chat(self, *, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> Iterable[ChatDelta | ChatToolCalls | ChatFinal]:
+        """Yield zero or more deltas followed by exactly one ChatToolCalls or ChatFinal.
 
         Raising LLMProviderError before the first delta means the whole call
         failed; raising after deltas means the stream was interrupted.

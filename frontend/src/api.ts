@@ -61,7 +61,7 @@ export const api = {
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),
   plan: (courseId: string) => request<{ plan: Plan | null }>(`/courses/${courseId}/plan`),
   archive: (courseId: string) => request<ArchiveSummary>(`/courses/${courseId}/archive`),
-  async turn(sessionId: string, content: string, onEvent: (payload: { type?: string; event?: string; status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null }) => void, attachmentIds: string[] = []): Promise<void> {
+  async turn(sessionId: string, content: string, onEvent: (payload: { type?: string; event?: string; status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null; call_id?: string; name?: string; summary?: string; ok?: boolean; origin?: string }) => void, attachmentIds: string[] = []): Promise<void> {
     let response: Response
     try {
       response = await fetch(`${BASE}/sessions/${sessionId}/turns`, json('POST', { message: content, attachment_ids: attachmentIds }))
@@ -84,7 +84,7 @@ export const api = {
         const data = event.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('')
         if (!data || data === '[DONE]') continue
         try {
-          const payload = JSON.parse(data) as { status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null }
+          const payload = JSON.parse(data) as { status?: string; delta?: string; content?: string; text?: string; error?: string; error_code?: string; resolved_course_id?: string | null; course_id?: string | null; course_name?: string | null; course_color?: string | null; call_id?: string; name?: string; summary?: string; ok?: boolean; origin?: string }
           if (payload.error) throw new ApiError(payload.error)
           if (eventName === 'turn_failed') {
             const message = payload.error_code === 'session_busy' ? '该会话正在生成回答，请稍后重试。'

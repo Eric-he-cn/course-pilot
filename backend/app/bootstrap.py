@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from adapters.embedding import BgeEmbedder
-from adapters.llm import DeepSeekTutorResponder, DemoTutorResponder, QwenOcrTranscriber
-from contracts.llm import TutorResponderPort, VisionTranscriberPort
+from adapters.llm import DeepSeekAgentChat, DemoAgentChat, QwenOcrTranscriber
+from contracts.llm import AgentChatPort, VisionTranscriberPort
 from modules.agent.service import TurnService
+from modules.agent.trace import TraceWriter
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
 from modules.knowledge.repository import KnowledgeRepository
@@ -31,7 +32,7 @@ class Application:
     knowledge: KnowledgeService
     knowledge_jobs: KnowledgeJobWorker
     sessions: SessionService
-    llm: TutorResponderPort
+    llm: AgentChatPort
     turns: TurnService
     learning: LearningService
     planning: PlanningService
@@ -60,10 +61,10 @@ class Application:
 
 def build_application(settings: Settings) -> Application:
     """The one composition root: modules never instantiate repositories or adapters themselves."""
-    fallback = DemoTutorResponder()
-    llm: TutorResponderPort = fallback
+    fallback = DemoAgentChat()
+    llm: AgentChatPort = fallback
     if settings.enable_remote_llm and settings.remote_llm_configured and settings.text_provider.lower() == "deepseek":
-        llm = DeepSeekTutorResponder(
+        llm = DeepSeekAgentChat(
             api_key=settings.text_api_key,
             base_url=settings.text_base_url,
             model=settings.text_model,
@@ -108,10 +109,11 @@ def build_application(settings: Settings) -> Application:
         workers=settings.background_job_workers,
         queue_capacity=settings.background_job_queue_capacity,
     )
-    return Application(
-        settings, store, courses, knowledge, jobs, sessions, llm,
-        TurnService(sessions, knowledge, llm, fallback),
-        LearningService(LearningRepository(store)),
-        PlanningService(PlanningRepository(store)),
-        vision,
+    learning = LearningService(LearningRepository(store))
+    planning = PlanningService(PlanningRepository(store))
+    turns = TurnService(
+        sessions, knowledge, planning, learning, llm, fallback,
+        trace=TraceWriter(settings.data_dir / "traces"),
+        history_token_budget=settings.agent_history_token_budget,
     )
+    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, vision)

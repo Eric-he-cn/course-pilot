@@ -1,5 +1,5 @@
-from .deepseek import DeepSeekTutorResponder
-from .demo import DemoTutorResponder
+from .deepseek import DeepSeekAgentChat
+from .demo import DemoAgentChat
 from .qwen_ocr import QwenOcrTranscriber
 
-__all__ = ["DeepSeekTutorResponder", "DemoTutorResponder", "QwenOcrTranscriber"]
+__all__ = ["DeepSeekAgentChat", "DemoAgentChat", "QwenOcrTranscriber"]

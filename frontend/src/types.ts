@@ -30,6 +30,14 @@ export interface Citation {
   score?: number
 }
 
+export interface ToolActivity {
+  callId: string
+  name: string
+  origin?: string
+  summary?: string
+  ok?: boolean
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -41,6 +49,8 @@ export interface Message {
   resolved_course_id?: string | null
   resolved_course_name?: string | null
   resolved_course_color?: string | null
+  // 工具活动仅在流式生成期间用于可视化“查了什么”，不做服务端持久化。
+  activity?: ToolActivity[]
   artifact?: { kind: string; visibility?: string; payload?: unknown }
 }
 

@@ -100,9 +100,14 @@ SSE 稳定顺序为：
 ```text
 turn_started      {request_id, session_id, scope_mode}
 course_resolution {status, resolved_course_id?, course_name?, course_color?, reason}
-citation/text_delta（流式增量）...
+tool_call         {call_id, name, arguments, origin}      # origin=seed 系统种子检索；origin=model 模型自主调用
+tool_result       {call_id, name, ok, summary}
+citation          {citation_id, document, page?, chunk_id, snippet, score}  # 工具命中的证据，跨工具去重编号
+text_delta（流式增量）...
 turn_completed | turn_failed
 ```
+
+课程解析成功后，服务端先用用户问题做一次种子检索（`origin=seed`），其结果与历史一并注入首个模型请求；模型可在随后的多轮里自主发起更多 `tool_call`（`origin=model`），因此 `tool_call/tool_result` 可穿插在 `text_delta` 之间。达到工具轮次上限后不再下发工具。
 
 供应商在输出任何增量前失败时发 `provider_fallback` 并切换本地 responder；已输出增量后中断则发 `stream_interrupted`，部分回答以 `interrupted` 状态持久化，随后以 `turn_failed` 结束，不静默重放。
 
@@ -113,7 +118,7 @@ turn_completed | turn_failed
 - Backend：Python 3.11+、FastAPI、标准库 SQLite、显式 migration、模块化目录、SSE。
 - Frontend：React + TypeScript + Vite；服务端是语义真源，前端只维护 UI 状态。
 - RAG Demo：支持 PDF/TXT/MD 上传、文本提取、切块和可检索索引。检索为混合召回：BGE 语义向量（`sentence-transformers`，与 1.0 相同的模型与查询前缀约定）+ SQLite FTS/词项，RRF 融合；embedding 依赖或模型不可用时自动退回纯词面检索，health 与 job 的 `retrieval_backend` 如实标注。
-- LLM：已实现独立内部合约、DeepSeek V4 Adapter 与本地 Demo Adapter。远端开关启用且 RAG 命中时调用 `deepseek-v4-flash` 的 Chat Completions，并关闭 thinking；未启用、课程未解析、没有证据或供应商失败时不伪造远端结果，health/SSE 明确报告 `provider`、`local_guardrail` 或 `demo_fallback`。provider 失败会发出 `provider_fallback` 事件后完成本轮，不暴露 Key 或供应商响应正文。
+- LLM：已实现带工具调用的多轮 chat 内部合约、DeepSeek V4 Adapter 与本地 Demo Adapter。远端开关启用时，Agent 先以用户问题做种子检索，再让 `deepseek-v4-flash` 在带证据的多轮循环里按需自主调用检索/资料/计划/档案工具（关闭 thinking，带工具轮次与步数上限）；工具执行只接受服务端 `ResolvedCourseContext`，模型不能填写 `course_id`。未启用、课程未解析、没有证据或供应商失败时不伪造远端结果，health/SSE 明确报告 `provider`、`local_guardrail` 或 `demo_fallback`。provider 在首个增量前失败会发出 `provider_fallback` 后由本地 responder 完成本轮；已输出增量后中断发 `stream_interrupted`，不暴露 Key 或供应商响应正文。
 - Wiki、Skill、掌握度和计划在 Demo 中覆盖主交互与接口骨架；不会为了展示效果写跨模块捷径。
 
 ## 5. 端到端验收

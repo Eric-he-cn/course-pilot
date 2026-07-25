@@ -13,6 +13,7 @@ const nav: { id: View; num: string }[] = [
   { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
+const TOOL_LABELS: Record<string, string> = { search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', get_archive: '学习档案' }
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
 function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : '刚刚' }
@@ -139,6 +140,13 @@ export default function App() {
             setActiveSession(current => current ? { ...current, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? current.course_name : null, course_color: isResolved ? payload.course_color ?? current.course_color : null } : current)
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
           }
+          if (payload.type === 'tool_call' && payload.call_id) {
+            const activity = { callId: payload.call_id, name: payload.name ?? '工具', origin: payload.origin }
+            setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...(item.activity ?? []), activity] } : item))
+          }
+          if (payload.type === 'tool_result' && payload.call_id) {
+            setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: (item.activity ?? []).map(entry => entry.callId === payload.call_id ? { ...entry, summary: payload.summary, ok: payload.ok } : entry) } : item))
+          }
           const delta = payload.delta ?? payload.content ?? payload.text ?? ''
           if (delta) setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
         }, attachmentIds); await loadMessages(targetSession.id); await loadSessions() }
@@ -219,7 +227,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
-  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div><div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <span key={entry.callId} className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${entry.summary ? 'done' : 'pending'}`}><i aria-hidden>{entry.summary ? (entry.ok === false ? '×' : '✓') : '…'}</i>{TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}</span>)}</div>}<div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {

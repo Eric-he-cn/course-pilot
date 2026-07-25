@@ -51,6 +51,9 @@ class Settings:
     vision_model: str = ""
     attachment_max_bytes: int = 10 * 1024 * 1024
     attachment_max_pixels: int = 12_000_000
+    # Agent 历史预算，以字符数保守近似 token（按 1 字符 ≤ 1 token，宁少勿超窗）。
+    # 默认对应 512K 软窗口里 128K 的历史份额。
+    agent_history_token_budget: int = 128_000
 
     @property
     def remote_llm_configured(self) -> bool:
@@ -92,4 +95,5 @@ class Settings:
             value("VISION_MODEL"),
             max(1, int(value("ATTACHMENT_MAX_BYTES", str(10 * 1024 * 1024)))),
             max(1, int(value("ATTACHMENT_MAX_PIXELS", "12000000"))),
+            max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
         )

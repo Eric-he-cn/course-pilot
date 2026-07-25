@@ -52,6 +52,8 @@ def main() -> None:
         turn.raise_for_status()
         if "event: course_resolution" not in turn.text or '"status": "resolved"' not in turn.text:
             raise RuntimeError("course resolution did not resolve")
+        if "event: tool_call" not in turn.text:
+            raise RuntimeError("resolved turn did not emit a tool_call span")
         if "event: citation" not in turn.text:
             raise RuntimeError("resolved turn returned no citation")
         if '"responder_mode": "provider"' not in turn.text or '"provider": "deepseek"' not in turn.text:
@@ -70,7 +72,7 @@ def main() -> None:
                     "llm_mode": health["llm"]["mode"],
                     "course_id": course["id"],
                     "job_status": job["status"],
-                    "sse": ["turn_started", "course_resolution", "citation", "text_delta", "turn_completed"],
+                    "sse": ["turn_started", "course_resolution", "tool_call", "citation", "tool_result", "text_delta", "turn_completed"],
                 },
                 ensure_ascii=False,
             )
