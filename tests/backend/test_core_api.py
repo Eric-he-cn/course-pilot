@@ -143,6 +143,18 @@ def test_default_titled_session_is_named_by_first_user_message(client):
     assert kept["title"] == "求导问题"
 
 
+def test_duplicate_course_name_is_rejected_with_a_readable_error(client):
+    created = client.post("/api/v2/courses", json={"name": "操作系统"})
+    assert created.status_code == 201
+    again = client.post("/api/v2/courses", json={"name": "操作系统"})
+    assert again.status_code == 422
+    assert "已存在" in again.json()["detail"]
+
+    other = client.post("/api/v2/courses", json={"name": "编译原理"}).json()
+    renamed = client.patch(f"/api/v2/courses/{other['id']}", json={"name": "操作系统"})
+    assert renamed.status_code == 422
+
+
 def test_course_session_is_immutable_and_invalid_general_course_binding_is_rejected(client):
     course = client.post("/api/v2/courses", json={"name": "线性代数"}).json()
     invalid = client.post("/api/v2/sessions", json={"scope_mode": "general", "course_id": course["id"]})

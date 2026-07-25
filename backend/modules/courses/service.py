@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sqlite3
 from core.common import new_id, utc_now
 from .models import Course
 from .repository import CourseRepository
@@ -16,8 +17,14 @@ class CourseService:
         if len(clean_name) > 100: raise ValueError("课程名称不能超过 100 个字符")
         chosen = color or _COLORS[len(self.list_courses()) % len(_COLORS)]
         if not chosen.startswith("#") or len(chosen) != 7: raise ValueError("课程颜色必须是 #RRGGBB")
-        course_id, timestamp = new_id("course"), utc_now(); self._repository.insert(course_id=course_id, name=clean_name, color=chosen, timestamp=timestamp); return self.get_course(course_id)  # type: ignore[return-value]
+        course_id, timestamp = new_id("course"), utc_now()
+        # 课程名在库里唯一，重名要给用户明确提示，而不是让约束冲突冒成 500。
+        try: self._repository.insert(course_id=course_id, name=clean_name, color=chosen, timestamp=timestamp)
+        except sqlite3.IntegrityError as error: raise ValueError("课程名称已存在") from error
+        return self.get_course(course_id)  # type: ignore[return-value]
     def update_course(self, course_id: str, *, wiki_enabled: bool | None = None, name: str | None = None) -> Course | None:
         if not self.get_course(course_id): return None
         if name is not None and not name.strip(): raise ValueError("课程名称不能为空")
-        self._repository.update(course_id, name=name.strip() if name is not None else None, wiki_enabled=wiki_enabled, timestamp=utc_now()); return self.get_course(course_id)
+        try: self._repository.update(course_id, name=name.strip() if name is not None else None, wiki_enabled=wiki_enabled, timestamp=utc_now())
+        except sqlite3.IntegrityError as error: raise ValueError("课程名称已存在") from error
+        return self.get_course(course_id)
