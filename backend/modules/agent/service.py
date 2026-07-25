@@ -9,6 +9,7 @@ from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
 from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, LLMProviderError, ToolCallRequest
 from core.common import utc_now
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
+from modules.memory.store import MemoryStore
 from modules.planning.api import PlanReaderPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 from modules.sessions.artifacts import ArtifactStore
@@ -22,14 +23,14 @@ from .trace import TraceWriter
 # practice 规程要求的副作用：漏一项就意味着这次练习断链（作答不进档案、
 # 或者题目没落盘导致下次无法批改）。服务端检查后补一轮提醒，只提醒一次。
 _PRACTICE_TODO = {
-    "emit_evidence": "为每道可判定的题各调用一次 emit_evidence（答对 attempt_correct，答错或用户说不会 attempt_incorrect，concept_id 取自概念目录）——漏掉这一步，作答不会进入学习档案",
+    "emit_evidence": "为每道用户作答过的题各调用一次 emit_evidence（答对 attempt_correct，答错或用户说不会 attempt_incorrect，concept_id 取自概念目录）——漏掉这一步，作答不会进入学习档案。用户这轮完全没提到的题不要记",
     "artifact_append": "把题目与答案要点写成 artifact（kind=practice 与 kind=practice_key），否则下一轮无法批改这些题",
 }
 
 
-def _practice_reminder(missing: list[str], question_count: int | None) -> str:
+def _practice_reminder(missing: list[str], question_count: int | None, emitted: int) -> str:
     lines = "\n".join(f"- {_PRACTICE_TODO[item]}" for item in missing)
-    scope = f"本次练习共 {question_count} 道题。" if question_count else ""
+    scope = f"本次练习共 {question_count} 道题，你已归因 {emitted} 道。" if question_count else ""
     return f"{scope}你还没有完成 practice 规程要求的这些步骤：\n{lines}\n现在只调用相应工具补上，不要重复输出正文。"
 
 
@@ -88,6 +89,7 @@ class TurnService:
         evidence: EvidenceWriterPort,
         artifacts: ArtifactStore,
         skills: SkillRegistry,
+        memory: MemoryStore,
         trace: TraceWriter | None = None,
         max_tool_rounds: int = 6,
         history_token_budget: int = 128_000,
@@ -97,9 +99,10 @@ class TurnService:
         self._fallback_responder = fallback_responder
         self._skills = skills
         self._artifacts = artifacts
+        self._memory = memory
         self._executor = ToolExecutor(
             knowledge=knowledge, plans=plans, archive=archive,
-            evidence=evidence, artifacts=artifacts, skills=skills,
+            evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
         )
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
@@ -108,6 +111,11 @@ class TurnService:
     @staticmethod
     def _event(event_name: str, **data: object) -> dict[str, object]:
         return {"event": event_name, "data": data}
+
+    def _memory_context(self, course_id: str) -> str:
+        """全局画像 + 当前课程记忆；只注入解析到的那门课，不跨课程。"""
+        blocks = [block for block in (self._memory.read_user(), self._memory.read_course(course_id)) if block]
+        return "\n\n".join(blocks)
 
     def _heartbeat(self, turn_id: str, last: float) -> float:
         """按 HEARTBEAT_SECONDS 节流续约：证明这一轮还活着，避免被下一轮当成失活抢占。"""
@@ -208,6 +216,7 @@ class TurnService:
                     history_token_budget=self._history_token_budget,
                     skill_summaries=self._skills.summaries(),
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
+                    memory=self._memory_context(context.course_id),
                 )
                 responder = self._responder
                 allowed_tools = MAIN_PROFILE
@@ -218,9 +227,10 @@ class TurnService:
                 pending = self._artifacts.latest_practice(session_id=session_id)
                 practice_skill = self._skills.get("practice")
                 awaiting_grade = pending is not None and not pending[2]
-                evidence_emitted = False
+                evidence_count = 0
                 artifact_written = False
                 practice_reminded = False
+                # message 此时已并入图片转录，所以拍照上传的作答与打字作答走同一条判断。
                 wants_practice = bool(_PRACTICE_INTENT.search(message))
                 if practice_skill is not None and (awaiting_grade or wants_practice):
                     call_id = "call_auto_practice"
@@ -253,7 +263,8 @@ class TurnService:
                             answer_segments.append("".join(segment_parts))
                             missing_steps = []
                             if active_skill == "practice" and not practice_reminded and tool_rounds < max_rounds:
-                                if awaiting_grade and not evidence_emitted:
+                                # 归因数少于题目数就提醒一次：模型常只写第一道就收尾。
+                                if awaiting_grade and evidence_count < (pending[1] if pending else 1):
                                     missing_steps.append("emit_evidence")
                                 if (wants_practice or awaiting_grade) and not artifact_written:
                                     missing_steps.append("artifact_append")
@@ -262,7 +273,7 @@ class TurnService:
                                 practice_reminded = True
                                 self._merge_usage(usage_total, outcome.usage)
                                 messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
-                                messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, pending[1] if pending else None)))
+                                messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, pending[1] if pending else None, evidence_count)))
                                 trace_record["practice_reminder"] = missing_steps
                                 continue
                             response = outcome
@@ -285,7 +296,7 @@ class TurnService:
                                 call_started = time.monotonic()
                                 result = self._executor.execute(scope=scope, session_id=session_id, name=call.name, arguments=call.arguments, registry=registry, allowed=allowed_tools)
                                 if call.name == "emit_evidence" and result.ok:
-                                    evidence_emitted = True
+                                    evidence_count += 1
                                 if call.name == "artifact_append" and result.ok:
                                     artifact_written = True
                                 if result.activated_skill and active_skill is None:
@@ -346,6 +357,16 @@ class TurnService:
                 trace_record.update(status="failed", error_code="turn_superseded")
                 yield self._event("turn_failed", error_code="turn_superseded", retryable=False)
                 return
+            if awaiting_grade and evidence_count > 0 and pending is not None:
+                # 状态闭合不能依赖模型写 artifact：漏写会让后续每轮都被当成作答重复归因。
+                try:
+                    self._artifacts.append(
+                        course_id=context.course_id or "", session_id=session_id, kind="practice_result",
+                        visibility="user_visible",
+                        payload={"practice_id": pending[0], "graded_at": utc_now(), "evidence_events": evidence_count, "closed_by": "server"},
+                    )
+                except Exception:
+                    pass
             citations = cited_only(answer, registry.citations)
             assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations, activity=activity)
             self._sessions.complete_turn(turn.id, status="completed")

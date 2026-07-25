@@ -27,6 +27,16 @@
 - 默认打开 RAG 资料库，完整展示上传、解析、切块、嵌入、索引、检索验证和错误恢复；复用 1.0 RAG 能力时通过 adapter 接入。
 - Wiki 是知识仓库中的可选视图，课程级默认关闭；用户开启后再选择教材解析到 Wiki。关闭 Wiki 不影响上传、索引、检索和 Tutor。
 
+### 1.4 练习与学习档案
+
+- 出题、评分、讲评、变式题合并为 `practice` skill。系统提示只带 skill 摘要，`use_skill` 时正文才注入；激活后工具集收窄到 skill 声明范围。
+- skill 路由不纯靠模型自觉：用户明确要练题、或本会话存在尚未批改的练习时，服务端直接注入规程，加载后仍由规程判断本轮该出题还是评分。
+- 规程要求的副作用由服务端校验：批改后归因数少于题目数、或出题后没落 artifact，都会补一轮提醒。漏掉归因意味着作答不进档案，不能只靠提示词约束。
+- 题目与答案要点存通用 artifact，答案要点 `visibility=model_private`，永不进前端 serializer。
+- 掌握度由 LLM 归因 + 确定性算法计算：BKT 更新掌握概率、FSRS 半衰期刻画遗忘，rating 由规则产生。追问与用户标记只入事件流不进数值；少于 3 个可归因客观事件显示"数据不足"。
+- 概念目录在教材索引后由纯规则任务生成，是归因的 ID 真源。目录外的概念一律记 `unattributed` 并进管理页待补录队列。
+- 长期记忆是 markdown：`data/user.md`（跨课程画像）与 `data/courses/<id>/memory.md`（课程情景记忆），Agent 通过 `memory_patch` 只改受管区块，用户手写段落不被覆盖。掌握度数值、错题与排期不写记忆。
+
 ## 2. 模块边界
 
 ```text
@@ -64,7 +74,7 @@ HTTP / SSE / Web / Feishu adapters
 | `PATCH` | `/api/v2/courses/{id}` | 修改 `wiki_enabled` 等课程设置 |
 | `POST` | `/api/v2/materials/{id}/wiki` | 用户显式触发 Wiki Demo job |
 | `GET` | `/api/v2/courses/{id}/plan` | 只读计划骨架：返回持久化计划或 `null`，写接口随规划功能开放 |
-| `GET` | `/api/v2/courses/{id}/archive` | 只读档案骨架：返回证据事件计数与最近事件 |
+| `GET` | `/api/v2/courses/{id}/archive` | 学习档案：证据事件、按概念的掌握度（BKT × 遗忘曲线）、未归因主题队列 |
 | `GET` | `/api/v2/health` | 返回 DB、LLM 配置和 Demo fallback 状态 |
 
 `SessionSummary` 最少包含：

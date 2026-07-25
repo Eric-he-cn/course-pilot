@@ -8,6 +8,7 @@ from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowl
 from contracts.llm import ToolSpec
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.planning.api import PlanReaderPort
+from modules.memory.store import MemoryStore
 from modules.sessions.artifacts import ArtifactStore
 
 from .skills import SkillRegistry
@@ -98,6 +99,22 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         },
     ),
     ToolSpec(
+        name="memory_patch",
+        description=(
+            "更新长期记忆的一个受管区块：user 记跨课程的学习偏好与目标，course 记这门课学到哪、"
+            "遗留问题和与用户的约定。只写叙述性内容——掌握度数值、错题记录与复习排期不写这里。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "enum": ["user", "course"]},
+                "section": {"type": "string", "description": "区块名，小写字母数字下划线，如 preferences / progress"},
+                "content": {"type": "string", "description": "该区块的完整新内容，会整块替换"},
+            },
+            "required": ["scope", "section", "content"],
+        },
+    ),
+    ToolSpec(
         name="use_skill",
         description="加载一个专项能力的操作规程。需要组织练习（出题/评分/讲评/变式题）时调用 practice。",
         parameters={
@@ -110,7 +127,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
 
 # 工具 profile（架构 §9.2）：skill 激活后切换到它的完整集合，而不是在主集合上做并集。
 # search_materials / get_plan / get_archive 是 rag_search / plan_read / archive_query 的历史名。
-MAIN_PROFILE = ("search_materials", "list_materials", "get_plan", "get_archive", "concept_search", "emit_evidence", "use_skill")
+MAIN_PROFILE = ("search_materials", "list_materials", "get_plan", "get_archive", "concept_search", "emit_evidence", "memory_patch", "use_skill")
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 
 
@@ -169,7 +186,7 @@ class ToolExecutor:
 
     def __init__(
         self, *, knowledge: KnowledgeSearchPort, plans: PlanReaderPort, archive: ArchiveReaderPort,
-        evidence: EvidenceWriterPort, artifacts: ArtifactStore, skills: SkillRegistry,
+        evidence: EvidenceWriterPort, artifacts: ArtifactStore, skills: SkillRegistry, memory: MemoryStore,
     ) -> None:
         self._knowledge = knowledge
         self._plans = plans
@@ -177,6 +194,7 @@ class ToolExecutor:
         self._evidence = evidence
         self._artifacts = artifacts
         self._skills = skills
+        self._memory = memory
 
     def execute(self, *, scope: ResolvedKnowledgeScope, session_id: str, name: str, arguments: str, registry: CitationRegistry, allowed: tuple[str, ...]) -> ToolOutcome:
         if name not in allowed:
@@ -206,6 +224,8 @@ class ToolExecutor:
                 return self._artifact_read(session_id, parsed)
             if name == "artifact_append":
                 return self._artifact_append(scope, session_id, parsed)
+            if name == "memory_patch":
+                return self._memory_patch(scope, parsed)
             if name == "use_skill":
                 return self._use_skill(parsed)
         except ValueError as error:
@@ -260,6 +280,13 @@ class ToolExecutor:
             visibility=str(parsed.get("visibility") or ""), payload=payload,
         )
         return ToolOutcome(text=f"已保存产物 {item.id}（kind={item.kind}, visibility={item.visibility}）。", ok=True, summary=f"存 {item.kind}")
+
+    def _memory_patch(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
+        message = self._memory.patch(
+            scope=str(parsed.get("scope") or ""), section=str(parsed.get("section") or ""),
+            content=str(parsed.get("content") or ""), course_id=scope.course_id,
+        )
+        return ToolOutcome(text=message, ok=True, summary=message)
 
     def _use_skill(self, parsed: dict) -> ToolOutcome:
         name = str(parsed.get("name") or "").strip()

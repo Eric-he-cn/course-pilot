@@ -16,6 +16,7 @@ from modules.knowledge.service import KnowledgeService
 from modules.knowledge.worker import KnowledgeJobWorker
 from modules.learning.repository import LearningRepository
 from modules.learning.service import LearningService
+from modules.memory.store import MemoryStore
 from modules.planning.repository import PlanningRepository
 from modules.planning.service import PlanningService
 from modules.sessions.resolver import CourseResolver
@@ -118,7 +119,7 @@ def build_application(settings: Settings) -> Application:
     skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
-        evidence=learning, artifacts=ArtifactStore(store), skills=skills,
+        evidence=learning, artifacts=ArtifactStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
     )

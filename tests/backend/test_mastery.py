@@ -103,3 +103,28 @@ def test_concept_extraction_is_stable_and_skips_running_headers():
     # 每页都出现的页眉不是概念。
     assert not any("SCHEDULING" in name for name in names)
     assert names == [item["name"] for item in extract_candidates(pages)]
+
+
+def test_memory_patch_replaces_managed_block_and_keeps_handwritten_text(tmp_path):
+    from modules.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path)
+    store.patch(scope="user", section="preferences", content="喜欢先给结论。")
+    store.patch(scope="course", section="progress", content="学到第 7 章。", course_id="course_x")
+
+    # 用户手写的段落必须活过 Agent 的下一次写入。
+    path = tmp_path / "user.md"
+    path.write_text(path.read_text(encoding="utf-8") + "\n## 我的笔记\n别动这段。\n", encoding="utf-8")
+    store.patch(scope="user", section="preferences", content="改成喜欢详细推导。")
+    text = store.read_user()
+    assert "别动这段。" in text
+    assert "改成喜欢详细推导。" in text and "喜欢先给结论。" not in text
+    assert text.count("agent:managed:preferences") == 2  # 区块被替换而不是重复追加
+    assert "学到第 7 章。" in store.read_course("course_x")
+    assert store.read_course("other_course") == ""  # 课程记忆互不可见
+
+    for bad in ({"scope": "user", "section": "Bad Name", "content": "x"},
+                {"scope": "course", "section": "progress", "content": "x"},
+                {"scope": "user", "section": "ok", "content": "   "}):
+        with pytest.raises(ValueError):
+            store.patch(**bad)
