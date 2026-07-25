@@ -6,6 +6,12 @@
       "runtimeExecutable": "./scripts/dev.sh",
       "runtimeArgs": [],
       "port": 5173
+    },
+    {
+      "name": "coursepilot-e2e",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["STORAGE_DATA_DIR=data/e2e", "./scripts/dev.sh"],
+      "port": 5173
     }
   ]
 }

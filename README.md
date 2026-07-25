@@ -32,3 +32,6 @@ cd frontend && pnpm install && cd ..
 ```bash
 .venv/bin/python scripts/smoke.py
 ```
+
+浏览器端到端测试见 `Docs/coursepilot-2.0-e2e-browser-test.md`：教材取自开源教材的章节切片，
+用 `scripts/e2e_fixture.py` 准备，测试实例跑在独立数据目录 `data/e2e`，不影响开发库。
