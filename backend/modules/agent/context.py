@@ -62,6 +62,9 @@ _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课�
 
 长期记忆（你此前记下的内容）：
 {memory}
+
+之前对话的摘要（更早的消息已压缩成这份摘要，其中提到的内容视为你自己讲过的）：
+{conversation_summary}
 """
 
 
@@ -94,15 +97,18 @@ def assemble_messages(
     skill_summaries: str = "",
     practice_digest: str = "",
     memory: str = "",
+    conversation_summary: str = "",
 ) -> AssembledContext:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
     与模型自己调 search_materials 得到的形态一致）。"""
     skills_block = skill_summaries or "（当前没有可加载的能力）"
     practice_block = practice_digest or "（本会话还没有练习记录）"
     memory_block = memory or "（还没有长期记忆）"
+    summary_block = conversation_summary or "（没有更早的对话）"
     system = _SYSTEM_PROMPT.format(
         course_name=course_name, materials=_material_lines(materials),
         skills=skills_block, practice_digest=practice_block, memory=memory_block,
+        conversation_summary=summary_block,
     )
     kept, dropped, clipped = _budgeted_history(history, history_token_budget)
     seed_arguments = json.dumps({"query": seed_query}, ensure_ascii=False)
@@ -114,12 +120,13 @@ def assemble_messages(
         ChatMessage(role="assistant", content="", tool_calls=(seed_call,)),
         ChatMessage(role="tool", content=seed_result_text, tool_call_id=SEED_CALL_ID),
     ]
-    # 三段动态内容也算在系统提示里，这里单独列出来，好看出记忆和练习状态占了多少。
+    # 动态内容也算在系统提示里，这里逐段列出来，好看出记忆、练习状态和摘要各占多少。
     segments = [
-        ("系统提示", len(system) - len(skills_block) - len(practice_block) - len(memory_block)),
+        ("系统提示", len(system) - len(skills_block) - len(practice_block) - len(memory_block) - len(summary_block)),
         ("能力摘要", len(skills_block)),
         ("练习状态", len(practice_block)),
         ("长期记忆", len(memory_block)),
+        ("对话摘要", len(summary_block)),
         ("会话历史", sum(len(item.content) for item in kept)),
         ("当前问题", len(question) + len(seed_arguments)),
         ("教材证据", len(seed_result_text)),

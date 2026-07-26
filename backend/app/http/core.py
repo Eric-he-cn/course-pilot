@@ -33,6 +33,11 @@ class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 
 
+class SessionRenameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
+
+
 class TurnRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     client_request_id: str = Field(default_factory=lambda: str(uuid4()))
@@ -81,6 +86,15 @@ def create_core_router(application: Application) -> APIRouter:
             raise _not_found(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+
+    @router.patch("/sessions/{session_id}")
+    def rename_session(session_id: str, request: SessionRenameRequest):
+        try:
+            return asdict(application.sessions.rename_session(session_id=session_id, title=request.title))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+        except LookupError as exc:
+            raise _not_found(exc) from exc
 
     @router.get("/sessions/{session_id}/messages")
     def list_messages(session_id: str):

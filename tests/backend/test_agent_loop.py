@@ -199,7 +199,7 @@ def test_every_injected_section_reaches_the_system_prompt():
     """format 会静默忽略没有占位符的 kwargs，注入内容漏了也不报错，所以逐段断言。"""
     from modules.agent.context import assemble_messages
 
-    marks = {"skill_summaries": "SKILLMARK", "practice_digest": "PRACTICEMARK", "memory": "MEMORYMARK"}
+    marks = {"skill_summaries": "SKILLMARK", "practice_digest": "PRACTICEMARK", "memory": "MEMORYMARK", "conversation_summary": "SUMMARYMARK"}
     system = assemble_messages(
         course_name="测试", materials=["a.md"], history=[], question="q",
         seed_query="q", seed_result_text="e", history_token_budget=1000, **marks,

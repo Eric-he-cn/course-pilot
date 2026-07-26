@@ -43,6 +43,7 @@ export const api = {
     return request<SessionSummary[]>(`/sessions?${params}`)
   },
   createSession: (scope: ScopeMode, courseId?: string) => request<SessionSummary>('/sessions', json('POST', { scope_mode: scope, course_id: courseId ?? null })),
+  renameSession: (sessionId: string, title: string) => request<SessionSummary>(`/sessions/${sessionId}`, json('PATCH', { title })),
   messages: async (sessionId: string) => {
     const payload = await request<{ messages: Array<Omit<Message, 'citations'> & { citations?: BackendCitation[] }> }>(`/sessions/${sessionId}/messages`)
     return payload.messages.map(message => ({ ...message, citations: message.citations?.map(citation => ({ ...citation, id: citation.id ?? citation.citation_id, material_name: citation.material_name ?? citation.document, text: citation.text ?? citation.snippet })) }))

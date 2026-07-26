@@ -74,6 +74,14 @@ export default function App() {
       setSessions(current => [session, ...current]); setActiveSession(session); setView('chat'); setMessages([])
     } catch (error) { setNotice(errorText(error)) } finally { setBusy(false) }
   }
+  async function renameSession(title: string) {
+    if (!activeSession) return
+    try {
+      const updated = await api.renameSession(activeSession.id, title)
+      setActiveSession(updated)
+      setSessions(current => current.map(item => item.id === updated.id ? updated : item))
+    } catch (error) { setNotice(errorText(error)) }
+  }
   async function createCourse() {
     const name = window.prompt('课程名称')?.trim(); if (!name) return
     setBusy(true)
@@ -116,7 +124,12 @@ export default function App() {
       <header className="topbar">
         <button className="icon-button mobile-only" aria-label="打开导航" onClick={() => setSidebarOpen(true)}>☰</button>
         <button className="icon-button collapse-only" aria-label="折叠侧栏" onClick={() => setSidebarCollapsed(value => !value)}>☷</button>
-        <div className="title-area"><b>{heading}</b><span className="crumb"><i style={{ backgroundColor: course?.color ?? '#D4D4D8' }} /> {workspaceName}</span></div>
+        <div className="title-area">
+          {view === 'chat' && activeSession
+            ? <SessionTitle session={activeSession} onRename={renameSession} />
+            : <b>{heading}</b>}
+          <span className="crumb"><i style={{ backgroundColor: course?.color ?? '#D4D4D8' }} /> {workspaceName}</span>
+        </div>
       </header>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label="关闭错误提示" onClick={() => setNotice('')}>×</button></div>}
       {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} contextUsage={contextUsage} onCitation={setCitation} onUpload={async file => {
@@ -151,7 +164,7 @@ export default function App() {
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
           }
           if (payload.type === 'context_usage' && payload.segments) {
-            setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0 })
+            setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
             activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin })
@@ -224,7 +237,6 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
       {messages.filter(item => item.role !== 'system').map(message => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope} />)}
     </div>
     <form className="composer-wrap" onSubmit={submit}>
-      {contextUsage && <ContextMeter usage={contextUsage} />}
       {(attachments.length > 0 || uploading) && <div className="attach-list">
         {attachments.map(item => <div className={item.needs_confirmation ? 'attach-chip warn' : 'attach-chip'} key={item.id}>
           <span className="attach-name">IMG · {item.filename}</span>
@@ -233,28 +245,54 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
         </div>)}
         {uploading && <div className="attach-chip pending"><span className="attach-name">IMG</span><span className="attach-preview">正在转录图片文字…</span></div>}
       </div>}
-      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} disabled={busy} aria-label="输入消息" rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label="上传图片提问"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>图片</button><span>Enter 发送 · Shift+Enter 换行 · 图片 ≤ 10 MiB</span><button className="send-button" type="submit" disabled={!draft.trim() || busy || uploading} aria-label="发送消息">{busy ? '…' : '↑'}</button></div></div>
+      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} disabled={busy} aria-label="输入消息" rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label="上传图片提问"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>图片</button><span>Enter 发送 · Shift+Enter 换行</span>{contextUsage && <ContextMeter usage={contextUsage} />}<button className="send-button" type="submit" disabled={!draft.trim() || busy || uploading} aria-label="发送消息">{busy ? '…' : '↑'}</button></div></div>
       <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={pickFile} />
       <p>回答优先依据当前课程的可检索资料；没有命中教材时会明确标注“以下不是当前教材结论”。</p></form>
   </section>
+}
+
+function SessionTitle({ session, onRename }: { session: SessionSummary; onRename: (title: string) => Promise<void> }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(session.title)
+  useEffect(() => { setDraft(session.title); setEditing(false) }, [session.id, session.title])
+  async function commit() {
+    setEditing(false)
+    const next = draft.trim()
+    if (next && next !== session.title) await onRename(next)
+    else setDraft(session.title)
+  }
+  if (editing) return <input
+    className="title-input" value={draft} autoFocus aria-label="会话标题"
+    onChange={event => setDraft(event.target.value)}
+    onBlur={() => void commit()}
+    onKeyDown={event => {
+      if (event.key === 'Enter') { event.preventDefault(); void commit() }
+      if (event.key === 'Escape') { setDraft(session.title); setEditing(false) }
+    }} />
+  return <button type="button" className="title-edit" onClick={() => setEditing(true)} title="点击重命名会话">
+    <b>{session.title || '未命名会话'}</b>
+    <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden><path d="M11.5 2.5l2 2-7.5 7.5-2.5.5.5-2.5z" /></svg>
+  </button>
 }
 
 function ContextMeter({ usage }: { usage: ContextUsage }) {
   const [open, setOpen] = useState(false)
   const k = (chars: number) => chars >= 1000 ? `${(chars / 1000).toFixed(1)}K` : String(chars)
   const percent = Math.min(100, Math.round((usage.total_chars / usage.limit_chars) * 100))
-  const filled = Math.round(percent / 5)
-  return <div className="context-meter">
-    <button type="button" onClick={() => setOpen(!open)} aria-expanded={open}>
-      <span className="meter-bar" aria-hidden>{'▓'.repeat(filled)}{'░'.repeat(20 - filled)}</span>
-      <span className="meter-total">{percent}% · {k(usage.total_chars)} / {k(usage.limit_chars)}</span>
-      <span className="meter-hint">上下文 · 字符数估算</span>
+  const filled = Math.max(1, Math.round(percent / 12.5))
+  const notice = usage.dropped_history > 0 || usage.clipped_history > 0
+  return <div className="context-chip">
+    <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} aria-label="查看本轮上下文构成" className={notice ? 'warn' : undefined}>
+      <span aria-hidden>{'▓'.repeat(filled)}{'░'.repeat(8 - filled)}</span>
+      <b>{percent}%</b>
     </button>
-    {open && <div className="meter-detail">
-      {usage.segments.map(segment => <div key={segment.label}><span>{segment.label}</span><b>{k(segment.chars)}</b></div>)}
-      <p>按字符数近似 token（未接真实 tokenizer，实际占用通常更小）。历史预算 {k(usage.history_budget_chars)}。</p>
-      {usage.dropped_history > 0 && <p className="meter-warn">更早的 {usage.dropped_history} 条消息未进入本轮上下文。</p>}
-      {usage.clipped_history > 0 && <p className="meter-warn">有 {usage.clipped_history} 条超长消息被截断后才进入上下文。</p>}
+    {open && <div className="context-popover">
+      <div className="popover-head"><b>本轮上下文</b><span>{k(usage.total_chars)} / {k(usage.limit_chars)}</span></div>
+      {usage.segments.map(segment => <div className="popover-row" key={segment.label}><span>{segment.label}</span><b>{k(segment.chars)}</b></div>)}
+      <p>按字符数近似 token（未接真实 tokenizer，实际占用通常更小）。</p>
+      {usage.compacted_messages > 0 && <p className="popover-note">更早的 {usage.compacted_messages} 条消息已压缩成摘要，仍在上下文里。</p>}
+      {usage.dropped_history > 0 && <p className="popover-warn">更早的 {usage.dropped_history} 条消息未进入本轮上下文。</p>}
+      {usage.clipped_history > 0 && <p className="popover-warn">有 {usage.clipped_history} 条超长消息被截断后才进入上下文。</p>}
     </div>}
   </div>
 }

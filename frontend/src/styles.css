@@ -72,6 +72,11 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .icon-button { min-height:32px; min-width:32px }
 .title-area { display:flex; align-items:center; gap:8px; min-width:0 }
 .title-area b { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:13.5px; font-weight:650 }
+.title-edit { display:flex; align-items:center; gap:6px; min-width:0; padding:3px 6px; margin-left:-6px; border:1px solid transparent; border-radius:6px; background:transparent; color:inherit }
+.title-edit:hover { border-color:var(--border); background:var(--panel) }
+.title-edit svg { flex:0 0 auto; color:var(--muted); opacity:0 }
+.title-edit:hover svg { opacity:1 }
+.title-input { min-width:0; width:min(320px,40vw); padding:3px 6px; border:1px solid var(--accent); border-radius:6px; background:var(--bg); color:var(--text); font-size:13.5px; font-weight:650 }
 .crumb { display:inline-flex; align-items:center; gap:6px; color:var(--muted); font-family:var(--mono); font-size:11.5px; white-space:nowrap }
 .notice { display:flex; justify-content:space-between; align-items:center; gap:16px; margin:12px 20px 0; padding:9px 12px; border:1px solid #FCA5A5; border-radius:6px; background:#FEF2F2; color:var(--danger); font-size:13px }
 .notice button { border:0; background:transparent; font-size:17px; color:inherit }
@@ -137,17 +142,23 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .composer-wrap>p { margin:7px 4px 0; color:var(--muted); font-size:11px }
 .attach-button { display:inline-flex; align-items:center; gap:5px; padding:4px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--muted); font-family:var(--mono); font-size:10px }
 .attach-button:hover:enabled { color:var(--accent); border-color:var(--accent) }
-.context-meter { margin-bottom:8px; border:1px solid var(--border); border-radius:8px; background:var(--panel) }
-.context-meter > button { display:flex; align-items:center; gap:10px; width:100%; padding:6px 10px; border:0; background:transparent; text-align:left }
-.context-meter .meter-bar { color:var(--accent); font-family:var(--mono); font-size:10px; letter-spacing:-.06em }
-.context-meter .meter-total { color:var(--text); font-family:var(--mono); font-size:11px }
-.context-meter .meter-hint { margin-left:auto; color:var(--muted); font-size:10.5px }
-.meter-detail { padding:2px 10px 8px; border-top:1px solid var(--border) }
-.meter-detail > div { display:flex; justify-content:space-between; padding:3px 0; font-size:11.5px }
-.meter-detail > div span { color:var(--muted) }
-.meter-detail > div b { color:var(--text); font-family:var(--mono); font-weight:500 }
-.meter-detail p { margin:6px 0 0; color:var(--muted); font-size:10.5px; line-height:1.5 }
-.meter-detail p.meter-warn { color:var(--warning) }
+/* 上下文用量：输入框元信息行里的紧凑 chip，点开在上方浮层展示分段明细。 */
+.context-chip { position:relative; margin-left:auto }
+.context-chip > button { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--muted); font-family:var(--mono); font-size:10px }
+.context-chip > button:hover { color:var(--accent); border-color:var(--accent) }
+.context-chip > button span { color:var(--accent); letter-spacing:-.06em }
+.context-chip > button b { color:var(--text); font-weight:500 }
+.context-chip > button.warn span { color:var(--warning) }
+.context-popover { position:absolute; right:0; bottom:calc(100% + 7px); z-index:20; width:260px; padding:9px 11px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); box-shadow:0 6px 20px rgba(24,24,27,.1); font-family:inherit }
+.popover-head { display:flex; align-items:baseline; justify-content:space-between; padding-bottom:6px; margin-bottom:4px; border-bottom:1px solid var(--border) }
+.popover-head b { font-size:12px }
+.popover-head span { color:var(--muted); font-family:var(--mono); font-size:10.5px }
+.popover-row { display:flex; justify-content:space-between; gap:10px; padding:2.5px 0; font-size:11.5px }
+.popover-row span { color:var(--muted) }
+.popover-row b { color:var(--text); font-family:var(--mono); font-weight:500 }
+.context-popover p { margin:7px 0 0; color:var(--muted); font-size:10.5px; line-height:1.5 }
+.context-popover p.popover-note { color:var(--accent) }
+.context-popover p.popover-warn { color:var(--warning) }
 .attach-list { display:flex; flex-direction:column; gap:6px; margin-bottom:8px }
 .attach-chip { display:flex; align-items:baseline; gap:10px; padding:7px 10px; border:1px solid var(--border); border-radius:6px; background:var(--panel); font-family:var(--mono); font-size:11px }
 .attach-chip .attach-name { flex:none; color:var(--accent); font-weight:600 }

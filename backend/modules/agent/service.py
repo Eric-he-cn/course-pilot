@@ -13,7 +13,9 @@ from modules.memory.store import MemoryStore
 from modules.planning.api import PlanReaderPort, PlanWriterPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 from modules.sessions.artifacts import ArtifactStore
+from modules.sessions.compactions import CompactionStore
 
+from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
 from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages, message_chars
 from .skills import SkillRegistry
 from .tools import MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, specs_for
@@ -99,18 +101,21 @@ class TurnService:
         plan_writer: PlanWriterPort,
         evidence: EvidenceWriterPort,
         artifacts: ArtifactStore,
+        compactions: CompactionStore,
         skills: SkillRegistry,
         memory: MemoryStore,
         trace: TraceWriter | None = None,
         max_tool_rounds: int = 6,
         history_token_budget: int = 128_000,
         context_char_limit: int = 512_000,
+        compact_threshold_ratio: float = 0.7,
     ) -> None:
         self._sessions, self._knowledge = sessions, knowledge
         self._responder = responder
         self._fallback_responder = fallback_responder
         self._skills = skills
         self._artifacts = artifacts
+        self._compactions = compactions
         self._memory = memory
         self._executor = ToolExecutor(
             knowledge=knowledge, plans=plans, plan_writer=plan_writer, archive=archive,
@@ -120,6 +125,7 @@ class TurnService:
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
         self._context_char_limit = context_char_limit
+        self._compact_threshold_ratio = compact_threshold_ratio
 
     @staticmethod
     def _event(event_name: str, **data: object) -> dict[str, object]:
@@ -144,8 +150,11 @@ class TurnService:
         for key, value in extra.items():
             total[key] = total.get(key, 0) + value
 
-    def _context_usage(self, messages: list[ChatMessage], base: list[tuple[str, int]], assembled) -> dict[str, object]:
-        """本轮上下文构成。工具循环追加的内容算进"工具结果"，不然看不到真正的大头。"""
+    def _context_usage(self, messages: list[ChatMessage], base: list[tuple[str, int]], assembled, summary) -> dict[str, object]:
+        """本轮上下文构成。工具循环追加的内容算进"工具结果"，不然看不到真正的大头。
+
+        字段名刻意避开 text / content / delta：前端对这三个键是无条件取值并拼进回答。
+        """
         total = message_chars(messages)
         segments = [*base, ("工具结果", max(0, total - sum(size for _, size in base)))]
         return self._event(
@@ -154,7 +163,62 @@ class TurnService:
             total_chars=total, limit_chars=self._context_char_limit,
             history_budget_chars=self._history_token_budget,
             dropped_history=assembled.dropped_history, clipped_history=assembled.clipped_history,
+            compacted_messages=summary.covers_message_count if summary else 0,
         )
+
+    def _compact_if_needed(self, *, session_id: str, turn_id: str, summary) -> dict[str, object] | None:
+        """把水位之后过长的那段对话压成摘要，为下一轮腾出上下文。
+
+        整段吞异常：这一轮的回答已经成功落库，压缩失败只该退回截断行为，
+        不能让用户看到"本次回答未能完成"。
+        """
+        try:
+            threshold = int(self._history_token_budget * self._compact_threshold_ratio)
+            watermark = summary.covers_through_created_at if summary else ""
+            pending = [
+                item for item in self._sessions.list_messages(session_id)
+                if item.created_at > watermark and item.role in {"user", "assistant"} and item.content.strip()
+            ]
+            live_chars = sum(len(item.content) for item in pending) + len(summary.summary_text if summary else "")
+            if live_chars <= threshold:
+                return None
+            boundary = self._compact_boundary(pending)
+            if boundary <= 0:
+                return None
+            head, kept = pending[:boundary], pending[boundary:]
+            text, reason = summarize(
+                responder=self._responder,
+                payload=CompactionInput(
+                    transcript=[(item.role, item.content) for item in head],
+                    previous_summary=summary.summary_text if summary else "",
+                ),
+            )
+            if text is None:
+                return {"status": "skipped", "reason": reason, "prompt_version": COMPACT_PROMPT_VERSION}
+            stored = self._compactions.append(
+                session_id=session_id, summary_text=text,
+                covers_through_message_id=head[-1].id, covers_through_created_at=head[-1].created_at,
+                covers_message_count=len(head), prompt_version=COMPACT_PROMPT_VERSION, turn_id=turn_id,
+            )
+            return {
+                "status": "compacted" if stored else "superseded", "covered": len(head),
+                "kept": len(kept), "summary_chars": len(text), "prompt_version": COMPACT_PROMPT_VERSION,
+            }
+        except Exception as error:
+            return {"status": "failed", "reason": f"unhandled:{type(error).__name__}"}
+
+    def _compact_boundary(self, pending: list) -> int:
+        """从最新往前留够 KEEP_RATIO 的原文，切点再前移到最近一条 user 消息，
+        避免把一问一答劈成两半（前半进摘要、后半留原文）导致摘要难读。"""
+        keep_budget = int(self._history_token_budget * KEEP_RATIO)
+        index = len(pending)
+        used = 0
+        while index > 0 and used < keep_budget:
+            index -= 1
+            used += len(pending[index].content)
+        while index > 0 and pending[index].role != "user":
+            index -= 1
+        return index
 
     @staticmethod
     def _display_args(raw: str) -> dict:
@@ -187,7 +251,13 @@ class TurnService:
                 blocks = "\n\n".join(f"[图片转录：{a.filename}]\n{a.transcription}" for a in attachments)
                 message = f"{message}\n\n{blocks}"
             # 历史在写入本轮用户消息之前取，天然不含当前问题。
-            history = [(item.role, item.content) for item in self._sessions.list_messages(session_id)]
+            # 已压缩的部分由摘要代表，只把水位之后的消息按原文送进上下文。
+            summary = self._compactions.latest(session_id=session_id)
+            watermark = summary.covers_through_created_at if summary else ""
+            history = [
+                (item.role, item.content) for item in self._sessions.list_messages(session_id)
+                if item.created_at > watermark
+            ]
             plan_intent = _has_plan_intent(message) or any(
                 role == "user" and _has_plan_intent(content) for role, content in history
             )
@@ -249,6 +319,7 @@ class TurnService:
                     skill_summaries=self._skills.summaries(),
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
                     memory=self._memory_context(context.course_id),
+                    conversation_summary=summary.summary_text if summary else "",
                 )
                 messages = assembled.messages
                 base_segments = assembled.segments
@@ -280,7 +351,7 @@ class TurnService:
                     trace_record["skill"] = {"name": "practice", "content_hash": practice_skill.content_hash, "activation": "auto"}
                 try:
                     while response is None:
-                        yield self._context_usage(messages, base_segments, assembled)
+                        yield self._context_usage(messages, base_segments, assembled, summary)
                         allow_tools = tool_rounds < max_rounds
                         segment_parts: list[str] = []
                         outcome: ChatToolCalls | ChatFinal | None = None
@@ -417,6 +488,11 @@ class TurnService:
                 usage=usage_total,
                 tool_rounds=tool_rounds,
             )
+            # 压缩放在这里而不是组装之前：本轮已经收尾，turn 锁已释放，
+            # 压缩慢或失败都不影响这一轮，也不会让长会话每轮都多等一次 LLM 调用。
+            compaction = self._compact_if_needed(session_id=session_id, turn_id=turn.id, summary=summary)
+            if compaction:
+                trace_record["compaction"] = compaction
         except SessionBusyError:
             trace_record.update(status="failed", error_code="session_busy")
             yield self._event("turn_failed", error_code="session_busy", retryable=True)

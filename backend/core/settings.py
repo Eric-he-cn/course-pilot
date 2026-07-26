@@ -56,6 +56,8 @@ class Settings:
     agent_history_token_budget: int = 128_000
     # 整轮上下文的软窗口，同样以字符数近似 token（架构 §5.5 的 512K 软窗口）。
     agent_context_char_limit: int = 512_000
+    # 历史占到预算这个比例就压缩；调小可以在短对话上验证压缩链路。
+    agent_compact_threshold_ratio: float = 0.7
 
     @property
     def remote_llm_configured(self) -> bool:
@@ -99,4 +101,5 @@ class Settings:
             max(1, int(value("ATTACHMENT_MAX_PIXELS", "12000000"))),
             max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
             max(2048, int(value("AGENT_CONTEXT_CHAR_LIMIT", "512000"))),
+            min(0.95, max(0.05, float(value("AGENT_COMPACT_THRESHOLD_RATIO", "0.7")))),
         )

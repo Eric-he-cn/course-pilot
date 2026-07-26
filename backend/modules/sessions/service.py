@@ -41,6 +41,11 @@ class SessionService:
             if existing: return self._summary(existing)
             raise
         return self.get_session(session_id)  # type: ignore[return-value]
+    def rename_session(self, *, session_id: str, title: str) -> SessionSummary:
+        cleaned = " ".join(title.split())[:120]
+        if not cleaned: raise ValueError("标题不能为空")
+        if not self._repository.set_title(session_id=session_id, title=cleaned, timestamp=utc_now()): raise LookupError("会话不存在")
+        return self.get_session(session_id)  # type: ignore[return-value]
     def list_messages(self, session_id: str) -> list[Message]:
         if not self.get_session(session_id): raise LookupError("会话不存在")
         messages = []

@@ -58,6 +58,7 @@ export interface ContextUsage {
   history_budget_chars: number
   dropped_history: number
   clipped_history: number
+  compacted_messages: number
 }
 
 /** SSE 事件负载：字段随事件类型而异，所以都是可选的。 */

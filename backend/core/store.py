@@ -130,6 +130,18 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
     """),
+    # 对话压缩：摘要 append-only，最新一条生效。水位用 created_at 而不是消息 id——
+    # 消息 id 是无序 uuid，比不了先后，也做不了单调校验。
+    (17, """
+        CREATE TABLE IF NOT EXISTS session_compactions (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+            covers_through_message_id TEXT NOT NULL REFERENCES messages(id),
+            covers_through_created_at TEXT NOT NULL, covers_message_count INTEGER NOT NULL,
+            summary_text TEXT NOT NULL, prompt_version TEXT NOT NULL,
+            turn_id TEXT, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_compaction_session ON session_compactions(session_id, created_at DESC);
+    """),
 )
 
 class SQLiteStore:

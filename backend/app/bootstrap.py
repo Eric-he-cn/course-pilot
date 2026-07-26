@@ -21,6 +21,7 @@ from modules.planning.repository import PlanningRepository
 from modules.planning.service import PlanningService
 from modules.sessions.resolver import CourseResolver
 from modules.sessions.artifacts import ArtifactStore
+from modules.sessions.compactions import CompactionStore
 from modules.sessions.repository import SessionRepository
 from modules.sessions.service import SessionService
 
@@ -120,9 +121,10 @@ def build_application(settings: Settings) -> Application:
     skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin", user_skills=UserSkillStore(store))
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
-        plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
+        plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), compactions=CompactionStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
         context_char_limit=settings.agent_context_char_limit,
+        compact_threshold_ratio=settings.agent_compact_threshold_ratio,
     )
     return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, vision)
