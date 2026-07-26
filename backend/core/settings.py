@@ -58,10 +58,17 @@ class Settings:
     agent_context_char_limit: int = 512_000
     # 历史占到预算这个比例就压缩；调小可以在短对话上验证压缩链路。
     agent_compact_threshold_ratio: float = 0.7
+    # 联网检索（SerpAPI）：未配置或未开启远端调用时，network 类工具整体不下发。
+    web_search_api_key: str = ""
+    web_timeout_seconds: float = 20
 
     @property
     def remote_llm_configured(self) -> bool:
         return bool(self.text_api_key and self.text_base_url and self.text_model)
+
+    @property
+    def web_search_configured(self) -> bool:
+        return bool(self.web_search_api_key)
 
     @property
     def vision_configured(self) -> bool:
@@ -102,4 +109,6 @@ class Settings:
             max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
             max(2048, int(value("AGENT_CONTEXT_CHAR_LIMIT", "512000"))),
             min(0.95, max(0.05, float(value("AGENT_COMPACT_THRESHOLD_RATIO", "0.7")))),
+            value("RESEARCH_SERPAPI_API_KEY"),
+            max(1.0, float(value("WEB_TIMEOUT_SECONDS", "20"))),
         )

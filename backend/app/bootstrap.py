@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from adapters.embedding import BgeEmbedder
+from adapters.web import HttpWebAccess
 from adapters.llm import DeepSeekAgentChat, DemoAgentChat, QwenOcrTranscriber
 from contracts.llm import AgentChatPort, VisionTranscriberPort
+from contracts.web import WebSearchPort
 from modules.agent.service import TurnService
 from modules.agent.skills import SkillRegistry, UserSkillStore
 from modules.agent.trace import TraceWriter
@@ -17,6 +19,7 @@ from modules.knowledge.worker import KnowledgeJobWorker
 from modules.learning.repository import LearningRepository
 from modules.learning.service import LearningService
 from modules.memory.store import MemoryStore
+from modules.notes.store import NoteStore
 from modules.planning.repository import PlanningRepository
 from modules.planning.service import PlanningService
 from modules.sessions.resolver import CourseResolver
@@ -43,6 +46,7 @@ class Application:
     planning: PlanningService
     skills: SkillRegistry
     vision: VisionTranscriberPort | None = None
+    web: WebSearchPort | None = None
 
     def llm_health(self) -> dict[str, object]:
         status = self.llm.health()
@@ -54,6 +58,11 @@ class Application:
             requested_provider=self.settings.text_provider,
         )
         return status
+
+    def web_health(self) -> dict[str, object]:
+        if self.web is None:
+            return {"configured": self.settings.web_search_configured, "enabled": False, "provider": "serpapi"}
+        return {**self.web.health(), "enabled": True}
 
     def vision_health(self) -> dict[str, object]:
         if self.vision is None:
@@ -89,6 +98,14 @@ def build_application(settings: Settings) -> Application:
             total_timeout_seconds=settings.llm_total_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
+    # 出网同样受远端总开关门控：关闭时联网工具当作不存在。
+    web: WebSearchPort | None = None
+    if settings.enable_remote_llm and settings.web_search_configured:
+        web = HttpWebAccess(
+            api_key=settings.web_search_api_key,
+            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+            total_timeout_seconds=settings.web_timeout_seconds,
+        )
     store = SQLiteStore(settings.database_path)
     store.migrate()
     courses = CourseService(CourseRepository(store))
@@ -122,9 +139,10 @@ def build_application(settings: Settings) -> Application:
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
         plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), compactions=CompactionStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
+        web=web, notes=NoteStore(settings.data_dir),
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
         context_char_limit=settings.agent_context_char_limit,
         compact_threshold_ratio=settings.agent_compact_threshold_ratio,
     )
-    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, vision)
+    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, vision, web)

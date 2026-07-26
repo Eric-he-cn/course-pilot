@@ -20,6 +20,8 @@ const TOOL_LABELS: Record<string, string> = {
   search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', plan_update: '写入计划',
   get_archive: '学习档案', concept_search: '概念目录', emit_evidence: '记录学习证据', memory_patch: '更新记忆',
   use_skill: '加载能力', artifact_read: '读取练习', artifact_append: '保存练习',
+  web_search: '联网检索', web_fetch: '读取网页', note_write: '写入笔记', note_read: '读取笔记',
+  calculator: '计算',
 }
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }

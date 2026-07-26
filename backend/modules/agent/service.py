@@ -13,12 +13,14 @@ from modules.memory.store import MemoryStore
 from modules.planning.api import PlanReaderPort, PlanWriterPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 from modules.sessions.artifacts import ArtifactStore
+from modules.notes.store import NoteStore
 from modules.sessions.compactions import CompactionStore
+from contracts.web import WebSearchPort
 
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
 from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages, message_chars
 from .skills import SkillRegistry
-from .tools import MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, specs_for
+from .tools import MAIN, MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, profile_for_skill, specs_for
 from .trace import TraceWriter
 
 
@@ -104,6 +106,8 @@ class TurnService:
         compactions: CompactionStore,
         skills: SkillRegistry,
         memory: MemoryStore,
+        web: WebSearchPort | None = None,
+        notes: NoteStore | None = None,
         trace: TraceWriter | None = None,
         max_tool_rounds: int = 6,
         history_token_budget: int = 128_000,
@@ -120,6 +124,7 @@ class TurnService:
         self._executor = ToolExecutor(
             knowledge=knowledge, plans=plans, plan_writer=plan_writer, archive=archive,
             evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
+            web=web, notes=notes,
         )
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
@@ -325,6 +330,9 @@ class TurnService:
                 base_segments = assembled.segments
                 responder = self._responder
                 allowed_tools = MAIN_PROFILE
+                capabilities = MAIN.capabilities
+                tool_budget = MAIN.per_tool_budget
+                tool_used: dict[str, int] = {}
                 active_skill: str | None = None
                 max_rounds = self._max_tool_rounds
                 # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
@@ -347,6 +355,7 @@ class TurnService:
                     messages.append(ChatMessage(role="tool", content=f"# Skill: practice\n\n{practice_skill.body}", tool_call_id=call_id))
                     base_segments = base_segments + [("skill 规程", len(practice_skill.body))]
                     active_skill, allowed_tools = "practice", practice_skill.allowed_tools
+                    capabilities = profile_for_skill(practice_skill.allowed_tools).capabilities
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                     trace_record["skill"] = {"name": "practice", "content_hash": practice_skill.content_hash, "activation": "auto"}
                 try:
@@ -355,7 +364,7 @@ class TurnService:
                         allow_tools = tool_rounds < max_rounds
                         segment_parts: list[str] = []
                         outcome: ChatToolCalls | ChatFinal | None = None
-                        for item in responder.chat(messages=messages, tools=specs_for(allowed_tools) if allow_tools else ()):
+                        for item in responder.chat(messages=messages, tools=specs_for(allowed_tools, capabilities=capabilities) if allow_tools else ()):
                             if isinstance(item, ChatDelta):
                                 segment_parts.append(item.text)
                                 answer_parts.append(item.text)
@@ -400,7 +409,13 @@ class TurnService:
                             for call in outcome.calls:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
-                                result = self._executor.execute(scope=scope, session_id=session_id, name=call.name, arguments=call.arguments, registry=registry, allowed=allowed_tools, plan_intent=plan_intent)
+                                result = self._executor.execute(
+                                    scope=scope, session_id=session_id, name=call.name, arguments=call.arguments,
+                                    registry=registry, allowed=allowed_tools, plan_intent=plan_intent,
+                                    capabilities=capabilities, budget=tool_budget, used=tool_used,
+                                )
+                                if result.reason is None:
+                                    tool_used[call.name] = tool_used.get(call.name, 0) + 1
                                 if call.name == "emit_evidence" and result.ok:
                                     evidence_count += 1
                                 if call.name == "artifact_append" and result.ok:
@@ -409,14 +424,16 @@ class TurnService:
                                     # 一轮只激活一个前台 skill，激活后工具集收窄到它声明的范围。
                                     active_skill = result.activated_skill
                                     skill = self._skills.get(active_skill)
-                                    allowed_tools = skill.allowed_tools if skill else allowed_tools
+                                    if skill:
+                                        allowed_tools = skill.allowed_tools
+                                        capabilities = profile_for_skill(skill.allowed_tools).capabilities
                                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                                     trace_record["skill"] = {"name": active_skill, "content_hash": skill.content_hash if skill else None, "activation": "model"}
                                 for citation in result.new_citations:
                                     yield self._event("citation", **citation)
                                 yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, summary=result.summary)
                                 activity.append({"call_id": call.id, "name": call.name, "origin": "model", "ok": result.ok, "summary": result.summary})
-                                trace_tools.append({"origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, "summary": result.summary, "duration_ms": int((time.monotonic() - call_started) * 1000)})
+                                trace_tools.append({"origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, "summary": result.summary, "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
                                 messages.append(ChatMessage(role="tool", content=result.text, tool_call_id=call.id))
                         else:
                             raise LLMProviderError("invalid_response", "供应商流结束但没有终态响应", retryable=False)

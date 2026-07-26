@@ -45,6 +45,7 @@ def build_knowledge_router(
     courses: CourseCatalogPort,
     llm_health: Callable[[], dict[str, object]],
     vision_health: Callable[[], dict[str, object]] = lambda: {},
+    web_health: Callable[[], dict[str, object]] = lambda: {},
 ) -> APIRouter:
     """Build the course-scoped knowledge HTTP adapter.
 
@@ -125,6 +126,6 @@ def build_knowledge_router(
 
     @router.get("/health")
     def health() -> dict[str, object]:
-        return {**knowledge.health(), "llm": llm_health(), "vision": vision_health()}
+        return {**knowledge.health(), "llm": llm_health(), "vision": vision_health(), "web": web_health()}
 
     return router

@@ -49,6 +49,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             courses=application.courses,
             llm_health=application.llm_health,
             vision_health=application.vision_health,
+            web_health=application.web_health,
         )
     )
     app.include_router(build_skills_router(skills=application.skills))
