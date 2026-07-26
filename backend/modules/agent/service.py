@@ -136,7 +136,7 @@ class TurnService:
         web: WebSearchPort | None = None,
         notes: NoteStore | None = None,
         trace: TraceWriter | None = None,
-        select_responder: Callable[[str | None, bool | None], AgentChatPort] | None = None,
+        select_responder: Callable[[str | None, str | None], AgentChatPort] | None = None,
         max_tool_rounds: int = 10,
         history_token_budget: int = 128_000,
         context_char_limit: int = 512_000,
@@ -264,7 +264,7 @@ class TurnService:
             return {"raw": raw[:200]}
 
     def run(self, *, session_id: str, message: str, client_request_id: str, attachment_ids: list[str] | None = None,
-            model_key: str | None = None, thinking: bool | None = None) -> Iterator[dict[str, object]]:
+            model_key: str | None = None, thinking: str | None = None) -> Iterator[dict[str, object]]:
         session = self._sessions.get_session(session_id)
         if session is None:
             raise LookupError("会话不存在")

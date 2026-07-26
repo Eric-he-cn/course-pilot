@@ -53,10 +53,18 @@ class ModelChoice:
         return bool(self.api_key and self.base_url and self.model)
 
     @property
-    def thinking_default(self) -> bool:
-        """配置里显式关掉才算关，其余按厂商默认（开）算。"""
+    def thinking_tier(self) -> str:
+        """从配置里的 extra_body 推出默认档位；档位名与 bootstrap.THINKING_TIERS 对应。"""
         thinking = self.extra_body.get("thinking")
-        return not (isinstance(thinking, dict) and thinking.get("type") == "disabled")
+        if not isinstance(thinking, dict):
+            # 没配就别替用户拍一个深度：adaptive 是「让模型自己决定这轮要不要想」。
+            return "adaptive"
+        kind, effort = thinking.get("type"), thinking.get("effort")
+        if kind == "disabled":
+            return "off"
+        if kind == "adaptive":
+            return "adaptive"
+        return "max" if effort == "max" else "high"
 
 
 def _read_models(value) -> tuple[ModelChoice, ...]:

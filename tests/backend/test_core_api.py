@@ -396,9 +396,10 @@ def test_health_lists_every_configured_model_for_the_picker(tmp_path):
         llm = client.get("/api/v2/health").json()["llm"]
     assert [item["model"] for item in llm["choices"]] == ["cheap-model", "strong-model"]
     assert [item["label"] for item in llm["choices"]] == ["模型一", "模型二"]
-    # 第一个模型显式关了思考，第二个没配就按厂商默认（开）算
-    assert [item["thinking_default"] for item in llm["choices"]] == [False, True]
-    assert llm["default_choice"] == "1" and llm["default_thinking"] is False
+    # 第一个模型显式关了思考；第二个没配 extra_body，落到 adaptive（不替用户拍深度）
+    assert [item["thinking_default"] for item in llm["choices"]] == ["off", "adaptive"]
+    assert llm["default_choice"] == "1" and llm["default_thinking"] == "off"
+    assert llm["thinking_tiers"] == ["off", "adaptive", "high", "max"]
 
 
 def test_turn_uses_the_model_named_in_the_header(tmp_path):
@@ -424,8 +425,9 @@ def test_turn_uses_the_model_named_in_the_header(tmp_path):
         runtime = workspaces.shared
         runtime.responders.clear()
         runtime.responders.update({
-            ("1", False): Probe("cheap-model"), ("1", True): Probe("cheap-thinking"),
-            ("2", False): Probe("strong-model"), ("2", True): Probe("strong-thinking"),
+            ("1", "off"): Probe("cheap-model"), ("1", "high"): Probe("cheap-high"),
+            ("2", "off"): Probe("strong-model"), ("2", "high"): Probe("strong-high"),
+            ("2", "max"): Probe("strong-max"), ("2", "adaptive"): Probe("strong-adaptive"),
         })
         # 必须是课程会话：通用会话解析不出课程会走 guardrail，一次都不调模型。
         course = client.post("/api/v2/courses", json={"name": "操作系统"}).json()
@@ -435,8 +437,11 @@ def test_turn_uses_the_model_named_in_the_header(tmp_path):
         for headers, expected in [
             ({}, "cheap-model"),                                                  # 不带头 → 构造时那个
             ({"X-CoursePilot-Model": "2"}, "strong-model"),
-            ({"X-CoursePilot-Model": "2", "X-CoursePilot-Thinking": "on"}, "strong-thinking"),
+            ({"X-CoursePilot-Model": "2", "X-CoursePilot-Thinking": "high"}, "strong-high"),
+            ({"X-CoursePilot-Model": "2", "X-CoursePilot-Thinking": "max"}, "strong-max"),
+            ({"X-CoursePilot-Model": "2", "X-CoursePilot-Thinking": "adaptive"}, "strong-adaptive"),
             ({"X-CoursePilot-Model": "99"}, "cheap-model"),                       # 认不出 → 落回第一个
+            ({"X-CoursePilot-Model": "2", "X-CoursePilot-Thinking": "bogus"}, "strong-model"),  # 档位认不出 → 默认档
         ]:
             used.clear()
             client.post(f"/api/v2/sessions/{session['id']}/turns",

@@ -62,11 +62,12 @@ class Application:
             # 界面据此渲染切换项；只列真的配齐了的。
             choices=[
                 {"key": choice.key, "label": choice.label, "model": choice.model,
-                 "provider": choice.provider, "thinking_default": choice.thinking_default}
+                 "provider": choice.provider, "thinking_default": choice.thinking_tier}
                 for choice in choices if choice.configured
             ],
             default_choice=choices[0].key,
-            default_thinking=choices[0].thinking_default,
+            default_thinking=choices[0].thinking_tier,
+            thinking_tiers=list(THINKING_TIERS),
         )
         return status
 
@@ -85,9 +86,26 @@ class Application:
         return {**self.vision.health(), "requested_provider": self.settings.vision_provider}
 
 
-def _with_thinking(extra_body: dict[str, object], enabled: bool) -> dict[str, object]:
-    """思考开关是厂商私有字段。用户没切换过就用配置里的原样值；切换了才覆盖。"""
-    return {**extra_body, "thinking": {"type": "enabled" if enabled else "disabled"}}
+# 思考档位 → 请求字段。这里写的是 DeepSeek V4 的形态：thinking.type 只接受
+# adaptive / enabled / disabled（不合法的值服务端会把合法列表回给你），思考深度是
+# 另一个维度，由 thinking.effort 表达。
+#
+# 换成别家模型时只改这张表，档位 key 不要动——前端下拉与请求头都按 key 传。参考：
+#   OpenAI o 系列：顶层 {"reasoning_effort": "low" | "medium" | "high"}
+#   Anthropic：    {"thinking": {"type": "enabled", "budget_tokens": 8000}}
+# 不支持思考的模型把四个档位都映射成 {} 即可，界面照旧能切、只是没有效果。
+THINKING_TIERS: dict[str, dict[str, object]] = {
+    "off": {"thinking": {"type": "disabled"}},
+    "adaptive": {"thinking": {"type": "adaptive"}},
+    "high": {"thinking": {"type": "enabled", "effort": "high"}},
+    "max": {"thinking": {"type": "enabled", "effort": "max"}},
+}
+DEFAULT_TIER = "off"
+
+
+def _with_thinking(extra_body: dict[str, object], tier: str) -> dict[str, object]:
+    """档位覆盖配置里的 thinking 字段，其余私有参数原样保留。"""
+    return {**extra_body, **THINKING_TIERS.get(tier, THINKING_TIERS[DEFAULT_TIER])}
 
 
 @dataclass(frozen=True)
@@ -100,7 +118,7 @@ class SharedRuntime:
     web: WebSearchPort | None
     embedder: object | None
     # (模型 key, 是否开思考) → 适配器。空表示没配远端，一律走 fallback。
-    responders: dict[tuple[str, bool], AgentChatPort] = field(default_factory=dict)
+    responders: dict[tuple[str, str], AgentChatPort] = field(default_factory=dict)
 
     def close(self) -> None:
         for item in (self.llm, self.fallback, self.classifier, self.vision, *self.responders.values()):
@@ -114,31 +132,31 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
     fallback = DemoAgentChat()
     llm: AgentChatPort = fallback
     classifier: AgentChatPort | None = None
-    responders: dict[tuple[str, bool], AgentChatPort] = {}
+    responders: dict[tuple[str, str], AgentChatPort] = {}
     # 认的是「配了 OpenAI 兼容端点」而不是某个厂商名：写死厂商名会让别家的配置静默退回本地兜底。
     remote_ready = settings.enable_remote_llm and settings.remote_llm_configured
     if remote_ready:
-        # 每个模型建开、关思考两个实例。思考是每次请求的选项，但把它做成 chat() 的参数要动
-        # 协议的全部实现；适配器本身很轻，多一个实例便宜得多。
+        # 每个模型 × 每个思考档位一个实例。思考是每次请求的选项，但把它做成 chat() 的参数
+        # 要动协议的全部实现；适配器本身很轻，多几个实例便宜得多。
         for choice in settings.models:
             if not choice.configured:
                 continue
-            for thinking in (True, False):
-                responders[(choice.key, thinking)] = OpenAICompatibleChat(
+            for tier in THINKING_TIERS:
+                responders[(choice.key, tier)] = OpenAICompatibleChat(
                     api_key=choice.api_key, base_url=choice.base_url, model=choice.model,
-                    provider=choice.provider, extra_body=_with_thinking(choice.extra_body, thinking),
+                    provider=choice.provider, extra_body=_with_thinking(choice.extra_body, tier),
                     connect_timeout_seconds=settings.llm_connect_timeout_seconds,
                     total_timeout_seconds=settings.llm_total_timeout_seconds,
                     max_output_tokens=settings.agent_max_output_tokens,
                     max_retries=settings.llm_max_retries,
                 )
         first = settings.models[0]
-        llm = responders.get((first.key, first.thinking_default), fallback)
+        llm = responders.get((first.key, first.thinking_tier), fallback)
         # 学科分类器：超时更短、不重试，它跑在 turn 锁内、首个增量之前，所以固定用第一个模型
         # 并关掉思考——它的任务只是从清单里挑一个 id。
         classifier = OpenAICompatibleChat(
             api_key=first.api_key, base_url=first.base_url, model=first.model,
-            provider=first.provider, extra_body=_with_thinking(first.extra_body, False),
+            provider=first.provider, extra_body=_with_thinking(first.extra_body, "off"),
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=6, max_output_tokens=256, max_retries=0,
         )
@@ -199,14 +217,15 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     # 内建 skill 目录随代码走（架构 §6）；导入的 skill 存库，启用后并入同一注册表。
     skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin", user_skills=UserSkillStore(store))
     choices = settings.models
-    default_key, default_thinking = choices[0].key, choices[0].thinking_default
+    default_key, default_tier = choices[0].key, choices[0].thinking_tier
 
-    def select_responder(key: str | None, thinking: bool | None) -> AgentChatPort:
-        """认不出的模型 key 一律落回第一个，别让一个过期的前端选择把整轮打挂。"""
+    def select_responder(key: str | None, tier: str | None) -> AgentChatPort:
+        """认不出的模型 key 或档位一律落回默认，别让一个过期的前端选择把整轮打挂。"""
         if not runtime.responders:
             return llm
         wanted = key if any(model.key == key for model in choices) else default_key
-        return runtime.responders.get((wanted, default_thinking if thinking is None else thinking), llm)
+        level = tier if tier in THINKING_TIERS else default_tier
+        return runtime.responders.get((wanted, level), llm)
 
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,

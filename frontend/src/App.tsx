@@ -534,17 +534,24 @@ function HelpView({ courses, health, onError, onTry }: { courses: Course[]; heal
   </div></section>
 }
 
-type ModelOption = { key: string; label: string; model: string; thinking_default: boolean }
+type ModelOption = { key: string; label: string; model: string; thinking_default: string }
+
+// 档位名与后端 THINKING_TIERS 对应。深度只在「开」这一档有意义；
+// adaptive 是让模型自己决定这一轮要不要想。
+const EFFORT_TIERS = ['high', 'max']
 
 function ModelPicker({ llm }: { llm: Record<string, unknown> }) {
   const options = (llm.choices as ModelOption[] | undefined) ?? []
   const [model, setModel] = useState(() => currentModel())
-  const [thinking, setThinking] = useState<boolean | null>(() => currentThinking())
+  const [tier, setTier] = useState(() => currentThinking())
   if (!llm.enabled) return <span className="statusbar-detail">{String(llm.provider)}/{String(llm.model)} · local demo</span>
   if (options.length === 0) return <span className="statusbar-detail">{String(llm.provider)}/{String(llm.model)}</span>
 
   const active = options.find(item => item.key === model) ?? options.find(item => item.key === llm.default_choice) ?? options[0]
-  const thinkingOn = thinking ?? active.thinking_default
+  const current = tier || active.thinking_default || 'off'
+  const mode = EFFORT_TIERS.includes(current) ? 'on' : current
+  const effort = EFFORT_TIERS.includes(current) ? current : 'high'
+  const apply = (next: string) => { setCurrentThinking(next); setTier(next) }
   return <>
     <label className="statusbar-picker">
       <span className="sr-only">对话模型</span>
@@ -554,12 +561,17 @@ function ModelPicker({ llm }: { llm: Record<string, unknown> }) {
     </label>
     <label className="statusbar-picker">
       <span className="sr-only">思考模式</span>
-      <select value={thinkingOn ? 'on' : 'off'} onChange={event => {
-        const next = event.target.value === 'on'
-        setCurrentThinking(next); setThinking(next)
-      }}>
+      <select value={mode} onChange={event => apply(event.target.value === 'on' ? effort : event.target.value)}>
         <option value="off">思考 关</option>
+        <option value="adaptive">思考 自动</option>
         <option value="on">思考 开</option>
+      </select>
+    </label>
+    <label className="statusbar-picker">
+      <span className="sr-only">思考深度</span>
+      <select value={effort} disabled={mode !== 'on'} onChange={event => apply(event.target.value)}>
+        <option value="high">深度 high</option>
+        <option value="max">深度 max</option>
       </select>
     </label>
   </>

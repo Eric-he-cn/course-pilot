@@ -13,18 +13,16 @@ export function clearCurrentUser() { localStorage.removeItem(USER_KEY) }
  *  没选过就不带这两个头，由服务端用配置里的第一个模型与它的默认值。 */
 export function currentModel(): string { return localStorage.getItem(MODEL_KEY) ?? '' }
 export function setCurrentModel(key: string) { localStorage.setItem(MODEL_KEY, key) }
-export function currentThinking(): boolean | null {
-  const raw = localStorage.getItem(THINKING_KEY)
-  return raw === null ? null : raw === 'on'
-}
-export function setCurrentThinking(on: boolean) { localStorage.setItem(THINKING_KEY, on ? 'on' : 'off') }
+/** 思考档位：off / adaptive / high / max，与后端 THINKING_TIERS 对应。 */
+export function currentThinking(): string { return localStorage.getItem(THINKING_KEY) ?? '' }
+export function setCurrentThinking(tier: string) { localStorage.setItem(THINKING_KEY, tier) }
 
 function modelHeaders(): Record<string, string> {
   const headers: Record<string, string> = {}
   const model = currentModel()
   if (model) headers['X-CoursePilot-Model'] = model
   const thinking = currentThinking()
-  if (thinking !== null) headers['X-CoursePilot-Thinking'] = thinking ? 'on' : 'off'
+  if (thinking) headers['X-CoursePilot-Thinking'] = thinking
   return headers
 }
 
