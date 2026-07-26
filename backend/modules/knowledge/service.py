@@ -6,18 +6,23 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Callable
 
-from core.common import new_id
+from core.common import new_id, utc_now
 from core.settings import Settings
 from contracts.embedding import EmbedderPort
 from contracts.knowledge import ConceptRef, KnowledgeHit, ResolvedKnowledgeScope
+from contracts.llm import ChatFinal
 from contracts.reranker import RerankerPort
 
 from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
 from .concepts import extract_candidates
-from . import scanned
+from . import scanned, wiki
 from .extract import SUPPORTED_SUFFIXES, extract_pages
+from .wiki import WikiStore
 from .models import Job, Material
 from .repository import KnowledgeRepository
+
+# 一次 Wiki 构建最多写多少页。每页一次模型调用，页数直接等于花的钱。
+WIKI_MAX_PAGES = 12
 
 
 class KnowledgeService:
@@ -38,6 +43,8 @@ class KnowledgeService:
         embedder: EmbedderPort | None = None,
         reranker: RerankerPort | None = None,
         transcriber: object | None = None,
+        wiki_store: WikiStore | None = None,
+        responder: object | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
@@ -45,6 +52,8 @@ class KnowledgeService:
         self._embedder = embedder
         self._reranker = reranker
         self._transcriber = transcriber
+        self._wiki = wiki_store
+        self._responder = responder
 
     def upload_material(self, *, course_id: str, filename: str, mime_type: str, content: bytes) -> Material:
         # 文件名会进提示词与界面：压掉空白、限长，避免换行伪造出新的提示词规则。
@@ -140,16 +149,54 @@ class KnowledgeService:
         return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=reason)
 
     def _run_wiki(self, job: Job, material: Material) -> Job:
+        """按这份教材抽出的概念逐个生成知识页。概念目录是索引时就建好的，这里只做写页。"""
         try:
-            self._repository.update_job(job.id, status="running", stage="reading_index", progress=20)
-            output = self._settings.data_dir / "wiki" / material.course_id
-            output.mkdir(parents=True, exist_ok=True)
-            source = self.search_course(course_id=material.course_id, query=Path(material.filename).stem, limit=6)
-            outline = "\n\n".join(hit.content[:500] for hit in source) or "（教材已索引；等待后续 Wiki 解析。）"
-            (output / f"{material.id}.md").write_text(f"# {material.filename}\n\n{outline}\n", encoding="utf-8")
-            return self._repository.update_job(job.id, status="completed", stage="wiki_completed", progress=100)
+            self._repository.update_job(job.id, status="running", stage="reading_index", progress=10)
+            if self._wiki is None or self._responder is None:
+                raise ValueError("Wiki 需要配好模型槽位（见 .env 的 TEXT_*）")
+            concepts = [
+                ConceptRef(row["id"], row["name"], row["page"])
+                for row in self._repository.list_material_concepts(material_id=material.id, limit=WIKI_MAX_PAGES)
+            ]
+            if not concepts:
+                raise ValueError("这份教材还没有抽出概念，先重建索引")
+
+            def progress(done: int, total: int) -> None:
+                self._repository.update_job(job.id, status="running", stage=f"wiki {done}/{total}", progress=10 + int(85 * done / total))
+
+            counts = wiki.build_pages(
+                course_id=material.course_id, concepts=concepts, store=self._wiki, now=utc_now(),
+                search=lambda query: self.search_course(course_id=material.course_id, query=query, limit=6),
+                ask=self._ask_once, on_progress=progress,
+            )
+            summary = f"新增 {counts['written']} 页，跳过 {counts['skipped']} 页（证据未变），{counts['ungrounded']} 个概念检索不到证据"
+            return self._repository.update_job(job.id, status="completed", stage="wiki_completed", progress=100, error_message=summary)
         except Exception as error:
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error))
+
+    def _ask_once(self, messages: list) -> object:
+        """把流式接口收成一次问答：Wiki 不需要边写边显示。"""
+        final = None
+        for event in self._responder.chat(messages=messages):
+            if isinstance(event, ChatFinal):
+                final = event
+        if final is None:
+            raise ValueError("模型没有返回完整结果")
+        return final
+
+    def wiki_pages(self, *, course_id: str) -> list[dict[str, object]]:
+        if self._wiki is None:
+            return []
+        return [
+            {"concept_id": page.concept_id, "concept_name": page.concept_name,
+             "updated_at": page.updated_at, "chars": page.chars}
+            for page in self._wiki.list_pages(course_id=course_id)
+        ]
+
+    def wiki_page(self, *, course_id: str, concept_id: str) -> str:
+        if self._wiki is None:
+            raise LookupError(concept_id)
+        return self._wiki.read(course_id=course_id, concept_id=concept_id)
 
     def search(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 6) -> list[KnowledgeHit]:
         """Agent-only search: the course is a server-issued resolver result."""

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 import pytest
 
 from contracts.knowledge import ResolvedKnowledgeScope
+from contracts.llm import ChatFinal
 from core.settings import Settings
 from core.store import SQLiteStore
 from modules.courses.models import Course
@@ -16,7 +17,30 @@ from modules.courses.service import CourseService
 from modules.knowledge.api import KnowledgeFeatureDisabledError
 from modules.knowledge.repository import KnowledgeRepository
 from modules.knowledge.service import KnowledgeService
+from modules.knowledge.wiki import HANDWRITTEN_MARKER, WikiStore
 from modules.knowledge.worker import KnowledgeJobWorker
+
+
+class StubResponder:
+    """Wiki 每页一次模型调用。这里只要一段确定的正文，别让测试依赖真模型。"""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def chat(self, *, messages, tools=()):
+        self.prompts.append(messages[-1].content)
+        yield ChatFinal(text="一句话定义：这是生成的概念页。[p.1]", finish_reason="stop",
+                        provider="stub", model="stub", mode="stub")
+
+
+WIKI_MATERIAL = """# 极限
+
+极限描述的是函数在某一点附近的趋势。
+
+# 连续性
+
+连续性建立在极限之上。
+"""
 
 
 def _pdf_with_pages(page_texts: list[str]) -> bytes:
@@ -58,6 +82,7 @@ class KnowledgeEnv:
     math: Course
     physics: Course
     wiki_enabled: bool = False
+    responder: object | None = None
 
     def wait_terminal(self, job_id: str):
         deadline = time.monotonic() + 2
@@ -86,13 +111,15 @@ def env(tmp_path):
     store.migrate()
     courses = CourseService(CourseRepository(store))
     holder: list[KnowledgeEnv] = []
+    responder = StubResponder()
     service = KnowledgeService(
         repository=KnowledgeRepository(store), settings=settings,
         wiki_is_enabled=lambda _course_id: holder[0].wiki_enabled,
+        wiki_store=WikiStore(settings.data_dir), responder=responder,
     )
     worker = KnowledgeJobWorker(service, workers=1, queue_capacity=4)
     worker.start()
-    holder.append(KnowledgeEnv(settings, store, service, worker, courses.create_course(name="数学"), courses.create_course(name="物理")))
+    holder.append(KnowledgeEnv(settings, store, service, worker, courses.create_course(name="数学"), courses.create_course(name="物理"), responder=responder))
     yield holder[0]
     worker.shutdown()
 
@@ -120,7 +147,7 @@ def test_index_persists_job_and_course_scoped_retrieval(env):
 
 def test_wiki_requires_explicit_course_flag_and_keeps_rag_independent(env):
     material = env.service.upload_material(
-        course_id=env.math.id, filename="notes.txt", mime_type="text/plain", content="极限是微积分的基础。".encode(),
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode(),
     )
     env.run_job(env.service.enqueue_index(material_id=material.id).id)
     with pytest.raises(KnowledgeFeatureDisabledError):
@@ -130,7 +157,65 @@ def test_wiki_requires_explicit_course_flag_and_keeps_rag_independent(env):
     env.wiki_enabled = True
     job = env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
     assert (job.type, job.status, job.stage) == ("wiki", "completed", "wiki_completed")
-    assert (env.settings.data_dir / "wiki" / env.math.id / f"{material.id}.md").is_file()
+
+    pages = env.service.wiki_pages(course_id=env.math.id)
+    assert pages, "启用后应该真的写出概念页"
+    content = env.service.wiki_page(course_id=env.math.id, concept_id=pages[0]["concept_id"])
+    # frontmatter 要能追溯：概念 id、证据指纹、提示词版本
+    assert "concept_id:" in content and "source_hash:" in content and "prompt_version: wiki-v1" in content
+    assert "source_refs:" in content and "notes.md" in content
+
+
+def test_wiki_only_feeds_the_model_retrieved_material(env):
+    """写页的证据必须来自检索，不能让模型拿通用知识补。"""
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode(),
+    )
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    env.wiki_enabled = True
+    env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+    assert env.responder.prompts, "应该调用过模型"
+    assert "极限描述的是函数在某一点附近的趋势" in env.responder.prompts[0], "教材原文要进提示词"
+    assert "notes.md" in env.responder.prompts[0], "出处也要给模型，它才能标引用"
+
+
+def test_rebuilding_skips_pages_whose_evidence_did_not_change(env):
+    """证据没变就不重写：既省 token，也避免每次生成一个不一样的版本。"""
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode(),
+    )
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    env.wiki_enabled = True
+    env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+    first_round = len(env.responder.prompts)
+    assert first_round > 0
+
+    job = env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+    assert len(env.responder.prompts) == first_round, "第二次不该再调模型"
+    assert "跳过" in (job.error_message or "")
+
+
+def test_rebuilding_keeps_the_handwritten_block(env):
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode(),
+    )
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    env.wiki_enabled = True
+    env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+    pages = env.service.wiki_pages(course_id=env.math.id)
+    concept_id = pages[0]["concept_id"]
+
+    store = WikiStore(env.settings.data_dir)
+    path = env.settings.data_dir / "wiki" / env.math.id / f"{concept_id}.md"
+    path.write_text(path.read_text(encoding="utf-8") + "\n我自己补的：这里容易和连续性搞混。\n", encoding="utf-8")
+
+    # 换一份证据强制重写，手写区必须留着
+    store.write(course_id=env.math.id, concept_id=concept_id, concept_name="极限",
+                body="重新生成的正文", source_hash="different", source_refs=["notes.txt #x"], updated_at="now")
+    rewritten = store.read(course_id=env.math.id, concept_id=concept_id)
+    assert "重新生成的正文" in rewritten
+    assert "我自己补的" in rewritten
+    assert rewritten.count(HANDWRITTEN_MARKER) == 1
 
 
 def test_pdf_chunks_keep_their_page_numbers_in_citations(env):

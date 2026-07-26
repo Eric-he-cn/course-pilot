@@ -15,6 +15,7 @@ from modules.agent.trace import TraceWriter
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
 from modules.knowledge.repository import KnowledgeRepository
+from modules.knowledge.wiki import WikiStore
 from modules.knowledge.service import KnowledgeService
 from modules.knowledge.worker import KnowledgeJobWorker
 from modules.learning.repository import LearningRepository
@@ -213,6 +214,8 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         reranker=reranker,
         # 扫描版 PDF 的逐页 OCR 复用对话里那个 vision 槽位，不额外配一份
         transcriber=vision,
+        wiki_store=WikiStore(settings.data_dir),
+        responder=llm,
     )
     resolver = CourseResolver(courses, classifier=classifier)
     sessions = SessionService(

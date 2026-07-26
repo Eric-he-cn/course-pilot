@@ -21,11 +21,15 @@ _STRIP_SUFFIX = re.compile(r"[\s：:。，,、；;.…\d]+$")
 _MATH_CHARS = re.compile(r"[=+×÷⊤⊥−±≤≥∈∑∏∫√∂∇|^~<>]")
 _NOISE = re.compile(r"https?://|@|\d{4}-\d{2}|\.(?:py|js|ts|json|md|txt|sh)$|^\W+$")
 _LATIN_ONLY = re.compile(r"^[A-Za-z0-9 ()\-.:'/]+$")
+# 整句的迹象：逗号、问号、句中的分号。概念名不会有这些。
+_SENTENCE_LIKE = re.compile(r"[,，;；?？!！]")
 _REPEATED = re.compile(r"(.)\1{3,}")
 _MIN_CHARS = 2
 _MAX_CHARS = 40
 # 出现在这么高比例的页面上，说明是页眉页脚而不是概念。
 _HEADER_PAGE_RATIO = 0.35
+# 页数少于这个数就不做页眉判定，否则短资料的概念会被全部剔掉。
+_HEADER_MIN_BUCKETS = 5
 
 
 def _normalize(raw: str) -> str:
@@ -36,6 +40,10 @@ def _normalize(raw: str) -> str:
 
 def _acceptable(name: str) -> bool:
     if not (_MIN_CHARS <= len(name) <= _MAX_CHARS):
+        return False
+    # 概念名是名词短语。带逗号或问号的是被编号正文行误判成标题的整句
+    # （「1 And as before, given our new assumptions」这种），不是概念。
+    if _SENTENCE_LIKE.search(name):
         return False
     if _NOISE.search(name) or _MATH_CHARS.search(name):
         return False
@@ -84,8 +92,14 @@ def extract_candidates(segments: list[tuple[int | None, str]], *, limit: int = 2
                     record(name, 1, page, bucket)
 
     total_buckets = len({page if page is not None else index for index, (page, _) in enumerate(segments)}) or 1
+    # 页眉判据在页数太少时会把所有概念都吃掉：只有 1 页时任何候选的占比都是 100%。
+    # 页数少于这个数就不判页眉——几页的资料本来也没有页眉重复的问题。
+    header_filter = total_buckets >= _HEADER_MIN_BUCKETS
     ranked = sorted(
-        ((name, count) for name, count in counts.items() if len(buckets[name]) / total_buckets <= _HEADER_PAGE_RATIO),
+        (
+            (name, count) for name, count in counts.items()
+            if not header_filter or len(buckets[name]) / total_buckets <= _HEADER_PAGE_RATIO
+        ),
         key=lambda item: (-item[1], item[0]),
     )
     return [{"name": name, "mention_count": count, "page": first_page.get(name)} for name, count in ranked[:limit]]

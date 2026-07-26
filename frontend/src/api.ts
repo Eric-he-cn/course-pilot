@@ -1,4 +1,4 @@
-import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent } from './types'
+import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
@@ -115,6 +115,8 @@ export const api = {
   startOcr: (materialId: string) => request<Job>(`/materials/${materialId}/ocr`, json('POST')),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   buildWiki: (materialId: string) => request<Job>(`/materials/${materialId}/wiki`, json('POST')),
+  wikiPages: (courseId: string) => request<{ pages: WikiPageSummary[] }>(`/courses/${courseId}/wiki`),
+  wikiPage: (courseId: string, conceptId: string) => request<{ concept_id: string; content: string }>(`/courses/${courseId}/wiki/${conceptId}`),
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),
   plan: (courseId: string) => request<{ plan: Plan | null }>(`/courses/${courseId}/plan`),
   archive: (courseId: string) => request<ArchiveSummary>(`/courses/${courseId}/archive`),

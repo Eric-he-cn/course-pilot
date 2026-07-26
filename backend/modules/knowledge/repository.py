@@ -202,6 +202,15 @@ class KnowledgeRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_material_concepts(self, *, material_id: str, limit: int) -> list[dict]:
+        """按提及次数排序：Wiki 页数有上限，先写这份教材里讲得最多的概念。"""
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT id, name, page FROM concepts WHERE material_id = ? ORDER BY mention_count DESC, name LIMIT ?",
+                (material_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def concept_exists(self, *, course_id: str, concept_id: str) -> bool:
         with self._store.read() as conn:
             return conn.execute("SELECT 1 FROM concepts WHERE id = ? AND course_id = ?", (concept_id, course_id)).fetchone() is not None

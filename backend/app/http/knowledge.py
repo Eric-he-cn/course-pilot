@@ -147,6 +147,19 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
         except ValueError as error:
             raise _not_found(str(error)) from error
 
+    @router.get("/courses/{course_id}/wiki")
+    def list_wiki_pages(course_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        require_course(application, course_id)
+        return {"pages": application.knowledge.wiki_pages(course_id=course_id)}
+
+    @router.get("/courses/{course_id}/wiki/{concept_id}")
+    def read_wiki_page(course_id: str, concept_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        require_course(application, course_id)
+        try:
+            return {"concept_id": concept_id, "content": application.knowledge.wiki_page(course_id=course_id, concept_id=concept_id)}
+        except (LookupError, ValueError) as error:
+            raise _not_found(str(error)) from error
+
     @router.get("/health")
     def health(application: Application = Depends(current_workspace)) -> dict[str, object]:
         return {**application.knowledge.health(), "llm": application.llm_health(), "vision": application.vision_health(),

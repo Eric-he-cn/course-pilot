@@ -38,7 +38,7 @@ def test_course_scoped_material_index_search_wiki_and_health(client):
     physics = client.post("/api/v2/courses", json={"name": "大学物理"}).json()
     upload = client.post(
         f"/api/v2/courses/{calculus['id']}/materials",
-        files={"file": ("calculus.md", "链式法则：先求外层导数，再乘内层导数。", "text/markdown")},
+        files={"file": ("calculus.md", "# 链式法则\n\n先求外层导数，再乘内层导数。\n", "text/markdown")},
     )
     assert upload.status_code == 201, upload.text
     material = upload.json()

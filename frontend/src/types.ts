@@ -158,6 +158,14 @@ export interface OcrEstimate {
   projected_minutes: number
 }
 
+// Wiki 知识页：一个概念一页
+export interface WikiPageSummary {
+  concept_id: string
+  concept_name: string
+  updated_at: string
+  chars: number
+}
+
 export interface Job {
   id: string
   material_id?: string
