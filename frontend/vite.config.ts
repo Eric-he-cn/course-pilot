@@ -9,6 +9,6 @@ export default defineConfig(({ mode }) => ({
       '/api': { target: loadEnv(mode, '.', 'VITE_').VITE_PROXY_TARGET || 'http://127.0.0.1:8000', changeOrigin: true },
     },
     // 浏览器端到端测试要把本地教材注入上传控件，只额外开放 fixture 目录。
-    fs: { allow: ['.', '../data/e2e-fixtures'] },
+    fs: { allow: ['.', '../testdata/fixtures'] },
   },
 }))

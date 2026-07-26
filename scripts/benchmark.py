@@ -5,7 +5,7 @@
 外加 Tutor 的取证引用、课程隔离与教材外兜底。断言对象是 SSE 事件与档案增量，
 所以模型换措辞不会让用例假失败。
 
-用法：先启动被测实例（STORAGE_DATA_DIR=data/e2e ./scripts/dev.sh），再运行本脚本。
+用法：先启动被测实例（STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh），再运行本脚本。
 """
 
 from __future__ import annotations

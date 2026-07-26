@@ -101,8 +101,8 @@ def rasterize(pdf: Path, page_number: int, target: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default=str(ROOT / "data" / "e2e-fixtures"), help="fixture 输出目录")
-    parser.add_argument("--data-dir", default=str(ROOT / "data" / "e2e"), help="e2e 后端数据目录，会被清空")
+    parser.add_argument("--out", default=str(ROOT / "testdata" / "fixtures"), help="fixture 输出目录")
+    parser.add_argument("--data-dir", default=str(ROOT / "testdata" / "e2e"), help="e2e 后端数据目录，会被清空")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -132,7 +132,7 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     shutil.rmtree(data_dir, ignore_errors=True)
     print(f"已清空 e2e 数据目录：{data_dir}")
-    print("启动被测实例：STORAGE_DATA_DIR=data/e2e ./scripts/dev.sh")
+    print("启动被测实例：STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh")
     print("\n教材来源：")
     for source in SOURCES:
         print(f"  {source.key} — {source.note}")

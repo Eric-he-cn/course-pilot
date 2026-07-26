@@ -2,8 +2,8 @@
 """事件流回放：掌握度算法改动后，用历史证据事件对比新旧曲线（策划书 §6）。
 
 用法：
-  改动算法前  python scripts/replay_mastery.py --data-dir data/e2e --save baseline.json
-  改动算法后  python scripts/replay_mastery.py --data-dir data/e2e --compare baseline.json
+  改动算法前  python scripts/replay_mastery.py --data-dir testdata/e2e --save baseline.json
+  改动算法后  python scripts/replay_mastery.py --data-dir testdata/e2e --compare baseline.json
 
 回放只读 evidence_events，不写任何数据；投影表本身可以随时用 rebuild 重建。
 """

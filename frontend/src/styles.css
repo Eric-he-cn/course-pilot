@@ -159,10 +159,17 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .context-popover p { margin:7px 0 0; color:var(--muted); font-size:10.5px; line-height:1.5 }
 .context-popover p.popover-note { color:var(--accent) }
 .context-popover p.popover-warn { color:var(--warning) }
-.mermaid-figure { margin:12px 0; padding:12px; overflow-x:auto; border:1px solid var(--border); border-radius:8px; background:var(--panel); text-align:center }
+.mermaid-figure { margin:12px 0; padding:12px; border:1px solid var(--border); border-radius:8px; background:var(--panel) }
+.mermaid-figure > div { overflow-x:auto; text-align:center }
 .mermaid-figure svg { max-width:100%; height:auto }
-.mermaid-source { margin:12px 0; padding:10px 12px; overflow-x:auto; border:1px solid var(--border); border-radius:8px; background:var(--panel); font-family:var(--mono); font-size:11.5px; line-height:1.6 }
+.mermaid-figure figcaption { display:flex; align-items:center; gap:9px; margin-top:9px; padding-top:8px; border-top:1px solid var(--border) }
+.mermaid-figure figcaption button { padding:3px 9px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-family:var(--mono); font-size:10.5px }
+.mermaid-figure figcaption button:hover { color:var(--accent); border-color:var(--accent) }
+.mermaid-figure figcaption span { color:var(--muted); font-size:10.5px }
+.mermaid-source { display:block; margin:12px 0; padding:10px 12px; overflow-x:auto; border:1px solid var(--border); border-radius:8px; background:var(--panel); font-family:var(--mono); font-size:11.5px; line-height:1.6 }
 .mermaid-source.failed { border-color:var(--warning) }
+.mermaid-hint { display:block; margin-bottom:6px; color:var(--muted); font-family:var(--sans); font-size:11px }
+.mermaid-source.failed .mermaid-hint { color:var(--warning) }
 .attach-list { display:flex; flex-direction:column; gap:6px; margin-bottom:8px }
 .attach-chip { display:flex; align-items:baseline; gap:10px; padding:7px 10px; border:1px solid var(--border); border-radius:6px; background:var(--panel); font-family:var(--mono); font-size:11px }
 .attach-chip .attach-name { flex:none; color:var(--accent); font-weight:600 }

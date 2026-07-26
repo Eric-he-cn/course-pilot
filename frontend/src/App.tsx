@@ -263,19 +263,45 @@ function Mermaid({ code }: { code: string }) {
   const id = useRef(`mermaid-${Math.random().toString(36).slice(2)}`)
   useEffect(() => {
     let cancelled = false
-    setFailed(false)
-    void (async () => {
-      try {
-        const mermaid = (await import('mermaid')).default
-        mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'strict' })
-        const { svg: rendered } = await mermaid.render(id.current, code)
-        if (!cancelled) setSvg(rendered)
-      } catch { if (!cancelled) setFailed(true) }
-    })()
-    return () => { cancelled = true }
+    // 流式期间每个增量都会改 code。不防抖就会每秒渲染几十次，而且代码没写完时
+    // 渲染失败又退回源码，画面在图与源码之间来回跳。等它稳定下来再渲染一次。
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const mermaid = (await import('mermaid')).default
+          mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'strict' })
+          const { svg: rendered } = await mermaid.render(id.current, code)
+          if (!cancelled) { setSvg(rendered); setFailed(false) }
+        } catch {
+          // 已经画出过就保留上一版，别把成图退回源码。
+          if (!cancelled) setFailed(current => current || !svg)
+        }
+      })()
+    }, 400)
+    return () => { cancelled = true; window.clearTimeout(timer) }
   }, [code])
-  if (failed || !svg) return <pre className={failed ? 'mermaid-source failed' : 'mermaid-source'}><code>{code}</code></pre>
-  return <div className="mermaid-figure" role="img" aria-label="图示" dangerouslySetInnerHTML={{ __html: svg }} />
+
+  function download() {
+    const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `coursepilot-图示-${new Date().toISOString().slice(0, 10)}.svg`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  if (!svg) return <pre className={failed ? 'mermaid-source failed' : 'mermaid-source'}>
+    <span className="mermaid-hint">{failed ? '这段图示代码有语法问题，下面是原文' : '正在生成图示…'}</span>
+    <code>{code}</code>
+  </pre>
+  return <figure className="mermaid-figure">
+    <div role="img" aria-label="图示" dangerouslySetInnerHTML={{ __html: svg }} />
+    <figcaption>
+      <button type="button" onClick={download}>下载 SVG</button>
+      <span>可用浏览器或任意矢量图工具打开</span>
+    </figcaption>
+  </figure>
 }
 
 const markdownComponents = {

@@ -10,6 +10,7 @@ frontend/node_modules/
 frontend/dist/
 
 data/
+testdata/
 *.db
 *.db-shm
 *.db-wal

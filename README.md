@@ -19,6 +19,28 @@ cd frontend && pnpm install && cd ..
 
 真实 DeepSeek Adapter 已接入：当 `.env` 同时配置 `TEXT_API_KEY`、`TEXT_MODEL=deepseek-v4-flash` 和 `COURSEPILOT_ENABLE_REMOTE_LLM=1` 时，课程解析和 RAG 命中后以流式方式调用 DeepSeek，逐段下发 `text_delta`。未启用或在输出任何增量前失败时，回退到有明确标识的本地 responder；已输出增量后中断则保留部分回答并发出 `stream_interrupted`，不静默重放。仓库示例配置仍默认关闭远端调用，避免误耗额度。教材支持 PDF/TXT/MD（PDF 引用带页码），默认上限 100 MiB；图片附件上限仍是 10 MiB。
 
+## 目录约定
+
+`data/` 只放真实使用产生的数据，测试与验证产物一律不进来：
+
+```
+data/                         用户工作区（STORAGE_DATA_DIR 默认指向这里）
+├─ coursepilot.db             会话、证据事件、掌握度、计划、产物
+├─ user.md                    跨课程画像（可直接编辑）
+├─ courses/<课程 id>/memory.md  该课程的情景记忆（可直接编辑）
+├─ materials/<课程 id>/        上传的教材原件
+├─ notes/<课程 id>/            助手写的课程笔记与学习卡片（markdown）
+├─ wiki/<课程 id>/             可选的 Course Wiki
+├─ traces/                    每轮对话的 JSONL + payloads/
+└─ backups/                   手工备份
+
+testdata/                     测试与验证，不是用户数据
+├─ fixtures/                  开源教材切片（scripts/e2e_fixture.py 下载）
+└─ e2e/                       端到端测试实例的独立数据目录
+```
+
+两个目录都在 `.gitignore` 里。想连测试实例就 `STORAGE_DATA_DIR=testdata/e2e`。
+
 ## 验证
 
 ```bash
@@ -34,7 +56,7 @@ cd frontend && pnpm install && cd ..
 ```
 
 浏览器端到端测试见 [端到端测试清单](Docs/coursepilot-2.0-e2e-browser-test.md)：教材取自开源教材的章节切片，
-用 `scripts/e2e_fixture.py` 准备，测试实例跑在独立数据目录 `data/e2e`，不影响开发库。
+用 `scripts/e2e_fixture.py` 准备，测试实例跑在独立数据目录 `testdata/e2e`，不影响开发库。
 
 ## 文档
 
@@ -53,8 +75,8 @@ cd frontend && pnpm install && cd ..
 
 ```bash
 .venv/bin/python scripts/benchmark.py                     # 冒烟：固定用例跑真实链路，只断言结构化行为
-.venv/bin/python scripts/evaluate.py --data-dir data/e2e  # 抽样：judge 给忠实度/归因/有用性打分
-.venv/bin/python scripts/replay_mastery.py --data-dir data/e2e --save baseline.json
+.venv/bin/python scripts/evaluate.py --data-dir testdata/e2e  # 抽样：judge 给忠实度/归因/有用性打分
+.venv/bin/python scripts/replay_mastery.py --data-dir testdata/e2e --save baseline.json
 ```
 
 `benchmark.py` 覆盖 practice 的出题、单题作答、多题作答、讲评、变式题、作答对象歧义，

@@ -11,7 +11,7 @@
 
 用内置 Browser pane（`mcp__Claude_Browser__*`）驱动。它没有文件选择器，教材上传靠页面自己
 `fetch` fixture 再注入到隐藏 input——`vite.config.ts` 的 `server.fs.allow` 只放开了
-`data/e2e-fixtures` 这一个目录，仓库其余文件（含 `.env`）仍返回 403。
+`testdata/fixtures` 这一个目录，仓库其余文件（含 `.env`）仍返回 403。
 
 两个实测坑：`javascript_tool` 单次调用 30 秒超时；标签页不在前台时 `setTimeout` 被浏览器节流到
 1 秒起。所以不要写长轮询，一次调用里的等待控制在 25 秒内，等不到就再发一次读取调用。
@@ -22,13 +22,13 @@
 .venv/bin/python scripts/e2e_fixture.py
 ```
 
-首次执行下载约 68 MB 开源教材，缓存在 `data/e2e-fixtures/source/`，重跑不再下载；随后切出章节、
-光栅化一页 PNG，并清空 `data/e2e`。测试用独立数据目录，不碰开发库 `data/coursepilot.db`。
+首次执行下载约 68 MB 开源教材，缓存在 `testdata/fixtures/source/`，重跑不再下载；随后切出章节、
+光栅化一页 PNG，并清空 `testdata/e2e`。测试用独立数据目录，不碰开发库 `data/coursepilot.db`。
 
 启动被测实例：`preview_start` 选 `coursepilot-e2e`，或
 
 ```bash
-STORAGE_DATA_DIR=data/e2e ./scripts/dev.sh
+STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
 ```
 
 `.env` 里 `COURSEPILOT_ENABLE_REMOTE_LLM=1` 必须开启，否则第 6 步起测的是本地 responder。
@@ -41,7 +41,7 @@ BGE 向量模型需已在本地缓存，否则首次索引会卡在下载模型�
 
 ```js
 window.__e2eUpload = async (selector, name) => {
-  const base = '/@fs' + '<项目绝对路径>/data/e2e-fixtures/'
+  const base = '/@fs' + '<项目绝对路径>/testdata/fixtures/'
   const blob = await (await fetch(base + encodeURIComponent(name))).blob()
   const input = document.querySelector(selector)
   const dt = new DataTransfer(); dt.items.add(new File([blob], name, { type: blob.type }))
@@ -135,7 +135,7 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
     验证：
 
     ```bash
-    tail -n 3 data/e2e/traces/*.jsonl | .venv/bin/python -c "import sys,json;[print(r.get('status'), 'rounds=%s' % r.get('tool_rounds'), [(t['origin'],t['name'],t['ok']) for t in r.get('tools',[])]) for l in sys.stdin if l.strip().startswith('{') for r in [json.loads(l)]]"
+    tail -n 3 testdata/e2e/traces/*.jsonl | .venv/bin/python -c "import sys,json;[print(r.get('status'), 'rounds=%s' % r.get('tool_rounds'), [(t['origin'],t['name'],t['ok']) for t in r.get('tools',[])]) for l in sys.stdin if l.strip().startswith('{') for r in [json.loads(l)]]"
     ```
 
     期望：`status=completed`、`tool_rounds ≥ 1`，`tools` 里既有 `seed` 也有 `model`。
@@ -167,7 +167,7 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
     - 几百 KB 但解压后上亿像素的 PNG：422「图片分辨率过高」，不是 500（校验必须在解码之前）。
     - 新建或改名成已存在的课程名：422「课程名称已存在」，界面提示可读，不是 500。
 
-20. **索引期间的检索延迟**：上传整本教材（`data/e2e-fixtures/source/d2l-zh.pdf`，813 页），
+20. **索引期间的检索延迟**：上传整本教材（`testdata/fixtures/source/d2l-zh.pdf`，813 页），
     在 job 处于 `embedding` 阶段时连续打几次 `POST /courses/{id}/knowledge/search`
     期望：中位数在秒级以内（当前实测中位 1.5s、最坏 3.0s；空闲时 30ms）。若退化到几十秒，
     说明向量模型的分段持锁被改回了整批持锁。
@@ -186,7 +186,7 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
 停掉实例，用坏 Key 重启，再问一次第 6 步的问题：
 
 ```bash
-TEXT_API_KEY=sk-invalid STORAGE_DATA_DIR=data/e2e ./scripts/dev.sh
+TEXT_API_KEY=sk-invalid STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
 ```
 
 期望：出现 `provider_fallback` 后由本地 responder 完成回答，回答带明确的本地标识，会话仍正常持久化；
