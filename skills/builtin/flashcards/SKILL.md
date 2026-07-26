@@ -3,6 +3,7 @@ name: flashcards
 description: 把教材内容做成可复习的学习卡片并存成课程笔记
 when_to_use: 用户要学习卡片、抽认卡、知识点清单，或者说要把某章内容整理成便于反复看的形式
 allowed_tools: [search_materials, list_materials, concept_search, note_read, note_write]
+examples: 把这一章做成学习卡片 | 整理成知识点清单 | 给我一套抽认卡
 ---
 
 ## 目标

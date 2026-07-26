@@ -3,6 +3,7 @@ name: diagram
 description: 用 mermaid 画流程图、思维导图或时序图讲清教材里的结构与流程
 when_to_use: 用户要流程图、思维导图、结构图、时序图，或者说"画一下""图解一下""捋一遍流程"
 allowed_tools: [search_materials, list_materials, concept_search, note_read, note_write]
+examples: 画一张流程图讲清这个算法 | 用思维导图捋一遍这一章 | 图解一下这两者的关系
 ---
 
 ## 目标

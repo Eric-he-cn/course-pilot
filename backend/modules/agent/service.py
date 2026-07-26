@@ -48,8 +48,8 @@ _PRACTICE_INTENT = re.compile(r"出\s*(?:几|[一二三四五六1-9])?\s*道|出
 _SKILL_INTENT = {
     "diagram": re.compile(r"流程图|思维导图|结构图|时序图|画[一张个]*图|画一下|图解|捋[一下]*[遍流]"),
     "flashcards": re.compile(r"学习卡片|抽认卡|记忆卡|卡片|知识点清单|整理成.{0,6}(卡|清单)"),
-    "mistake_review": re.compile(r"错题|复盘|哪里薄弱|弱项|做错的|错在哪"),
-    "research": re.compile(r"联网|上网|查一下网|最新进展|业界|工业界|论文里"),
+    "mistake_review": re.compile(r"错题|复盘|哪里.{0,4}(薄弱|不会|没掌握)|薄弱|弱项|做错的|错在哪"),
+    "research": re.compile(r"联网|上网|查一下网|最新进展|业界|工业界|论文里|教材外|课外的?资料"),
 }
 
 

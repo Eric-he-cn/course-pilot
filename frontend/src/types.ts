@@ -52,6 +52,7 @@ export interface SkillInfo {
   origin: 'builtin' | 'user'
   status: 'enabled' | 'draft' | 'permission_denied'
   content_hash: string
+  examples?: string[]
 }
 
 export interface ContextUsage {

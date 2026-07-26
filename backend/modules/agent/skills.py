@@ -31,6 +31,8 @@ class SkillDefinition:
     allowed_tools: tuple[str, ...]
     body: str
     content_hash: str  # trace 按 hash 聚合 judge 评分（§7.6）
+    # 触发例句：帮助页直接展示，和规程同文件，改规程的人顺手改例句
+    examples: tuple[str, ...] = ()
     origin: str = "builtin"
     status: str = "enabled"
     denied_tools: tuple[str, ...] = ()
@@ -68,6 +70,7 @@ def parse_skill(text: str, *, source: str = "上传内容") -> SkillDefinition:
         name=name, description=fields["description"], when_to_use=fields["when_to_use"],
         allowed_tools=_parse_list(fields["allowed_tools"]), body=body,
         content_hash=hashlib.sha1(text.encode()).hexdigest()[:12],
+        examples=tuple(item.strip() for item in fields.get("examples", "").split("|") if item.strip()),
     )
 
 
@@ -200,13 +203,14 @@ class SkillRegistry:
         builtin = [
             {"name": skill.name, "description": skill.description, "when_to_use": skill.when_to_use,
              "allowed_tools": list(skill.allowed_tools), "denied_tools": [], "origin": "builtin",
-             "status": "enabled", "content_hash": skill.content_hash}
+             "status": "enabled", "content_hash": skill.content_hash, "examples": list(skill.examples)}
             for skill in self._definitions.values()
         ]
         imported = [
             {"name": skill.name, "description": skill.description, "when_to_use": skill.when_to_use,
              "allowed_tools": list(skill.allowed_tools), "denied_tools": list(skill.denied_tools),
-             "origin": "user", "status": skill.status, "content_hash": skill.content_hash}
+             "origin": "user", "status": skill.status, "content_hash": skill.content_hash,
+             "examples": list(skill.examples)}
             for skill in (self._user_skills.list_all() if self._user_skills is not None else [])
         ]
         return builtin + imported

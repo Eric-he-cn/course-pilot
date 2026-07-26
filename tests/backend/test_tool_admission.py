@@ -214,3 +214,43 @@ def test_only_research_skill_can_reach_the_network():
     registry = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
     online = {name for name in registry.builtin_names() if "network" in capabilities_of(registry.get(name).allowed_tools)}
     assert online == {"research"}
+
+
+def test_every_skill_example_actually_triggers_its_own_pre_routing():
+    """帮助页展示的例句必须真的能命中预路由，否则用户照着说却加载不到 skill。
+    这条是帮助页不腐烂的那个检查。
+
+    practice 有两个触发源：意图正则（要练题）与"本会话有待批改的练习"这个状态，
+    所以它的作答类例句不该被要求命中正则，只要求至少有一句命中。
+    """
+    from modules.agent.service import _PRACTICE_INTENT, _SKILL_INTENT
+    from modules.agent.skills import SkillRegistry
+
+    registry = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
+    for name in registry.builtin_names():
+        skill = registry.get(name)
+        assert skill.examples, f"{name} 没有触发例句"
+        pattern = _PRACTICE_INTENT if name == "practice" else _SKILL_INTENT.get(name)
+        assert pattern is not None, f"{name} 没有预路由正则"
+        hits = [example for example in skill.examples if pattern.search(example)]
+        if name == "practice":
+            assert hits, "practice 的例句里至少要有一句能命中意图正则"
+        else:
+            assert len(hits) == len(skill.examples), \
+                f"{name} 这些例句命中不了自己的预路由正则：{set(skill.examples) - set(hits)}"
+
+
+def test_frontend_tool_labels_and_capability_hints_cover_every_tool():
+    """前端的中文名与能力分组是硬编码的镜像：漏一个工具就会在界面上露出英文函数名，
+    或者在使用说明里被归错组。"""
+    import re
+
+    app = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    labels = set(re.findall(r"(\w+): '", app.split("const TOOL_LABELS")[1].split("}")[0]))
+    hints = dict(re.findall(r"(\w+): '(\w+)'", app.split("TOOL_CAPABILITY_HINT")[1].split("}")[0]))
+    backend = set(TOOL_CAPABILITY)
+
+    assert labels == backend, f"TOOL_LABELS 与后端工具不一致：{labels ^ backend}"
+    assert set(hints) == backend, f"TOOL_CAPABILITY_HINT 少了：{backend - set(hints)}"
+    for name, capability in hints.items():
+        assert TOOL_CAPABILITY[name] == capability, f"{name} 的能力分组前后端不一致"

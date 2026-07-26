@@ -7,11 +7,11 @@ import 'katex/dist/katex.min.css'
 import { ApiError, api } from './api'
 import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, SkillInfo, ToolActivity } from './types'
 
-type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings'
+type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
 type TurnResolution = { sessionId: string; status: string; courseId: string | null; courseName: string | null }
 
-const viewNames: Record<View, string> = { chat: '对话', library: '知识仓库', plan: '学习计划', archive: '学习档案', settings: '管理与设置' }
+const viewNames: Record<View, string> = { chat: '对话', library: '知识仓库', plan: '学习计划', archive: '学习档案', settings: '管理与设置', help: '使用说明' }
 const nav: { id: View; num: string }[] = [
   { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
@@ -22,6 +22,15 @@ const TOOL_LABELS: Record<string, string> = {
   use_skill: '加载能力', artifact_read: '读取练习', artifact_append: '保存练习',
   web_search: '联网检索', web_fetch: '读取网页', note_write: '写入笔记', note_read: '读取笔记',
   calculator: '计算',
+}
+
+const TOOL_CAPABILITY_HINT: Record<string, string> = {
+  search_materials: 'read_course', list_materials: 'read_course', get_plan: 'read_course',
+  get_archive: 'read_course', concept_search: 'read_course', note_read: 'read_course',
+  emit_evidence: 'write_state', plan_update: 'write_state', memory_patch: 'write_state',
+  artifact_append: 'write_state', note_write: 'write_note',
+  web_search: 'network', web_fetch: 'network',
+  calculator: 'free', use_skill: 'free', artifact_read: 'free',
 }
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
@@ -44,6 +53,8 @@ export default function App() {
   const [turnResolution, setTurnResolution] = useState<TurnResolution | null>(null)
   // 上下文构成来自服务端实际组装结果；换会话就清空，避免显示上一会话的数字。
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
+  // 帮助页点例句后带进对话输入框
+  const [draftSeed, setDraftSeed] = useState('')
 
   const course = useMemo(() => courses.find(item => item.id === workspace.courseId) ?? null, [courses, workspace.courseId])
   const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewNames[view]
@@ -123,7 +134,10 @@ export default function App() {
         </button>) : <p className="mini-empty">此工作区还没有会话。</p>}
       </div>
       <button className="new-session" onClick={newSession} disabled={busy}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
-      <div className="sidebar-foot"><button onClick={() => { setView('settings'); setSidebarOpen(false) }}>⚙ <span>管理与设置</span></button></div>
+      <div className="sidebar-foot">
+        <button onClick={() => { setView('help'); setSidebarOpen(false) }}>? <span>使用说明</span></button>
+        <button onClick={() => { setView('settings'); setSidebarOpen(false) }}>⚙ <span>管理与设置</span></button>
+      </div>
     </aside>
     <main className="main">
       <header className="topbar">
@@ -137,7 +151,7 @@ export default function App() {
         </div>
       </header>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label="关闭错误提示" onClick={() => setNotice('')}>×</button></div>}
-      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} contextUsage={contextUsage} onCitation={setCitation} onUpload={async file => {
+      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} contextUsage={contextUsage} draftSeed={draftSeed} onSeedUsed={() => setDraftSeed('')} onCitation={setCitation} onUpload={async file => {
         try {
           let targetSession = activeSession
           if (!targetSession) {
@@ -199,11 +213,12 @@ export default function App() {
         }
         finally { setBusy(false) }
       }} busy={busy} />}
-      {view !== 'chat' && view !== 'settings' && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId }, { keepView: true })} onCreate={createCourse} />}
+      {!['chat', 'settings', 'help'].includes(view) && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId }, { keepView: true })} onCreate={createCourse} />}
       {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
       {view === 'archive' && course && <ArchiveView course={course} onError={setNotice} />}
       {view === 'settings' && <SettingsView courses={courses} onError={setNotice} />}
+      {view === 'help' && <HelpView courses={courses} health={health} onError={setNotice} onTry={text => { setView('chat'); setDraftSeed(text) }} />}
       <footer className="statusbar">
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
         {healthLlm && <span>{String(healthLlm.provider)}/{String(healthLlm.model)}{healthLlm.enabled ? '' : ' · local demo'}</span>}
@@ -215,8 +230,9 @@ export default function App() {
   </div>
 }
 
-function ChatView({ session, messages, workspaceName, scope, turnResolution, contextUsage, onCitation, onUpload, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
+function ChatView({ session, messages, workspaceName, scope, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
   const [draft, setDraft] = useState(''); const composer = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => { if (draftSeed) { setDraft(draftSeed); onSeedUsed(); composer.current?.focus() } }, [draftSeed])
   const [attachments, setAttachments] = useState<Attachment[]>([]); const [uploading, setUploading] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
   const isCourseScope = session ? session.scope_mode === 'course' : scope === 'course'
@@ -321,6 +337,106 @@ const markdownComponents = {
   table(props: { children?: unknown }) {
     return <div className="table-scroll"><table>{props.children as never}</table></div>
   },
+}
+
+
+const CAPABILITY_GROUPS: { key: string; label: string; hint: string }[] = [
+  { key: 'read_course', label: '只读你的课程数据', hint: '检索教材、查概念目录、读计划与档案、读笔记' },
+  { key: 'write_state', label: '会改学习状态', hint: '写证据事件、改学习计划、更新长期记忆' },
+  { key: 'write_note', label: '会新建课程笔记', hint: '把整理好的内容写进 data/notes/' },
+  { key: 'network', label: '会访问外部网络', hint: '联网检索与抓取网页，每轮有次数上限' },
+  { key: 'free', label: '无副作用', hint: '算术求值、加载能力、读跨轮产物' },
+]
+
+/** 使用说明。可数的内容一律来自接口，避免变成需要人工同步的死文档。 */
+function HelpView({ courses, health, onError, onTry }: { courses: Course[]; health: Record<string, unknown> | null; onError: (message: string) => void; onTry: (text: string) => void }) {
+  const [skills, setSkills] = useState<SkillInfo[] | null>(null)
+  const [indexedCourses, setIndexedCourses] = useState<string[]>([])
+  const [hasSession, setHasSession] = useState(false)
+  useEffect(() => {
+    api.skills().then(payload => setSkills(payload.skills)).catch(error => { setSkills([]); onError(errorText(error)) })
+    void (async () => {
+      const indexed: string[] = []
+      for (const course of courses) {
+        try {
+          const materials = await api.materials(course.id)
+          if (materials.some(item => (item.index_status ?? item.status) === 'indexed')) indexed.push(course.name)
+        } catch { /* 单门课读不到不影响清单 */ }
+      }
+      setIndexedCourses(indexed)
+      try { setHasSession((await api.sessions('course')).length + (await api.sessions('general')).length > 0) } catch { /* 同上 */ }
+    })()
+  }, [courses.length])
+
+  const rag = (health?.rag ?? null) as Record<string, unknown> | null
+  const llm = (health?.llm ?? null) as Record<string, unknown> | null
+  const web = (health?.web ?? null) as Record<string, unknown> | null
+  const steps = [
+    { done: courses.length > 0, title: '新建一门课程', hint: '左栏「＋ 新建课程」' },
+    { done: indexedCourses.length > 0, title: '上传教材并等索引完成', hint: '知识仓库页上传 PDF / TXT / MD，单个 ≤ 100 MiB' },
+    { done: hasSession, title: '开始提问', hint: '回答会带教材文件名与页码，可点开看原文' },
+  ]
+  const grouped = CAPABILITY_GROUPS.map(group => ({
+    ...group,
+    tools: Object.entries(TOOL_LABELS).filter(([name]) => TOOL_CAPABILITY_HINT[name] === group.key).map(([, label]) => label),
+  })).filter(group => group.tools.length > 0)
+
+  return <section className="page"><div className="page-inner">
+    <div className="hero"><div><p className="eyebrow">使用说明</p><h1>CoursePilot 能做什么</h1>
+      <p>这一页的清单与能力都读自当前这台实例的真实状态，不是宣传文案。</p></div></div>
+
+    <article className="card"><h2>上手四步</h2>
+      <p>已完成的会自动打勾，勾的依据是真实数据而不是记录。</p>
+      {steps.map((step, index) => <div className={`help-step ${step.done ? 'done' : ''}`} key={step.title}>
+        <i aria-hidden>{step.done ? '✓' : index + 1}</i>
+        <div><b>{step.title}</b><small>{step.hint}</small></div>
+      </div>)}
+    </article>
+
+    <article className="card"><h2>两种会话模式</h2>
+      <div className="help-columns">
+        <div><b>通用会话</b><p>每轮按你的问题解析课程。说不出唯一一门课时它会<strong>先问你</strong>，绝不跨课程取证；
+          课程名互相包含时（「深度学习」与「深度学习进阶」）取更具体的那个。问题里没有课程名时，会用模型判一次学科。</p></div>
+        <div><b>课程会话</b><p>固定一门课，所有提问都只用这门课的资料。适合连续学一章内容。</p></div>
+      </div>
+    </article>
+
+    <article className="card"><h2>专项能力{skills ? ` · ${skills.length} 个` : ''}</h2>
+      <p>说出对应的话就会自动加载相应规程，不需要手动选。点例句可以直接试。</p>
+      {skills === null ? <p className="mini-empty">正在读取…</p> : skills.filter(item => item.status === 'enabled').map(skill => <div className="help-skill" key={skill.name}>
+        <div className="help-skill-head"><b>{skill.name}</b><span>{skill.origin === 'builtin' ? '内建' : '导入'}</span></div>
+        <p>{skill.description}</p>
+        <small>什么时候用：{skill.when_to_use}</small>
+        {skill.examples && skill.examples.length > 0 && <div className="help-examples">
+          {skill.examples.map(example => <button type="button" key={example} onClick={() => onTry(example)}>{example}</button>)}
+        </div>}
+      </div>)}
+    </article>
+
+    <article className="card"><h2>这台实例现在的状态</h2>
+      <dl className="help-facts">
+        <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)}${llm.enabled ? '' : '（远端未启用，走本地兜底，回答不带教材检索）'}` : '未知'}</dd></div>
+        <div><dt>教材检索</dt><dd>{rag?.backend === 'hybrid_bge' ? '语义 + 词面混合' : '仅词面 —— 中文问题命中英文教材会很差，建议在知识仓库点一次「重建索引」'}</dd></div>
+        <div><dt>联网</dt><dd>{web && (web as Record<string, unknown>).enabled ? '已启用，每轮最多检索 3 次、抓取 3 次' : '未启用（缺 RESEARCH_SERPAPI_API_KEY 或未开远端调用）'}</dd></div>
+        <div><dt>硬限制</dt><dd>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB，一轮最多 6 次工具调用（加载能力后放宽到 12 次）</dd></div>
+      </dl>
+    </article>
+
+    <article className="card"><h2>它能碰到什么</h2>
+      <p>工具按副作用分组。真正需要留意的是后三组。</p>
+      {grouped.map(group => <div className="help-group" key={group.key}>
+        <div><b>{group.label}</b><small>{group.hint}</small></div>
+        <span>{group.tools.join('、')}</span>
+      </div>)}
+      <p className="help-note">导入的第三方 skill 拿不到「改学习状态」里的计划与记忆、也拿不到笔记与联网——
+        权限是「声明 ∩ 白名单」的交集，越权申请会被拒绝而不是静默降权。</p>
+    </article>
+
+    <article className="card"><h2>不做什么</h2>
+      <p>播客音频、通用闪卡产品、泛化每日简报、整卷模拟考试、社交对战、多租户商业化。
+        通用会话也不会在同一轮里跨多门课读写——无法解析唯一课程时必须先问。</p>
+    </article>
+  </div></section>
 }
 
 function ToolChip({ entry }: { entry: ToolActivity }) {
