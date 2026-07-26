@@ -303,31 +303,55 @@ def specs_for(allowed: tuple[str, ...], *, capabilities: frozenset[str] | None =
 
 
 class CitationRegistry:
-    """整轮统一的引用编号：同一 chunk 在多次检索中命中共用一个编号。"""
+    """整轮统一的引用编号：教材与网页共用一套编号，kind 区分两类来源。
+    去重口径——教材按 chunk，网页按 URL。"""
 
     def __init__(self) -> None:
-        self._by_chunk: dict[str, int] = {}
+        self._by_key: dict[str, int] = {}
         self.citations: list[dict] = []
 
     def register(self, hit: KnowledgeHit) -> tuple[int, bool]:
-        existing = self._by_chunk.get(hit.citation.chunk_id)
-        if existing is not None:
-            return existing, False
-        number = len(self.citations) + 1
-        self._by_chunk[hit.citation.chunk_id] = number
-        self.citations.append(
+        return self._add(
+            f"chunk:{hit.citation.chunk_id}",
             {
-                "citation_id": f"citation_{number}",
-                "number": number,
+                "kind": "material",
                 "material_id": hit.citation.material_id,
                 "document": hit.citation.document,
                 "page": hit.citation.page,
                 "chunk_id": hit.citation.chunk_id,
                 "snippet": hit.citation.snippet,
                 "score": hit.citation.score,
-            }
+            },
         )
+
+    def register_web(self, *, url: str, title: str, snippet: str) -> tuple[int, bool]:
+        """同一 URL 无论来自 web_search 还是 web_fetch 都是同一条来源：
+        用户点开的是同一个外链，编两个号只会让 SOURCES 出现重复条目。"""
+        return self._add(f"web:{url}", {"kind": "web", "url": url, "title": title, "snippet": snippet})
+
+    def _add(self, key: str, payload: dict) -> tuple[int, bool]:
+        existing = self._by_key.get(key)
+        if existing is not None:
+            return existing, False
+        number = len(self.citations) + 1
+        self._by_key[key] = number
+        self.citations.append({"citation_id": f"citation_{number}", "number": number, **payload})
         return number, True
+
+
+# 网页标题与摘要是外部可控文本，还会经引用数据渲染到前端：压成单行并中和方括号，
+# 免得它在工具正文里伪装成 "[1] 文档：…" 这样的教材引用标记。
+_BRACKETS = str.maketrans({"[": "（", "]": "）"})
+
+
+def _plain_line(text: str, limit: int = 120) -> str:
+    return _clip(" ".join(text.split()).translate(_BRACKETS), limit)
+
+
+def _citable_url(url: str) -> str:
+    """只有 http/https 能进引用：引用里的 URL 会被前端渲染成可点链接。"""
+    cleaned = url.split("#", 1)[0].strip()
+    return cleaned if cleaned.lower().startswith(("http://", "https://")) else ""
 
 
 _CITATION_MARK = re.compile(r"\[(\d+)\]")
@@ -423,9 +447,9 @@ class ToolExecutor:
             if name == "use_skill":
                 return self._use_skill(parsed)
             if name == "web_search":
-                return self._web_search(parsed)
+                return self._web_search(parsed, registry)
             if name == "web_fetch":
-                return self._web_fetch(parsed)
+                return self._web_fetch(parsed, registry)
             if name == "note_write":
                 return self._note_write(scope, parsed)
             if name == "note_read":
@@ -523,7 +547,7 @@ class ToolExecutor:
             blocks.append(f"[{number}] 文档：{hit.citation.document}{page}；片段：{hit.citation.chunk_id}\n{hit.content}")
         return ToolOutcome(text="\n\n".join(blocks), ok=True, summary=f"检索「{_clip(query, 24)}」命中 {len(hits)} 段", new_citations=new_citations)
 
-    def _web_search(self, parsed: dict) -> ToolOutcome:
+    def _web_search(self, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
         query = str(parsed.get("query") or "").strip()
         if not query:
             raise ValueError("web_search 需要非空的 query")
@@ -532,13 +556,23 @@ class ToolExecutor:
         outcome = self._web.search(query=query)
         if not outcome.results:
             return ToolOutcome(text=f"「{query}」没有检索到结果。", ok=True, summary=f"联网检索「{_clip(query, 20)}」无结果")
-        lines = [f"- {item.title}\n  {item.url}\n  {item.snippet}" for item in outcome.results]
+        lines, new_citations = [], []
+        for item in outcome.results:
+            title, snippet = _plain_line(item.title), _plain_line(item.snippet, 400)
+            url = _citable_url(item.url)
+            if not url:
+                lines.append(f"- {title}（链接不可用，不能引用）\n  {snippet}")
+                continue
+            number, is_new = registry.register_web(url=url, title=title, snippet=snippet)
+            if is_new:
+                new_citations.append(registry.citations[number - 1])
+            lines.append(f"- [{number}] {title}\n  {url}\n  {snippet}")
         return ToolOutcome(
-            text=_UNTRUSTED_PREFIX + f"联网检索「{query}」的结果：\n" + "\n".join(lines),
-            ok=True, summary=f"联网检索「{_clip(query, 20)}」{len(outcome.results)} 条",
+            text=_UNTRUSTED_PREFIX + f"联网检索「{query}」的结果（[n] 是网络来源的引用编号）：\n" + "\n".join(lines),
+            ok=True, summary=f"联网检索「{_clip(query, 20)}」{len(outcome.results)} 条", new_citations=new_citations,
         )
 
-    def _web_fetch(self, parsed: dict) -> ToolOutcome:
+    def _web_fetch(self, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
         url = str(parsed.get("url") or "").strip()
         if not url:
             raise ValueError("web_fetch 需要非空的 url")
@@ -552,11 +586,20 @@ class ToolExecutor:
             )
         if not page.text.strip():
             return ToolOutcome(text="该网页没有可读正文。", ok=True, summary="网页无正文")
-        head = f"网页标题：{page.title}\n地址：{page.url}\n" if page.title else f"地址：{page.url}\n"
+        title = _plain_line(page.title)
+        citable = _citable_url(page.url)
         tail = "\n\n（正文已截断）" if page.truncated else ""
+        new_citations = []
+        if citable:
+            number, is_new = registry.register_web(url=citable, title=title, snippet=_plain_line(page.text, 400))
+            if is_new:
+                new_citations.append(registry.citations[number - 1])
+            head = f"[{number}] 网页标题：{title}\n地址：{citable}\n"
+        else:
+            head = f"网页标题：{title}\n" if title else ""
         return ToolOutcome(
             text=_UNTRUSTED_PREFIX + head + page.text + tail,
-            ok=True, summary=f"抓取 {_clip(page.title or page.url, 24)}",
+            ok=True, summary=f"抓取 {_clip(title or page.url, 24)}", new_citations=new_citations,
         )
 
     def _note_write(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:

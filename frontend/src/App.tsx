@@ -746,6 +746,25 @@ function PlanDays({ items }: { items: Plan['items'] }) {
   </div>
 }
 
+// 只让 http(s) 变成可点链接。后端已经挡了伪协议，前端再挡一次——
+// 这个值最终进 href，两边都不该信对方。
+function safeHref(url?: string): string | null {
+  if (!url) return null
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null
+  } catch { return null }
+}
+
+function CitationChip({ item, fallbackNumber, onOpen }: { item: Citation; fallbackNumber: number; onOpen: (citation: Citation) => void }) {
+  const label = <><i>[{item.number ?? fallbackNumber}]</i>{item.kind === 'web'
+    ? (item.title || item.url || '网页')
+    : `${item.material_name ?? '资料'}${item.page ? `:${item.page}` : ''}`}</>
+  const href = item.kind === 'web' ? safeHref(item.url) : null
+  if (href) return <a className="citation-web" href={href} target="_blank" rel="noopener noreferrer nofollow" title={item.url}>{label}</a>
+  return <button onClick={() => onOpen(item)}>{label}</button>
+}
+
 function MessageCard({ message, onCitation, showResolution, onRetry }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void }) {
   if (message.role === 'user') return <article className="message user-message"><div>{message.content}</div></article>
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
@@ -753,7 +772,7 @@ function MessageCard({ message, onCitation, showResolution, onRetry }: { message
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
     {message.status === 'stopped' && <div className="degraded-notice"><span>已停止。上面的内容没有存进会话记录。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}
-    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {

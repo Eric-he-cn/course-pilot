@@ -454,3 +454,6 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 /* 甘特图是计划总览，放在明细之前；条目多时横向滚动，不要压缩整页 */
 .plan-gantt { margin:6px 0 18px; padding-bottom:6px; overflow-x:auto }
 .plan-gantt svg { max-width:none }
+
+/* 网页来源与教材来源同一排，用下划线区分「点开会离开本页」 */
+.citations .citation-web { text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px }

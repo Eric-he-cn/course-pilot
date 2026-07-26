@@ -24,6 +24,11 @@ export interface Citation {
   id?: string
   // 服务端给出的引用编号，与回答正文里的 [n] 对应
   number?: number
+  // 来源类别显式给出：网页点开是外链，教材点开是原文抽屉。
+  // 不靠「有没有 url」这类隐式判断——那会在字段缺失时静默走错分支。
+  kind?: 'material' | 'web'
+  url?: string
+  title?: string
   material_id?: string
   material_name?: string
   page?: number | null
