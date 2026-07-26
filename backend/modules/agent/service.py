@@ -213,6 +213,10 @@ class TurnService:
             usage_total: dict[str, int] = {}
             tool_rounds = 0
             seq = 0
+            # practice 状态在分支外也要读（收尾时的状态闭合），所以先初始化。
+            pending: tuple | None = None
+            awaiting_grade = False
+            evidence_count = 0
             if context.status != "resolved" or context.course_id is None:
                 if context.candidates:
                     answer = "你的问题同时提到了" + "、".join(f"「{name}」" for name in context.candidates) + "，我不确定该用哪一门的资料。说明是哪一门，我就接着答。"
@@ -257,7 +261,6 @@ class TurnService:
                 pending = self._artifacts.latest_practice(session_id=session_id)
                 practice_skill = self._skills.get("practice")
                 awaiting_grade = pending is not None and not pending[2]
-                evidence_count = 0
                 artifact_written = False
                 practice_reminded = False
                 # message 此时已并入图片转录，所以拍照上传的作答与打字作答走同一条判断。

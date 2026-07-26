@@ -208,6 +208,18 @@ def test_every_injected_section_reaches_the_system_prompt():
         assert mark in system
 
 
+def test_unresolved_course_turn_completes_instead_of_failing(client):
+    """未解析课程走的是护栏分支，收尾时读到的 practice 状态必须已初始化。"""
+    for name in ("热力学", "电磁学"):
+        client.post("/api/v2/courses", json={"name": name})
+    session_id = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()["id"]
+
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "vague-1", "message": "帮我复习一下"}).text)
+
+    assert events[-1][0] == "turn_completed"
+    assert events[-1][1]["finish_reason"] == "course_unresolved"
+
+
 def test_context_segments_cover_the_whole_prompt_and_report_truncation():
     """分段之和必须等于实际发出去的字符数，否则上下文视图会误导用户。"""
     from modules.agent.context import assemble_messages, message_chars
