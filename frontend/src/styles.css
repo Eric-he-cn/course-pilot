@@ -438,3 +438,13 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .login-submit { padding:9px; border:1px solid var(--text); border-radius:8px; background:var(--text); color:#fff; font-size:13.5px; font-weight:600 }
 .login-submit:hover { opacity:.88 }
 .login-card > small { color:var(--muted); font-family:var(--mono); font-size:10.5px; text-align:center }
+
+/* ---- 学习计划：按天分段，今天要一眼看到 ---- */
+.plan-days { display:grid; gap:14px }
+.plan-day h3 { display:flex; align-items:center; gap:9px; margin:0 0 6px; padding-bottom:5px; border-bottom:1px solid var(--border); font-family:var(--mono); font-size:11.5px; font-weight:600; color:var(--muted); letter-spacing:.03em }
+.plan-day h3 em { padding:1px 6px; border-radius:4px; background:var(--panel); font-style:normal; font-size:10.5px }
+.plan-day h3 span { margin-left:auto; font-weight:400 }
+.plan-day.is-today h3 { color:var(--accent); border-bottom-color:var(--accent) }
+.plan-day.is-today h3 em { background:#D1FAE5; color:var(--accent) }
+.plan-day.is-past { opacity:.6 }
+.plan-day .material-row { padding-left:2px }

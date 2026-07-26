@@ -182,7 +182,7 @@ export default function App() {
       <div className="side-label">WORKSPACE</div>
       <button className={`workspace-card ${workspace.scope === 'general' ? 'selected' : ''}`} onClick={() => switchWorkspace({ scope: 'general' })}>
         <span className="general-icon" aria-hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M12 3v18M3 12h18" opacity=".35" /></svg></span>
-        <span className="workspace-copy"><b>通用模式</b><small>每轮按问题解析课程</small></span>
+        <span className="workspace-copy"><b>不指定课程</b><small>按问题自动判断</small></span>
       </button>
       <div className="course-switcher">
         {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id} onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
@@ -194,7 +194,7 @@ export default function App() {
       <nav className="main-nav" aria-label="学习导航">
         {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false) }}><span aria-hidden>{item.num}</span><b>{viewNames[item.id]}</b></button>)}
       </nav>
-      <div className="sessions-head"><span>SESSIONS</span><button aria-label="新建会话" onClick={newSession} disabled={busy}>＋</button></div>
+      <div className="sessions-head"><span>SESSIONS</span></div>
       <div className="session-list">
         {sessions.length ? sessions.map(session => <button className={`session ${session.id === activeSession?.id ? 'active' : ''}`} key={session.id} onClick={() => { setActiveSession(session); setView('chat'); setSidebarOpen(false) }}>
           <i title={session.scope_mode === 'general' ? '通用会话' : '课程会话'} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || '未命名会话'}</b><small>{timeLabel(session.updated_at)}</small></span>
@@ -298,7 +298,7 @@ export default function App() {
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
           try { await loadMessages(targetSession.id); await loadSessions() }
-          catch { setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '本次回答未能完成。', artifact: { kind: 'interrupted' } } : item)) }
+          catch { setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '回答中断了，重发一次。', artifact: { kind: 'interrupted' } } : item)) }
         }
         finally { setBusy(false); abortRef.current = null }
       }} busy={busy} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
@@ -312,7 +312,7 @@ export default function App() {
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
         {/* 掉线时这些都是缓存的旧值，留着会让人以为服务还在 */}
         {apiOnline !== false && healthLlm && <ModelPicker llm={healthLlm} />}
-        {apiOnline !== false && healthRag && <span className="statusbar-detail">retrieval: {String(healthRag.backend)}</span>}
+        {apiOnline !== false && healthRag && <span className="statusbar-detail">{String(healthRag.backend).includes('bge') ? '混合检索' : '关键词检索'}</span>}
         {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">回答优先用当前课程的资料，没命中教材会标注出来</span>}
         <span className="right">CoursePilot v2.0</span>
       </footer>
@@ -355,7 +355,12 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
     {contextNote && <div className="session-context">{contextNote}</div>}
     <div className="messages" aria-live="polite">
       {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式每轮按问题解析课程。直接说出课程名最准。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
-      {messages.filter(item => item.role !== 'system').map(message => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope} />)}
+      {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope}
+        onRetry={busy ? undefined : (() => {
+          // 重发这条回答对应的那句提问——往前找最近的一条 user 消息
+          const asked = [...list.slice(0, index)].reverse().find(item => item.role === 'user')
+          return asked ? () => void onSend(asked.content, []) : undefined
+        })()} />)}
     </div>
     <form className="composer-wrap" onSubmit={submit}>
       {(attachments.length > 0 || uploading) && <div className="attach-list">
@@ -684,14 +689,33 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
   </div>
 }
 
-function MessageCard({ message, onCitation, showResolution }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean }) {
+function PlanDays({ items }: { items: Plan['items'] }) {
+  const today = new Date().toLocaleDateString('sv')   // sv locale 就是 YYYY-MM-DD
+  const days = new Map<string, Plan['items']>()
+  for (const item of [...items].sort((a, b) => a.due_date.localeCompare(b.due_date))) {
+    days.set(item.due_date, [...(days.get(item.due_date) ?? []), item])
+  }
+  return <div className="plan-days">
+    {[...days].map(([date, dayItems]) => {
+      const when = date === today ? '今天' : date < today ? '已过' : ''
+      return <section className={`plan-day ${date === today ? 'is-today' : ''} ${date < today ? 'is-past' : ''}`} key={date}>
+        <h3>{date.slice(5).replace('-', ' / ')}{when && <em>{when}</em>}<span>{dayItems.length} 项</span></h3>
+        {dayItems.map(item => <div className="material-row" key={item.id}>
+          <div className="material-copy"><b>{item.title}</b><small>{item.status}{item.concept_name ? ` · ${item.concept_name}` : ''}</small></div>
+        </div>)}
+      </section>
+    })}
+  </div>
+}
+
+function MessageCard({ message, onCitation, showResolution, onRetry }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void }) {
   if (message.role === 'user') return <article className="message user-message"><div>{message.content}</div></article>
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
-    {message.status === 'stopped' && <div className="degraded-notice">已停止。上面的内容没有存进会话记录。</div>}
-    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答中断了。已生成的部分会保留，重新发送可以继续。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+    {message.status === 'stopped' && <div className="degraded-notice"><span>已停止。上面的内容没有存进会话记录。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}
+    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
@@ -757,7 +781,7 @@ function PlanView({ course, onError }: { course: Course; onError: (message: stri
   }, [course.id])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>在对话里说要排计划或改计划，助手就会写到这里。每次改动升一个版本，过去的条目不动。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div>{plan.items.map(item => <div className="material-row" key={item.id}><div className="file-mark">{item.due_date.slice(5)}</div><div className="material-copy"><b>{item.title}</b><small>{item.status}{item.concept_name ? ` · ${item.concept_name}` : ''}</small></div></div>)}</article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
+    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div><PlanDays items={plan.items} /></article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {
@@ -769,7 +793,7 @@ function ArchiveView({ course, onError }: { course: Course; onError: (message: s
     api.archive(course.id).then(setArchive).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
   }, [course.id])
   return <section className="page"><div className="page-inner">
-    <div className="hero"><div><p className="eyebrow">学习档案</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>掌握度由证据事件投影而来。</p></div></div>
+    <div className="hero"><div><p className="eyebrow">学习档案</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>答题记录只增不改，掌握度由这些记录算出。</p></div></div>
     {!loaded ? <p className="mini-empty">正在读取档案…</p> : error ? <RetryCard title="档案读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : !archive ? <p className="mini-empty">暂无档案数据。</p> : <>
       <article className="card"><div className="card-heading"><div><h2>概念掌握度</h2><p>BKT 后验 × 遗忘曲线；证据不足的概念不给判断</p></div></div>
         {archive.mastery.length ? archive.mastery.map(item => <div className="material-row" key={item.concept_id}>
