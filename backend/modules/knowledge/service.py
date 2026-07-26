@@ -139,7 +139,15 @@ class KnowledgeService:
         lexical = self._repository.search(course_id=course_id, query=query, limit=limit)
         dense = self._dense_search(course_id=course_id, query=query, limit=limit)
         if not dense:
+            # 语义检索不可用（模型未配置、加载失败、向量维度不一致）时没有相似度口径，
+            # 不做阈值判定，词面结果照原样返回。
             return lexical
+        # 阈值只认 dense 的余弦相似度：RRF 融合分只反映排名，与内容像不像无关。
+        # 默认 0（关闭）——余弦分的绝对值不跨库可比，实测两份教材需要的分界差 0.06，
+        # 而短查询（「Round Robin」）比闲聊（「在吗」）只高 0.003。标定方法见 .env.example。
+        threshold = self._settings.rag_min_similarity
+        if threshold > 0 and max(hit.citation.score for hit in dense) < threshold:
+            return []
         return self._fuse_rrf(dense, lexical, limit=limit)
 
     def _dense_search(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:

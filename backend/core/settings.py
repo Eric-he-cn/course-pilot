@@ -119,6 +119,9 @@ class Settings:
     rag_embedding_model: str = ""
     rag_embedding_device: str = "auto"
     rag_embedding_batch_size: int = 256
+    # 检索命中的余弦相似度下限，低于它就当这次没搜到。默认按 bge-base-zh-v1.5 实测取值：
+    # 明显无关的闲聊在 0.22 以下，教材相关的查询在 0.24 以上，取 0.20 留出误杀余量。
+    rag_min_similarity: float = 0.0
     # vision 槽位（OCR）：未配置时附件上传返回 feature_disabled。
     vision_provider: str = ""
     vision_base_url: str = ""
@@ -200,6 +203,7 @@ class Settings:
             value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"),
             value("RAG_EMBEDDING_DEVICE", "auto"),
             max(1, int(value("RAG_EMBEDDING_BATCH_SIZE", "256"))),
+            min(1.0, max(0.0, float(value("RAG_MIN_SIMILARITY", "0.2")))),
             value("VISION_PROVIDER"),
             value("VISION_BASE_URL"),
             value("VISION_API_KEY"),

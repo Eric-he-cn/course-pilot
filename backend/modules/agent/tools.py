@@ -537,7 +537,7 @@ class ToolExecutor:
             return ToolOutcome(text="search_materials 需要非空的 query 参数。", ok=False, summary="缺少查询词")
         hits = self._knowledge.search(scope=scope, query=query, limit=SEARCH_LIMIT)
         if not hits:
-            return ToolOutcome(text="（未检索到相关教材内容；可换关键词再查一次）", ok=True, summary=f"检索「{_clip(query, 24)}」未命中")
+            return ToolOutcome(text="（本课程资料里这次没有匹配到相关内容，教材已索引；可换关键词或换个说法再查一次。确实没有就按通用知识回答，并说明来源不是教材）", ok=True, summary=f"检索「{_clip(query, 24)}」未命中")
         blocks, new_citations = [], []
         for hit in hits:
             number, is_new = registry.register(hit)
