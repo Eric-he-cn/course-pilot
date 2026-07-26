@@ -66,8 +66,11 @@ export default function App() {
   async function loadMessages(id: string) {
     try { setMessages(await api.messages(id)) } catch (error) { setMessages([]); setNotice(errorText(error)) }
   }
-  function switchWorkspace(next: Workspace) {
-    setWorkspace(next); setView('chat'); setSidebarOpen(false); setCitation(null); setTurnResolution(null); setContextUsage(null)
+  // keepView：从某个页面内选课程时留在当前页，不要弹回对话。
+  function switchWorkspace(next: Workspace, options: { keepView?: boolean } = {}) {
+    setWorkspace(next)
+    if (!options.keepView) setView('chat')
+    setSidebarOpen(false); setCitation(null); setTurnResolution(null); setContextUsage(null)
   }
   async function newSession() {
     setBusy(true)
@@ -189,7 +192,7 @@ export default function App() {
         }
         finally { setBusy(false) }
       }} busy={busy} />}
-      {view !== 'chat' && view !== 'settings' && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId })} onCreate={createCourse} />}
+      {view !== 'chat' && view !== 'settings' && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId }, { keepView: true })} onCreate={createCourse} />}
       {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
       {view === 'archive' && course && <ArchiveView course={course} onError={setNotice} />}
