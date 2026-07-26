@@ -255,15 +255,18 @@ MAIN = ToolProfile(
 )
 MAIN_PROFILE = MAIN.tools
 
-# 练习态不出网：让用户在做题时联网等于让他查答案。这条要显式声明，
-# 不能靠"名单里恰好没有 web_search"来保证。
-PRACTICE_CAPABILITIES = frozenset({READ_COURSE, WRITE_STATE, FREE})
-
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 
 
+def capabilities_of(names: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(TOOL_CAPABILITY[name] for name in names if name in TOOL_CAPABILITY)
+
+
 def profile_for_skill(allowed: tuple[str, ...]) -> ToolProfile:
-    return ToolProfile(tools=allowed, capabilities=PRACTICE_CAPABILITIES)
+    """skill 激活后能力恰好等于它声明的工具所需——声明即权限，多一分都没有。
+    "练习时不能出网"这类安全属性由 SKILL.md 不声明联网工具来表达，
+    并有测试盯着它不被悄悄加回来。"""
+    return ToolProfile(tools=allowed, capabilities=capabilities_of(allowed))
 
 
 def validate_profiles() -> list[str]:

@@ -9,8 +9,9 @@ from contracts.web import WebAccessError
 from modules.agent.calculator import CalculationError, evaluate
 from modules.agent.tools import (
     MAIN,
-    PRACTICE_CAPABILITIES,
     TOOL_CAPABILITY,
+    capabilities_of,
+    profile_for_skill,
     specs_for,
     validate_profiles,
 )
@@ -28,11 +29,27 @@ def test_schema_layer_hides_tools_the_profile_cannot_use():
     main_names = {spec.name for spec in specs_for(MAIN.tools, capabilities=MAIN.capabilities)}
     assert {"web_search", "web_fetch", "note_write", "calculator"} <= main_names
 
-    practice_names = {spec.name for spec in specs_for(MAIN.tools, capabilities=PRACTICE_CAPABILITIES)}
-    # 练习态不出网也不写笔记：让用户做题时联网等于让他查答案。
-    assert "web_search" not in practice_names and "web_fetch" not in practice_names
-    assert "note_write" not in practice_names
-    assert "search_materials" in practice_names and "emit_evidence" in practice_names
+
+def test_practice_skill_stays_offline():
+    """练习时能出网等于让用户查答案。这条安全属性由 practice 不声明联网工具来表达，
+    这个用例盯着它不被悄悄加回来。"""
+    from pathlib import Path
+
+    from modules.agent.skills import load_skill
+
+    practice = load_skill(Path(__file__).resolve().parents[2] / "skills" / "builtin" / "practice" / "SKILL.md")
+    granted = {spec.name for spec in specs_for(practice.allowed_tools, capabilities=capabilities_of(practice.allowed_tools))}
+    assert "web_search" not in granted and "web_fetch" not in granted
+    assert "note_write" not in granted
+    assert "search_materials" in granted and "emit_evidence" in granted
+
+
+def test_skill_capabilities_are_exactly_what_it_declares():
+    """声明即权限：多给一分都不行，少给一分 skill 就半残。"""
+    profile = profile_for_skill(("search_materials", "note_write"))
+    assert profile.capabilities == frozenset({"read_course", "write_note"})
+    names = {spec.name for spec in specs_for(profile.tools, capabilities=profile.capabilities)}
+    assert names == {"search_materials", "note_write"}
 
 
 def test_privileged_tools_are_not_importable_by_user_skills():
@@ -171,3 +188,29 @@ def test_system_prompt_states_today_and_web_content_rule():
     ).messages[0].content
     assert "今天是 2" in system  # 排计划要靠注入的日期，不能让模型猜
     assert "网络内容" in system
+
+
+def test_all_builtin_skills_load_and_declare_known_tools():
+    """内建 skill 的工具声明必须都能解析出来：声明了不存在的工具就是半残 skill，
+    要在这里报出来而不是等运行期静默拒绝。"""
+    from modules.agent.skills import SkillRegistry
+
+    root = Path(__file__).resolve().parents[2] / "skills" / "builtin"
+    registry = SkillRegistry.from_directory(root)
+    names = set(registry.builtin_names())
+    assert names == {"practice", "flashcards", "diagram", "mistake_review", "research"}
+
+    for name in names:
+        skill = registry.get(name)
+        granted = {spec.name for spec in specs_for(skill.allowed_tools, capabilities=capabilities_of(skill.allowed_tools))}
+        assert granted == set(skill.allowed_tools), f"{name} 声明了无法授予的工具：{set(skill.allowed_tools) - granted}"
+        assert skill.when_to_use and skill.description
+
+
+def test_only_research_skill_can_reach_the_network():
+    """联网是最该被显式限制的能力：除了 research，其余 skill 都不该拿到。"""
+    from modules.agent.skills import SkillRegistry
+
+    registry = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
+    online = {name for name in registry.builtin_names() if "network" in capabilities_of(registry.get(name).allowed_tools)}
+    assert online == {"research"}

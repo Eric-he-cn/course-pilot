@@ -43,6 +43,15 @@ def _practice_reminder(missing: list[str], question_count: int | None, emitted: 
 # 规程第一步就是判断本轮该做什么。
 _PRACTICE_INTENT = re.compile(r"出\s*(?:几|[一二三四五六1-9])?\s*道|出题|出几题|练练|练习题|做几道|来[一两]道|小测|测测我|考考我|练一练")
 
+# 其余 skill 的预路由：模型不会主动 use_skill，漏加载就等于规程没生效
+# （画图不挑图型、卡片不落盘、联网不标来源）。误命中的代价很小——规程第一步都是判断本轮该做什么。
+_SKILL_INTENT = {
+    "diagram": re.compile(r"流程图|思维导图|结构图|时序图|画[一张个]*图|画一下|图解|捋[一下]*[遍流]"),
+    "flashcards": re.compile(r"学习卡片|抽认卡|记忆卡|卡片|知识点清单|整理成.{0,6}(卡|清单)"),
+    "mistake_review": re.compile(r"错题|复盘|哪里薄弱|弱项|做错的|错在哪"),
+    "research": re.compile(r"联网|上网|查一下网|最新进展|业界|工业界|论文里"),
+}
+
 
 # 写计划的放行条件：只认用户键入的原话，图片转录不算——一张写着"复习计划"的
 # 教材照片不该获得写权限。排计划往往要先问考试日期，所以意图在本会话里粘住。
@@ -346,20 +355,30 @@ class TurnService:
                 practice_reminded = False
                 # message 此时已并入图片转录，所以拍照上传的作答与打字作答走同一条判断。
                 wants_practice = bool(_PRACTICE_INTENT.search(message))
-                if practice_skill is not None and (awaiting_grade or wants_practice):
-                    call_id = "call_auto_practice"
-                    yield self._event("tool_call", call_id=call_id, name="use_skill", arguments={"name": "practice"}, origin="auto")
-                    reason = f"练习 {pending[0]} 待批改" if awaiting_grade else "用户要练题"
-                    yield self._event("tool_result", call_id=call_id, name="use_skill", ok=True, summary=f"自动加载 practice（{reason}）")
-                    activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True, "summary": "自动加载 practice"})
-                    trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": {"name": "practice"}, "ok": True, "summary": "自动加载", "duration_ms": 0})
-                    messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps({"name": "practice"})),)))
-                    messages.append(ChatMessage(role="tool", content=f"# Skill: practice\n\n{practice_skill.body}", tool_call_id=call_id))
-                    base_segments = base_segments + [("skill 规程", len(practice_skill.body))]
-                    active_skill, allowed_tools = "practice", practice_skill.allowed_tools
-                    capabilities = profile_for_skill(practice_skill.allowed_tools).capabilities
+                auto_skill, auto_reason = None, ""
+                if practice_skill is not None and awaiting_grade:
+                    auto_skill, auto_reason = practice_skill, f"练习 {pending[0]} 待批改"
+                elif practice_skill is not None and wants_practice:
+                    auto_skill, auto_reason = practice_skill, "用户要练题"
+                else:
+                    for name, pattern in _SKILL_INTENT.items():
+                        if pattern.search(message) and (candidate := self._skills.get(name)) is not None:
+                            auto_skill, auto_reason = candidate, "命中意图"
+                            break
+                if auto_skill is not None:
+                    call_id = f"call_auto_{auto_skill.name}"
+                    arguments = {"name": auto_skill.name}
+                    yield self._event("tool_call", call_id=call_id, name="use_skill", arguments=arguments, origin="auto")
+                    yield self._event("tool_result", call_id=call_id, name="use_skill", ok=True, summary=f"自动加载 {auto_skill.name}（{auto_reason}）")
+                    activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True, "summary": f"自动加载 {auto_skill.name}"})
+                    trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载", "decision": "allowed", "reason": None, "duration_ms": 0})
+                    messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps(arguments)),)))
+                    messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{auto_skill.body}", tool_call_id=call_id))
+                    base_segments = base_segments + [("skill 规程", len(auto_skill.body))]
+                    active_skill, allowed_tools = auto_skill.name, auto_skill.allowed_tools
+                    capabilities = profile_for_skill(auto_skill.allowed_tools).capabilities
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
-                    trace_record["skill"] = {"name": "practice", "content_hash": practice_skill.content_hash, "activation": "auto"}
+                    trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
                 try:
                     while response is None:
                         yield self._context_usage(messages, base_segments, assembled, summary)

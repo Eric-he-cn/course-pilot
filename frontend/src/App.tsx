@@ -256,6 +256,36 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
   </section>
 }
 
+/** mermaid 代码块渲染成图；流式期间代码往往不完整，渲染失败就保留代码本身。 */
+function Mermaid({ code }: { code: string }) {
+  const [svg, setSvg] = useState('')
+  const [failed, setFailed] = useState(false)
+  const id = useRef(`mermaid-${Math.random().toString(36).slice(2)}`)
+  useEffect(() => {
+    let cancelled = false
+    setFailed(false)
+    void (async () => {
+      try {
+        const mermaid = (await import('mermaid')).default
+        mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'strict' })
+        const { svg: rendered } = await mermaid.render(id.current, code)
+        if (!cancelled) setSvg(rendered)
+      } catch { if (!cancelled) setFailed(true) }
+    })()
+    return () => { cancelled = true }
+  }, [code])
+  if (failed || !svg) return <pre className={failed ? 'mermaid-source failed' : 'mermaid-source'}><code>{code}</code></pre>
+  return <div className="mermaid-figure" role="img" aria-label="图示" dangerouslySetInnerHTML={{ __html: svg }} />
+}
+
+const markdownComponents = {
+  code(props: { className?: string; children?: unknown }) {
+    const code = String(props.children ?? '').replace(/\n$/, '')
+    if (props.className?.includes('language-mermaid')) return <Mermaid code={code} />
+    return <code className={props.className}>{props.children as never}</code>
+  },
+}
+
 function SessionTitle({ session, onRename }: { session: SessionSummary; onRename: (title: string) => Promise<void> }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(session.title)
@@ -307,7 +337,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
-  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <span key={entry.call_id} className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${entry.summary ? 'done' : 'pending'}`}><i aria-hidden>{entry.summary ? (entry.ok === false ? '×' : '✓') : '…'}</i>{TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}</span>)}</div>}<div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <span key={entry.call_id} className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${entry.summary ? 'done' : 'pending'}`}><i aria-hidden>{entry.summary ? (entry.ok === false ? '×' : '✓') : '…'}</i>{TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}</span>)}</div>}<div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
