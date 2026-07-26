@@ -85,6 +85,9 @@ TEXT_EXTRA_BODY={"thinking":{"type":"disabled"}}
 
 ![工具链](Docs/images/chat-tools.png)
 
+**教材与网页来源统一编号。** 回答里的 `[1] [2]` 不分来源，底部 SOURCES 一起列出：
+教材点开看原文片段，网页点开跳外链。教材外的内容始终带「不是当前教材结论」的标注。
+
 **五个专项能力。** 说出对应的话会自动加载，不用手动选：
 
 | 能力 | 什么时候用 |
@@ -100,6 +103,7 @@ TEXT_EXTRA_BODY={"thinking":{"type":"disabled"}}
 ![图示](Docs/images/chat-diagram.png)
 
 **学习计划。** 在对话里说要排计划，助手写进来。每次改动升一版，过去的条目不动。
+顶部一张甘特图看整个周期的节奏，下面按天分段、今天高亮。
 
 ![学习计划](Docs/images/plan.png)
 
@@ -122,6 +126,17 @@ TEXT_EXTRA_BODY={"thinking":{"type":"disabled"}}
 
 ![使用说明](Docs/images/help.png)
 
+**随时换模型和思考档位。** 底部状态栏三个下拉：模型、思考（关 / 自动 / 开）、
+思考深度。想配几个模型就在 `.env` 里往下加编号，同一家的第二个模型只要写一行 model id。
+
+![模型切换](Docs/images/model-picker.png)
+
+**数据可以删干净。** 会话在侧栏悬停就能改名或删除；教材在知识仓库里删；课程在管理页删。
+删除前会列出连带影响——删一门课会带走它的教材、概念、掌握度、计划、笔记与会话，
+所以这句话必须写在你点确认之前。
+
+![删除确认](Docs/images/delete-confirm.png)
+
 ## 边界
 
 - **没有 shell 执行。** 学习助手没有理由执行命令。
@@ -135,7 +150,7 @@ TEXT_EXTRA_BODY={"thinking":{"type":"disabled"}}
 ./scripts/check.sh
 ```
 
-跑后端全部测试（187 个）、Python 编译检查、前端类型检查与生产构建。不需要 API key，
+跑后端全部测试、Python 编译检查、前端类型检查与生产构建。不需要 API key，
 不发网络请求。
 
 后端 FastAPI + SQLite（标准库，显式 migration），前端 React 19 + TypeScript + Vite。
