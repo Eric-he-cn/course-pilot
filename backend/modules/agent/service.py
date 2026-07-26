@@ -276,7 +276,9 @@ class TurnService:
             trace_record["turn_id"] = turn.id
             self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="user", content=message)
             context = self._sessions.resolve_turn(turn=turn, message=message)
-            trace_record["resolution"] = {"status": context.status, "course_id": context.course_id, "reason": context.reason}
+            # 解析可能花掉几秒（学科分类器），而心跳只在流式增量分支续约。
+            last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
+            trace_record["resolution"] = {"status": context.status, "course_id": context.course_id, "reason": context.reason, "classifier": context.classifier}
             yield self._event(
                 "course_resolution", status=context.status, resolved_course_id=context.course_id, course_id=context.course_id, course_name=context.course_name,
                 course_color=context.course_color, reason=context.reason, resolver_version=context.resolver_version,

@@ -120,7 +120,16 @@ def build_application(settings: Settings) -> Application:
         wiki_is_enabled=lambda course_id: bool((course := courses.get_course(course_id)) and course.wiki_enabled),
         embedder=embedder,
     )
-    resolver = CourseResolver(courses)
+    # 学科分类器复用同一个适配器，只是超时更短、不重试：它跑在 turn 锁内、首个增量之前，
+    # 沿用 180s 总超时会把一轮拖进失活阈值。远端未启用时显式不给分类器。
+    classifier: AgentChatPort | None = None
+    if settings.enable_remote_llm and settings.remote_llm_configured and settings.text_provider.lower() == "deepseek":
+        classifier = DeepSeekAgentChat(
+            api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
+            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+            total_timeout_seconds=6, max_output_tokens=256, max_retries=0,
+        )
+    resolver = CourseResolver(courses, classifier=classifier)
     sessions = SessionService(
         SessionRepository(store), courses, resolver,
         vision=vision,
