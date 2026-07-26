@@ -79,6 +79,8 @@ class OpenAICompatibleChat:
         self._state_lock = threading.Lock()
         self._last_call_ok: bool | None = None
         self._last_error_code: str | None = None
+        # 撞过一次「必须回传 reasoning_content」之后就一直带上这个字段。
+        self._echo_reasoning = False
 
     @property
     def mode(self) -> str:
@@ -170,9 +172,16 @@ class OpenAICompatibleChat:
                     attempt += 1
                     time.sleep(0.2 * (2 ** (attempt - 1)))
                     continue
+                detail = _detail(error.response, self._api_key)
+                # 思考模式要求 assistant 消息回传 reasoning_content，只校验字段在不在，空串就行。
+                # 不预先发这个字段：它是厂商扩展，对不认识它的服务发过去可能被拒。撞上一次就记住。
+                if status == 400 and not self._echo_reasoning and "reasoning_content" in detail:
+                    self._echo_reasoning = True
+                    payload["messages"] = self._to_wire(messages)
+                    continue
                 code = f"http_{status}"
                 self._record_failure(code)
-                raise LLMProviderError(code, f"{self._provider} 请求失败（HTTP {status}）{_detail(error.response, self._api_key)}", retryable=retryable) from error
+                raise LLMProviderError(code, f"{self._provider} 请求失败（HTTP {status}）{detail}", retryable=retryable) from error
             except httpx.RequestError as error:
                 if emitted:
                     # 已输出增量后不重放整轮，避免重复文本（架构 §5.8）。
@@ -220,8 +229,7 @@ class OpenAICompatibleChat:
         if function.get("arguments"):
             entry["arguments"] += function["arguments"]
 
-    @staticmethod
-    def _to_wire(messages: Sequence[ChatMessage]) -> list[dict[str, object]]:
+    def _to_wire(self, messages: Sequence[ChatMessage]) -> list[dict[str, object]]:
         wire: list[dict[str, object]] = []
         for message in messages:
             if message.role == "assistant" and message.tool_calls:
@@ -229,8 +237,9 @@ class OpenAICompatibleChat:
                     {
                         "role": "assistant",
                         "content": message.content or "",
-                        # 思考模式要求原样回传上一轮的思考内容，缺了整轮请求会被拒。
-                        **({"reasoning_content": message.reasoning} if message.reasoning else {}),
+                        # 思考模式下这个字段必须在。种子检索那条 assistant 消息是服务端构造的，
+                        # 本来就没有思考内容，给空串即可——厂商只校验字段存在。
+                        **({"reasoning_content": message.reasoning} if message.reasoning or self._echo_reasoning else {}),
                         "tool_calls": [
                             {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}}
                             for call in message.tool_calls

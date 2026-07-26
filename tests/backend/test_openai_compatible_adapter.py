@@ -76,6 +76,55 @@ def test_reasoning_is_streamed_apart_from_the_answer_and_passed_back():
     assert assistant["reasoning_content"] == "先看看教材再决定查什么"
 
 
+def test_reasoning_echo_is_learned_from_the_rejection_not_sent_upfront():
+    """思考模式要求 assistant 消息带 reasoning_content，只校验字段存在（空串就行）。
+    但这是厂商扩展字段，预先发给不认识它的服务可能被拒——所以撞上那个 400 才补，然后记住。
+    种子检索那条 assistant 消息是服务端构造的，本来就没有思考内容，正是靠这条路径过。"""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        assistant = next((m for m in body["messages"] if m["role"] == "assistant"), None)
+        if assistant is not None and "reasoning_content" not in assistant:
+            return httpx.Response(400, json={"error": {"message": "The `reasoning_content` in the thinking mode must be passed back to the API."}})
+        return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]}))
+
+    seeded = [
+        *_messages(),
+        ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id="seed", name="search_materials", arguments="{}"),)),
+        ChatMessage(role="tool", content="[1] 片段", tool_call_id="seed"),
+    ]
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = _adapter(client)
+        final = list(adapter.chat(messages=seeded))[-1]
+        assert isinstance(final, ChatFinal)
+        assert len(bodies) == 2, "第一次不带字段、被拒后补上重试"
+        assert "reasoning_content" not in bodies[0]["messages"][2]
+        assert bodies[1]["messages"][2]["reasoning_content"] == ""
+
+        # 学到之后同一个适配器实例直接带上，不再白撞一次
+        list(adapter.chat(messages=seeded))
+        assert bodies[2]["messages"][2]["reasoning_content"] == ""
+
+
+def test_reasoning_field_stays_absent_for_providers_that_never_ask():
+    """没要求过这个字段的服务，一次都不该收到它。"""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]}))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        list(_adapter(client).chat(messages=[
+            *_messages(),
+            ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id="seed", name="search_materials", arguments="{}"),)),
+            ChatMessage(role="tool", content="[1] 片段", tool_call_id="seed"),
+        ]))
+    assert all("reasoning_content" not in m for body in bodies for m in body["messages"])
+
+
 def test_provider_error_carries_the_server_explanation():
     """4xx 只有状态码等于没有线索——是模型名错了还是参数不被接受，全靠服务端这句话。"""
     def handler(request: httpx.Request) -> httpx.Response:
