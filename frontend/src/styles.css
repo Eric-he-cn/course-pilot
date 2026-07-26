@@ -447,4 +447,6 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .plan-day.is-today h3 { color:var(--accent); border-bottom-color:var(--accent) }
 .plan-day.is-today h3 em { background:#D1FAE5; color:var(--accent) }
 .plan-day.is-past { opacity:.6 }
-.plan-day .material-row { padding-left:2px }
+/* 分组之后每行不再需要日期标记那一列，否则标题会落进 40px 里被压成省略号 */
+.plan-day .material-row { grid-template-columns:minmax(0,1fr) auto; padding:10px 2px }
+.plan-day .material-copy b { white-space:normal; overflow:visible }
