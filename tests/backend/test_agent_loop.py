@@ -260,3 +260,50 @@ def test_provider_tool_call_markup_never_reaches_the_answer():
     cleaned, stripped = _strip_provider_markup(leaked)
     assert cleaned == "第 1 题正确。" and stripped is True
     assert _strip_provider_markup("正常回答") == ("正常回答", False)
+
+
+def test_tool_call_written_as_prose_never_reaches_the_user(client):
+    """工具预算用完后供应商偶尔把 tool_call 当正文吐出来。整段都是这种标记时，
+    剥离后为空——不能回退成原文，那等于把 <｜｜DSML｜｜tool_calls> 摊给用户看。"""
+    from modules.agent.service import _strip_provider_markup
+
+    leaked_text = (
+        '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="web_search">\n'
+        '<｜｜DSML｜｜parameter name="query" string="true">context compaction</｜｜DSML｜｜parameter>\n'
+        '</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>'
+    )
+    cleaned, leaked = _strip_provider_markup(leaked_text)
+    assert leaked is True
+    assert cleaned == "", "整段都是标记就该剥成空，由上层换成一句人话"
+    assert "DSML" not in cleaned
+
+    # 正文后面跟着标记时，正文要留下
+    mixed, leaked = _strip_provider_markup("时间片越长响应越差。[1]\n" + leaked_text)
+    assert leaked is True
+    assert mixed == "时间片越长响应越差。[1]"
+
+
+def test_running_out_of_tool_budget_tells_the_model_to_wrap_up(client):
+    """光是不下发 tools，模型并不知道预算用完了，会继续尝试调用并把调用写成正文。
+    这里断言服务端明确说了那一句。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    seen: list[list[str]] = []
+
+    class Greedy:
+        mode, provider, model = "provider", "example", "example-model"
+        def __init__(self): self.calls = 0
+        def chat(self, *, messages, tools=()):
+            seen.append([m.content for m in messages if m.role == "user"])
+            self.calls += 1
+            if self.calls <= 8:
+                yield ChatToolCalls((ToolCallRequest(f"c{self.calls}", "search_materials", '{"query": "时间片"}'),))
+            else:
+                yield ChatFinal("时间片越长响应越差。[1]", "stop", self.provider, self.model, self.mode)
+        def health(self): return {}
+        def close(self): pass
+
+    workspace(client).turns._responder = Greedy()
+    client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "budget-1", "message": "时间片太长会怎样？"})
+
+    told = [msgs for msgs in seen if any("工具调用次数已用完" in m for m in msgs)]
+    assert told, "预算耗尽后应该明确告诉模型收尾"

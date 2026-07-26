@@ -88,8 +88,10 @@ def join_answer(segments: list[str]) -> str:
 
 
 def _strip_provider_markup(answer: str) -> tuple[str, bool]:
+    """整段回答都是内部标记时剥完就空了。这时候不能回退成原文——那等于把
+    <｜｜DSML｜｜tool_calls> 这种东西直接摊给用户看。"""
     cleaned = _PROVIDER_MARKUP.sub("", answer).rstrip()
-    return (cleaned or answer, cleaned != answer.rstrip())
+    return cleaned, cleaned != answer.rstrip()
 
 
 class TurnService:
@@ -348,6 +350,7 @@ class TurnService:
                 if self._select_responder and (model_key is not None or thinking is not None):
                     responder = self._select_responder(model_key, thinking)
                 allowed_tools = MAIN_PROFILE
+                budget_notified = False
                 capabilities = MAIN.capabilities
                 tool_budget = MAIN.per_tool_budget
                 tool_used: dict[str, int] = {}
@@ -390,6 +393,15 @@ class TurnService:
                     while response is None:
                         yield self._context_usage(messages, base_segments, assembled, summary)
                         allow_tools = tool_rounds < max_rounds
+                        if not allow_tools and not budget_notified:
+                            # 只是不下发 tools 的话模型并不知道，它会继续尝试调用、把调用写成正文
+                            # （见 _PROVIDER_MARKUP）。明确说一句，让它用手上的资料收尾。
+                            budget_notified = True
+                            messages.append(ChatMessage(
+                                role="user",
+                                content="工具调用次数已用完。现在只用上面已经取得的资料作答，不要再尝试调用任何工具；"
+                                        "资料不足的部分直接说明缺什么。",
+                            ))
                         segment_parts: list[str] = []
                         reasoning = ""
                         outcome: ChatToolCalls | ChatFinal | None = None
@@ -511,6 +523,9 @@ class TurnService:
                 answer, leaked = _strip_provider_markup(join_answer(answer_segments) or "".join(answer_parts) or response.text)
                 if leaked:
                     trace_record["provider_markup_stripped"] = True
+                if not answer.strip():
+                    answer = "（这一轮没能给出回答：模型把工具调用写成了正文。上面的检索结果仍然有效，可以直接再问一次。）"
+                    trace_record["empty_after_markup_strip"] = True
                 finish_reason, responder_mode = response.finish_reason, response.mode
                 provider, model = response.provider, response.model
             if not self._sessions.touch_turn(turn.id):
