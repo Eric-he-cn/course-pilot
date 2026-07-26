@@ -1,6 +1,17 @@
 import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
+const USER_KEY = 'cp-username'
+
+export function currentUser(): string { return localStorage.getItem(USER_KEY) ?? '' }
+export function setCurrentUser(name: string) { localStorage.setItem(USER_KEY, name) }
+export function clearCurrentUser() { localStorage.removeItem(USER_KEY) }
+
+/** HTTP 头值是 ByteString：中日韩用户名必须编码后再放，否则浏览器 fetch 直接抛 TypeError。 */
+function userHeaders(): Record<string, string> {
+  const name = currentUser()
+  return name ? { 'X-CoursePilot-User': encodeURIComponent(name) } : {}
+}
 type BackendCitation = Citation & { citation_id?: string; document?: string; snippet?: string }
 
 export class ApiError extends Error {
@@ -10,7 +21,7 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(`${BASE}${path}`, init)
+    response = await fetch(`${BASE}${path}`, { ...init, headers: { ...(init?.headers ?? {}), ...userHeaders() } })
   } catch {
     throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')
   }
@@ -20,6 +31,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const body = await response.json() as { detail?: string | { message?: string; error?: { message?: string } } }
       detail = typeof body.detail === 'string' ? body.detail : body.detail?.message ?? body.detail?.error?.message ?? ''
     } catch { /* response is not JSON */ }
+    if (response.status === 422 && detail.includes('用户名')) {
+      // 本地存了个规则变严后不再合法的名字：清掉，让界面回到登录页。
+      clearCurrentUser()
+    }
     throw new ApiError(detail || `请求失败（${response.status}）`, response.status)
   }
   if (response.status === 204) return undefined as T
@@ -77,7 +92,8 @@ export const api = {
   async turn(sessionId: string, content: string, onEvent: (payload: TurnEvent) => void, attachmentIds: string[] = [], signal?: AbortSignal): Promise<void> {
     let response: Response
     try {
-      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, { ...json('POST', { message: content, attachment_ids: attachmentIds }), signal })
+      const init = json('POST', { message: content, attachment_ids: attachmentIds })
+      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, { ...init, headers: { ...init.headers, ...userHeaders() }, signal })
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
       throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')

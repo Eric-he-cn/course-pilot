@@ -4,12 +4,14 @@ from dataclasses import asdict
 from functools import partial
 from typing import Callable
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from modules.courses.api import CourseCatalogPort
 from modules.knowledge.api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
+from app.bootstrap import Application
+from app.http.deps import current_workspace
 from modules.knowledge.service import KnowledgeService
 from modules.knowledge.worker import KnowledgeJobWorker
 
@@ -38,15 +40,7 @@ def _job_payload(job: object) -> dict[str, object]:
     return result
 
 
-def build_knowledge_router(
-    *,
-    knowledge: KnowledgeService,
-    jobs: KnowledgeJobWorker,
-    courses: CourseCatalogPort,
-    llm_health: Callable[[], dict[str, object]],
-    vision_health: Callable[[], dict[str, object]] = lambda: {},
-    web_health: Callable[[], dict[str, object]] = lambda: {},
-) -> APIRouter:
+def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: False) -> APIRouter:
     """Build the course-scoped knowledge HTTP adapter.
 
     The course check is performed through the public CourseCatalogPort.  The
@@ -54,23 +48,23 @@ def build_knowledge_router(
     """
     router = APIRouter(prefix="/api/v2", tags=["knowledge"])
 
-    def require_course(course_id: str) -> None:
-        if courses.get_course(course_id) is None:
+    def require_course(application: Application, course_id: str) -> None:
+        if application.courses.get_course(course_id) is None:
             raise _not_found("课程不存在")
 
     @router.get("/courses/{course_id}/materials")
-    def list_materials(course_id: str) -> list[dict[str, object]]:
-        require_course(course_id)
-        return [_material_payload(material) for material in knowledge.list_materials(course_id=course_id)]
+    def list_materials(course_id: str, application: Application = Depends(current_workspace)) -> list[dict[str, object]]:
+        require_course(application, course_id)
+        return [_material_payload(material) for material in application.knowledge.list_materials(course_id=course_id)]
 
     @router.post("/courses/{course_id}/materials", status_code=201)
-    async def upload_material(course_id: str, file: UploadFile = File(...)) -> dict[str, object]:
-        require_course(course_id)
+    async def upload_material(course_id: str, file: UploadFile = File(...), application: Application = Depends(current_workspace)) -> dict[str, object]:
+        require_course(application, course_id)
         try:
             content = await file.read()
             material = await run_in_threadpool(
                 partial(
-                    knowledge.upload_material,
+                    application.knowledge.upload_material,
                     course_id=course_id,
                     filename=file.filename or "upload",
                     mime_type=file.content_type or "application/octet-stream",
@@ -84,39 +78,39 @@ def build_knowledge_router(
             await file.close()
 
     @router.post("/materials/{material_id}/index")
-    def index_material(material_id: str) -> dict[str, object]:
+    def index_material(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:
-            job = knowledge.enqueue_index(material_id=material_id)
-            jobs.submit(job.id)
-            return _job_payload(knowledge.get_job(job_id=job.id) or job)
+            job = application.knowledge.enqueue_index(material_id=material_id)
+            application.knowledge_jobs.submit(job.id)
+            return _job_payload(application.knowledge.get_job(job_id=job.id) or job)
         except ValueError as error:
             raise _not_found(str(error)) from error
 
     @router.get("/jobs/{job_id}")
-    def get_job(job_id: str) -> dict[str, object]:
-        job = knowledge.get_job(job_id=job_id)
+    def get_job(job_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        job = application.knowledge.get_job(job_id=job_id)
         if job is None:
             raise _not_found("任务不存在")
         return _job_payload(job)
 
     @router.post("/courses/{course_id}/knowledge/search")
-    def search_course_knowledge(course_id: str, body: SearchRequest) -> list[dict[str, object]]:
-        require_course(course_id)
+    def search_course_knowledge(course_id: str, body: SearchRequest, application: Application = Depends(current_workspace)) -> list[dict[str, object]]:
+        require_course(application, course_id)
         return [
             {
                 "material_id": hit.citation.material_id, "material_name": hit.citation.document,
                 "page": hit.citation.page, "chunk_id": hit.citation.chunk_id,
                 "text": hit.citation.snippet, "score": hit.citation.score, "course_id": course_id,
             }
-            for hit in knowledge.search_course(course_id=course_id, query=body.query, limit=body.limit)
+            for hit in application.knowledge.search_course(course_id=course_id, query=body.query, limit=body.limit)
         ]
 
     @router.post("/materials/{material_id}/wiki")
-    def build_wiki(material_id: str) -> dict[str, object]:
+    def build_wiki(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:
-            job = knowledge.enqueue_wiki_build(material_id=material_id)
-            jobs.submit(job.id)
-            return _job_payload(knowledge.get_job(job_id=job.id) or job)
+            job = application.knowledge.enqueue_wiki_build(material_id=material_id)
+            application.knowledge_jobs.submit(job.id)
+            return _job_payload(application.knowledge.get_job(job_id=job.id) or job)
         except KnowledgeFeatureDisabledError as error:
             raise HTTPException(status_code=409, detail={"code": "feature_disabled", "message": str(error)}) from error
         except MaterialNotIndexedError as error:
@@ -125,7 +119,8 @@ def build_knowledge_router(
             raise _not_found(str(error)) from error
 
     @router.get("/health")
-    def health() -> dict[str, object]:
-        return {**knowledge.health(), "llm": llm_health(), "vision": vision_health(), "web": web_health()}
+    def health(application: Application = Depends(current_workspace)) -> dict[str, object]:
+        return {**application.knowledge.health(), "llm": application.llm_health(), "vision": application.vision_health(),
+                "web": application.web_health(), "workspace": {"legacy_data_pending": legacy_data_pending()}}
 
     return router

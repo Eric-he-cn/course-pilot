@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 
 import pytest
+from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -91,7 +92,7 @@ def test_general_turn_resolves_per_turn_and_uses_course_scoped_evidence(client):
     assert messages["session"]["resolved_course_id"] == calculus["id"]
     assert {item["resolved_course_id"] for item in messages["messages"]} == {calculus["id"]}
     assert {item["resolution_status"] for item in messages["messages"]} == {"resolved"}
-    with client.app.state.application.store.read() as connection:
+    with workspace(client).store.read() as connection:
         context = connection.execute("SELECT * FROM turn_course_context").fetchone()
         stored = connection.execute("SELECT course_id FROM sessions WHERE id = ?", (session["id"],)).fetchone()
     assert context["resolved_course_id"] == calculus["id"]
@@ -176,7 +177,7 @@ def test_web_cannot_forge_feishu_source_and_feishu_service_session_is_singleton(
     rejected = client.post("/api/v2/sessions", json={"scope_mode": "general", "source": "feishu"})
     assert rejected.status_code == 422
 
-    sessions = client.app.state.application.sessions
+    sessions = workspace(client).sessions
     first = sessions.create_session(scope_mode="general", course_id=None, title="飞书入口", source="feishu", owner_id="owner-a")
     second = sessions.create_session(scope_mode="general", course_id=None, title="重复投递", source="feishu", owner_id="owner-a")
     another_owner = sessions.create_session(scope_mode="general", course_id=None, title="另一位用户", source="feishu", owner_id="owner-b")
@@ -225,7 +226,7 @@ def test_errors_use_a_stable_envelope(client):
 
 def test_database_enforces_one_active_turn_per_session(client):
     session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
-    sessions = client.app.state.application.sessions
+    sessions = workspace(client).sessions
     first, created = sessions.start_turn(session_id=session["id"], client_request_id="active-1")
     assert created is True
     try:
@@ -261,7 +262,7 @@ def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
     ).json()
     _wait_for_job(client, client.post(f"/api/v2/materials/{material['id']}/index").json()["id"])
     session = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()
-    client.app.state.application.turns._responder = FailingResponder()
+    workspace(client).turns._responder = FailingResponder()
 
     response = client.post(
         f"/api/v2/sessions/{session['id']}/turns",
@@ -313,7 +314,7 @@ def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(cli
     ).json()
     _wait_for_job(client, client.post(f"/api/v2/materials/{material['id']}/index").json()["id"])
     session = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()
-    client.app.state.application.turns._responder = InterruptingResponder()
+    workspace(client).turns._responder = InterruptingResponder()
 
     response = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "drop-1", "message": "链式法则？"})
     events = _events(response.text)
@@ -335,14 +336,14 @@ def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(cli
 def test_client_disconnect_mid_stream_does_not_brick_the_session(client):
     client.post("/api/v2/courses", json={"name": "高等数学"})
     session = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
-    turns = client.app.state.application.turns
+    turns = workspace(client).turns
 
     generator = turns.run(session_id=session["id"], message="链式法则", client_request_id="disconnect-1")
     first = next(generator)
     assert first["event"] == "turn_started"
     generator.close()  # 模拟客户端断连：在 yield 处抛 GeneratorExit
 
-    with client.app.state.application.store.read() as connection:
+    with workspace(client).store.read() as connection:
         row = connection.execute("SELECT status FROM turn_requests WHERE client_request_id = 'disconnect-1'").fetchone()
     assert row["status"] == "failed"
 
@@ -355,12 +356,12 @@ def test_startup_recovers_stale_running_turns(tmp_path):
     settings = _settings(tmp_path)
     with TestClient(create_app(settings=settings)) as first:
         session = first.post("/api/v2/sessions", json={"scope_mode": "general"}).json()
-        turn, created = first.app.state.application.sessions.start_turn(session_id=session["id"], client_request_id="crash-1")
+        turn, created = workspace(first).sessions.start_turn(session_id=session["id"], client_request_id="crash-1")
         assert created is True
         # 不 complete，模拟进程在 turn 进行中崩溃
 
     with TestClient(create_app(settings=settings)) as second:
-        recovered_sessions = second.app.state.application.sessions
+        recovered_sessions = workspace(second).sessions
         next_turn, created = recovered_sessions.start_turn(session_id=session["id"], client_request_id="crash-2")
         assert created is True
         recovered_sessions.complete_turn(next_turn.id, status="completed")

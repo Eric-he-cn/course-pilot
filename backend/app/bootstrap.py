@@ -76,54 +76,36 @@ class Application:
         return {**self.vision.health(), "requested_provider": self.settings.vision_provider}
 
 
-def build_application(settings: Settings) -> Application:
-    """The one composition root: modules never instantiate repositories or adapters themselves."""
+@dataclass(frozen=True)
+class SharedRuntime:
+    """跨用户共享的部分：适配器与向量模型只建一次。"""
+    llm: AgentChatPort
+    fallback: AgentChatPort
+    classifier: AgentChatPort | None
+    vision: VisionTranscriberPort | None
+    web: WebSearchPort | None
+    embedder: object | None
+
+    def close(self) -> None:
+        for item in (self.llm, self.fallback, self.classifier, self.vision):
+            close = getattr(item, "close", None)
+            if callable(close):
+                try: close()
+                except Exception: pass
+
+
+def build_shared_runtime(settings: Settings) -> SharedRuntime:
     fallback = DemoAgentChat()
     llm: AgentChatPort = fallback
     if settings.enable_remote_llm and settings.remote_llm_configured and settings.text_provider.lower() == "deepseek":
         llm = DeepSeekAgentChat(
-            api_key=settings.text_api_key,
-            base_url=settings.text_base_url,
-            model=settings.text_model,
+            api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=settings.llm_total_timeout_seconds,
             max_output_tokens=settings.agent_max_output_tokens,
             max_retries=settings.llm_max_retries,
         )
-    vision: VisionTranscriberPort | None = None
-    if settings.enable_remote_llm and settings.vision_configured and settings.vision_provider.lower() == "dashscope":
-        vision = QwenOcrTranscriber(
-            api_key=settings.vision_api_key,
-            base_url=settings.vision_base_url,
-            model=settings.vision_model,
-            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
-            total_timeout_seconds=settings.llm_total_timeout_seconds,
-            max_retries=settings.llm_max_retries,
-        )
-    # 出网同样受远端总开关门控：关闭时联网工具当作不存在。
-    web: WebSearchPort | None = None
-    if settings.enable_remote_llm and settings.web_search_configured:
-        web = HttpWebAccess(
-            api_key=settings.web_search_api_key,
-            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
-            total_timeout_seconds=settings.web_timeout_seconds,
-        )
-    store = SQLiteStore(settings.database_path)
-    store.migrate()
-    courses = CourseService(CourseRepository(store))
-    embedder = (
-        BgeEmbedder(model_name=settings.rag_embedding_model, device=settings.rag_embedding_device, batch_size=settings.rag_embedding_batch_size)
-        if settings.rag_embedding_model
-        else None
-    )
-    knowledge = KnowledgeService(
-        repository=KnowledgeRepository(store),
-        settings=settings,
-        wiki_is_enabled=lambda course_id: bool((course := courses.get_course(course_id)) and course.wiki_enabled),
-        embedder=embedder,
-    )
-    # 学科分类器复用同一个适配器，只是超时更短、不重试：它跑在 turn 锁内、首个增量之前，
-    # 沿用 180s 总超时会把一轮拖进失活阈值。远端未启用时显式不给分类器。
+    # 学科分类器：超时更短、不重试，它跑在 turn 锁内、首个增量之前。
     classifier: AgentChatPort | None = None
     if settings.enable_remote_llm and settings.remote_llm_configured and settings.text_provider.lower() == "deepseek":
         classifier = DeepSeekAgentChat(
@@ -131,6 +113,43 @@ def build_application(settings: Settings) -> Application:
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=6, max_output_tokens=256, max_retries=0,
         )
+    vision: VisionTranscriberPort | None = None
+    if settings.enable_remote_llm and settings.vision_configured and settings.vision_provider.lower() == "dashscope":
+        vision = QwenOcrTranscriber(
+            api_key=settings.vision_api_key, base_url=settings.vision_base_url, model=settings.vision_model,
+            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+            total_timeout_seconds=settings.llm_total_timeout_seconds,
+            max_retries=settings.llm_max_retries,
+        )
+    web: WebSearchPort | None = None
+    if settings.enable_remote_llm and settings.web_search_configured:
+        web = HttpWebAccess(
+            api_key=settings.web_search_api_key,
+            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+            total_timeout_seconds=settings.web_timeout_seconds,
+        )
+    embedder = (
+        BgeEmbedder(model_name=settings.rag_embedding_model, device=settings.rag_embedding_device, batch_size=settings.rag_embedding_batch_size)
+        if settings.rag_embedding_model else None
+    )
+    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, web=web, embedder=embedder)
+
+
+def build_application(settings: Settings, shared: SharedRuntime | None = None) -> Application:
+    """The one composition root: modules never instantiate repositories or adapters themselves."""
+    runtime = shared or build_shared_runtime(settings)
+    llm, fallback, classifier = runtime.llm, runtime.fallback, runtime.classifier
+    vision, web, embedder = runtime.vision, runtime.web, runtime.embedder
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    store = SQLiteStore(settings.database_path)
+    store.migrate()
+    courses = CourseService(CourseRepository(store))
+    knowledge = KnowledgeService(
+        repository=KnowledgeRepository(store),
+        settings=settings,
+        wiki_is_enabled=lambda course_id: bool((course := courses.get_course(course_id)) and course.wiki_enabled),
+        embedder=embedder,
+    )
     resolver = CourseResolver(courses, classifier=classifier)
     sessions = SessionService(
         SessionRepository(store), courses, resolver,

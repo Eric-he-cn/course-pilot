@@ -415,3 +415,20 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .memory-editor:focus-visible { border-color:var(--accent) }
 .send-button.stop { color:var(--danger); border-color:#FCA5A5; font-size:11px }
 .send-button.stop:hover { background:#FEF2F2 }
+
+/* ---- 登录 ---- */
+.login-screen { display:grid; place-items:center; height:100vh; padding:24px; background:var(--panel) }
+.login-card { display:flex; flex-direction:column; gap:12px; width:min(440px,100%); padding:26px 28px 22px; border:1px solid var(--border); border-radius:12px; background:var(--bg); box-shadow:0 6px 24px rgb(24 24 27 / 6%) }
+.login-card .brand { padding:0 0 4px }
+.login-card h1 { margin:0; font-size:19px; font-weight:650 }
+.login-card > p { margin:0; color:var(--muted); font-size:12.5px; line-height:1.7 }
+.login-card input { padding:9px 12px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-size:14px }
+.login-card input:focus-visible { border-color:var(--accent) }
+.login-error { color:var(--danger); font-size:12px }
+.login-suggestions { display:flex; flex-wrap:wrap; align-items:center; gap:6px }
+.login-suggestions > span { color:var(--muted); font-size:11.5px }
+.login-suggestions button { padding:3px 9px; border:1px solid var(--border); border-radius:12px; background:var(--bg); color:var(--text); font-size:11.5px }
+.login-suggestions button:hover { color:var(--accent); border-color:var(--accent) }
+.login-submit { padding:9px; border:1px solid var(--text); border-radius:8px; background:var(--text); color:#fff; font-size:13.5px; font-weight:600 }
+.login-submit:hover { opacity:.88 }
+.login-card > small { color:var(--muted); font-family:var(--mono); font-size:10.5px; text-align:center }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -69,12 +70,12 @@ def _talk(client: TestClient, session_id: str, *, rounds: int, chars: int = 700)
 
 def test_compaction_replaces_early_messages_with_a_summary(client):
     responder = Responder()
-    client.app.state.application.turns._responder = responder
+    workspace(client).turns._responder = responder
     session_id = _session(client)
 
     _talk(client, session_id, rounds=4)
 
-    summary = client.app.state.application.turns._compactions.latest(session_id=session_id)
+    summary = workspace(client).turns._compactions.latest(session_id=session_id)
     assert summary is not None, "历史超过阈值后应该产生摘要"
     assert summary.summary_text == "压缩后的摘要正文"
     assert summary.covers_message_count > 0
@@ -89,7 +90,7 @@ def test_compaction_replaces_early_messages_with_a_summary(client):
 
 def test_summary_is_injected_and_early_history_is_dropped(client):
     responder = Responder()
-    client.app.state.application.turns._responder = responder
+    workspace(client).turns._responder = responder
     session_id = _session(client)
     _talk(client, session_id, rounds=4)
 
@@ -120,11 +121,11 @@ def test_summary_is_injected_and_early_history_is_dropped(client):
 )
 def test_unusable_summary_is_not_persisted(client, script, why):
     """摘要一旦落库，水位就永久生效、那批原文再也不进上下文，所以宁可不压。"""
-    client.app.state.application.turns._responder = Responder(compact_script=script)
+    workspace(client).turns._responder = Responder(compact_script=script)
     session_id = _session(client)
     _talk(client, session_id, rounds=4)
 
-    assert client.app.state.application.turns._compactions.latest(session_id=session_id) is None, why
+    assert workspace(client).turns._compactions.latest(session_id=session_id) is None, why
 
 
 def test_compaction_failure_does_not_fail_the_turn(client):
@@ -132,20 +133,20 @@ def test_compaction_failure_does_not_fail_the_turn(client):
         raise LLMProviderError("upstream_error", "供应商挂了", retryable=True)
         yield  # pragma: no cover - 使其成为生成器
 
-    client.app.state.application.turns._responder = Responder(compact_script=boom)
+    workspace(client).turns._responder = Responder(compact_script=boom)
     session_id = _session(client)
     _talk(client, session_id, rounds=3)
 
     body = client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "last", "message": "再来一轮" + "问" * 700}).text
     assert "event: turn_completed" in body
     assert "event: turn_failed" not in body
-    assert client.app.state.application.turns._compactions.latest(session_id=session_id) is None
+    assert workspace(client).turns._compactions.latest(session_id=session_id) is None
 
 
 def test_watermark_only_moves_forward(client):
-    store = client.app.state.application.turns._compactions
+    store = workspace(client).turns._compactions
     session_id = _session(client)
-    message = client.app.state.application.sessions.append_message(
+    message = workspace(client).sessions.append_message(
         session_id=session_id, turn_id=None, role="user", content="一条消息",
     )
     common = dict(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -58,9 +58,20 @@ class Settings:
     agent_context_char_limit: int = 512_000
     # 历史占到预算这个比例就压缩；调小可以在短对话上验证压缩链路。
     agent_compact_threshold_ratio: float = 0.7
+    # 缺请求头时落到哪个用户：本地无认证应用里这是合理默认，也让脚本不用带头就能跑。
+    default_user: str = "local"
     # 联网检索（SerpAPI）：未配置或未开启远端调用时，network 类工具整体不下发。
     web_search_api_key: str = ""
     web_timeout_seconds: float = 20
+
+    def for_workspace(self, workspace_dir: Path) -> "Settings":
+        """某个用户工作区的 Settings。三个路径字段必须一起换——只改 data_dir
+        会把数据库和教材留在共享目录，那正是最典型的"漏一个隔离通道"。"""
+        return replace(
+            self, data_dir=workspace_dir,
+            database_path=workspace_dir / "coursepilot.db",
+            uploads_dir=workspace_dir / "materials",
+        )
 
     @property
     def remote_llm_configured(self) -> bool:
@@ -109,6 +120,7 @@ class Settings:
             max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
             max(2048, int(value("AGENT_CONTEXT_CHAR_LIMIT", "512000"))),
             min(0.95, max(0.05, float(value("AGENT_COMPACT_THRESHOLD_RATIO", "0.7")))),
+            value("COURSEPILOT_DEFAULT_USER", "local"),
             value("RESEARCH_SERPAPI_API_KEY"),
             max(1.0, float(value("WEB_TIMEOUT_SECONDS", "20"))),
         )

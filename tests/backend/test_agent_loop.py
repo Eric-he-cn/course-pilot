@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -72,7 +73,7 @@ def test_model_search_loops_and_reuses_citation_numbering(client):
         [ChatToolCalls((ToolCallRequest("c1", "search_materials", '{"query": "链式法则"}'),))],
         [ChatDelta("先外层后内层。[1]"), ChatFinal("先外层后内层。[1]", "stop", "deepseek", "deepseek-v4-flash", "provider")],
     ])
-    client.app.state.application.turns._responder = scripted
+    workspace(client).turns._responder = scripted
 
     events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "loop-1", "message": "链式法则怎么用？"}).text)
     names = [name for name, _ in events]
@@ -95,7 +96,7 @@ def test_only_cited_evidence_is_persisted(client):
     text = "\n\n".join(f"第 {i} 节：向量范数用于衡量向量长度，编号 {i}。" for i in range(1, 6))
     session_id = _indexed_course_session(client, name="数值分析", text=text)
     scripted = ScriptedChat([[ChatDelta("只用了第一条证据。[1]"), ChatFinal("只用了第一条证据。[1]", "stop", "deepseek", "deepseek-v4-flash", "provider")]])
-    client.app.state.application.turns._responder = scripted
+    workspace(client).turns._responder = scripted
 
     events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "cite-1", "message": "向量范数是什么？"}).text)
     retrieved = [name for name, _ in events].count("citation")
@@ -111,7 +112,7 @@ def test_prior_messages_are_injected_into_the_prompt(client):
     client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "h-1", "message": "行列式是什么？"})
 
     scripted = ScriptedChat([[ChatDelta("好的。"), ChatFinal("好的。", "stop", "deepseek", "deepseek-v4-flash", "provider")]])
-    client.app.state.application.turns._responder = scripted
+    workspace(client).turns._responder = scripted
     client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "h-2", "message": "那它和特征值有关吗？"})
 
     seen = [(message.role, message.content) for message in scripted.calls[0]["messages"]]
@@ -126,7 +127,7 @@ def test_plan_and_archive_tools_report_empty_state(client):
         [ChatToolCalls((ToolCallRequest("p1", "get_plan", "{}"), ToolCallRequest("a1", "get_archive", "{}")))],
         [ChatDelta("暂无计划与记录。"), ChatFinal("暂无计划与记录。", "stop", "deepseek", "deepseek-v4-flash", "provider")],
     ])
-    client.app.state.application.turns._responder = scripted
+    workspace(client).turns._responder = scripted
 
     events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "tool-1", "message": "我的复习计划到哪了？"}).text)
     summaries = [data["summary"] for name, data in events if name == "tool_result"]
@@ -137,7 +138,7 @@ def test_plan_and_archive_tools_report_empty_state(client):
 def test_stale_turn_does_not_lock_the_session_forever(client):
     """客户端断连后 running turn 可能残留，心跳过期的 turn 必须让新一轮接管会话。"""
     session_id = _indexed_course_session(client, name="信号与系统", text="卷积把冲激响应与输入序列结合起来。")
-    sessions = client.app.state.application.sessions
+    sessions = workspace(client).sessions
     turn, _ = sessions.start_turn(session_id=session_id, client_request_id="orphan")
 
     busy = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "blocked", "message": "卷积是什么？"}).text)
@@ -172,7 +173,7 @@ def test_tool_budget_is_bounded(client):
         def close(self):
             return None
 
-    client.app.state.application.turns._responder = AlwaysCallsTools()
+    workspace(client).turns._responder = AlwaysCallsTools()
     events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "budget-1", "message": "有哪些资料？"}).text)
 
     assert events[-1][0] == "turn_completed"

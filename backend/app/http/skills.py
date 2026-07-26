@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 
-from modules.agent.skills import IMPORTABLE_TOOLS, SOURCE_MAX_BYTES, SkillRegistry
+from app.bootstrap import Application
+from app.http.deps import current_workspace
+from modules.agent.skills import IMPORTABLE_TOOLS, SOURCE_MAX_BYTES
 
 
-def build_skills_router(*, skills: SkillRegistry) -> APIRouter:
+def build_skills_router() -> APIRouter:
     """Skill 目录与导入：导入的 skill 默认关闭，权限按白名单收窄。"""
     router = APIRouter(prefix="/api/v2", tags=["skills"])
 
@@ -13,11 +15,11 @@ def build_skills_router(*, skills: SkillRegistry) -> APIRouter:
         return HTTPException(status_code=status, detail={"error": {"code": code, "message": message, "retryable": False}})
 
     @router.get("/skills")
-    def list_skills() -> dict[str, object]:
-        return {"skills": skills.catalog(), "importable_tools": list(IMPORTABLE_TOOLS)}
+    def list_skills(application: Application = Depends(current_workspace)) -> dict[str, object]:
+        return {"skills": application.skills.catalog(), "importable_tools": list(IMPORTABLE_TOOLS)}
 
     @router.post("/skills", status_code=201)
-    async def import_skill(file: UploadFile) -> dict[str, object]:
+    async def import_skill(file: UploadFile, application: Application = Depends(current_workspace)) -> dict[str, object]:
         if not (file.filename or "").lower().endswith(".md"):
             raise fail(422, "unsupported_media_type", "只接受 .md 文件（首版仅支持 prompt-only skill）")
         raw = await file.read()
@@ -28,7 +30,7 @@ def build_skills_router(*, skills: SkillRegistry) -> APIRouter:
         except UnicodeDecodeError:
             raise fail(422, "invalid_encoding", "文件不是 UTF-8 文本") from None
         try:
-            definition = skills.import_skill(text)
+            definition = application.skills.import_skill(text)
         except ValueError as error:
             raise fail(422, "invalid_skill", str(error)) from None
         return {
@@ -38,9 +40,9 @@ def build_skills_router(*, skills: SkillRegistry) -> APIRouter:
         }
 
     @router.patch("/skills/{name}")
-    def set_enabled(name: str, payload: dict) -> dict[str, object]:
+    def set_enabled(name: str, payload: dict, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:
-            definition = skills.set_enabled(name=name, enabled=bool(payload.get("enabled")))
+            definition = application.skills.set_enabled(name=name, enabled=bool(payload.get("enabled")))
         except LookupError:
             raise fail(404, "not_found", "该 skill 不存在或不是导入的 skill") from None
         except ValueError as error:
@@ -48,9 +50,9 @@ def build_skills_router(*, skills: SkillRegistry) -> APIRouter:
         return {"name": definition.name, "status": definition.status}
 
     @router.delete("/skills/{name}", status_code=204)
-    def remove(name: str) -> None:
+    def remove(name: str, application: Application = Depends(current_workspace)) -> None:
         try:
-            skills.remove(name=name)
+            application.skills.remove(name=name)
         except LookupError:
             raise fail(404, "not_found", "该 skill 不存在或不是导入的 skill") from None
 

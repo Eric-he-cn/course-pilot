@@ -18,6 +18,13 @@ OUT = ROOT / "Docs" / "images"
 # 每张图：文件名、说明、到达该画面要点的按钮文字序列、可选的收尾脚本
 SHOTS: list[dict] = [
     {
+        "name": "login.png",
+        "caption": "登录：输入用户名或从随机建议里挑一个；每个用户名对应一份独立的工作区",
+        "script": "localStorage.removeItem('cp-username'); location.reload();",
+        "wait": 1500,
+        "expect": ".login-card",
+    },
+    {
         "name": "chat-citation.png",
         "caption": "对话取证：回答带教材文件名与页码，公式正常渲染，底部 SOURCES 可点开原文",
         "clicks": ["操作系统", "对话"],

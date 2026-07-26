@@ -5,6 +5,7 @@ import json
 
 import httpx
 import pytest
+from conftest import workspace
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -147,7 +148,7 @@ def test_upload_attachment_returns_feature_disabled_without_vision_slot(client):
 
 
 def test_upload_attachment_transcribes_and_turn_injects_transcription(client):
-    client.app.state.application.sessions._vision = _FakeVision()  # 测试注入：绕过真实网络调用
+    workspace(client).sessions._vision = _FakeVision()  # 测试注入：绕过真实网络调用
     course = client.post("/api/v2/courses", json={"name": "高等数学"}).json()
     session_id = _session(client)
 
@@ -181,7 +182,7 @@ def test_turn_with_unknown_attachment_fails_cleanly(client):
 
 
 def test_attachment_of_another_session_is_rejected(client):
-    client.app.state.application.sessions._vision = _FakeVision()
+    workspace(client).sessions._vision = _FakeVision()
     session_a, session_b = _session(client), _session(client)
     attachment = client.post(f"/api/v2/sessions/{session_a}/attachments", files={"file": ("a.png", _png(), "image/png")}).json()
     response = client.post(

@@ -273,7 +273,8 @@ def test_notes_have_a_read_route(tmp_path):
         course = client.post("/api/v2/courses", json={"name": "算法"}).json()
         assert client.get(f"/api/v2/courses/{course['id']}/notes").json() == {"notes": []}
 
-        NoteStore(data_dir).write(course_id=course["id"], title="调度卡片", content="# Q1\n答案")
+        NoteStore(client.app.state.workspaces.default().settings.data_dir).write(
+            course_id=course["id"], title="调度卡片", content="# Q1\n答案")
         listed = client.get(f"/api/v2/courses/{course['id']}/notes").json()["notes"]
         assert [note["title"] for note in listed] == ["调度卡片"]
 

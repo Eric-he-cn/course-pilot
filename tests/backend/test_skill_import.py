@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -36,7 +37,7 @@ def _upload(client, text: str, filename: str = "SKILL.md"):
 def test_imported_skill_is_disabled_until_enabled(client):
     created = _upload(client, _skill()).json()
     assert created["status"] == "draft"
-    registry = client.app.state.application.skills
+    registry = workspace(client).skills
     assert "exam_drill" not in registry.names()  # 草稿不进系统提示，也不能被 use_skill 加载
 
     assert client.patch("/api/v2/skills/exam_drill", json={"enabled": True}).json()["status"] == "enabled"
@@ -55,7 +56,7 @@ def test_privileged_tools_are_refused_instead_of_silently_dropped(client):
     blocked = client.patch("/api/v2/skills/exam_drill", json={"enabled": True})
     assert blocked.status_code == 409
     assert "memory_patch" in blocked.json()["error"]["message"]
-    assert "exam_drill" not in client.app.state.application.skills.names()
+    assert "exam_drill" not in workspace(client).skills.names()
 
 
 def test_builtin_skills_cannot_be_shadowed(client):
@@ -63,7 +64,7 @@ def test_builtin_skills_cannot_be_shadowed(client):
     assert response.status_code == 422
     assert "同名" in response.json()["error"]["message"]
     # 内建 practice 仍然是代码里那一份
-    assert client.app.state.application.skills.get("practice").origin == "builtin"
+    assert workspace(client).skills.get("practice").origin == "builtin"
 
 
 @pytest.mark.parametrize(
@@ -90,7 +91,7 @@ def test_delete_removes_an_enabled_skill_from_the_registry(client):
     _upload(client, _skill())
     client.patch("/api/v2/skills/exam_drill", json={"enabled": True})
     assert client.delete("/api/v2/skills/exam_drill").status_code == 204
-    assert "exam_drill" not in client.app.state.application.skills.names()
+    assert "exam_drill" not in workspace(client).skills.names()
     assert client.delete("/api/v2/skills/exam_drill").status_code == 404
 
 

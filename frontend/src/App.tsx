@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import { ApiError, api } from './api'
+import { ApiError, api, clearCurrentUser, currentUser, setCurrentUser } from './api'
 import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, SessionSummary, SkillInfo, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
@@ -36,7 +36,52 @@ const TOOL_CAPABILITY_HINT: Record<string, string> = {
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
 function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : '刚刚' }
 
+const ADJECTIVES = ['勤奋的', '好奇的', '专注的', '沉稳的', '敏捷的', '踏实的', '爱问的', '安静的']
+const CREATURES = ['水獺', '猫头鹰', '小海豹', '刺猬', '树懒', '狐狸', '柯基', '企鹅']
+
+function randomNames(count = 5): string[] {
+  const picked = new Set<string>()
+  while (picked.size < count) {
+    picked.add(ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)] + CREATURES[Math.floor(Math.random() * CREATURES.length)])
+  }
+  return [...picked]
+}
+
+/** 登录：只输用户名，没有密码。用途是把不同人的资料分开存，不是访问控制。 */
+function LoginView({ onLogin }: { onLogin: (name: string) => void }) {
+  const [name, setName] = useState(() => currentUser())
+  const [suggestions] = useState(() => randomNames())
+  const [error, setError] = useState('')
+  const remembered = currentUser()
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    const value = name.trim()
+    if (!value) { setError('请输入一个用户名'); return }
+    if (value.length > 32) { setError('用户名不能超过 32 个字符'); return }
+    if (!/^[\p{L}\p{N} _-]+$/u.test(value)) { setError('只能用中日韩文字、字母、数字、空格与 - _'); return }
+    onLogin(value)
+  }
+  return <div className="login-screen">
+    <form className="login-card" onSubmit={submit}>
+      <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
+      <h1>用哪个名字继续？</h1>
+      <p>每个用户名对应一份独立的课程、教材与学习记录。<strong>没有密码</strong>——
+        这只是把不同人的资料分开存，同一台机器上知道名字就能进，别拿它当访问控制。</p>
+      <input value={name} autoFocus aria-label="用户名" placeholder="输入用户名"
+        onChange={event => { setName(event.target.value); setError('') }} />
+      {error && <span className="login-error">{error}</span>}
+      <div className="login-suggestions">
+        <span>随便挑一个：</span>
+        {suggestions.map(item => <button type="button" key={item} onClick={() => { setName(item); setError('') }}>{item}</button>)}
+      </div>
+      <button className="login-submit" type="submit">{remembered && remembered === name.trim() ? `以「${remembered}」继续` : '进入'}</button>
+      {remembered && <small>上次用的是「{remembered}」</small>}
+    </form>
+  </div>
+}
+
 export default function App() {
+  const [username, setUsername] = useState(() => currentUser())
   const [courses, setCourses] = useState<Course[]>([])
   const [workspace, setWorkspace] = useState<Workspace>({ scope: 'general' })
   const [sessions, setSessions] = useState<SessionSummary[]>([])
@@ -109,6 +154,8 @@ export default function App() {
     catch (error) { setNotice(errorText(error)) } finally { setBusy(false) }
   }
 
+  if (!username) return <LoginView onLogin={name => { setCurrentUser(name); setUsername(name); window.location.reload() }} />
+
   const workspaceName = workspace.scope === 'general' ? '通用模式' : course?.name ?? '课程工作区'
   const healthLlm = (health?.llm ?? null) as Record<string, unknown> | null
   const healthRag = (health?.rag ?? null) as Record<string, unknown> | null
@@ -140,6 +187,7 @@ export default function App() {
       <button className="new-session" onClick={newSession} disabled={busy}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
       <div className="sidebar-foot">
         <button onClick={() => { setView('help'); setSidebarOpen(false) }}>? <span>使用说明</span></button>
+        <button onClick={() => { clearCurrentUser(); window.location.reload() }} title={`当前：${username}`}>⇄ <span>切换用户（{username}）</span></button>
         <button onClick={() => { setView('settings'); setSidebarOpen(false) }}>⚙ <span>管理与设置</span></button>
       </div>
     </aside>

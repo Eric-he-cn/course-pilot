@@ -6,12 +6,13 @@ from functools import partial
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import Application
+from app.http.deps import current_workspace
 from contracts.llm import LLMProviderError
 from modules.sessions.api import VisionFeatureDisabledError
 
@@ -48,22 +49,22 @@ def _not_found(error: Exception) -> HTTPException:
     return HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(error), "retryable": False}})
 
 
-def create_core_router(application: Application) -> APIRouter:
+def create_core_router() -> APIRouter:
     router = APIRouter(prefix="/api/v2", tags=["core"])
 
     @router.get("/courses")
-    def list_courses():
+    def list_courses(application: Application = Depends(current_workspace)):
         return [asdict(course) for course in application.courses.list_courses()]
 
     @router.post("/courses", status_code=201)
-    def create_course(request: CourseCreateRequest):
+    def create_course(request: CourseCreateRequest, application: Application = Depends(current_workspace)):
         try:
             return asdict(application.courses.create_course(name=request.name, color=request.color))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
 
     @router.patch("/courses/{course_id}")
-    def update_course(course_id: str, request: CourseUpdateRequest):
+    def update_course(course_id: str, request: CourseUpdateRequest, application: Application = Depends(current_workspace)):
         try:
             course = application.courses.update_course(course_id, name=request.name, wiki_enabled=request.wiki_enabled)
         except ValueError as exc:
@@ -73,11 +74,11 @@ def create_core_router(application: Application) -> APIRouter:
         return asdict(course)
 
     @router.get("/sessions")
-    def list_sessions(scope_mode: Optional[str] = None, course_id: Optional[str] = None):
+    def list_sessions(scope_mode: Optional[str] = None, course_id: Optional[str] = None, application: Application = Depends(current_workspace)):
         return [asdict(session) for session in application.sessions.list_sessions(scope_mode=scope_mode, course_id=course_id)]
 
     @router.post("/sessions", status_code=201)
-    def create_session(request: SessionCreateRequest):
+    def create_session(request: SessionCreateRequest, application: Application = Depends(current_workspace)):
         try:
             # HTTP is the Web channel.  Channel adapters call the use case
             # directly, so a browser cannot impersonate the Feishu source.
@@ -88,7 +89,7 @@ def create_core_router(application: Application) -> APIRouter:
             raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
 
     @router.patch("/sessions/{session_id}")
-    def rename_session(session_id: str, request: SessionRenameRequest):
+    def rename_session(session_id: str, request: SessionRenameRequest, application: Application = Depends(current_workspace)):
         try:
             return asdict(application.sessions.rename_session(session_id=session_id, title=request.title))
         except ValueError as exc:
@@ -97,7 +98,7 @@ def create_core_router(application: Application) -> APIRouter:
             raise _not_found(exc) from exc
 
     @router.get("/sessions/{session_id}/messages")
-    def list_messages(session_id: str):
+    def list_messages(session_id: str, application: Application = Depends(current_workspace)):
         try:
             session = application.sessions.get_session(session_id)
             messages = application.sessions.list_messages(session_id)
@@ -106,7 +107,7 @@ def create_core_router(application: Application) -> APIRouter:
         return {"session": asdict(session) if session else None, "messages": [asdict(message) for message in messages]}
 
     @router.post("/sessions/{session_id}/attachments", status_code=201)
-    async def upload_attachment(session_id: str, file: UploadFile = File(...)):
+    async def upload_attachment(session_id: str, file: UploadFile = File(...), application: Application = Depends(current_workspace)):
         try:
             content = await file.read()
             attachment = await run_in_threadpool(
@@ -131,7 +132,7 @@ def create_core_router(application: Application) -> APIRouter:
             await file.close()
 
     @router.post("/sessions/{session_id}/turns")
-    def turn(session_id: str, request: TurnRequest):
+    def turn(session_id: str, request: TurnRequest, application: Application = Depends(current_workspace)):
         if application.sessions.get_session(session_id) is None:
             raise _not_found(LookupError("会话不存在"))
         def stream():
