@@ -92,6 +92,16 @@ def judge(chat: OpenAICompatibleChat, case: str) -> dict:
         return {"error": "judge JSON 解析失败", "raw": raw[:200]}
 
 
+def user_database(data_dir: Path) -> Path:
+    """库在 <data>/users/<user_id>/ 下。指向 <data>/coursepilot.db 会拿到一个不存在或空的库。"""
+    candidates = sorted(Path(data_dir).glob("users/*/coursepilot.db"))
+    if not candidates:
+        raise SystemExit(f"{data_dir} 下没有找到用户库")
+    if len(candidates) > 1:
+        raise SystemExit(f"{data_dir} 下有多个用户库，用 --data-dir 指定到一个：{[str(p) for p in candidates]}")
+    return candidates[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=str(ROOT / "data"), help="被评测实例的数据目录")
@@ -117,7 +127,7 @@ def main() -> None:
     results, scored = [], {"faithfulness": [], "attribution": [], "usefulness": []}
     try:
         for record in records:
-            verdict = judge(chat, render_case(record, data_dir / "coursepilot.db"))
+            verdict = judge(chat, render_case(record, user_database(data_dir)))
             entry = {
                 "turn_id": record.get("turn_id"), "prompt_version": record.get("prompt_version"),
                 "skill": (record.get("skill") or {}).get("name"), "model": (record.get("responder") or {}).get("model"),

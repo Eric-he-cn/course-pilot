@@ -107,8 +107,22 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
+def workspace(data_dir: Path) -> Path:
+    """库、笔记、trace 都在 <data>/users/<user_id>/ 下，不在 <data>/ 根上。
+
+    直接按根目录找会拿到空结果，然后以「一条都没有」的样子失败——那种报错看不出是
+    路径不对还是功能没生效，所以这里一次解析清楚。
+    """
+    candidates = sorted(path.parent for path in data_dir.glob("users/*/coursepilot.db"))
+    if not candidates:
+        raise SystemExit(f"{data_dir} 下没有找到用户工作区，先让实例跑起来并发一次请求")
+    if len(candidates) > 1:
+        raise SystemExit(f"{data_dir} 下有多个用户工作区，换一个干净的数据目录再跑：{[str(p) for p in candidates]}")
+    return candidates[0]
+
+
 def db(data_dir: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(data_dir / "coursepilot.db")
+    connection = sqlite3.connect(workspace(data_dir) / "coursepilot.db")
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -176,7 +190,14 @@ def journey(base: str, data_dir: Path) -> None:
 
     # ---- 第 5 步：排计划（写操作 + 版本化） ----
     print("\n[5] 学习计划")
-    plan_turn = ask(base, session["id"], "我 8 月 10 号考这门课，帮我排一份从明天到考试前的复习计划，每天 2 小时", "j-plan")
+    # 要把考试范围说清楚。只说「排个计划」时模型会先反问范围（资料库只有一章，它无法
+    # 判断该覆盖到哪），那是合理行为，不该拿它当失败。
+    plan_turn = ask(
+        base, session["id"],
+        "我 8 月 10 号考这门课，考试范围就是资料库里这一章 CPU 调度，我还没开始复习。"
+        "直接排一份从明天到考试前的计划写进系统，每天 2 小时，不用再问我",
+        "j-plan",
+    )
     check("排计划调用了 plan_update", "plan_update" in plan_turn.tools, str(plan_turn.tools))
     plan = call(base, f"/courses/{course['id']}/plan")["plan"]
     check("计划已落库且有版本", bool(plan) and plan["version"] >= 1, str(plan and plan["version"]))
@@ -191,7 +212,8 @@ def journey(base: str, data_dir: Path) -> None:
     check("图示输出 mermaid 代码块", "```mermaid" in diagram.answer)
     cards = ask(base, session["id"], "把 FIFO 和 SJF 做成学习卡片存起来", "j-cards")
     check("卡片写入笔记", "note_write" in cards.tools, str(cards.tools))
-    notes = sorted((data_dir / "notes" / course["id"]).glob("*.md")) if (data_dir / "notes" / course["id"]).is_dir() else []
+    notes_dir = workspace(data_dir) / "notes" / course["id"]
+    notes = sorted(notes_dir.glob("*.md")) if notes_dir.is_dir() else []
     check("笔记落在课程隔离目录", len(notes) > 0, f"{[n.name for n in notes]}")
 
     # ---- 第 7 步：错题复盘 ----
@@ -230,7 +252,7 @@ def journey(base: str, data_dir: Path) -> None:
 
     # ---- 第 11 步：可观测 ----
     print("\n[11] 可观测")
-    traces = sorted((data_dir / "traces").glob("*.jsonl"))
+    traces = sorted((workspace(data_dir) / "traces").glob("*.jsonl"))
     lines = [json.loads(line) for path in traces for line in path.read_text().splitlines() if line.strip()]
     check("每轮都有 trace", len(lines) >= 10, f"{len(lines)} 条")
     check("trace 记录工具决策", any(t.get("decision") for line in lines for t in line.get("tools", [])))

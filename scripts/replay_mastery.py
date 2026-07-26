@@ -57,6 +57,16 @@ def curves(database: Path) -> dict[str, dict]:
     return result
 
 
+def user_database(data_dir: Path) -> Path:
+    """库在 <data>/users/<user_id>/ 下。指向 <data>/coursepilot.db 会拿到一个不存在或空的库。"""
+    candidates = sorted(Path(data_dir).glob("users/*/coursepilot.db"))
+    if not candidates:
+        raise SystemExit(f"{data_dir} 下没有找到用户库")
+    if len(candidates) > 1:
+        raise SystemExit(f"{data_dir} 下有多个用户库，用 --data-dir 指定到一个：{[str(p) for p in candidates]}")
+    return candidates[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=str(ROOT / "data"))
@@ -64,9 +74,7 @@ def main() -> None:
     parser.add_argument("--compare", default="", help="与基线对比，报告变化")
     args = parser.parse_args()
 
-    database = Path(args.data_dir) / "coursepilot.db"
-    if not database.is_file():
-        raise SystemExit(f"找不到 {database}")
+    database = user_database(Path(args.data_dir))
     current = curves(database)
     print(f"算法版本 {ALGORITHM_VERSION}，回放 {len(current)} 个概念、{sum(item['events'] for item in current.values())} 条事件")
     for concept_id, item in sorted(current.items(), key=lambda pair: pair[1]["name"]):
