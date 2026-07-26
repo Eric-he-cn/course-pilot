@@ -73,6 +73,13 @@ def create_core_router() -> APIRouter:
             raise _not_found(LookupError("课程不存在"))
         return asdict(course)
 
+    @router.delete("/courses/{course_id}", status_code=204)
+    def delete_course(course_id: str, application: Application = Depends(current_workspace)) -> None:
+        try:
+            application.courses.delete_course(course_id)
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+
     @router.get("/sessions")
     def list_sessions(scope_mode: Optional[str] = None, course_id: Optional[str] = None, application: Application = Depends(current_workspace)):
         return [asdict(session) for session in application.sessions.list_sessions(scope_mode=scope_mode, course_id=course_id)]
@@ -93,6 +100,13 @@ def create_core_router() -> APIRouter:
             return asdict(application.sessions.rename_session(session_id=session_id, title=request.title))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+
+    @router.delete("/sessions/{session_id}", status_code=204)
+    def delete_session(session_id: str, application: Application = Depends(current_workspace)) -> None:
+        try:
+            application.sessions.delete_session(session_id)
         except LookupError as exc:
             raise _not_found(exc) from exc
 

@@ -77,6 +77,14 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
         finally:
             await file.close()
 
+    @router.delete("/materials/{material_id}", status_code=204)
+    def delete_material(material_id: str, application: Application = Depends(current_workspace)) -> None:
+        # 删除会跨越 knowledge 与 learning 的表，编排放在 courses 服务里统一排顺序。
+        try:
+            application.courses.delete_material(material_id)
+        except LookupError as error:
+            raise _not_found(str(error)) from error
+
     @router.post("/materials/{material_id}/index")
     def index_material(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:

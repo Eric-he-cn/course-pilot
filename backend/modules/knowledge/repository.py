@@ -37,11 +37,46 @@ def _job(row: object) -> Job:
     )
 
 
+def _purge_materials(connection, material_ids: list[str]) -> None:
+    """引用教材的表全是 NO ACTION 外键，删除顺序得自己排。chunks_fts 要按 chunk_id
+    反查 chunks，所以必须排在 chunks 之前。"""
+    if not material_ids:
+        return
+    marks = ",".join("?" * len(material_ids))
+    owned_concepts = f"SELECT id FROM concepts WHERE material_id IN ({marks})"
+    for statement in (
+        # 概念没了掌握度投影也留不住；原始 evidence_events 保留，日后可重算。
+        f"DELETE FROM concept_mastery WHERE concept_id IN ({owned_concepts})",
+        f"DELETE FROM concept_aliases WHERE concept_id IN ({owned_concepts})",
+        f"DELETE FROM concepts WHERE material_id IN ({marks})",
+        f"DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE material_id IN ({marks}))",
+        f"DELETE FROM chunks WHERE material_id IN ({marks})",
+        f"DELETE FROM jobs WHERE material_id IN ({marks})",
+        f"DELETE FROM materials WHERE id IN ({marks})",
+    ):
+        connection.execute(statement, material_ids)
+
+
 class KnowledgeRepository:
     """Owns the knowledge tables; other modules must use its public service/port."""
 
     def __init__(self, store: SQLiteStore) -> None:
         self._store = store
+
+    def delete_material(self, material_id: str) -> Path | None:
+        """删库并回传原文件路径；磁盘清理留给调用方在事务提交之后做。"""
+        with self._store.write() as conn:
+            row = conn.execute("SELECT storage_path FROM materials WHERE id = ?", (material_id,)).fetchone()
+            if row is None:
+                return None
+            _purge_materials(conn, [material_id])
+        return Path(row["storage_path"])
+
+    def delete_course_materials(self, connection, *, course_id: str) -> list[Path]:
+        """课程下的全部教材，与调用方共用事务。"""
+        rows = connection.execute("SELECT id, storage_path FROM materials WHERE course_id = ?", (course_id,)).fetchall()
+        _purge_materials(connection, [row["id"] for row in rows])
+        return [Path(row["storage_path"]) for row in rows]
 
     def health_check(self) -> int:
         """Return the applied migration version without exposing the shared store."""

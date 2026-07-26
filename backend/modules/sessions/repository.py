@@ -2,8 +2,32 @@ from __future__ import annotations
 import json
 import sqlite3
 from core.store import SQLiteStore
+def _purge_sessions(connection: sqlite3.Connection, session_ids: list[str]) -> None:
+    """引用会话的表全是 NO ACTION 外键，删除顺序得自己排：引用方先走，被引用方后走。
+    session_compactions 还引用 messages，所以必须排在 messages 之前。"""
+    if not session_ids: return
+    marks = ",".join("?" * len(session_ids))
+    for statement in (
+        f"DELETE FROM session_compactions WHERE session_id IN ({marks})",
+        f"DELETE FROM turn_course_context WHERE turn_id IN (SELECT id FROM turn_requests WHERE session_id IN ({marks}))",
+        f"DELETE FROM turn_requests WHERE session_id IN ({marks})",
+        f"DELETE FROM messages WHERE session_id IN ({marks})",
+        f"DELETE FROM attachments WHERE session_id IN ({marks})",
+        f"DELETE FROM artifacts WHERE session_id IN ({marks})",
+        # 渠道绑定只是"当前聊到哪个会话"的指针，会话没了指针清空即可。
+        f"UPDATE channel_bindings SET active_session_id = NULL WHERE active_session_id IN ({marks})",
+        f"DELETE FROM sessions WHERE id IN ({marks})",
+    ): connection.execute(statement, session_ids)
 class SessionRepository:
     def __init__(self, store: SQLiteStore) -> None: self._store = store
+    def delete_session(self, session_id: str) -> bool:
+        with self._store.write() as c:
+            if c.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None: return False
+            _purge_sessions(c, [session_id]); return True
+    def delete_course_sessions(self, connection: sqlite3.Connection, *, course_id: str) -> None:
+        """随课程一起删掉它的课程会话，与调用方共用事务；通用会话只清掉历史解析痕迹。"""
+        _purge_sessions(connection, [row["id"] for row in connection.execute("SELECT id FROM sessions WHERE course_id = ?", (course_id,))])
+        connection.execute("UPDATE sessions SET last_resolved_course_id = NULL WHERE last_resolved_course_id = ?", (course_id,))
     def list_session_rows(self, *, scope_mode: str | None, course_id: str | None):
         clauses, params = ["kind = 'user'"], []
         if scope_mode: clauses.append("scope_mode = ?"); params.append(scope_mode)

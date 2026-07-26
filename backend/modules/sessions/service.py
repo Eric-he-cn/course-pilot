@@ -35,6 +35,10 @@ class SessionService:
         if not cleaned: raise ValueError("标题不能为空")
         if not self._repository.set_title(session_id=session_id, title=cleaned, timestamp=utc_now()): raise LookupError("会话不存在")
         return self.get_session(session_id)  # type: ignore[return-value]
+    def delete_session(self, session_id: str) -> None:
+        """连带删掉消息、turn 与产物。正在跑的 turn 不拦：挂死的 turn 不该永久堵住删除，
+        而外键打开着，它后续的写入只会失败，不会把会话写回来。"""
+        if not self._repository.delete_session(session_id): raise LookupError("会话不存在")
     def list_messages(self, session_id: str) -> list[Message]:
         if not self.get_session(session_id): raise LookupError("会话不存在")
         messages = []

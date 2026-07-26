@@ -191,16 +191,23 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(settings.database_path)
     store.migrate()
-    courses = CourseService(CourseRepository(store))
+    knowledge_repository, session_repository = KnowledgeRepository(store), SessionRepository(store)
+    courses = CourseService(
+        CourseRepository(store), data_dir=settings.data_dir,
+        # 删课程要连带清掉会话与教材，清理动作由各自的仓库提供，courses 只编排顺序。
+        purge_sessions=session_repository.delete_course_sessions,
+        purge_materials=knowledge_repository.delete_course_materials,
+        purge_material=knowledge_repository.delete_material,
+    )
     knowledge = KnowledgeService(
-        repository=KnowledgeRepository(store),
+        repository=knowledge_repository,
         settings=settings,
         wiki_is_enabled=lambda course_id: bool((course := courses.get_course(course_id)) and course.wiki_enabled),
         embedder=embedder,
     )
     resolver = CourseResolver(courses, classifier=classifier)
     sessions = SessionService(
-        SessionRepository(store), courses, resolver,
+        session_repository, courses, resolver,
         vision=vision,
         attachment_max_bytes=settings.attachment_max_bytes,
         attachment_max_pixels=settings.attachment_max_pixels,
