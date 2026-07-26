@@ -178,50 +178,23 @@ class LLMClient(Protocol):
 
 ### 5.4 配置模型
 
-```dotenv
-TEXT_PROVIDER=deepseek
-TEXT_BASE_URL=https://api.deepseek.com
-TEXT_API_KEY=...
-TEXT_MODEL=deepseek-v4-flash
-TEXT_THINKING_DEFAULT=disabled
-TEXT_REASONING_EFFORT=high
+完整字段与默认值见仓库根目录的 `.env.example`，那里是唯一来源；这里只写约束。
 
-MODEL_CONTEXT_LIMIT_TOKENS=1000000
-AGENT_CONTEXT_WINDOW_TOKENS=131072
-AGENT_MAX_INPUT_TOKENS=114688
-AGENT_MAX_OUTPUT_TOKENS=8192
-AGENT_CONTEXT_RESERVE_TOKENS=8192
+模型接入认协议不认厂商：任何兼容 OpenAI Chat Completions 的服务都能配，包括自建的。
+要求支持流式与 function calling，否则工具循环跑不起来。`TEXT_PROVIDER` 只是显示用的名字，
+不参与任何分支判断——写死厂商名做判断会让别家的配置静默退回本地兜底。
 
-VISION_PROVIDER=dashscope
-VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-VISION_API_KEY=...
-VISION_MODEL=qwen-vl-ocr
+厂商私有的请求字段统一走 `TEXT_EXTRA_BODY`（JSON 对象，原样并入请求体），
+适配器本身只发标准字段。覆盖 `messages` / `stream` 这类协议字段会在构造期报错。
 
-JUDGE_PROVIDER=...
-JUDGE_BASE_URL=...
-JUDGE_API_KEY=...
-JUDGE_MODEL=...
-
-RAG_EMBEDDING_MODEL=BAAI/bge-base-zh-v1.5
-RAG_EMBEDDING_DEVICE=auto
-RAG_EMBEDDING_BATCH_SIZE=256
-RAG_CHUNK_SIZE=600
-RAG_CHUNK_OVERLAP=120
-RAG_TOP_K_RESULTS=6
-
-STORAGE_DATA_DIR=./data
-SERVER_HOST=127.0.0.1
-SERVER_PORT=8000
-RESEARCH_SERPAPI_API_KEY=...
-APP_LOG_LEVEL=INFO
-```
-
+- `TEXT_*` 四项配齐并把 `COURSEPILOT_ENABLE_REMOTE_LLM` 打到 1 才会调远端，否则走本地兜底 responder。
+- `VISION_*` 四项决定图片提问是否可用，未配置时附件上传返回 `feature_disabled`。
+- `RESEARCH_SERPAPI_API_KEY` 留空时，network 类工具整体不下发给模型。
 - API Key 只从环境变量或操作系统密钥环读取，不写入 SQLite、Markdown、trace 或前端。
-- 2.0 运行时只读取按能力命名的新变量，不再回退 `OPENAI_* / DEFAULT_MODEL*`。若需要迁移 1.0 配置，由一次性迁移命令显式读取旧文件并写成新命名，避免两套变量长期共存。
-- 同一把百炼 Key 可以同时配置到 `text` 和 `vision` 槽位，但两个槽位仍然使用各自的 model id 和能力声明。
-- 当前中国内地通用 DashScope 域名可继续使用；拿到 Workspace ID 后，生产环境优先切换到北京地域的 workspace 专属域名，并确保 API Key、域名和模型地域一致。
+  供应商 4xx 的错误说明会带进本地 trace 用于排查，其中的密钥在写入前抹掉。
+- 2.0 运行时只读取按能力命名的新变量，不再回退 `OPENAI_* / DEFAULT_MODEL*`。
 
-### 5.5 DeepSeek V4 调用策略与 512K 软窗口
+### 5.5 调用策略与 512K 软窗口
 
 截至 2026-07-20，正式模型名是 `deepseek-v4-flash / deepseek-v4-pro`；`deepseek-chat / deepseek-reasoner` 仅是 Flash 非思考/思考模式的兼容别名，并将在 2026-07-24 23:59（北京时间）下线。首版固定 `deepseek-v4-flash`，不再保留两个旧模型名。官方模型支持 1M context，但 API 没有“把窗口改成固定档位”的独立参数；CoursePilot 通过上下文组装器限制发送的 token 数，取 512K 作软窗口，在 1M 上限内留出余量。[DeepSeek 模型与价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)、[Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)。
 
@@ -245,7 +218,7 @@ APP_LOG_LEVEL=INFO
 - DeepSeek context cache 默认开启。上下文组装保持“稳定系统提示 → 稳定课程信息 → 动态历史/RAG”的顺序，并记录 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
 - 请求传入内部用户 ID 的 HMAC 作为 `user_id`，用于 provider 侧 KV cache 与调度隔离，不发送邮箱、IM 用户标识等隐私标识。
 
-### 5.6 DeepSeek 与千问 OCR 结论
+### 5.6 首版选型的实测结论
 
 截至 2026-07-20，DeepSeek 官方列出的 V4 Flash / Pro API 支持 JSON Output 和 Tool Calls，适合主 Agent；但官方同时明确 V4 为 text-only，图片需要由其他视觉模型代理。因此，**单独一个 DeepSeek API 不足以完成 OCR**。另外，`deepseek-chat / deepseek-reasoner` 旧别名将于 2026-07-24 弃用，2.0 不再将该别名写死在代码中。
 
@@ -273,8 +246,8 @@ OCR 不与讲解合并成一次黑盒调用：
   "plain_text": "...",
   "latex_blocks": [{"latex": "...", "region": [0, 0, 100, 40]}],
   "uncertain_spans": [{"text": "...", "reason": "blurred_or_ambiguous"}],
-  "provider": "dashscope",
-  "model": "qwen-vl-ocr",
+  "provider": "<VISION_PROVIDER>",
+  "model": "<VISION_MODEL>",
   "needs_confirmation": false
 }
 ```
@@ -804,7 +777,7 @@ course-pilot/
 │  └─ wiki/
 ├─ tools/                       # registry / projection / policy / executor / audit
 ├─ infrastructure/
-│  ├─ llm/                      # deepseek / dashscope / fake adapters
+│  ├─ llm/                      # openai_compatible / vision_ocr / demo adapters
 │  ├─ rag/                      # 1.0 RAG 通过 port 接入
 │  ├─ store/                    # SQLite + migrations
 │  ├─ git/
@@ -828,7 +801,7 @@ course-pilot/
 | 资产 | 处置 |
 | --- | --- |
 | `rag/` 全部（解析、切块、索引、混合检索、rerank） | 原位复用，先用 adapter 包成 `rag_search`；不在 Agent 重写期间同时更换检索算法 |
-| `core/llm/openai_compat.py` | 作为 DeepSeek/OpenAI-compatible adapter 的行为参考，经内部协议隔离后逐步替换 |
+| `core/llm/openai_compat.py` | 作为 OpenAI-compatible adapter 的行为参考，经内部协议隔离后逐步替换 |
 | QuizMaster / Grader 的提示词和 Artifact | 合并、简化为 `practice` SKILL.md 与通用 artifact；不迁移练习阶段状态机或专用 Artifact schema |
 | ToolHub / RequestContext | 不复用实现；将权限、预算、去重、幂等、错误分类、请求隔离与审计作为新 `tools/` 系统的回归要求 |
 | benchmark / judge / review / gold | 整体保留为 full regression，再选小集合作 smoke；新增 trace、skill、归因和 mastery replay 维度 |
