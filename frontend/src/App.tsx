@@ -343,6 +343,21 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
     const ids = attachments.map(item => item.id)
     setDraft(''); setAttachments([]); await onSend(text, ids)
   }
+  const scroller = useRef<HTMLDivElement>(null)
+  const lastContent = messages.length ? messages[messages.length - 1].content.length : 0
+  // 换会话就贴到最新一条：不控制的话滚动位置由渲染时序决定，同一个会话两次进去可能停在不同地方。
+  useEffect(() => {
+    const box = scroller.current
+    if (box) box.scrollTop = box.scrollHeight
+  }, [session?.id, messages.length])
+  // 流式追加时跟随，但用户手动往上翻了就别把他拽回来。
+  useEffect(() => {
+    const box = scroller.current
+    if (!box) return
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120
+    if (nearBottom) box.scrollTop = box.scrollHeight
+  }, [lastContent])
+
   const contextNote = !session ? '发送第一条消息会自动创建会话。'
     : session.scope_mode !== 'general' ? ''
     : turnResolution?.sessionId === session.id
@@ -353,7 +368,7 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
   return <section className="chat-view">
     {/* 课程会话的会话名与课程顶栏已经显示了，这里只留通用会话才有的逐轮解析结果。 */}
     {contextNote && <div className="session-context">{contextNote}</div>}
-    <div className="messages" aria-live="polite">
+    <div className="messages" aria-live="polite" ref={scroller}>
       {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式每轮按问题解析课程。直接说出课程名最准。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
       {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope}
         onRetry={busy ? undefined : (() => {
