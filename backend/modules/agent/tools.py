@@ -259,6 +259,11 @@ MAIN_PROFILE = MAIN.tools
 
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 
+# 基座工具：不需要每份 SKILL.md 重复声明，也不该被某个规程收窄掉。
+# 记忆是跨 skill 的记事本——任何规程执行期间都可能出现值得长期记住的事，
+# 而 profile 是整体替换而不是并集，不在这里兜住，skill 一激活它就从工具集里消失。
+BASELINE_TOOLS: tuple[str, ...] = ("memory_patch",)
+
 
 def capabilities_of(names: tuple[str, ...]) -> frozenset[str]:
     return frozenset(TOOL_CAPABILITY[name] for name in names if name in TOOL_CAPABILITY)
@@ -267,6 +272,7 @@ def capabilities_of(names: tuple[str, ...]) -> frozenset[str]:
 def profile_for_skill(allowed: tuple[str, ...]) -> ToolProfile:
     """skill 激活后能力恰好等于它声明的工具所需——声明即权限，多一分都没有。
     花钱工具的次数上限沿用主 profile，不让 skill 绕开预算。"""
+    allowed = tuple(dict.fromkeys(allowed + BASELINE_TOOLS))
     return ToolProfile(
         tools=allowed,
         capabilities=capabilities_of(allowed),

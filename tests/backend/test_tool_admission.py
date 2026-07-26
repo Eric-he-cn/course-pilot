@@ -45,12 +45,15 @@ def test_skill_gets_exactly_its_declared_tools_and_inherits_spend_limits():
     assert profile.per_tool_budget["web_search"] == MAIN.per_tool_budget["web_search"]
 
 
-def test_skill_capabilities_are_exactly_what_it_declares():
-    """声明即权限：多给一分都不行，少给一分 skill 就半残。"""
+def test_skill_gets_its_declared_tools_plus_the_baseline():
+    """声明即权限，例外只有基座工具：它们是跨 skill 的基础设施，不必每份
+    SKILL.md 重复声明。既没声明、又不在基座里的，一件都拿不到。"""
+    from modules.agent.tools import BASELINE_TOOLS
+
     profile = profile_for_skill(("search_materials", "note_write"))
-    assert profile.capabilities == frozenset({"read_course", "write_note"})
     names = {spec.name for spec in specs_for(profile.tools, capabilities=profile.capabilities)}
-    assert names == {"search_materials", "note_write"}
+    assert names == {"search_materials", "note_write", *BASELINE_TOOLS}
+    assert "plan_update" not in names and "web_search" not in names and "use_skill" not in names
 
 
 def test_privileged_tools_are_not_importable_by_user_skills():

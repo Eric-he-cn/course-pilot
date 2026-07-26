@@ -354,3 +354,57 @@ def test_repeating_the_same_query_costs_no_budget(client):
     model_queries = [item for item in executed if "太长会怎样" not in item]
     assert len(model_queries) == 2, f"模型侧实际执行了 {model_queries}"
     assert sum(1 for _, data in _events(body) if data.get("summary", "").endswith("已复用）")) == 2
+
+
+def test_saying_remember_without_calling_the_tool_gets_one_reminder(client):
+    """用户报的真实 bug：模型回答「已记住」但从未调用 memory_patch，用户打开长期记忆是空的。
+    提示词软要求挡不住，所以服务端事后检查一次并补一轮。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    prompts: list[str] = []
+
+    class ForgetsToWrite:
+        mode, provider, model = "provider", "example", "example-model"
+        def __init__(self): self.calls = 0
+        def chat(self, *, messages, tools=()):
+            prompts.extend(m.content for m in messages if m.role == "user")
+            self.calls += 1
+            if self.calls == 1:
+                # 第一轮：只说记住了，一个工具都不调——就是用户遇到的情形
+                yield ChatDelta("已记住！")
+                yield ChatFinal("已记住！", "stop", self.provider, self.model, self.mode)
+            elif self.calls == 2:
+                yield ChatToolCalls((ToolCallRequest("m1", "memory_patch",
+                    '{"scope": "user", "section": "preferences", "content": "先给摘要再展开"}'),))
+            else:
+                yield ChatFinal("已经写进长期记忆了。", "stop", self.provider, self.model, self.mode)
+
+    workspace(client).turns._responder = ForgetsToWrite()
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "mem-1", "message": "记住我喜欢先给摘要再写详细内容"})
+
+    assert any("还没有写进长期记忆" in p for p in prompts), "该补一轮提醒"
+    # 补的那一轮真的写进去了
+    assert "先给摘要再展开" in client.get("/api/v2/memory").json()["content"]
+
+
+def test_no_reminder_when_the_model_already_wrote_memory(client):
+    """已经写成功了就别再啰嗦一轮——补提醒只在真的漏了的时候发。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    prompts: list[str] = []
+
+    class WritesProperly:
+        mode, provider, model = "provider", "example", "example-model"
+        def __init__(self): self.calls = 0
+        def chat(self, *, messages, tools=()):
+            prompts.extend(m.content for m in messages if m.role == "user")
+            self.calls += 1
+            if self.calls == 1:
+                yield ChatToolCalls((ToolCallRequest("m1", "memory_patch",
+                    '{"scope": "user", "section": "preferences", "content": "先给摘要"}'),))
+            else:
+                yield ChatFinal("记住了。", "stop", self.provider, self.model, self.mode)
+
+    workspace(client).turns._responder = WritesProperly()
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "mem-2", "message": "记住我喜欢先给摘要"})
+    assert not any("还没有写进长期记忆" in p for p in prompts)

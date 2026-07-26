@@ -57,6 +57,10 @@ _SKILL_INTENT = {
 # 写计划的放行条件：只认用户键入的原话，图片转录不算——一张写着"复习计划"的
 # 教材照片不该获得写权限。排计划往往要先问考试日期，所以意图在本会话里粘住。
 _PLAN_INTENT = re.compile(r"计划|规划|复习安排|学习安排|安排一下|备考|日程|考试.{0,4}(准备|安排)")
+
+# 要求记住某件事的说法。模型不会主动调 memory_patch，却照样回答「已记住」——
+# 用户因此看到空的 user.md。命中这个又没真写成，就补一轮让它补上。
+_MEMORY_INTENT = re.compile(r"记住|记一下|记下来|别忘|以后都|下次也|默认就|我的习惯|我喜欢")
 _TRANSCRIPTION_MARK = "[图片转录："
 
 
@@ -371,6 +375,9 @@ class TurnService:
                 tool_budget = MAIN.per_tool_budget
                 tool_used: dict[str, int] = {}
                 tool_results: dict[tuple[str, str], object] = {}
+                # 只认用户键入的原话：一张写着「记住」的教材照片不该触发。
+                wants_memory = bool(_MEMORY_INTENT.search(message.split(_TRANSCRIPTION_MARK)[0]))
+                memory_written = memory_reminded = False
                 active_skill: str | None = None
                 max_rounds = self._max_tool_rounds
                 # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
@@ -448,6 +455,15 @@ class TurnService:
                                     missing_steps.append("emit_evidence")
                                 if (wants_practice or awaiting_grade) and not artifact_written:
                                     missing_steps.append("artifact_append")
+                            if not missing_steps and wants_memory and not memory_written and not memory_reminded and tool_rounds < max_rounds:
+                                # 用户明确要求记住，但这一轮没有一次成功的 memory_patch：
+                                # 模型会照样说「已记住」，用户下次打开长期记忆却是空的。
+                                memory_reminded = True
+                                self._merge_usage(usage_total, outcome.usage)
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="user", content="用户要求记住的内容你还没有写进长期记忆。现在只调用 memory_patch 补上，不要重复输出正文。"))
+                                trace_record["memory_reminder"] = True
+                                continue
                             if missing_steps:
                                 # 规程有步骤没做完就补一轮，只补一次。
                                 practice_reminded = True
@@ -490,6 +506,8 @@ class TurnService:
                                     if result.reason is None:
                                         tool_used[call.name] = tool_used.get(call.name, 0) + 1
                                         tool_results[repeat_key] = result
+                                if call.name == "memory_patch" and result.ok:
+                                    memory_written = True
                                 if call.name == "emit_evidence" and result.ok:
                                     evidence_count += 1
                                 if call.name == "artifact_append" and result.ok:
