@@ -480,3 +480,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .danger-actions button.danger { border-color:var(--danger); background:var(--danger); color:#fff }
 .danger-text { color:var(--danger) }
 .settings-course { flex-wrap:wrap }
+.ocr-card .ocr-estimate { width:100%; margin:10px 0 8px; border-collapse:collapse; font-size:12.5px }
+.ocr-card .ocr-estimate th { width:88px; padding:5px 0; color:var(--muted); font-weight:400; text-align:left; vertical-align:top }
+.ocr-card .ocr-estimate td { padding:5px 0 }
+.ocr-card .danger-actions { margin-top:12px }

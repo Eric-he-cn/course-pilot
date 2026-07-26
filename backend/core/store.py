@@ -138,6 +138,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
         CREATE INDEX IF NOT EXISTS idx_compaction_session ON session_compactions(session_id, created_at DESC);
     """),
+    # 扫描版 PDF 的 OCR 批准。OCR 要花模型额度，所以要有一条「用户看过估算并同意」的记录；
+    # 留在库里，重新索引就不必再问一次。
+    (18, "ALTER TABLE materials ADD COLUMN ocr_approved INTEGER NOT NULL DEFAULT 0;"),
 )
 
 class SQLiteStore:

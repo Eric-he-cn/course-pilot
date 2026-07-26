@@ -4,6 +4,9 @@ python-multipart>=0.0.9
 pypdf>=4.0
 pytest>=8.0
 httpx>=0.27
-# 语义检索（BGE 向量）；缺失或加载失败时自动退回纯词面检索
+# 语义检索（BGE 向量）与重排（cross-encoder）；缺失或加载失败时自动退回纯词面检索
 sentence-transformers>=3.0
 pillow>=10.0
+# 扫描版 PDF 逐页渲染成图再交给 OCR。选它是因为 license 干净（BSD-3/Apache-2.0）
+# 且不依赖系统库；PyMuPDF 功能相近但是 AGPL，与本项目的 MIT 不兼容。
+pypdfium2>=4.0

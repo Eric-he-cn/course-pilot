@@ -5,7 +5,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { ApiError, api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
-import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, SessionSummary, SkillInfo, ToolActivity } from './types'
+import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -873,6 +873,7 @@ function MessageCard({ message, onCitation, showResolution, onRetry }: { message
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
   const [tab, setTab] = useState<'rag' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
   const [ragBackend, setRagBackend] = useState<string>('')
+  const [ocrTarget, setOcrTarget] = useState<string>(''); const [ocrEstimate, setOcrEstimate] = useState<OcrEstimate | null>(null); const [ocrRunning, setOcrRunning] = useState(false)
   const reload = async () => { try { setMaterials(await api.materials(course.id)) } catch (error) { onError(errorText(error)) } }
   const removeMaterial = async (materialId: string) => {
     try { await api.deleteMaterial(materialId); await reload() }
@@ -885,22 +886,33 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   async function upload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; if (file.size > MAX_MATERIAL_BYTES) { onError('教材文件超过 100 MiB 上限。'); return } setLoading(true); try { const material = await api.uploadMaterial(course.id, file); setMaterials(current => [material, ...current]); const job = await api.indexMaterial(material.id); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } finally { setLoading(false); event.target.value = '' } }
   async function toggleWiki() { try { onCourseChange(await api.updateCourse(course.id, { wiki_enabled: !course.wiki_enabled })) } catch (error) { onError(errorText(error)) } }
   async function reindex(materialId: string) { try { const job = await api.indexMaterial(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
+  function askOcr(materialId: string) {
+    // 估算本身要真跑两页，所以点开对话框就发起，拿到再显示数字
+    setOcrTarget(materialId); setOcrEstimate(null)
+    api.estimateOcr(materialId).then(setOcrEstimate).catch(error => { onError(errorText(error)); setOcrTarget('') })
+  }
+  async function confirmOcr() {
+    if (!ocrTarget) return
+    setOcrRunning(true)
+    try { const job = await api.startOcr(ocrTarget); setJobs(current => ({ ...current, [job.id]: job })); setOcrTarget('') }
+    catch (error) { onError(errorText(error)) } finally { setOcrRunning(false) }
+  }
   async function buildWiki(materialId: string) { try { const job = await api.buildWiki(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)) } catch (error) { onError(errorText(error)); setResults([]) } finally { setLoading(false) } }
-  const backendLabel = ragBackend === 'hybrid_bge' ? '语义 + 词面混合检索' : ragBackend ? '仅词面检索（语义向量未启用）' : ''
+  const backendLabel = ragBackend === 'hybrid_bge_rerank' ? '混合检索 + 重排' : ragBackend === 'hybrid_bge' ? '语义 + 词面混合检索' : ragBackend ? '仅词面检索（语义向量未启用）' : ''
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课的教材、索引与检索都在这里。换课程用左栏。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>课程笔记</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
-    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、Word、PowerPoint、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{results.length > 0 && <article className="card results-card"><h2>检索结果</h2>{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}</> : <article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料，开始「提取目录 → 概念候选 → 页面草稿 → 待确认」。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
+    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、Word、PowerPoint、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{results.length > 0 && <article className="card results-card"><h2>检索结果</h2>{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? '这份 PDF'} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : <article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料，开始「提取目录 → 概念候选 → 页面草稿 → 待确认」。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
       const wikiJob = Object.values(jobs).find(item => item.material_id === material.id && item.type === 'wiki')
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
       return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? '未命名资料'}</b><small>{wikiJob ? (STAGE_LABELS[String(wikiJob.stage ?? wikiJob.status)] ?? String(wikiJob.status)) : '已索引，可独立解析到 Wiki'}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <small className="danger-text">{wikiJob.error}</small>}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? '重新解析到 Wiki' : '解析到 Wiki'}</button></div>
     }) : <div className="empty-inline">请先上传并完成至少一份资料的索引。</div>}</> : <div className="empty-inline"><b>Wiki 尚未启用</b><p>Wiki 用来浏览教材生成的知识页。不开也不影响提问与检索。</p></div>}</article>}</div></section>
 }
 
-const STAGE_LABELS: Record<string, string> = { uploaded: '待索引', queued: '排队中', starting: '准备中', extracting: '解析文本', chunking: '切块', embedding: '生成语义向量', indexing: '建立索引', completed: '已索引', indexed: '已索引', indexing_failed: '失败', failed: '失败', reading_index: '读取索引', wiki_completed: 'Wiki 已生成' }
+const STAGE_LABELS: Record<string, string> = { uploaded: '待索引', queued: '排队中', starting: '准备中', extracting: '解析文本', chunking: '切块', embedding: '生成语义向量', indexing: '建立索引', completed: '已索引', indexed: '已索引', indexing_failed: '失败', failed: '失败', reading_index: '读取索引', wiki_completed: 'Wiki 已生成', needs_ocr: '需要 OCR' }
 const INDEX_PIPELINE: [string, string][] = [['extracting', '解析'], ['chunking', '切块'], ['embedding', '向量'], ['indexing', '索引']]
 
-function MaterialRow({ material, jobs, onReindex, onDelete }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void; onDelete?: (materialId: string) => Promise<void> }) {
+function MaterialRow({ material, jobs, onReindex, onDelete, onOcr }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void; onDelete?: (materialId: string) => Promise<void>; onOcr?: (materialId: string) => void }) {
   const [confirming, setConfirming] = useState(false)
   const job = Object.values(jobs).find(item => item.material_id === material.id)
   const rawStatus = job?.stage ?? job?.status ?? material.index_status ?? material.status ?? 'uploaded'
@@ -910,6 +922,8 @@ function MaterialRow({ material, jobs, onReindex, onDelete }: { material: Materi
   const indexed = (material.index_status ?? material.status) === 'indexed'
   const semantic = (material.embedded_count ?? 0) > 0
   const stageIndex = INDEX_PIPELINE.findIndex(([stage]) => stage === job?.stage)
+  // 扫描版停在这里等确认：OCR 要花模型额度，先给账单再让用户点
+  const needsOcr = job?.stage === 'needs_ocr' || (material.index_status ?? material.status) === 'needs_ocr'
   const productSummary = indexed && !jobActive
     ? `${material.chunk_count ?? 0} 块 · ${semantic ? '语义 + 词面检索就绪' : '仅词面（点「重建索引」补语义向量）'}`
     : null
@@ -922,7 +936,8 @@ function MaterialRow({ material, jobs, onReindex, onDelete }: { material: Materi
       {job && <div className="job-progress"><i style={{ width: `${job.progress ?? 15}%` }} /></div>}
       {failed && job?.error && <small className="danger-text">{job.error}</small>}
     </div>
-    {!jobActive && <button className="text-button" onClick={() => onReindex(material.id)}>{failed ? '重试索引' : '重建索引'}</button>}
+    {needsOcr && onOcr && <button className="primary-button" onClick={() => onOcr(material.id)}>估算 OCR 用量</button>}
+    {!jobActive && !needsOcr && <button className="text-button" onClick={() => onReindex(material.id)}>{failed ? '重试索引' : '重建索引'}</button>}
     {!jobActive && onDelete && <button className="text-button danger-text" onClick={() => setConfirming(true)}>删除</button>}
     <span className={`status-tag ${failed ? 'failed' : ''}`}>{statusLabel}</span>
     {confirming && onDelete && <DangerConfirm
@@ -937,6 +952,33 @@ function MaterialRow({ material, jobs, onReindex, onDelete }: { material: Materi
   </div>
 }
 function fileKind(material: Material) { const name = material.filename ?? material.name ?? ''; return name.split('.').pop()?.toUpperCase().slice(0, 4) || 'FILE' }
+
+const thousands = (value: number) => value.toLocaleString('en-US')
+
+/** OCR 账单。取样那行是真跑出来的，全书那行是按页数外推的——两者要分开写，
+ *  否则会让人以为外推值也是实测。 */
+function OcrEstimatePanel({ filename, estimate, running, onConfirm, onCancel }: {
+  filename: string; estimate: OcrEstimate | null; running: boolean
+  onConfirm: () => void; onCancel: () => void
+}) {
+  return <article className="card ocr-card">
+    <h2>「{filename}」是扫描版</h2>
+    <p>这份 PDF 没有文字层，要先逐页转成文字才能检索。转录会消耗你配置的 OCR 模型额度。</p>
+    {estimate === null ? <p className="mini-empty">正在取样估算…</p> : <table className="ocr-estimate"><tbody>
+      <tr><th>页数</th><td>{estimate.pages} 页</td></tr>
+      <tr><th>实测取样</th><td>{estimate.sampled_pages} 页 · {thousands(estimate.sample_prompt_tokens + estimate.sample_completion_tokens)} token · {estimate.sample_seconds}s</td></tr>
+      <tr><th>全书预计</th><td><b>{thousands(estimate.projected_total_tokens)} token</b>（输入 {thousands(estimate.projected_prompt_tokens)} ＋ 输出 {thousands(estimate.projected_completion_tokens)}）</td></tr>
+      <tr><th>预计耗时</th><td>约 {estimate.projected_minutes} 分钟</td></tr>
+    </tbody></table>}
+    <small className="help-note">全书数字按取样线性外推，实际随页面繁简浮动。折算成钱要按你自己那家的计价乘一下。</small>
+    <div className="danger-actions">
+      <button className="primary-button" disabled={estimate === null || running} onClick={onConfirm}>
+        {running ? '正在转录…' : '确认并开始 OCR'}
+      </button>
+      <button className="ghost-button" onClick={onCancel}>取消</button>
+    </div>
+  </article>
+}
 
 function PlanView({ course, onError }: { course: Course; onError: (message: string) => void }) {
   const [plan, setPlan] = useState<Plan | null>(null)

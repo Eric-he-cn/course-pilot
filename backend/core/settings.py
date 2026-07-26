@@ -67,6 +67,24 @@ class ModelChoice:
         return "max" if effort == "max" else "high"
 
 
+# 已在真实语料上标定过阈值的重排模型。标定方法与完整数据见 adapters/reranker.py 的注释。
+# rerank 分是无界 logit 过 sigmoid 得来的，尺度跟着模型走，换模型必须重新标定。
+CALIBRATED_RERANK_THRESHOLDS: dict[str, float] = {
+    "BAAI/bge-reranker-v2-m3": 0.3,
+    "BAAI/bge-reranker-base": 0.3,
+}
+
+
+def _rerank_threshold(raw: str, model_name: str) -> float:
+    """没显式配阈值时，只对标定过的模型启用过滤。
+
+    给一个没标定过的模型套上别人的阈值，等于随机误杀教材内容——那种情况宁可不过滤。
+    """
+    if raw.strip():
+        return min(1.0, max(0.0, float(raw)))
+    return CALIBRATED_RERANK_THRESHOLDS.get(model_name, 0.0)
+
+
 def _read_models(value) -> tuple[ModelChoice, ...]:
     """第一个模型用不带后缀的 TEXT_*；之后按 TEXT_MODEL_2、_3… 递增，扫到断号为止。
     同一家的第二个模型只需要填 TEXT_MODEL_n 一行，其余字段继承第一个。"""
@@ -119,9 +137,15 @@ class Settings:
     rag_embedding_model: str = ""
     rag_embedding_device: str = "auto"
     rag_embedding_batch_size: int = 256
-    # 检索命中的余弦相似度下限，低于它就当这次没搜到。默认按 bge-base-zh-v1.5 实测取值：
-    # 明显无关的闲聊在 0.22 以下，教材相关的查询在 0.24 以上，取 0.20 留出误杀余量。
+    # 召回阶段的余弦下限，默认 0（关闭）。余弦分的绝对值不跨库可比——实测正例最低 0.375、
+    # 负例最高 0.525，任何取值都会误杀。判「有没有搜到」交给下面的 rerank 分。
     rag_min_similarity: float = 0.0
+    # 重排：空字符串关闭，此时退回 RRF 排序并且阈值不生效。
+    rag_reranker_model: str = ""
+    # 送进 rerank 的候选数（词面 top-N ∪ 语义 top-N 去重后截断）
+    rag_rerank_candidates: int = 20
+    # rerank 分下限，逐条过滤，全部低于它就等于这次没搜到。标定见 adapters/reranker.py
+    rag_min_rerank_score: float = 0.2
     # vision 槽位（OCR）：未配置时附件上传返回 feature_disabled。
     vision_provider: str = ""
     vision_base_url: str = ""
@@ -186,6 +210,7 @@ class Settings:
         data_dir = Path(value("STORAGE_DATA_DIR", str(root / "data")))
         if not data_dir.is_absolute():
             data_dir = root / data_dir
+        reranker_model = value("RAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
         return cls(
             data_dir, data_dir / "coursepilot.db", data_dir / "materials",
             value("TEXT_PROVIDER", "openai_compatible"), value("TEXT_BASE_URL"),
@@ -203,7 +228,10 @@ class Settings:
             value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"),
             value("RAG_EMBEDDING_DEVICE", "auto"),
             max(1, int(value("RAG_EMBEDDING_BATCH_SIZE", "256"))),
-            min(1.0, max(0.0, float(value("RAG_MIN_SIMILARITY", "0.2")))),
+            min(1.0, max(0.0, float(value("RAG_MIN_SIMILARITY", "0")))),
+            reranker_model,
+            max(1, int(value("RAG_RERANK_CANDIDATES", "20"))),
+            _rerank_threshold(value("RAG_MIN_RERANK_SCORE"), reranker_model),
             value("VISION_PROVIDER"),
             value("VISION_BASE_URL"),
             value("VISION_API_KEY"),

@@ -25,6 +25,7 @@ def _material(row: object) -> Material:
         mime_type=row["mime_type"], byte_size=row["byte_size"], index_status=row["index_status"],
         created_at=row["created_at"], updated_at=row["updated_at"],
         chunk_count=row["chunk_count"], embedded_count=row["embedded_count"],
+        ocr_approved=bool(row["ocr_approved"]),
     )
 
 
@@ -112,6 +113,10 @@ class KnowledgeRepository:
     def set_material_status(self, material_id: str, status: str) -> None:
         with self._store.write() as conn:
             conn.execute("UPDATE materials SET index_status = ?, updated_at = ? WHERE id = ?", (status, utc_now(), material_id))
+
+    def set_ocr_approved(self, material_id: str, approved: bool) -> None:
+        with self._store.write() as conn:
+            conn.execute("UPDATE materials SET ocr_approved = ?, updated_at = ? WHERE id = ?", (int(approved), utc_now(), material_id))
 
     def create_job(self, *, type: str, material_id: str, course_id: str, retrieval_backend: str | None = None) -> Job:
         job_id, now = new_id("job"), utc_now()

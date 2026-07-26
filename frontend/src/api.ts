@@ -1,4 +1,4 @@
-import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent } from './types'
+import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
@@ -111,6 +111,8 @@ export const api = {
   setSkillEnabled: (name: string, enabled: boolean) => request<{ name: string; status: string }>(`/skills/${name}`, json('PATCH', { enabled })),
   deleteSkill: (name: string) => request<void>(`/skills/${name}`, { method: 'DELETE' }),
   indexMaterial: (materialId: string) => request<Job>(`/materials/${materialId}/index`, json('POST')),
+  estimateOcr: (materialId: string) => request<OcrEstimate>(`/materials/${materialId}/ocr/estimate`, json('POST')),
+  startOcr: (materialId: string) => request<Job>(`/materials/${materialId}/ocr`, json('POST')),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   buildWiki: (materialId: string) => request<Job>(`/materials/${materialId}/wiki`, json('POST')),
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),

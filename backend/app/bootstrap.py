@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from adapters.embedding import BgeEmbedder
+from adapters.reranker import CrossEncoderReranker
 from adapters.web import HttpWebAccess
 from adapters.llm import DemoAgentChat, OpenAICompatibleChat, VisionOcrTranscriber
 from contracts.llm import AgentChatPort, VisionTranscriberPort
@@ -117,6 +118,7 @@ class SharedRuntime:
     vision: VisionTranscriberPort | None
     web: WebSearchPort | None
     embedder: object | None
+    reranker: object | None = None
     # (模型 key, 是否开思考) → 适配器。空表示没配远端，一律走 fallback。
     responders: dict[tuple[str, str], AgentChatPort] = field(default_factory=dict)
 
@@ -180,14 +182,18 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
         BgeEmbedder(model_name=settings.rag_embedding_model, device=settings.rag_embedding_device, batch_size=settings.rag_embedding_batch_size)
         if settings.rag_embedding_model else None
     )
-    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, web=web, embedder=embedder, responders=responders)
+    reranker = (
+        CrossEncoderReranker(model_name=settings.rag_reranker_model, device=settings.rag_embedding_device)
+        if settings.rag_reranker_model else None
+    )
+    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, web=web, embedder=embedder, reranker=reranker, responders=responders)
 
 
 def build_application(settings: Settings, shared: SharedRuntime | None = None) -> Application:
     """The one composition root: modules never instantiate repositories or adapters themselves."""
     runtime = shared or build_shared_runtime(settings)
     llm, fallback, classifier = runtime.llm, runtime.fallback, runtime.classifier
-    vision, web, embedder = runtime.vision, runtime.web, runtime.embedder
+    vision, web, embedder, reranker = runtime.vision, runtime.web, runtime.embedder, runtime.reranker
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(settings.database_path)
     store.migrate()
@@ -204,6 +210,9 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         settings=settings,
         wiki_is_enabled=lambda course_id: bool((course := courses.get_course(course_id)) and course.wiki_enabled),
         embedder=embedder,
+        reranker=reranker,
+        # 扫描版 PDF 的逐页 OCR 复用对话里那个 vision 槽位，不额外配一份
+        transcriber=vision,
     )
     resolver = CourseResolver(courses, classifier=classifier)
     sessions = SessionService(

@@ -142,6 +142,20 @@ export interface Material {
   error?: string | null
   chunk_count?: number
   embedded_count?: number
+  ocr_approved?: boolean
+}
+
+// OCR 估算：取样是实测的，projected 是按页数外推的
+export interface OcrEstimate {
+  pages: number
+  sampled_pages: number
+  sample_prompt_tokens: number
+  sample_completion_tokens: number
+  sample_seconds: number
+  projected_prompt_tokens: number
+  projected_completion_tokens: number
+  projected_total_tokens: number
+  projected_minutes: number
 }
 
 export interface Job {

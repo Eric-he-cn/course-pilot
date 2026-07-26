@@ -94,6 +94,27 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
         except ValueError as error:
             raise _not_found(str(error)) from error
 
+    @router.post("/materials/{material_id}/ocr/estimate")
+    def estimate_ocr(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """真 OCR 两页量成本再外推。本身要花一点额度，所以是 POST 而不是 GET。"""
+        try:
+            return application.knowledge.estimate_ocr(material_id=material_id)
+        except KnowledgeFeatureDisabledError as error:
+            raise HTTPException(status_code=409, detail={"code": "feature_disabled", "message": str(error)}) from error
+        except ValueError as error:
+            raise _not_found(str(error)) from error
+
+    @router.post("/materials/{material_id}/ocr")
+    def start_ocr(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        try:
+            job = application.knowledge.approve_ocr(material_id=material_id)
+            application.knowledge_jobs.submit(job.id)
+            return _job_payload(application.knowledge.get_job(job_id=job.id) or job)
+        except KnowledgeFeatureDisabledError as error:
+            raise HTTPException(status_code=409, detail={"code": "feature_disabled", "message": str(error)}) from error
+        except ValueError as error:
+            raise _not_found(str(error)) from error
+
     @router.get("/jobs/{job_id}")
     def get_job(job_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         job = application.knowledge.get_job(job_id=job_id)
