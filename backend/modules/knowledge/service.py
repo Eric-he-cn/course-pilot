@@ -12,6 +12,7 @@ from contracts.knowledge import ConceptRef, KnowledgeHit, ResolvedKnowledgeScope
 
 from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
 from .concepts import extract_candidates
+from .extract import SUPPORTED_SUFFIXES, extract_pages
 from .models import Job, Material
 from .repository import KnowledgeRepository
 
@@ -23,7 +24,7 @@ class KnowledgeService:
     code receives the port through bootstrap and never receives this repository.
     """
 
-    _ALLOWED_SUFFIXES = {".pdf", ".txt", ".md"}
+    _ALLOWED_SUFFIXES = SUPPORTED_SUFFIXES
 
     def __init__(
         self,
@@ -43,7 +44,7 @@ class KnowledgeService:
         safe_name = re.sub(r"\s+", " ", Path(filename).name).strip()[:120]
         suffix = Path(safe_name).suffix.lower()
         if not safe_name or suffix not in self._ALLOWED_SUFFIXES:
-            raise ValueError("仅支持 PDF、TXT 或 MD 教材")
+            raise ValueError("仅支持 PDF、Word、PowerPoint、TXT 或 MD 教材")
         if not content:
             raise ValueError("教材不能为空")
         if len(content) > self._settings.material_max_bytes:
@@ -199,7 +200,7 @@ class KnowledgeService:
             path = self._repository.material_storage_path(material.id)
             if path is None or not path.is_file():
                 raise ValueError("教材文件不存在")
-            segments = self._extract_pages(path, material.filename)
+            segments = extract_pages(path, material.filename)
             self._repository.update_job(job.id, status="running", stage="chunking", progress=40)
             chunks = [(page, piece) for page, text in segments for piece in self._chunk(text)]
             if not chunks:
@@ -223,29 +224,6 @@ class KnowledgeService:
         except Exception as error:
             self._repository.set_material_status(material.id, "failed")
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error), retrieval_backend="sqlite_fts")
-
-    def _extract_pages(self, path: Path, filename: str) -> list[tuple[int | None, str]]:
-        """Extract text segments with their page numbers; page is None when unknown."""
-        raw = path.read_bytes()
-        if Path(filename).suffix.lower() in {".txt", ".md"}:
-            return [(None, raw.decode("utf-8", errors="replace").strip())]
-        try:
-            # Avoid asking pypdf to parse clearly incomplete data: besides being
-            # noisy, it cannot improve on the fallback below.
-            if b"%%EOF" not in raw:
-                raise ValueError("incomplete PDF")
-            from pypdf import PdfReader  # Optional at unit-test time; declared runtime dependency.
-            pages = [(number, (page.extract_text() or "").strip()) for number, page in enumerate(PdfReader(str(path)).pages, start=1)]
-            if any(text for _, text in pages):
-                return pages
-        except Exception:
-            # Some valid PDFs are image-only or use unsupported encodings.  Fall
-            # through to the small local fallback before reporting extraction
-            # failure to the job.
-            pass
-        # Dependency-free PDF fallback: support common literal-string text operators.
-        fragments = re.findall(rb"\(([^()]*)\)\s*(?:Tj|TJ)", raw)
-        return [(None, "\n".join(fragment.decode("latin-1", errors="replace") for fragment in fragments).strip())]
 
     def _chunk(self, text: str) -> list[str]:
         normalized = re.sub(r"\r\n?", "\n", text).strip()

@@ -20,3 +20,6 @@ testdata/
 
 .claude/settings.local.json
 .playwright-mcp/
+
+# 探索期的工作目录：调研笔记、标定数据、临时脚本，不进仓库
+Docs/工作目录/
