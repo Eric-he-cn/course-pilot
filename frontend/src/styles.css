@@ -89,6 +89,9 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .statusbar .right { margin-left:auto }
 /* 窄屏让位给连接状态：按 class 标出可省略的项，按位置写会在插入新项时隐藏错东西 */
 .statusbar-detail { overflow:hidden; text-overflow:ellipsis }
+/* 状态栏里的下拉：看起来还是状态栏文字，点开才是选择器 */
+.statusbar-picker select { border:1px solid transparent; border-radius:4px; padding:1px 3px; background:transparent; color:inherit; font-family:var(--mono); font-size:10.5px }
+.statusbar-picker select:hover { border-color:var(--border); background:var(--bg) }
 
 /* ---- 对话 ---- */
 .chat-view { display:flex; flex:1; flex-direction:column; min-height:0 }
@@ -324,7 +327,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
   .mobile-only { display:inline-grid }
   .collapse-only { display:none }
   .topbar { padding:0 12px }
-  .statusbar-detail { display:none }
+  .statusbar-detail,.statusbar-picker { display:none }
   .messages { padding-left:16px; padding-right:16px }
   .session-context { padding-left:16px; padding-right:16px }
   .composer-wrap { padding:10px 12px 14px }

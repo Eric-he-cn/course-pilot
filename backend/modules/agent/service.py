@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
 from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest
@@ -118,6 +118,7 @@ class TurnService:
         web: WebSearchPort | None = None,
         notes: NoteStore | None = None,
         trace: TraceWriter | None = None,
+        select_responder: Callable[[str | None, bool | None], AgentChatPort] | None = None,
         max_tool_rounds: int = 6,
         history_token_budget: int = 128_000,
         context_char_limit: int = 512_000,
@@ -126,6 +127,8 @@ class TurnService:
         self._sessions, self._knowledge = sessions, knowledge
         self._responder = responder
         self._fallback_responder = fallback_responder
+        # 本轮用哪个模型由调用方按请求决定；没给就一直用构造时那个。
+        self._select_responder = select_responder
         self._skills = skills
         self._artifacts = artifacts
         self._compactions = compactions
@@ -242,7 +245,8 @@ class TurnService:
         except json.JSONDecodeError:
             return {"raw": raw[:200]}
 
-    def run(self, *, session_id: str, message: str, client_request_id: str, attachment_ids: list[str] | None = None) -> Iterator[dict[str, object]]:
+    def run(self, *, session_id: str, message: str, client_request_id: str, attachment_ids: list[str] | None = None,
+            model_key: str | None = None, thinking: bool | None = None) -> Iterator[dict[str, object]]:
         session = self._sessions.get_session(session_id)
         if session is None:
             raise LookupError("会话不存在")
@@ -339,7 +343,10 @@ class TurnService:
                 )
                 messages = assembled.messages
                 base_segments = assembled.segments
+                # 没带选择就用构造时注入的那个（生产里即配置中第一个模型与它的默认思考状态）。
                 responder = self._responder
+                if self._select_responder and (model_key is not None or thinking is not None):
+                    responder = self._select_responder(model_key, thinking)
                 allowed_tools = MAIN_PROFILE
                 capabilities = MAIN.capabilities
                 tool_budget = MAIN.per_tool_budget

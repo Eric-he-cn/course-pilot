@@ -6,13 +6,13 @@ from functools import partial
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import Application
-from app.http.deps import current_workspace
+from app.http.deps import current_workspace, model_choice
 from contracts.llm import LLMProviderError
 from modules.sessions.api import VisionFeatureDisabledError
 
@@ -131,11 +131,12 @@ def create_core_router() -> APIRouter:
             await file.close()
 
     @router.post("/sessions/{session_id}/turns")
-    def turn(session_id: str, request: TurnRequest, application: Application = Depends(current_workspace)):
+    def turn(session_id: str, request: TurnRequest, http_request: Request, application: Application = Depends(current_workspace)):
         if application.sessions.get_session(session_id) is None:
             raise _not_found(LookupError("会话不存在"))
+        model_key, thinking = model_choice(http_request)
         def stream():
-            for payload in application.turns.run(session_id=session_id, message=request.message, client_request_id=request.client_request_id, attachment_ids=request.attachment_ids):
+            for payload in application.turns.run(session_id=session_id, message=request.message, client_request_id=request.client_request_id, attachment_ids=request.attachment_ids, model_key=model_key, thinking=thinking):
                 yield f"event: {payload['event']}\ndata: {json.dumps(payload['data'], ensure_ascii=False)}\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

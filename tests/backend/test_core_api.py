@@ -375,3 +375,70 @@ def test_health_reports_enabled_provider_adapter_without_exposing_key(tmp_path):
     assert llm["model"] == "example-model"
     assert "api_key" not in llm
     assert "test-secret" not in json.dumps(llm)
+
+
+def _multi_model_settings(tmp_path):
+    from core.settings import ModelChoice
+    base = _settings(tmp_path)
+    return replace(
+        base, text_api_key="k", enable_remote_llm=True,
+        text_models=(
+            ModelChoice(key="1", label="模型一", provider="example", base_url="https://api.example.com/v1",
+                        api_key="k", model="cheap-model", extra_body={"thinking": {"type": "disabled"}}),
+            ModelChoice(key="2", label="模型二", provider="example", base_url="https://api.example.com/v1",
+                        api_key="k", model="strong-model"),
+        ),
+    )
+
+
+def test_health_lists_every_configured_model_for_the_picker(tmp_path):
+    with TestClient(create_app(settings=_multi_model_settings(tmp_path))) as client:
+        llm = client.get("/api/v2/health").json()["llm"]
+    assert [item["model"] for item in llm["choices"]] == ["cheap-model", "strong-model"]
+    assert [item["label"] for item in llm["choices"]] == ["模型一", "模型二"]
+    # 第一个模型显式关了思考，第二个没配就按厂商默认（开）算
+    assert [item["thinking_default"] for item in llm["choices"]] == [False, True]
+    assert llm["default_choice"] == "1" and llm["default_thinking"] is False
+
+
+def test_turn_uses_the_model_named_in_the_header(tmp_path):
+    """界面把选择放在请求头里，服务端据此选适配器；认不出的 key 落回第一个模型，
+    不能让一个过期的前端选择把整轮打挂。"""
+    used: list[str] = []
+
+    class Probe:
+        mode, provider = "provider", "example"
+        def __init__(self, model): self.model = model
+        def chat(self, *, messages, tools=()):
+            used.append(self.model)
+            yield ChatDelta("好")
+            from contracts.llm import ChatFinal
+            yield ChatFinal("好", "stop", self.provider, self.model, self.mode)
+        def health(self): return {"mode": self.mode, "provider": self.provider, "model": self.model}
+        def close(self): pass
+
+    app = create_app(settings=_multi_model_settings(tmp_path))
+    with TestClient(app) as client:
+        client.get("/api/v2/health")
+        workspaces = app.state.workspaces
+        runtime = workspaces.shared
+        runtime.responders.clear()
+        runtime.responders.update({
+            ("1", False): Probe("cheap-model"), ("1", True): Probe("cheap-thinking"),
+            ("2", False): Probe("strong-model"), ("2", True): Probe("strong-thinking"),
+        })
+        # 必须是课程会话：通用会话解析不出课程会走 guardrail，一次都不调模型。
+        course = client.post("/api/v2/courses", json={"name": "操作系统"}).json()
+        session = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()
+
+        workspaces.default().turns._responder = Probe("cheap-model")
+        for headers, expected in [
+            ({}, "cheap-model"),                                                  # 不带头 → 构造时那个
+            ({"X-CoursePilot-Model": "2"}, "strong-model"),
+            ({"X-CoursePilot-Model": "2", "X-CoursePilot-Thinking": "on"}, "strong-thinking"),
+            ({"X-CoursePilot-Model": "99"}, "cheap-model"),                       # 认不出 → 落回第一个
+        ]:
+            used.clear()
+            client.post(f"/api/v2/sessions/{session['id']}/turns",
+                        json={"client_request_id": f"req-{expected}-{len(headers)}", "message": "你好"}, headers=headers)
+            assert used and used[0] == expected, f"headers={headers} 期望 {expected}，实际 {used}"

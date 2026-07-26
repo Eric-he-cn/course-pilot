@@ -19,7 +19,7 @@ def _read_dotenv(path: Path) -> dict[str, str]:
     return values
 
 
-def _parse_extra_body(raw: str) -> dict[str, object]:
+def _parse_extra_body(raw: str, name: str = "TEXT_EXTRA_BODY") -> dict[str, object]:
     """配置错了就在启动时说清楚，别留到第一次对话才炸。"""
     text = raw.strip()
     if not text:
@@ -27,10 +27,62 @@ def _parse_extra_body(raw: str) -> dict[str, object]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as error:
-        raise ValueError(f"TEXT_EXTRA_BODY 不是合法 JSON：{error}") from error
+        raise ValueError(f"{name} 不是合法 JSON：{error}") from error
     if not isinstance(parsed, dict):
-        raise ValueError("TEXT_EXTRA_BODY 必须是 JSON 对象")
+        raise ValueError(f"{name} 必须是 JSON 对象")
     return parsed
+
+
+_CN_DIGITS = "一二三四五六七八九"
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    """一个可选的对话模型。序号即 key，标签不带性能判断——用户要的是「模型一/二」。"""
+
+    key: str
+    label: str
+    provider: str
+    base_url: str
+    api_key: str
+    model: str
+    extra_body: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.base_url and self.model)
+
+    @property
+    def thinking_default(self) -> bool:
+        """配置里显式关掉才算关，其余按厂商默认（开）算。"""
+        thinking = self.extra_body.get("thinking")
+        return not (isinstance(thinking, dict) and thinking.get("type") == "disabled")
+
+
+def _read_models(value) -> tuple[ModelChoice, ...]:
+    """第一个模型用不带后缀的 TEXT_*；之后按 TEXT_MODEL_2、_3… 递增，扫到断号为止。
+    同一家的第二个模型只需要填 TEXT_MODEL_n 一行，其余字段继承第一个。"""
+    first = ModelChoice(
+        key="1", label="模型一",
+        provider=value("TEXT_PROVIDER", "openai_compatible"), base_url=value("TEXT_BASE_URL"),
+        api_key=value("TEXT_API_KEY"), model=value("TEXT_MODEL"),
+        extra_body=_parse_extra_body(value("TEXT_EXTRA_BODY")),
+    )
+    models = [first]
+    for index in range(2, 10):
+        model = value(f"TEXT_MODEL_{index}").strip()
+        if not model:
+            break
+        raw_extra = value(f"TEXT_EXTRA_BODY_{index}").strip()
+        models.append(ModelChoice(
+            key=str(index), label=f"模型{_CN_DIGITS[index - 1]}",
+            provider=value(f"TEXT_PROVIDER_{index}") or first.provider,
+            base_url=value(f"TEXT_BASE_URL_{index}") or first.base_url,
+            api_key=value(f"TEXT_API_KEY_{index}") or first.api_key,
+            model=model,
+            extra_body=_parse_extra_body(raw_extra, f"TEXT_EXTRA_BODY_{index}") if raw_extra else dict(first.extra_body),
+        ))
+    return tuple(models)
 
 
 @dataclass(frozen=True)
@@ -80,6 +132,8 @@ class Settings:
     web_timeout_seconds: float = 20
     # 厂商私有的请求字段（如关闭思考模式），原样并入 chat/completions 请求体。
     text_extra_body: dict[str, object] = field(default_factory=dict)
+    # 可选的对话模型。第一项等同上面那组 text_* 字段，界面按它们的顺序给用户切换。
+    text_models: tuple[ModelChoice, ...] = ()
 
     def for_workspace(self, workspace_dir: Path) -> "Settings":
         """某个用户工作区的 Settings。三个路径字段必须一起换——只改 data_dir
@@ -93,6 +147,16 @@ class Settings:
     @property
     def remote_llm_configured(self) -> bool:
         return bool(self.text_api_key and self.text_base_url and self.text_model)
+
+    @property
+    def models(self) -> tuple[ModelChoice, ...]:
+        """直接构造 Settings（测试、脚本）时不必填 text_models，这里从单模型字段兜出一个。"""
+        if self.text_models:
+            return self.text_models
+        return (ModelChoice(
+            key="1", label="模型一", provider=self.text_provider, base_url=self.text_base_url,
+            api_key=self.text_api_key, model=self.text_model, extra_body=dict(self.text_extra_body),
+        ),)
 
     @property
     def web_search_configured(self) -> bool:
@@ -141,4 +205,5 @@ class Settings:
             value("RESEARCH_SERPAPI_API_KEY"),
             max(1.0, float(value("WEB_TIMEOUT_SECONDS", "20"))),
             _parse_extra_body(value("TEXT_EXTRA_BODY")),
+            _read_models(value),
         )

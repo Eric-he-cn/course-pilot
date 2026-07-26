@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import { ApiError, api, clearCurrentUser, currentUser, onConnectionLost, setCurrentUser } from './api'
+import { ApiError, api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, SessionSummary, SkillInfo, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
@@ -311,7 +311,7 @@ export default function App() {
       <footer className="statusbar">
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
         {/* 掉线时这些都是缓存的旧值，留着会让人以为服务还在 */}
-        {apiOnline !== false && healthLlm && <span className="statusbar-detail">{String(healthLlm.provider)}/{String(healthLlm.model)}{healthLlm.enabled ? '' : ' · local demo'}</span>}
+        {apiOnline !== false && healthLlm && <ModelPicker llm={healthLlm} />}
         {apiOnline !== false && healthRag && <span className="statusbar-detail">retrieval: {String(healthRag.backend)}</span>}
         {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">回答优先用当前课程的资料，没命中教材会标注出来</span>}
         <span className="right">CoursePilot v2.0</span>
@@ -532,6 +532,37 @@ function HelpView({ courses, health, onError, onTry }: { courses: Course[]; heal
         通用会话不在同一轮里跨多门课读写；解析不出唯一课程时会先问你。</p>
     </article>
   </div></section>
+}
+
+type ModelOption = { key: string; label: string; model: string; thinking_default: boolean }
+
+function ModelPicker({ llm }: { llm: Record<string, unknown> }) {
+  const options = (llm.choices as ModelOption[] | undefined) ?? []
+  const [model, setModel] = useState(() => currentModel())
+  const [thinking, setThinking] = useState<boolean | null>(() => currentThinking())
+  if (!llm.enabled) return <span className="statusbar-detail">{String(llm.provider)}/{String(llm.model)} · local demo</span>
+  if (options.length === 0) return <span className="statusbar-detail">{String(llm.provider)}/{String(llm.model)}</span>
+
+  const active = options.find(item => item.key === model) ?? options.find(item => item.key === llm.default_choice) ?? options[0]
+  const thinkingOn = thinking ?? active.thinking_default
+  return <>
+    <label className="statusbar-picker">
+      <span className="sr-only">对话模型</span>
+      <select value={active.key} onChange={event => { setCurrentModel(event.target.value); setModel(event.target.value) }}>
+        {options.map(item => <option key={item.key} value={item.key}>{item.label} · {item.model}</option>)}
+      </select>
+    </label>
+    <label className="statusbar-picker">
+      <span className="sr-only">思考模式</span>
+      <select value={thinkingOn ? 'on' : 'off'} onChange={event => {
+        const next = event.target.value === 'on'
+        setCurrentThinking(next); setThinking(next)
+      }}>
+        <option value="off">思考 关</option>
+        <option value="on">思考 开</option>
+      </select>
+    </label>
+  </>
 }
 
 function ThinkingHint({ activity }: { activity?: ToolActivity[] }) {

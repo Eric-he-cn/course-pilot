@@ -2,10 +2,31 @@ import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Messa
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
+const MODEL_KEY = 'cp-model'
+const THINKING_KEY = 'cp-thinking'
 
 export function currentUser(): string { return localStorage.getItem(USER_KEY) ?? '' }
 export function setCurrentUser(name: string) { localStorage.setItem(USER_KEY, name) }
 export function clearCurrentUser() { localStorage.removeItem(USER_KEY) }
+
+/** 模型与思考开关存在本地：服务端保持无状态，多个标签页可以各用各的。
+ *  没选过就不带这两个头，由服务端用配置里的第一个模型与它的默认值。 */
+export function currentModel(): string { return localStorage.getItem(MODEL_KEY) ?? '' }
+export function setCurrentModel(key: string) { localStorage.setItem(MODEL_KEY, key) }
+export function currentThinking(): boolean | null {
+  const raw = localStorage.getItem(THINKING_KEY)
+  return raw === null ? null : raw === 'on'
+}
+export function setCurrentThinking(on: boolean) { localStorage.setItem(THINKING_KEY, on ? 'on' : 'off') }
+
+function modelHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {}
+  const model = currentModel()
+  if (model) headers['X-CoursePilot-Model'] = model
+  const thinking = currentThinking()
+  if (thinking !== null) headers['X-CoursePilot-Thinking'] = thinking ? 'on' : 'off'
+  return headers
+}
 
 /** HTTP 头值是 ByteString：中日韩用户名必须编码后再放，否则浏览器 fetch 直接抛 TypeError。 */
 function userHeaders(): Record<string, string> {
@@ -100,7 +121,7 @@ export const api = {
     let response: Response
     try {
       const init = json('POST', { message: content, attachment_ids: attachmentIds })
-      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, { ...init, headers: { ...init.headers, ...userHeaders() }, signal })
+      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, { ...init, headers: { ...init.headers, ...userHeaders(), ...modelHeaders() }, signal })
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
       throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')

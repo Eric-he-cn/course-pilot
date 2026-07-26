@@ -9,6 +9,17 @@ from app.bootstrap import Application
 from core.identity import InvalidUsername
 
 USER_HEADER = "X-CoursePilot-User"
+MODEL_HEADER = "X-CoursePilot-Model"
+THINKING_HEADER = "X-CoursePilot-Thinking"
+
+
+def model_choice(request: Request) -> tuple[str | None, bool | None]:
+    """本轮用哪个模型、要不要开思考。都不带就用配置里的第一个模型与它的默认值。
+    选择放在请求头而不是服务端：多个标签页可以各用各的，服务端保持无状态。"""
+    key = request.headers.get(MODEL_HEADER, "").strip() or None
+    raw = request.headers.get(THINKING_HEADER, "").strip().lower()
+    thinking = True if raw in {"1", "on", "true"} else False if raw in {"0", "off", "false"} else None
+    return key, thinking
 
 
 def current_workspace(request: Request) -> Application:
