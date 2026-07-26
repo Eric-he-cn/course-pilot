@@ -18,11 +18,18 @@ export class ApiError extends Error {
   constructor(message: string, public status?: number) { super(message) }
 }
 
+/** 只报告掉线，不报告在线：在线由 health 心跳判定。
+ *  开发时前端走 vite 代理，后端挂了代理会返回 500 而不是让 fetch 抛错——
+ *  把「拿到响应」当成在线，掉线就永远发现不了。 */
+let reportOffline: (() => void) | null = null
+export function onConnectionLost(fn: () => void) { reportOffline = fn }
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
     response = await fetch(`${BASE}${path}`, { ...init, headers: { ...(init?.headers ?? {}), ...userHeaders() } })
   } catch {
+    reportOffline?.()
     throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')
   }
   if (!response.ok) {

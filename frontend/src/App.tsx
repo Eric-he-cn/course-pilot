@@ -1,10 +1,10 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import { ApiError, api, clearCurrentUser, currentUser, setCurrentUser } from './api'
+import { ApiError, api, clearCurrentUser, currentUser, onConnectionLost, setCurrentUser } from './api'
 import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, SessionSummary, SkillInfo, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
@@ -109,10 +109,26 @@ export default function App() {
   const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewNames[view]
 
   useEffect(() => { localStorage.setItem('cp-sidebar-collapsed', String(sidebarCollapsed)) }, [sidebarCollapsed])
+  const heartbeat = useCallback(async () => {
+    try {
+      const payload = await api.health()
+      // 后端真的在，才算在线：代理给的 500 走不到这里。
+      setHealth(payload); setApiOnline(true)
+    } catch {
+      setApiOnline(false)
+    }
+  }, [])
   useEffect(() => {
-    api.health().then(payload => { setApiOnline(true); setHealth(payload) }).catch(() => setApiOnline(false))
+    onConnectionLost(() => setApiOnline(false))
+    void heartbeat()
     api.courses().then(setCourses).catch(error => setNotice(errorText(error)))
   }, [])
+  // health 是唯一权威的探针：只靠用户操作发现不了掉线（盯着状态栏不点东西时没有请求），
+  // 而开发时走 vite 代理，后端挂了拿到的是代理给的 500，不能当成在线。
+  useEffect(() => {
+    const timer = window.setInterval(heartbeat, apiOnline === false ? 5000 : 15000)
+    return () => window.clearInterval(timer)
+  }, [apiOnline, heartbeat])
   useEffect(() => { void loadSessions() }, [workspace.scope, workspace.courseId])
   useEffect(() => { setTurnResolution(null); setContextUsage(null); if (activeSession) void loadMessages(activeSession.id) }, [activeSession?.id])
 
@@ -294,9 +310,10 @@ export default function App() {
       {view === 'help' && <HelpView courses={courses} health={health} onError={setNotice} onTry={text => { setView('chat'); setDraftSeed(text) }} />}
       <footer className="statusbar">
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
-        {healthLlm && <span className="statusbar-detail">{String(healthLlm.provider)}/{String(healthLlm.model)}{healthLlm.enabled ? '' : ' · local demo'}</span>}
-        {healthRag && <span className="statusbar-detail">retrieval: {String(healthRag.backend)}</span>}
-        {view === 'chat' && <span className="statusbar-detail">回答优先用当前课程的资料，没命中教材会标注出来</span>}
+        {/* 掉线时这些都是缓存的旧值，留着会让人以为服务还在 */}
+        {apiOnline !== false && healthLlm && <span className="statusbar-detail">{String(healthLlm.provider)}/{String(healthLlm.model)}{healthLlm.enabled ? '' : ' · local demo'}</span>}
+        {apiOnline !== false && healthRag && <span className="statusbar-detail">retrieval: {String(healthRag.backend)}</span>}
+        {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">回答优先用当前课程的资料，没命中教材会标注出来</span>}
         <span className="right">CoursePilot v2.0</span>
       </footer>
     </main>
