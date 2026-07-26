@@ -1,0 +1,4 @@
+# 仅用于生成文档截图（scripts/screenshots.py）。运行 CoursePilot 本身不需要它。
+#   .venv/bin/python -m pip install -r requirements-docs.txt
+#   .venv/bin/python -m playwright install chromium
+playwright>=1.45

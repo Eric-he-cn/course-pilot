@@ -4,6 +4,12 @@
 
 语义检索使用 `RAG_EMBEDDING_MODEL`（默认 `BAAI/bge-base-zh-v1.5`）；`sentence-transformers` 缺失或模型加载失败时自动退回纯词面检索，health 会如实报告。在向量能力加入之前上传的教材需要在知识仓库点一次“重建索引”才有语义召回。跨语言检索质量受模型限制，换用 `BAAI/bge-m3` 并重建索引可获得更好的中英互检效果。
 
+![对话取证](Docs/images/chat-citation.png)
+
+![使用说明](Docs/images/help.png)
+
+更多界面见[项目介绍](Docs/项目介绍.md)；截图由 `scripts/screenshots.py` 生成，UI 改动后重跑一次即可。
+
 ## 本地启动
 
 要求 Python 3.11+ 与 pnpm。
@@ -91,6 +97,16 @@ STORAGE_DATA_DIR=testdata/e2e-fresh .venv/bin/python -m uvicorn app.main:app --a
 `benchmark.py` 覆盖 practice 的出题、单题作答、多题作答、讲评、变式题、作答对象歧义，
 外加取证引用、课程隔离与课程解析；断言的是 SSE 事件与档案增量，模型换措辞不会假失败。
 `evaluate.py` 的评分按 `prompt_version` 聚合，改提示词后新旧版本可分别对比。
+```bash
+.venv/bin/python scripts/screenshots.py --url http://127.0.0.1:5174   # 重新生成文档截图
+```
+
+截图脚本需要一次性装个无头浏览器（不进运行时依赖）：
+
+```bash
+.venv/bin/python -m pip install -r requirements-docs.txt && .venv/bin/python -m playwright install chromium
+```
+
 `replay_mastery.py` 在改掌握度算法前存基线、改完对比；事件数变化的概念会被标为"数据已变化，
 不可比"，只有相同事件流下的差异才算算法影响。跑 benchmark 或评测时不要同时改后端代码——
 dev.sh 的 `--reload` 会重启进程并切断正在进行的 SSE。
