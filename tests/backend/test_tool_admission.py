@@ -283,3 +283,44 @@ def test_notes_have_a_read_route(tmp_path):
         # 课程隔离：另一门课看不到这篇
         other = client.post("/api/v2/courses", json={"name": "编译"}).json()
         assert client.get(f"/api/v2/courses/{other['id']}/notes").json() == {"notes": []}
+
+
+def test_memory_has_read_and_write_routes(tmp_path):
+    """长期记忆此前只有文件没有入口，而项目介绍宣称"可读可编辑"。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from core.settings import Settings
+
+    data_dir = tmp_path / "data"
+    settings = Settings(
+        data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
+        text_provider="deepseek", text_base_url="x", text_api_key="", text_model="m",
+        enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
+    )
+    with TestClient(create_app(settings=settings)) as client:
+        assert client.get("/api/v2/memory").json()["content"] == ""
+        client.put("/api/v2/memory", json={"content": "偏好：先给结论再展开"})
+        assert "先给结论" in client.get("/api/v2/memory").json()["content"]
+
+        course = client.post("/api/v2/courses", json={"name": "算法"}).json()
+        client.put(f"/api/v2/courses/{course['id']}/memory", json={"content": "学到第 7 章"})
+        assert "第 7 章" in client.get(f"/api/v2/courses/{course['id']}/memory").json()["content"]
+        # 课程记忆互不串台，也不影响跨课程画像
+        assert "先给结论" in client.get("/api/v2/memory").json()["content"]
+        assert client.get("/api/v2/courses/course_missing/memory").status_code == 404
+        # 超长拒绝
+        assert client.put("/api/v2/memory", json={"content": "长" * 50_000}).status_code == 422
+
+
+def test_agent_written_managed_blocks_survive_a_manual_rewrite(tmp_path):
+    """用户整份改写后，助手的受管区块仍能被 memory_patch 重新写入。"""
+    from modules.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path)
+    store.patch(scope="user", section="preferences", content="喜欢先看例子")
+    store.write_whole(scope="user", content="我自己手写的一段，把标记删了")
+    assert "手写" in store.read_user() and "喜欢先看例子" not in store.read_user()
+    store.patch(scope="user", section="preferences", content="喜欢先看例子")
+    body = store.read_user()
+    assert "手写" in body and "喜欢先看例子" in body  # 手写段落没被覆盖

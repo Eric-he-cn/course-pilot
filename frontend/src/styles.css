@@ -10,6 +10,7 @@
   -webkit-font-smoothing:antialiased;
 }
 * { box-sizing:border-box }
+html,body { height:100%; overflow:hidden }
 body { margin:0; min-width:320px; background:var(--bg) }
 ::selection { background:#D1FAE5 }
 button,input,textarea { font:inherit }
@@ -17,11 +18,11 @@ button { cursor:pointer }
 button:focus-visible,input:focus-visible,textarea:focus-visible { outline:none; box-shadow:var(--focus) }
 button:disabled { cursor:not-allowed; opacity:.5 }
 
-.app { display:grid; grid-template-columns:252px minmax(0,1fr); min-height:100vh; transition:grid-template-columns .18s cubic-bezier(.2,.8,.2,1) }
+.app { display:grid; grid-template-columns:252px minmax(0,1fr); height:100vh; overflow:hidden; transition:grid-template-columns .18s cubic-bezier(.2,.8,.2,1) }
 .app.sidebar-collapsed { grid-template-columns:72px minmax(0,1fr) }
 
 /* ---- 侧栏 ---- */
-.sidebar { display:flex; flex-direction:column; min-height:100vh; padding:16px 10px 12px; border-right:1px solid var(--border); background:var(--panel); overflow:hidden; z-index:3 }
+.sidebar { display:flex; flex-direction:column; height:100%; min-height:0; padding:16px 10px 12px; border-right:1px solid var(--border); background:var(--panel); overflow:hidden; z-index:3 }
 .brand { display:flex; align-items:center; gap:9px; padding:0 8px 16px }
 .brandmark { display:grid; place-items:center; height:28px; width:28px; border-radius:7px; background:var(--text); color:#fff; font-family:var(--mono); font-size:12px; font-weight:700; letter-spacing:-.02em }
 .brand-copy { display:flex; align-items:center; gap:7px; white-space:nowrap }
@@ -52,7 +53,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .main-nav b { font-weight:450 }
 .sessions-head { display:flex; align-items:center; justify-content:space-between; padding:12px 8px 5px; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.1em }
 .sessions-head button { border:0; background:transparent; color:var(--accent); font-size:17px; line-height:1 }
-.session-list { overflow-y:auto; min-height:48px }
+.session-list { flex:1 1 auto; overflow-y:auto; min-height:48px }
 .session { position:relative; display:grid; grid-template-columns:8px minmax(0,1fr); align-items:center; gap:8px; width:100%; padding:7px 8px; border-radius:6px }
 .session-text { display:grid; min-width:0; line-height:1.3 }
 .session-text b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; font-weight:500 }
@@ -60,12 +61,12 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .new-session { margin:10px 2px 0; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:12.5px }
 .new-session:hover { border-color:#D4D4D8 }
 .mini-empty { margin:7px; color:var(--muted); font-size:12px }
-.sidebar-foot { margin-top:auto; padding-top:10px; border-top:1px solid var(--border) }
+.sidebar-foot { flex:0 0 auto; margin-top:auto; padding-top:10px; border-top:1px solid var(--border) }
 .sidebar-foot button { display:flex; align-items:center; gap:8px; width:100%; padding:7px 8px; border-radius:6px; color:var(--muted); font-size:13px }
 .sidebar-foot button:hover { background:var(--bg); border-color:var(--border) }
 
 /* ---- 顶栏 ---- */
-.main { display:flex; flex-direction:column; min-width:0; min-height:100vh }
+.main { display:flex; flex-direction:column; min-width:0; height:100%; min-height:0; overflow:hidden }
 .topbar { display:flex; align-items:center; flex:0 0 46px; gap:10px; padding:0 16px; border-bottom:1px solid var(--border); background:var(--bg); z-index:2 }
 .icon-button,.ghost-button { border:1px solid var(--border); border-radius:6px; color:var(--text); background:var(--bg); padding:6px 10px; font-size:13px }
 .icon-button:hover,.ghost-button:hover { border-color:#D4D4D8; background:var(--panel) }
@@ -91,7 +92,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .chat-view { display:flex; flex:1; flex-direction:column; min-height:0 }
 .session-context { display:flex; align-items:center; gap:8px; padding:9px max(20px,calc((100% - 760px)/2)); color:var(--muted); border-bottom:1px solid var(--border); background:var(--bg); font-size:12px }
 .scope-pill { color:var(--muted); border:1px solid var(--border); border-radius:5px; padding:1px 7px; font-family:var(--mono); font-size:10.5px; letter-spacing:.04em }
-.messages { flex:1; overflow:auto; padding:28px max(20px,calc((100% - 760px)/2)) 20px }
+.messages { position:relative; flex:1; overflow:auto; padding:28px max(20px,calc((100% - 760px)/2)) 20px }
 .message { margin:0 0 26px }
 .user-message { display:flex; justify-content:flex-end }
 .user-message>div { max-width:72%; padding:9px 13px; border:1px solid var(--border); border-radius:8px; background:var(--panel); white-space:pre-wrap; line-height:1.6 }
@@ -180,7 +181,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .attach-chip>button:hover { color:var(--danger) }
 
 /* ---- 通用页面 ---- */
-.page { overflow:auto; flex:1; padding:28px clamp(20px,4vw,48px) }
+.page { position:relative; overflow-y:auto; flex:1; min-height:0; padding:28px clamp(20px,4vw,48px) }
 .page-inner { max-width:1120px; margin:auto }
 .hero { display:flex; align-items:flex-start; gap:24px; margin-bottom:22px; padding-bottom:16px; border-bottom:1px solid var(--border) }
 .hero h1 { margin:0 0 6px; font-size:24px; font-weight:650; letter-spacing:-.02em }
@@ -403,4 +404,14 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .note-viewer-head { display:flex; align-items:center; justify-content:space-between; padding:9px 12px; border-bottom:1px solid var(--border); background:var(--panel) }
 .note-viewer-head b { font-size:13px }
 .note-viewer-head button { border:0; background:transparent; color:var(--muted); font-size:17px; line-height:1 }
-.note-viewer .message-content { max-height:520px; overflow-y:auto; padding:12px 14px }
+.note-viewer .message-content { position:relative; max-height:520px; overflow-y:auto; padding:12px 14px }
+
+/* 长期记忆编辑器 */
+.memory-head { display:flex; align-items:center; gap:8px; margin:10px 0 8px; flex-wrap:wrap }
+.memory-head select { padding:5px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:12.5px }
+.memory-head > span { margin-right:auto; color:var(--muted); font-family:var(--mono); font-size:10.5px }
+.memory-head .ghost-button { padding:4px 10px; font-size:12px }
+.memory-editor { display:block; width:100%; min-height:180px; max-height:420px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-family:var(--mono); font-size:12px; line-height:1.65; resize:vertical }
+.memory-editor:focus-visible { border-color:var(--accent) }
+.send-button.stop { color:var(--danger); border-color:#FCA5A5; font-size:11px }
+.send-button.stop:hover { background:#FEF2F2 }

@@ -70,13 +70,18 @@ export const api = {
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),
   plan: (courseId: string) => request<{ plan: Plan | null }>(`/courses/${courseId}/plan`),
   archive: (courseId: string) => request<ArchiveSummary>(`/courses/${courseId}/archive`),
+  memory: (courseId?: string) => request<{ scope: string; content: string }>(courseId ? `/courses/${courseId}/memory` : '/memory'),
+  saveMemory: (content: string, courseId?: string) => request<{ scope: string; content: string }>(courseId ? `/courses/${courseId}/memory` : '/memory', json('PUT', { content })),
   notes: (courseId: string) => request<{ notes: NoteSummary[] }>(`/courses/${courseId}/notes`),
   note: (courseId: string, title: string) => request<{ title: string; content: string }>(`/courses/${courseId}/notes/${encodeURIComponent(title)}`),
-  async turn(sessionId: string, content: string, onEvent: (payload: TurnEvent) => void, attachmentIds: string[] = []): Promise<void> {
+  async turn(sessionId: string, content: string, onEvent: (payload: TurnEvent) => void, attachmentIds: string[] = [], signal?: AbortSignal): Promise<void> {
     let response: Response
     try {
-      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, json('POST', { message: content, attachment_ids: attachmentIds }))
-    } catch { throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。') }
+      response = await fetch(`${BASE}/sessions/${sessionId}/turns`, { ...json('POST', { message: content, attachment_ids: attachmentIds }), signal })
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error
+      throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')
+    }
     if (!response.ok || !response.body) {
       let detail = ''
       try {
@@ -86,6 +91,9 @@ export const api = {
       throw new ApiError(detail || `发送失败（${response.status}）`, response.status)
     }
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
+    // 用户点停止：中断读取即可，服务端的 finally 会把这一轮落成终态，
+    // 已生成的内容仍在库里，上层回读消息就能拿到。
+    signal?.addEventListener('abort', () => void reader.cancel().catch(() => {}), { once: true })
     while (true) {
       const { done, value } = await reader.read(); if (done) break
       buffer += decoder.decode(value, { stream: true })

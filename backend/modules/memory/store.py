@@ -9,6 +9,7 @@ _BLOCK = "<!-- agent:managed:{section} -->\n{content}\n<!-- /agent:managed:{sect
 _BLOCK_PATTERN = "<!-- agent:managed:{section} -->.*?<!-- /agent:managed:{section} -->"
 _SECTION_NAME = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 _MAX_SECTION_CHARS = 2000
+_MAX_FILE_CHARS = 40_000
 _MAX_FILE_CHARS = 20_000
 
 _USER_HEADER = """# 用户画像
@@ -49,6 +50,20 @@ class MemoryStore:
             return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
         except OSError:
             return ""
+
+    def write_whole(self, *, scope: str, content: str, course_id: str | None = None) -> None:
+        """整份覆盖，供用户在界面上直接编辑。受管区块的 marker 由用户自己负责保留——
+        这是他自己的文件，但删掉 marker 后 memory_patch 会重新追加区块。"""
+        if scope not in {"user", "course"}:
+            raise ValueError("scope 只能是 user 或 course")
+        if scope == "course" and not course_id:
+            raise ValueError("课程记忆需要 course_id")
+        if len(content) > _MAX_FILE_CHARS:
+            raise ValueError(f"记忆文件不能超过 {_MAX_FILE_CHARS} 字")
+        path = self._user_path() if scope == "user" else self._course_path(course_id or "")
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content.strip() + "\n" if content.strip() else "", encoding="utf-8")
 
     def patch(self, *, scope: str, section: str, content: str, course_id: str | None = None) -> str:
         """整块替换某个受管区块；区块不存在就追加。返回一句写入结果说明。"""

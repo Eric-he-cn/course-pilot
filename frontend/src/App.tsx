@@ -55,6 +55,10 @@ export default function App() {
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   // 帮助页点例句后带进对话输入框
   const [draftSeed, setDraftSeed] = useState('')
+  // 停止生成：中断 SSE 读取，服务端 finally 会把这一轮落成终态，已生成的内容仍在库里
+  const abortRef = useRef<AbortController | null>(null)
+  // reader.cancel() 会让读取正常结束而不抛错，所以"是否被停止"要显式记，不能靠捕获异常判断。
+  const stoppedRef = useRef(false)
 
   const course = useMemo(() => courses.find(item => item.id === workspace.courseId) ?? null, [courses, workspace.courseId])
   const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewNames[view]
@@ -173,6 +177,9 @@ export default function App() {
         const pendingId = `pending-assistant-${Date.now()}`
         const activity: ToolActivity[] = []
         setMessages(current => [...current, optimistic, { id: pendingId, role: 'assistant', content: '', status: 'streaming' }]); setBusy(true)
+        const controller = new AbortController()
+        abortRef.current = controller
+        stoppedRef.current = false
         try { await api.turn(targetSession.id, content, payload => {
           const resolved = payload.type === 'course_resolution' || payload.event === 'course_resolution'
           if (resolved) {
@@ -204,15 +211,33 @@ export default function App() {
             setMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: `远端模型 ${payload.provider ?? ''} 不可用，本次已切换到本地兜底模型` } : item))
           }
           if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice('回答达到长度上限，内容可能不完整。')
-        }, attachmentIds); await loadMessages(targetSession.id); await loadSessions() }
+        }, attachmentIds, controller.signal)
+          if (stoppedRef.current) {
+            // 客户端断连时服务端生成器可能挂在 yield 上不进 finally，部分回答不一定落盘，
+            // 所以保留本地已渲染的内容并标明它没有保存。
+            setMessages(current => current.map(item => item.id === pendingId
+              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）' }
+              : item))
+            await loadSessions()
+          } else {
+            await loadMessages(targetSession.id); await loadSessions()
+          }
+        }
         catch (error) {
+          if (stoppedRef.current) {
+            setMessages(current => current.map(item => item.id === pendingId
+              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）' }
+              : item))
+            void loadSessions()
+            return
+          }
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
           try { await loadMessages(targetSession.id); await loadSessions() }
           catch { setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '本次回答未能完成。', artifact: { kind: 'interrupted' } } : item)) }
         }
-        finally { setBusy(false) }
-      }} busy={busy} />}
+        finally { setBusy(false); abortRef.current = null }
+      }} busy={busy} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
       {!['chat', 'settings', 'help'].includes(view) && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId }, { keepView: true })} onCreate={createCourse} />}
       {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
@@ -230,7 +255,7 @@ export default function App() {
   </div>
 }
 
-function ChatView({ session, messages, workspaceName, scope, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
+function ChatView({ session, messages, workspaceName, scope, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, onStop, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onStop: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
   const [draft, setDraft] = useState(''); const composer = useRef<HTMLTextAreaElement>(null)
   useEffect(() => { if (draftSeed) { setDraft(draftSeed); onSeedUsed(); composer.current?.focus() } }, [draftSeed])
   const [attachments, setAttachments] = useState<Attachment[]>([]); const [uploading, setUploading] = useState(false)
@@ -273,7 +298,9 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
         </div>)}
         {uploading && <div className="attach-chip pending"><span className="attach-name">IMG</span><span className="attach-preview">正在转录图片文字…</span></div>}
       </div>}
-      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} disabled={busy} aria-label="输入消息" rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label="上传图片提问"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>图片</button><span>Enter 发送 · Shift+Enter 换行</span>{contextUsage && <ContextMeter usage={contextUsage} />}<button className="send-button" type="submit" disabled={!draft.trim() || busy || uploading} aria-label="发送消息">{busy ? '…' : '↑'}</button></div></div>
+      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} aria-label="输入消息" rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label="上传图片提问"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>图片</button><span>Enter 发送 · Shift+Enter 换行</span>{contextUsage && <ContextMeter usage={contextUsage} />}{busy
+      ? <button className="send-button stop" type="button" onClick={onStop} aria-label="停止生成" title="停止生成">■</button>
+      : <button className="send-button" type="submit" disabled={!draft.trim() || uploading} aria-label="发送消息">↑</button>}</div></div>
       <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={pickFile} />
       <p>回答优先依据当前课程的可检索资料；没有命中教材时会明确标注“以下不是当前教材结论”。</p></form>
   </section>
@@ -545,6 +572,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
+    {message.status === 'stopped' && <div className="degraded-notice">你停止了这次生成。上面的内容只在本次界面里，没有保存到会话记录。</div>}
     {message.degraded && <div className="degraded-notice">{message.degraded}。本次回答不使用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
@@ -642,6 +670,49 @@ function ArchiveView({ course, onError }: { course: Course; onError: (message: s
   </div></section>
 }
 
+/** 长期记忆：user.md 与课程 memory.md 此前只有文件、没有入口，而文档宣称"可读可编辑"。 */
+function MemoryCard({ courses, onError }: { courses: Course[]; onError: (message: string) => void }) {
+  const [scope, setScope] = useState<string>('user')
+  const [content, setContent] = useState('')
+  const [draft, setDraft] = useState('')
+  const [loaded, setLoaded] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const courseId = scope === 'user' ? undefined : scope
+  useEffect(() => {
+    setLoaded(false)
+    api.memory(courseId)
+      .then(payload => { setContent(payload.content); setDraft(payload.content) })
+      .catch(error => onError(errorText(error)))
+      .finally(() => setLoaded(true))
+  }, [scope])
+  async function save() {
+    setSaving(true)
+    try {
+      const payload = await api.saveMemory(draft, courseId)
+      setContent(payload.content); setDraft(payload.content)
+    } catch (error) { onError(errorText(error)) } finally { setSaving(false) }
+  }
+  const dirty = draft !== content
+  return <article className="card"><h2>长期记忆</h2>
+    <p>助手跨课程记住的偏好与目标写在 <code>user.md</code>，每门课的学习进展写在各自的
+      <code>memory.md</code>。掌握度数值、错题与复习排期不在这里，它们由证据事件维护。</p>
+    <div className="memory-head">
+      <select value={scope} onChange={event => setScope(event.target.value)} aria-label="选择记忆范围">
+        <option value="user">跨课程画像（user.md）</option>
+        {courses.map(course => <option value={course.id} key={course.id}>{course.name} · 课程记忆</option>)}
+      </select>
+      <span>{dirty ? '有未保存的修改' : loaded ? '已是最新' : '读取中…'}</span>
+      <button className="ghost-button" disabled={!dirty || saving} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
+      <button className="ghost-button" disabled={!dirty} onClick={() => setDraft(content)}>放弃修改</button>
+    </div>
+    <textarea className="memory-editor" value={draft} onChange={event => setDraft(event.target.value)}
+      placeholder={loaded ? '还没有内容。助手会在对话中自动补写，你也可以直接在这里写。' : '读取中…'}
+      spellCheck={false} aria-label="记忆内容" />
+    <p className="help-note">带 <code>agent:managed</code> 标记的区块由助手维护，删掉标记后它会重新追加一份；
+      标记之外的段落助手不会覆盖。</p>
+  </article>
+}
+
 const SKILL_STATUS: Record<string, string> = { enabled: '已启用', draft: '未启用', permission_denied: '权限不足' }
 
 function SkillsCard({ onError }: { onError: (message: string) => void }) {
@@ -691,7 +762,7 @@ function SettingsView({ courses, onError }: { courses: Course[]; onError: (messa
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const rag = (health?.rag ?? null) as Record<string, unknown> | null
   const embedding = (rag?.embedding ?? null) as Record<string, unknown> | null
-  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、能力（Skill）与服务状态分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <div className="settings-course" key={course.id}><i style={{ backgroundColor: course.color }} /><b>{course.name}</b><span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span></div>) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><SkillsCard onError={onError} /><article className="card"><h2>飞书渠道</h2><p>首版只有飞书渠道；飞书始终使用一个通用会话，不提供课程选择。密钥绝不在前端回显。</p><button className="ghost-button" disabled>配置飞书（等待接口）</button></article><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、能力（Skill）与服务状态分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <div className="settings-course" key={course.id}><i style={{ backgroundColor: course.color }} /><b>{course.name}</b><span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span></div>) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><article className="card"><h2>飞书渠道</h2><p>首版只有飞书渠道；飞书始终使用一个通用会话，不提供课程选择。密钥绝不在前端回显。</p><button className="ghost-button" disabled>配置飞书（等待接口）</button></article><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
     <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? '远端已启用' : '本地 Demo responder'}` : '未知'}</dd></div>
     <div><dt>检索方式</dt><dd>{rag?.backend === 'hybrid_bge' ? '语义 + 词面混合' : '仅词面'}</dd></div>
     {embedding && <div><dt>向量模型</dt><dd>{String(embedding.model)} · {embedding.error ? `加载失败：${String(embedding.error)}` : embedding.loaded ? '已加载' : '待首次使用时加载'}</dd></div>}

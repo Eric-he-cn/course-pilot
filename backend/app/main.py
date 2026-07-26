@@ -53,7 +53,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         )
     )
     app.include_router(build_skills_router(skills=application.skills))
-    app.include_router(build_study_router(learning=application.learning, planning=application.planning, courses=application.courses, notes=application.notes))
+    app.include_router(build_study_router(learning=application.learning, planning=application.planning, courses=application.courses, notes=application.notes, memory=application.memory))
     return app
 
 
