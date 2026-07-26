@@ -254,3 +254,32 @@ def test_frontend_tool_labels_and_capability_hints_cover_every_tool():
     assert set(hints) == backend, f"TOOL_CAPABILITY_HINT 少了：{backend - set(hints)}"
     for name, capability in hints.items():
         assert TOOL_CAPABILITY[name] == capability, f"{name} 的能力分组前后端不一致"
+
+
+def test_notes_have_a_read_route(tmp_path):
+    """笔记有 4 个 skill 在写，必须有查看入口，否则用户存了看不到。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from core.settings import Settings
+
+    data_dir = tmp_path / "data"
+    settings = Settings(
+        data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
+        text_provider="deepseek", text_base_url="x", text_api_key="", text_model="m",
+        enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
+    )
+    with TestClient(create_app(settings=settings)) as client:
+        course = client.post("/api/v2/courses", json={"name": "算法"}).json()
+        assert client.get(f"/api/v2/courses/{course['id']}/notes").json() == {"notes": []}
+
+        NoteStore(data_dir).write(course_id=course["id"], title="调度卡片", content="# Q1\n答案")
+        listed = client.get(f"/api/v2/courses/{course['id']}/notes").json()["notes"]
+        assert [note["title"] for note in listed] == ["调度卡片"]
+
+        body = client.get(f"/api/v2/courses/{course['id']}/notes/调度卡片").json()
+        assert "答案" in body["content"]
+        assert client.get(f"/api/v2/courses/{course['id']}/notes/不存在的").status_code == 404
+        # 课程隔离：另一门课看不到这篇
+        other = client.post("/api/v2/courses", json={"name": "编译"}).json()
+        assert client.get(f"/api/v2/courses/{other['id']}/notes").json() == {"notes": []}

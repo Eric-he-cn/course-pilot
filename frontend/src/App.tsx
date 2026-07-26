@@ -5,7 +5,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { ApiError, api } from './api'
-import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, SkillInfo, ToolActivity } from './types'
+import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, SessionSummary, SkillInfo, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -459,6 +459,34 @@ function ToolChip({ entry }: { entry: ToolActivity }) {
   </span>
 }
 
+/** 课程笔记：助手用 note_write 落盘的学习卡片与整理稿，此前没有任何查看入口。 */
+function NotesPanel({ course, onError }: { course: Course; onError: (message: string) => void }) {
+  const [notes, setNotes] = useState<NoteSummary[] | null>(null)
+  const [open, setOpen] = useState<{ title: string; content: string } | null>(null)
+  useEffect(() => {
+    setNotes(null); setOpen(null)
+    api.notes(course.id).then(payload => setNotes(payload.notes)).catch(error => { setNotes([]); onError(errorText(error)) })
+  }, [course.id])
+  async function read(title: string) {
+    try { setOpen(await api.note(course.id, title)) } catch (error) { onError(errorText(error)) }
+  }
+  return <article className="card">
+    <div className="card-heading"><div><h2>课程笔记</h2>
+      <p>助手整理并存下的内容，落在 <code>data/notes/{course.id.slice(0, 14)}…/</code>。说「做成学习卡片」「存下来」就会写到这里。</p></div></div>
+    {notes === null ? <p className="mini-empty">正在读取…</p> : notes.length === 0
+      ? <div className="empty-inline"><b>还没有笔记</b><p>在对话里让助手把内容整理成学习卡片或概念梳理，它会自动存到这里。</p></div>
+      : notes.map(note => <div className="material-row" key={note.title}>
+          <div className="file-mark">MD</div>
+          <div className="material-copy"><b>{note.title}</b><small>{note.chars} 字 · 更新于 {note.updated_at.slice(0, 16).replace('T', ' ')}</small></div>
+          <button className="ghost-button" onClick={() => void read(note.title)}>查看</button>
+        </div>)}
+    {open && <div className="note-viewer">
+      <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label="关闭笔记">×</button></div>
+      <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{open.content}</ReactMarkdown></div>
+    </div>}
+  </article>
+}
+
 function RetryCard({ title, message, onRetry }: { title: string; message: string; onRetry: () => void }) {
   return <article className="card"><h2>{title}</h2><p>{message}</p>
     <button className="ghost-button" onClick={onRetry}>重新读取</button>
@@ -521,7 +549,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
-  const [tab, setTab] = useState<'rag' | 'wiki'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
+  const [tab, setTab] = useState<'rag' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
   const [ragBackend, setRagBackend] = useState<string>('')
   const reload = async () => { try { setMaterials(await api.materials(course.id)) } catch (error) { onError(errorText(error)) } }
   const indexedMaterials = materials.filter(item => (item.index_status ?? item.status) === 'indexed')
@@ -534,7 +562,8 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   async function buildWiki(materialId: string) { try { const job = await api.buildWiki(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)) } catch (error) { onError(errorText(error)); setResults([]) } finally { setLoading(false) } }
   const backendLabel = ragBackend === 'hybrid_bge' ? '语义 + 词面混合检索' : ragBackend ? '仅词面检索（语义向量未启用）' : ''
-  return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课程的教材、索引与检索都在这里；切换课程请使用左栏工作区。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button></div>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课程的教材、索引与检索都在这里；切换课程请使用左栏工作区。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>课程笔记</button></div>
+    {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
     {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB；对话图片仍为 ≤ 10 MiB，后端会再次校验。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，确认索引质量与可引用片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>状态来自后端 job，不在浏览器模拟进度。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} />) : <div className="empty-inline">尚未上传资料。上传并完成索引后，即可在此验证检索结果。</div>}</article>{results.length > 0 && <article className="card results-card"><h2>检索结果</h2>{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}</> : <article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭时不触发教材解析，不影响 RAG 检索或 Tutor；关闭不会删除既有页面。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选择已完成索引的资料，显式启动“提取目录 → 概念候选 → 页面草稿 → 待确认”。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
       const wikiJob = Object.values(jobs).find(item => item.material_id === material.id && item.type === 'wiki')
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false

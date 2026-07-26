@@ -1,4 +1,4 @@
-import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode, SkillInfo, TurnEvent } from './types'
+import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 type BackendCitation = Citation & { citation_id?: string; document?: string; snippet?: string }
@@ -70,6 +70,8 @@ export const api = {
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),
   plan: (courseId: string) => request<{ plan: Plan | null }>(`/courses/${courseId}/plan`),
   archive: (courseId: string) => request<ArchiveSummary>(`/courses/${courseId}/archive`),
+  notes: (courseId: string) => request<{ notes: NoteSummary[] }>(`/courses/${courseId}/notes`),
+  note: (courseId: string, title: string) => request<{ title: string; content: string }>(`/courses/${courseId}/notes/${encodeURIComponent(title)}`),
   async turn(sessionId: string, content: string, onEvent: (payload: TurnEvent) => void, attachmentIds: string[] = []): Promise<void> {
     let response: Response
     try {

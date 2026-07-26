@@ -45,6 +45,7 @@ class Application:
     learning: LearningService
     planning: PlanningService
     skills: SkillRegistry
+    notes: NoteStore
     vision: VisionTranscriberPort | None = None
     web: WebSearchPort | None = None
 
@@ -141,6 +142,7 @@ def build_application(settings: Settings) -> Application:
         workers=settings.background_job_workers,
         queue_capacity=settings.background_job_queue_capacity,
     )
+    notes = NoteStore(settings.data_dir)
     learning = LearningService(LearningRepository(store))
     planning = PlanningService(PlanningRepository(store), concept_exists=knowledge.concept_exists)
     # 内建 skill 目录随代码走（架构 §6）；导入的 skill 存库，启用后并入同一注册表。
@@ -148,10 +150,10 @@ def build_application(settings: Settings) -> Application:
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
         plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), compactions=CompactionStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
-        web=web, notes=NoteStore(settings.data_dir),
+        web=web, notes=notes,
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
         context_char_limit=settings.agent_context_char_limit,
         compact_threshold_ratio=settings.agent_compact_threshold_ratio,
     )
-    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, vision, web)
+    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, notes, vision, web)

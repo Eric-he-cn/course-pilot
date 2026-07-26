@@ -55,6 +55,12 @@ export interface SkillInfo {
   examples?: string[]
 }
 
+export interface NoteSummary {
+  title: string
+  chars: number
+  updated_at: string
+}
+
 export interface ContextUsage {
   segments: { label: string; chars: number }[]
   total_chars: number

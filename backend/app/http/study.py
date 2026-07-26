@@ -6,10 +6,11 @@ from fastapi import APIRouter, HTTPException
 
 from modules.courses.api import CourseCatalogPort
 from modules.learning.service import LearningService
+from modules.notes.store import NoteStore
 from modules.planning.service import PlanningService
 
 
-def build_study_router(*, learning: LearningService, planning: PlanningService, courses: CourseCatalogPort) -> APIRouter:
+def build_study_router(*, learning: LearningService, planning: PlanningService, courses: CourseCatalogPort, notes: NoteStore) -> APIRouter:
     """学习计划与学习档案的只读骨架接口；写链路随对应功能落地。"""
     router = APIRouter(prefix="/api/v2", tags=["study"])
 
@@ -27,5 +28,20 @@ def build_study_router(*, learning: LearningService, planning: PlanningService, 
     def get_archive(course_id: str) -> dict[str, object]:
         require_course(course_id)
         return asdict(learning.get_archive(course_id=course_id))
+
+    @router.get("/courses/{course_id}/notes")
+    def list_notes(course_id: str) -> dict[str, object]:
+        require_course(course_id)
+        return {"notes": [asdict(note) for note in notes.list_notes(course_id=course_id)]}
+
+    @router.get("/courses/{course_id}/notes/{title}")
+    def read_note(course_id: str, title: str) -> dict[str, object]:
+        require_course(course_id)
+        try:
+            return {"title": title, "content": notes.read(course_id=course_id, title=title)}
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(exc), "retryable": False}}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "invalid_request", "message": str(exc), "retryable": False}}) from exc
 
     return router

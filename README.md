@@ -79,6 +79,15 @@ testdata/                     测试与验证，不是用户数据
 .venv/bin/python scripts/replay_mastery.py --data-dir testdata/e2e --save baseline.json
 ```
 
+`e2e_journey.py` 是一条有状态的连贯旅程：从空库开始建课、索引教材、提问取证、练习闭环、
+排计划、画图存笔记、错题复盘、联网调研、课程边界、会话管理，最后核对 trace，共 30 项断言。
+与 benchmark 的区别是后一步依赖前一步的产物。用法：
+
+```bash
+STORAGE_DATA_DIR=testdata/e2e-fresh .venv/bin/python -m uvicorn app.main:app --app-dir backend --port 8001
+.venv/bin/python scripts/e2e_journey.py --base http://127.0.0.1:8001 --data-dir testdata/e2e-fresh
+```
+
 `benchmark.py` 覆盖 practice 的出题、单题作答、多题作答、讲评、变式题、作答对象歧义，
 外加取证引用、课程隔离与课程解析；断言的是 SSE 事件与档案增量，模型换措辞不会假失败。
 `evaluate.py` 的评分按 `prompt_version` 聚合，改提示词后新旧版本可分别对比。
