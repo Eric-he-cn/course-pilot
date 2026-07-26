@@ -195,6 +195,19 @@ def test_material_names_cannot_inject_prompt_rules():
     assert len(injected_line[0]) < 100  # 超长文件名被截断
 
 
+def test_every_injected_section_reaches_the_system_prompt():
+    """format 会静默忽略没有占位符的 kwargs，注入内容漏了也不报错，所以逐段断言。"""
+    from modules.agent.context import assemble_messages
+
+    marks = {"skill_summaries": "SKILLMARK", "practice_digest": "PRACTICEMARK", "memory": "MEMORYMARK"}
+    system = assemble_messages(
+        course_name="测试", materials=["a.md"], history=[], question="q",
+        seed_query="q", seed_result_text="e", history_token_budget=1000, **marks,
+    )[0].content
+    for mark in marks.values():
+        assert mark in system
+
+
 def test_filler_segments_are_dropped_but_substance_is_kept():
     from modules.agent.service import join_answer
 
