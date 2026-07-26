@@ -517,6 +517,13 @@ function HelpView({ courses, health, onError, onTry }: { courses: Course[]; heal
   </div></section>
 }
 
+function ThinkingHint({ activity }: { activity?: ToolActivity[] }) {
+  // 工具跑完到第一个字之间有一段空档，这里不说话用户就以为卡在上一个工具上。
+  const running = activity?.find(entry => !entry.summary)
+  const label = running ? `正在${TOOL_LABELS[running.name] ?? running.name}` : activity?.length ? '正在思考' : '正在准备'
+  return <span className="typing">{label}<i aria-hidden /><i aria-hidden /><i aria-hidden /></span>
+}
+
 function ToolChip({ entry }: { entry: ToolActivity }) {
   const pending = !entry.summary
   const [now, setNow] = useState(() => Date.now())
@@ -624,7 +631,7 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
     {message.status === 'stopped' && <div className="degraded-notice">已停止。上面的内容没有存进会话记录。</div>}
-    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答中断了。已生成的部分会保留，重新发送可以继续。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答中断了。已生成的部分会保留，重新发送可以继续。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {

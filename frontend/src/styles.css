@@ -102,6 +102,9 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .agent-label span { color:var(--accent); font-weight:700 }
 .message-content { font-size:14.5px; line-height:1.75 }
 .typing { color:var(--muted) }
+.typing i { display:inline-block; width:3px; height:3px; margin-left:3px; border-radius:50%; background:currentColor; animation:cp-dots 1.4s ease-in-out infinite }
+.typing i:nth-of-type(2) { animation-delay:.2s }
+.typing i:nth-of-type(3) { animation-delay:.4s }
 .citations { display:flex; flex-wrap:wrap; gap:5px 14px; margin-top:14px; padding:9px 12px; border:1px solid var(--border); border-radius:8px; background:var(--panel) }
 .refs-label { flex:0 0 100%; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.08em }
 .citations button { display:inline-flex; align-items:center; gap:5px; border:0; padding:0; background:none; color:var(--text); font-family:var(--mono); font-size:11.5px }
@@ -349,6 +352,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 
 /* ---- 进行中的活体感：唯一被允许的循环动画位（视觉方案 §6.1 的低频呼吸） ---- */
 @keyframes cp-breathe { 0%,100% { opacity:.3 } 50% { opacity:1 } }
+@keyframes cp-dots { 0%,70%,100% { opacity:.18 } 35% { opacity:1 } }
 @keyframes cp-caret { 50% { opacity:0 } }
 .tool-chip.pending i { animation:cp-breathe 1.6s ease-in-out infinite }
 .message-content.streaming > *:last-child::after { content:'\258D'; margin-left:2px; color:var(--accent); animation:cp-caret 1s steps(1) infinite }
@@ -365,7 +369,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 /* 全局 reduced-motion 只压时长，不关无限循环——0.01ms 的无限动画仍在每帧合成，
    对光敏用户是真实风险。这里显式关掉新增的循环动画。 */
 @media (prefers-reduced-motion:reduce) {
-  .tool-chip.pending i { animation:none !important; opacity:1 }
+  .tool-chip.pending i,.typing i { animation:none !important; opacity:1 }
   .message-content.streaming > *:last-child::after { animation:none !important }
   .citation-drawer { animation:none !important }
 }
