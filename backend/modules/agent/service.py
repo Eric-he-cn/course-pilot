@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterator
 
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
-from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, LLMProviderError, ToolCallRequest
+from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest
 from core.common import utc_now
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.memory.store import MemoryStore
@@ -384,6 +384,7 @@ class TurnService:
                         yield self._context_usage(messages, base_segments, assembled, summary)
                         allow_tools = tool_rounds < max_rounds
                         segment_parts: list[str] = []
+                        reasoning = ""
                         outcome: ChatToolCalls | ChatFinal | None = None
                         for item in responder.chat(messages=messages, tools=specs_for(allowed_tools, capabilities=capabilities) if allow_tools else ()):
                             if isinstance(item, ChatDelta):
@@ -392,6 +393,13 @@ class TurnService:
                                 seq += 1
                                 last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
                                 yield self._event("text_delta", seq=seq, text=item.text)
+                            elif isinstance(item, ChatReasoning):
+                                # 思考期间一个字都不下发，界面会停在上一个动作上；而且没有心跳，
+                                # 长思考会让这一轮被判失活、被下一轮抢占。
+                                last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
+                                if not reasoning:
+                                    yield self._event("reasoning_started")
+                                reasoning += item.text
                             else:
                                 outcome = item
                                 break
@@ -426,7 +434,8 @@ class TurnService:
                             self._merge_usage(usage_total, outcome.usage)
                             tool_rounds += 1
                             answer_segments.append("".join(segment_parts))
-                            messages.append(ChatMessage(role="assistant", content="".join(segment_parts), tool_calls=outcome.calls))
+                            # reasoning 必须原样带回去：思考模式下厂商会拒收缺它的 assistant 消息。
+                            messages.append(ChatMessage(role="assistant", content="".join(segment_parts), tool_calls=outcome.calls, reasoning=outcome.reasoning or reasoning))
                             for call in outcome.calls:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
@@ -472,6 +481,8 @@ class TurnService:
                         trace_record.update(status="failed", error_code="stream_interrupted")
                         yield self._event("turn_failed", error_code="stream_interrupted", retryable=False, message_id=assistant.id)
                         return
+                    # 供应商为什么拒绝，只有这条消息说得清；不落 trace 就等于线索断在这里。
+                    trace_record["provider_error"] = {"code": error.code, "message": str(error)[:300]}
                     yield self._event(
                         "provider_fallback",
                         provider=self._responder.provider,

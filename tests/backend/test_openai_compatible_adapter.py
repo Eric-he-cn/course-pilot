@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from adapters.llm.openai_compatible import OpenAICompatibleChat
-from contracts.llm import ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, LLMProviderError, ToolCallRequest, ToolSpec
+from contracts.llm import ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest, ToolSpec
 
 _TOOLS = (
     ToolSpec(
@@ -40,6 +40,52 @@ def _adapter(client: httpx.Client, *, max_retries: int = 0) -> OpenAICompatibleC
         max_retries=max_retries,
         client=client,
     )
+
+
+def test_reasoning_is_streamed_apart_from_the_answer_and_passed_back():
+    """思考内容走 reasoning_content：只读 content 的话思考期间一个字都拿不到；
+    而且它必须随 assistant 消息回传，缺了厂商会拒收整轮（真实踩过的 HTTP 400）。"""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"content": None, "reasoning_content": "先看看教材"}}]},
+            {"choices": [{"delta": {"content": None, "reasoning_content": "再决定查什么"}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "search_materials", "arguments": "{}"}}]}}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))
+
+    thoughts = [i.text for i in items if isinstance(i, ChatReasoning)]
+    assert thoughts == ["先看看教材", "再决定查什么"]
+    assert not [i for i in items if isinstance(i, ChatDelta)], "思考内容不该混进答案文本"
+    calls = items[-1]
+    assert isinstance(calls, ChatToolCalls)
+    assert calls.reasoning == "先看看教材再决定查什么"
+
+    # 回传：assistant 历史消息里要带上 reasoning_content
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        list(_adapter(client).chat(messages=[
+            *_messages(),
+            ChatMessage(role="assistant", content="", tool_calls=calls.calls, reasoning=calls.reasoning),
+            ChatMessage(role="tool", content="检索结果", tool_call_id="c1"),
+        ]))
+    assistant = [m for m in bodies[-1]["messages"] if m["role"] == "assistant"][0]
+    assert assistant["reasoning_content"] == "先看看教材再决定查什么"
+
+
+def test_provider_error_carries_the_server_explanation():
+    """4xx 只有状态码等于没有线索——是模型名错了还是参数不被接受，全靠服务端这句话。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "The `reasoning_content` must be passed back."}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LLMProviderError) as caught:
+            list(_adapter(client).chat(messages=_messages()))
+    assert caught.value.code == "http_400"
+    assert "reasoning_content" in str(caught.value)
 
 
 def test_extra_body_is_merged_and_cannot_break_the_protocol():
@@ -211,8 +257,13 @@ def test_mid_stream_drop_is_reported_as_stream_interrupted_not_retried():
 
 
 def test_provider_error_is_sanitized_and_recorded():
+    """服务端对错误的说明要带上（不然 4xx 无从下手），但密钥一律抹掉——
+    401 的消息里回显 key 是真实存在的情况。响应体其余部分不进错误消息。"""
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": {"message": "sensitive-provider-body"}})
+        return httpx.Response(401, json={
+            "error": {"message": "Invalid api key: test-secret"},
+            "debug": "sensitive-provider-body",
+        })
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         adapter = _adapter(client)
@@ -221,5 +272,6 @@ def test_provider_error_is_sanitized_and_recorded():
         assert raised.value.code == "http_401"
         assert raised.value.retryable is False
         assert "test-secret" not in str(raised.value)
+        assert "***" in str(raised.value)
         assert "sensitive-provider-body" not in str(raised.value)
         assert adapter.health()["last_error_code"] == "http_401"

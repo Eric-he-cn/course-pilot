@@ -37,6 +37,8 @@ class ChatMessage:
     content: str
     tool_calls: tuple[ToolCallRequest, ...] = ()
     tool_call_id: str | None = None
+    # 思考模式下厂商要求把上一轮的思考内容随 assistant 消息回传，不带会被拒。
+    reasoning: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,11 +49,19 @@ class ChatDelta:
 
 
 @dataclass(frozen=True)
+class ChatReasoning:
+    """思考内容增量。它不是答案的一部分，但要回传给厂商，也用来告诉界面「还在想」。"""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class ChatToolCalls:
     """本次响应以工具调用结束；调用方执行后回填 tool 消息继续对话。"""
 
     calls: tuple[ToolCallRequest, ...]
     usage: dict[str, int] = field(default_factory=dict)
+    reasoning: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,7 +112,7 @@ class AgentChatPort(Protocol):
     @property
     def model(self) -> str: ...
 
-    def chat(self, *, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> Iterable[ChatDelta | ChatToolCalls | ChatFinal]:
+    def chat(self, *, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> Iterable[ChatDelta | ChatReasoning | ChatToolCalls | ChatFinal]:
         """Yield zero or more deltas followed by exactly one ChatToolCalls or ChatFinal.
 
         Raising LLMProviderError before the first delta means the whole call

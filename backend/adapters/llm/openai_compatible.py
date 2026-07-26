@@ -11,6 +11,7 @@ from contracts.llm import (
     ChatDelta,
     ChatFinal,
     ChatMessage,
+    ChatReasoning,
     ChatToolCalls,
     LLMProviderError,
     ToolCallRequest,
@@ -19,6 +20,23 @@ from contracts.llm import (
 
 
 _PROTOCOL_FIELDS = frozenset({"model", "messages", "stream", "tools", "max_tokens"})
+
+
+def _detail(response: httpx.Response, secret: str) -> str:
+    """带上服务端对错误的说明：4xx 只有状态码根本没法查——模型名错了、参数不被接受、
+    还是缺了某个必传字段，全靠这句话。只取结构化的 error.message，不回显整个响应体；
+    密钥就算被服务端回显也在这里抹掉。这条消息只进本地 trace，不随事件发给前端。"""
+    try:
+        response.read()
+        message = (response.json().get("error") or {}).get("message")
+    except Exception:
+        return ""
+    if not isinstance(message, str):
+        return ""
+    text = " ".join(message.split())[:200]
+    if secret:
+        text = text.replace(secret, "***")
+    return f"：{text}" if text else ""
 
 
 class OpenAICompatibleChat:
@@ -51,6 +69,7 @@ class OpenAICompatibleChat:
         if clashing:
             raise ValueError(f"extra_body 不能覆盖协议字段：{'、'.join(clashing)}")
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
+        self._api_key = api_key
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         self._max_output_tokens = max(256, max_output_tokens)
         self._max_retries = max(0, max_retries)
@@ -91,8 +110,12 @@ class OpenAICompatibleChat:
             emitted = False
             try:
                 with self._client.stream("POST", self._endpoint, json=payload, headers=self._headers) as response:
+                    # 出错时必须在这里读完 body：离开 with 之后流已关闭，服务端的说明就再也拿不到了。
+                    if response.status_code >= 400:
+                        response.read()
                     response.raise_for_status()
                     parts: list[str] = []
+                    reasoning_parts: list[str] = []
                     tool_calls_acc: dict[int, dict[str, str]] = {}
                     finish_reason, usage = "stop", {}
                     for line in response.iter_lines():
@@ -114,6 +137,12 @@ class OpenAICompatibleChat:
                             emitted = True
                             parts.append(piece)
                             yield ChatDelta(piece)
+                        # 思考内容单独走一路：它不进答案，但要回传给厂商。
+                        # 刻意不设 emitted——答案还没开始，网络抖动时整轮重试仍然安全。
+                        thinking = delta.get("reasoning_content")
+                        if isinstance(thinking, str) and thinking:
+                            reasoning_parts.append(thinking)
+                            yield ChatReasoning(thinking)
                         for raw_call in delta.get("tool_calls") or []:
                             self._accumulate_tool_call(tool_calls_acc, raw_call)
                         if choices[0].get("finish_reason"):
@@ -124,7 +153,7 @@ class OpenAICompatibleChat:
                             for index, acc in sorted(tool_calls_acc.items())
                         )
                         self._record_success()
-                        yield ChatToolCalls(calls=calls, usage=usage)
+                        yield ChatToolCalls(calls=calls, usage=usage, reasoning="".join(reasoning_parts))
                         return
                     text = "".join(parts).strip()
                     if not text:
@@ -143,7 +172,7 @@ class OpenAICompatibleChat:
                     continue
                 code = f"http_{status}"
                 self._record_failure(code)
-                raise LLMProviderError(code, f"{self._provider} 请求失败（HTTP {status}）", retryable=retryable) from error
+                raise LLMProviderError(code, f"{self._provider} 请求失败（HTTP {status}）{_detail(error.response, self._api_key)}", retryable=retryable) from error
             except httpx.RequestError as error:
                 if emitted:
                     # 已输出增量后不重放整轮，避免重复文本（架构 §5.8）。
@@ -200,6 +229,8 @@ class OpenAICompatibleChat:
                     {
                         "role": "assistant",
                         "content": message.content or "",
+                        # 思考模式要求原样回传上一轮的思考内容，缺了整轮请求会被拒。
+                        **({"reasoning_content": message.reasoning} if message.reasoning else {}),
                         "tool_calls": [
                             {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}}
                             for call in message.tool_calls
