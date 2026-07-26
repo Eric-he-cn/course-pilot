@@ -87,11 +87,12 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .statusbar .ok { color:var(--accent) }
 .statusbar .bad { color:var(--danger) }
 .statusbar .right { margin-left:auto }
+/* 窄屏让位给连接状态：按 class 标出可省略的项，按位置写会在插入新项时隐藏错东西 */
+.statusbar-detail { overflow:hidden; text-overflow:ellipsis }
 
 /* ---- 对话 ---- */
 .chat-view { display:flex; flex:1; flex-direction:column; min-height:0 }
 .session-context { display:flex; align-items:center; gap:8px; padding:9px max(20px,calc((100% - 760px)/2)); color:var(--muted); border-bottom:1px solid var(--border); background:var(--bg); font-size:12px }
-.scope-pill { color:var(--muted); border:1px solid var(--border); border-radius:5px; padding:1px 7px; font-family:var(--mono); font-size:10.5px; letter-spacing:.04em }
 .messages { position:relative; flex:1; overflow:auto; padding:28px max(20px,calc((100% - 760px)/2)) 20px }
 .message { margin:0 0 26px }
 .user-message { display:flex; justify-content:flex-end }
@@ -282,8 +283,6 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .citation-drawer>p { color:var(--muted); font-family:var(--mono); font-size:11px }
 
 /* ---- 会话上下文条 ---- */
-.context-course { display:inline-flex; align-items:center; gap:6px; color:var(--text); font-weight:600 }
-.context-course i { display:inline-block; width:7px; height:7px; border-radius:50% }
 .course-heading { display:flex; align-items:center; gap:10px }
 .course-heading i { display:inline-block; flex:0 0 auto; width:11px; height:11px; border-radius:50% }
 .connection { display:none }
@@ -322,7 +321,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
   .mobile-only { display:inline-grid }
   .collapse-only { display:none }
   .topbar { padding:0 12px }
-  .statusbar span:nth-child(2),.statusbar span:nth-child(3) { display:none }
+  .statusbar-detail { display:none }
   .messages { padding-left:16px; padding-right:16px }
   .session-context { padding-left:16px; padding-right:16px }
   .composer-wrap { padding:10px 12px 14px }
