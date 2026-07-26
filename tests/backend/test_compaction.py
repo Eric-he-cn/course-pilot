@@ -14,8 +14,8 @@ def _settings(tmp_path, *, compact_ratio: float = 0.7) -> Settings:
     data_dir = tmp_path / "data"
     return Settings(
         data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
-        text_provider="deepseek", text_base_url="https://api.deepseek.com", text_api_key="",
-        text_model="deepseek-v4-flash", enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
+        text_provider="example", text_base_url="https://api.example.com/v1", text_api_key="",
+        text_model="example-model", enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
         agent_history_token_budget=2_000, agent_compact_threshold_ratio=compact_ratio,
     )
 
@@ -30,8 +30,8 @@ class Responder:
     """辅导轮次固定回一句；压缩调用按提示词特征识别，单独给脚本。"""
 
     mode = "provider"
-    provider = "deepseek"
-    model = "deepseek-v4-flash"
+    provider = "example"
+    model = "example-model"
 
     def __init__(self, compact_script=None):
         self._compact_script = compact_script
@@ -41,12 +41,12 @@ class Responder:
         if any("<summary>" in message.content for message in messages if message.role == "system"):
             self.compact_calls.append(messages[-1].content)
             if self._compact_script is None:
-                yield ChatFinal("<summary>压缩后的摘要正文</summary>", "stop", "deepseek", "deepseek-v4-flash", "provider")
+                yield ChatFinal("<summary>压缩后的摘要正文</summary>", "stop", "example", "example-model", "provider")
                 return
             yield from self._compact_script()
             return
         yield ChatDelta("好的。")
-        yield ChatFinal("好的。", "stop", "deepseek", "deepseek-v4-flash", "provider")
+        yield ChatFinal("好的。", "stop", "example", "example-model", "provider")
 
     def health(self):
         return {}
@@ -114,8 +114,8 @@ def test_summary_is_injected_and_early_history_is_dropped(client):
 @pytest.mark.parametrize(
     "script, why",
     [
-        (lambda: iter([ChatFinal("忘了包标签的裸文本", "stop", "deepseek", "m", "provider")]), "解析不出 summary 标签"),
-        (lambda: iter([ChatFinal("<summary>   </summary>", "stop", "deepseek", "m", "provider")]), "摘要为空"),
+        (lambda: iter([ChatFinal("忘了包标签的裸文本", "stop", "example", "m", "provider")]), "解析不出 summary 标签"),
+        (lambda: iter([ChatFinal("<summary>   </summary>", "stop", "example", "m", "provider")]), "摘要为空"),
         (lambda: iter([ChatToolCalls((ToolCallRequest("x", "list_materials", "{}"),))]), "违规调用工具"),
     ],
 )

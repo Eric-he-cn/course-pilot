@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from PIL import Image, UnidentifiedImageError
 
-# 与 Qwen-OCR 支持范围一致的常见格式；其余 MIME 直接拒绝。
+# 主流 OCR 服务普遍支持的常见格式；其余 MIME 直接拒绝。
 _ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
 # 允许解码的像素上限相对 max_pixels 的倍数：再大就不值得为了缩放先解进内存。
 _DECODE_HEADROOM = 8

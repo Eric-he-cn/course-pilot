@@ -5,7 +5,7 @@ from pathlib import Path
 
 from adapters.embedding import BgeEmbedder
 from adapters.web import HttpWebAccess
-from adapters.llm import DeepSeekAgentChat, DemoAgentChat, QwenOcrTranscriber
+from adapters.llm import DemoAgentChat, OpenAICompatibleChat, VisionOcrTranscriber
 from contracts.llm import AgentChatPort, VisionTranscriberPort
 from contracts.web import WebSearchPort
 from modules.agent.service import TurnService
@@ -52,11 +52,11 @@ class Application:
 
     def llm_health(self) -> dict[str, object]:
         status = self.llm.health()
-        adapter_available = self.settings.text_provider.lower() == "deepseek"
+        # 适配器认 OpenAI 兼容协议，配齐三项就能用，不挑厂商。
         status.update(
             configured=self.settings.remote_llm_configured,
-            enabled=self.settings.enable_remote_llm and self.settings.remote_llm_configured and adapter_available,
-            adapter_available=adapter_available,
+            enabled=self.settings.enable_remote_llm and self.settings.remote_llm_configured,
+            adapter_available=True,
             requested_provider=self.settings.text_provider,
         )
         return status
@@ -97,26 +97,28 @@ class SharedRuntime:
 def build_shared_runtime(settings: Settings) -> SharedRuntime:
     fallback = DemoAgentChat()
     llm: AgentChatPort = fallback
-    if settings.enable_remote_llm and settings.remote_llm_configured and settings.text_provider.lower() == "deepseek":
-        llm = DeepSeekAgentChat(
-            api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
-            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+    classifier: AgentChatPort | None = None
+    # 认的是「配了 OpenAI 兼容端点」而不是某个厂商名：写死厂商名会让别家的配置静默退回本地兜底。
+    remote_ready = settings.enable_remote_llm and settings.remote_llm_configured
+    common = {
+        "api_key": settings.text_api_key, "base_url": settings.text_base_url, "model": settings.text_model,
+        "provider": settings.text_provider, "extra_body": settings.text_extra_body,
+        "connect_timeout_seconds": settings.llm_connect_timeout_seconds,
+    }
+    if remote_ready:
+        llm = OpenAICompatibleChat(
+            **common,
             total_timeout_seconds=settings.llm_total_timeout_seconds,
             max_output_tokens=settings.agent_max_output_tokens,
             max_retries=settings.llm_max_retries,
         )
-    # 学科分类器：超时更短、不重试，它跑在 turn 锁内、首个增量之前。
-    classifier: AgentChatPort | None = None
-    if settings.enable_remote_llm and settings.remote_llm_configured and settings.text_provider.lower() == "deepseek":
-        classifier = DeepSeekAgentChat(
-            api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
-            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
-            total_timeout_seconds=6, max_output_tokens=256, max_retries=0,
-        )
+        # 学科分类器：超时更短、不重试，它跑在 turn 锁内、首个增量之前。
+        classifier = OpenAICompatibleChat(**common, total_timeout_seconds=6, max_output_tokens=256, max_retries=0)
     vision: VisionTranscriberPort | None = None
-    if settings.enable_remote_llm and settings.vision_configured and settings.vision_provider.lower() == "dashscope":
-        vision = QwenOcrTranscriber(
+    if settings.enable_remote_llm and settings.vision_configured:
+        vision = VisionOcrTranscriber(
             api_key=settings.vision_api_key, base_url=settings.vision_base_url, model=settings.vision_model,
+            provider=settings.vision_provider,
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=settings.llm_total_timeout_seconds,
             max_retries=settings.llm_max_retries,

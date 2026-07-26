@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -16,6 +17,20 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
+
+
+def _parse_extra_body(raw: str) -> dict[str, object]:
+    """配置错了就在启动时说清楚，别留到第一次对话才炸。"""
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"TEXT_EXTRA_BODY 不是合法 JSON：{error}") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("TEXT_EXTRA_BODY 必须是 JSON 对象")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -63,6 +78,8 @@ class Settings:
     # 联网检索（SerpAPI）：未配置或未开启远端调用时，network 类工具整体不下发。
     web_search_api_key: str = ""
     web_timeout_seconds: float = 20
+    # 厂商私有的请求字段（如关闭思考模式），原样并入 chat/completions 请求体。
+    text_extra_body: dict[str, object] = field(default_factory=dict)
 
     def for_workspace(self, workspace_dir: Path) -> "Settings":
         """某个用户工作区的 Settings。三个路径字段必须一起换——只改 data_dir
@@ -96,8 +113,8 @@ class Settings:
             data_dir = root / data_dir
         return cls(
             data_dir, data_dir / "coursepilot.db", data_dir / "materials",
-            value("TEXT_PROVIDER", "deepseek"), value("TEXT_BASE_URL", "https://api.deepseek.com"),
-            value("TEXT_API_KEY"), value("TEXT_MODEL", "deepseek-v4-flash"),
+            value("TEXT_PROVIDER", "openai_compatible"), value("TEXT_BASE_URL"),
+            value("TEXT_API_KEY"), value("TEXT_MODEL"),
             value("COURSEPILOT_ENABLE_REMOTE_LLM", "0").lower() in {"1", "true", "yes"},
             max(100, int(value("RAG_CHUNK_SIZE", "600"))), max(0, int(value("RAG_CHUNK_OVERLAP", "120"))),
             max(1, int(value("RAG_TOP_K_RESULTS", "6"))),
@@ -123,4 +140,5 @@ class Settings:
             value("COURSEPILOT_DEFAULT_USER", "local"),
             value("RESEARCH_SERPAPI_API_KEY"),
             max(1.0, float(value("WEB_TIMEOUT_SECONDS", "20"))),
+            _parse_extra_body(value("TEXT_EXTRA_BODY")),
         )

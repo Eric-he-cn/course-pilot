@@ -9,7 +9,7 @@ from conftest import workspace
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from adapters.llm.qwen_ocr import QwenOcrTranscriber
+from adapters.llm.vision_ocr import VisionOcrTranscriber
 from app.main import create_app
 from contracts.llm import LLMProviderError, VisionTranscription
 from modules.sessions.images import process_image
@@ -23,17 +23,17 @@ def _png(width: int = 64, height: int = 64) -> bytes:
     return buffer.getvalue()
 
 
-def _adapter(client: httpx.Client, *, max_retries: int = 0) -> QwenOcrTranscriber:
-    return QwenOcrTranscriber(
+def _adapter(client: httpx.Client, *, max_retries: int = 0) -> VisionOcrTranscriber:
+    return VisionOcrTranscriber(
         api_key="test-secret",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        model="qwen-vl-ocr",
+        base_url="https://api.example.com/v1",
+        model="example-ocr-model",
         max_retries=max_retries,
         client=client,
     )
 
 
-def test_qwen_ocr_sends_data_url_and_parses_transcription():
+def test_vision_ocr_sends_data_url_and_parses_transcription():
     captured: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -50,10 +50,10 @@ def test_qwen_ocr_sends_data_url_and_parses_transcription():
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         result = _adapter(client).transcribe(content=b"fake-image", mime_type="image/png")
 
-    assert captured["url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    assert captured["url"] == "https://api.example.com/v1/chat/completions"
     body = captured["body"]
     assert isinstance(body, dict)
-    assert body["model"] == "qwen-vl-ocr"
+    assert body["model"] == "example-ocr-model"
     parts = body["messages"][0]["content"]
     assert parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert parts[1]["text"] == "Read all the text in the image."
@@ -63,7 +63,7 @@ def test_qwen_ocr_sends_data_url_and_parses_transcription():
     assert result.usage["total_tokens"] == 241
 
 
-def test_qwen_ocr_empty_transcription_needs_confirmation():
+def test_vision_ocr_empty_transcription_needs_confirmation():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": [{"message": {"content": "  "}}]})
 
@@ -73,7 +73,7 @@ def test_qwen_ocr_empty_transcription_needs_confirmation():
     assert result.needs_confirmation is True
 
 
-def test_qwen_ocr_error_is_sanitized():
+def test_vision_ocr_error_is_sanitized():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "sensitive-provider-body"}})
 
@@ -120,7 +120,7 @@ def test_process_image_downscales_and_strips_exif():
 
 
 class _FakeVision:
-    provider, model = "dashscope", "qwen-vl-ocr"
+    provider, model = "example-vision", "example-ocr-model"
 
     def transcribe(self, *, content: bytes, mime_type: str) -> VisionTranscription:
         return VisionTranscription(plain_text="链式法则示例图", provider=self.provider, model=self.model, needs_confirmation=False)

@@ -2,7 +2,7 @@
 name: practice
 description: 组织完整练习过程，包括出题、评分、讲评和变式题
 when_to_use: 用户想练习或要做题、提交了对最近练习的作答、要求讲评错题或要同考点的变式题，以及每日小测触发时
-allowed_tools: [search_materials, list_materials, concept_search, get_archive, emit_evidence, artifact_read, artifact_append]
+allowed_tools: [search_materials, list_materials, concept_search, get_archive, emit_evidence, artifact_read, artifact_append, web_search, web_fetch]
 examples: 出三道题考考我 | 我觉得答案是 B | 讲讲我刚才那道题为什么错
 ---
 
@@ -76,6 +76,8 @@ examples: 出三道题考考我 | 我觉得答案是 B | 讲讲我刚才那道�
 - 用户提交作答前，绝不透露标准答案、评分要点或 `model_private` artifact 的任何内容，
   用户直接问答案时先请他先写出自己的思路。
 - 不出教材证据覆盖不到的题；宁可少出一道，也不要凭通用知识编题。
+- 出题和判分的依据只能是教材。联网只用来核对术语的标准说法、补讲评时的背景，
+  查到的内容不作为判分依据，也不拿网上的题当本次练习的题目。
 - 只对可判定的客观作答写证据事件。用户说"我大概懂了"这类自述不是作答，不写事件。
 - 概念只能从 `concept_search` 返回的列表里选，列表外的概念一律传 `topic_hint`。
 - 不产出整卷或模拟考试——那不在产品范围内。

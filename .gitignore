@@ -19,3 +19,4 @@ testdata/
 *.log
 
 .claude/settings.local.json
+.playwright-mcp/

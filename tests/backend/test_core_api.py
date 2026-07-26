@@ -20,10 +20,10 @@ def _settings(tmp_path) -> Settings:
         data_dir=data_dir,
         database_path=data_dir / "coursepilot.db",
         uploads_dir=data_dir / "materials",
-        text_provider="deepseek",
-        text_base_url="https://api.deepseek.com",
+        text_provider="example",
+        text_base_url="https://api.example.com/v1",
         text_api_key="",
-        text_model="deepseek-v4-flash",
+        text_model="example-model",
         enable_remote_llm=False,
         chunk_size=120,
         chunk_overlap=20,
@@ -238,8 +238,8 @@ def test_database_enforces_one_active_turn_per_session(client):
 def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
     class FailingResponder:
         mode = "provider"
-        provider = "deepseek"
-        model = "deepseek-v4-flash"
+        provider = "example"
+        model = "example-model"
 
         def chat(self, *, messages, tools=()):
             raise LLMProviderError("network_error", "unavailable", retryable=True)
@@ -268,7 +268,7 @@ def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
         "turn_started", "course_resolution", "tool_call", "citation", "tool_result", "context_usage", "provider_fallback", "text_delta", "turn_completed",
     ]
     assert _first(events, "provider_fallback") == {
-        "provider": "deepseek", "model": "deepseek-v4-flash", "error_code": "network_error", "retryable": True,
+        "provider": "example", "model": "example-model", "error_code": "network_error", "retryable": True,
     }
     assert "Demo responder" in _first(events, "text_delta")["text"]
     assert _first(events, "turn_completed")["responder_mode"] == "demo_fallback"
@@ -289,8 +289,8 @@ def test_no_evidence_turn_still_answers_with_explicit_label(client):
 def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(client):
     class InterruptingResponder:
         mode = "provider"
-        provider = "deepseek"
-        model = "deepseek-v4-flash"
+        provider = "example"
+        model = "example-model"
 
         def chat(self, *, messages, tools=()):
             yield ChatDelta("链式法则是复合函数")
@@ -362,7 +362,8 @@ def test_startup_recovers_stale_running_turns(tmp_path):
         recovered_sessions.complete_turn(next_turn.id, status="completed")
 
 
-def test_health_reports_enabled_deepseek_adapter_without_exposing_key(tmp_path):
+def test_health_reports_enabled_provider_adapter_without_exposing_key(tmp_path):
+    # provider 名刻意用一个没听过的值：适配器认协议不认厂商，配齐就该启用。
     settings = replace(_settings(tmp_path), text_api_key="test-secret", enable_remote_llm=True)
     with TestClient(create_app(settings=settings)) as remote_client:
         llm = remote_client.get("/api/v2/health").json()["llm"]
@@ -370,7 +371,7 @@ def test_health_reports_enabled_deepseek_adapter_without_exposing_key(tmp_path):
     assert llm["enabled"] is True
     assert llm["adapter_available"] is True
     assert llm["mode"] == "provider"
-    assert llm["provider"] == "deepseek"
-    assert llm["model"] == "deepseek-v4-flash"
+    assert llm["provider"] == "example"
+    assert llm["model"] == "example-model"
     assert "api_key" not in llm
     assert "test-secret" not in json.dumps(llm)

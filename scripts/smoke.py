@@ -30,8 +30,8 @@ def main() -> None:
     course_name = f"高等数学 Smoke {suffix}"
     with httpx.Client(timeout=90) as client:
         health = require(client.get(f"{BASE_URL}/health"))
-        if health["llm"]["mode"] != "provider" or health["llm"]["model"] != "deepseek-v4-flash":
-            raise RuntimeError(f"DeepSeek adapter is not active: {health['llm']}")
+        if health["llm"]["mode"] != "provider":
+            raise RuntimeError(f"远端适配器未启用，当前走的是本地兜底：{health['llm']}")
         course = require(client.post(f"{BASE_URL}/courses", json={"name": course_name}))
         material = require(
             client.post(
@@ -56,8 +56,8 @@ def main() -> None:
             raise RuntimeError("resolved turn did not emit a tool_call span")
         if "event: citation" not in turn.text:
             raise RuntimeError("resolved turn returned no citation")
-        if '"responder_mode": "provider"' not in turn.text or '"provider": "deepseek"' not in turn.text:
-            raise RuntimeError("resolved turn did not use the DeepSeek provider")
+        if '"responder_mode": "provider"' not in turn.text:
+            raise RuntimeError("这一轮没有走远端模型")
         messages = require(client.get(f"{BASE_URL}/sessions/{session['id']}/messages"))
         if not isinstance(messages, dict) or len(messages["messages"]) != 2:
             raise RuntimeError("messages were not persisted")

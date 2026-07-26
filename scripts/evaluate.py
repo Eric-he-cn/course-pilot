@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from adapters.llm.deepseek import DeepSeekAgentChat  # noqa: E402
+from adapters.llm.openai_compatible import OpenAICompatibleChat  # noqa: E402
 from contracts.llm import ChatDelta, ChatMessage  # noqa: E402
 from core.settings import Settings  # noqa: E402
 
@@ -76,7 +76,7 @@ def render_case(record: dict, store_path: Path) -> str:
     )
 
 
-def judge(chat: DeepSeekAgentChat, case: str) -> dict:
+def judge(chat: OpenAICompatibleChat, case: str) -> dict:
     messages = [ChatMessage(role="system", content=_JUDGE_PROMPT), ChatMessage(role="user", content=case)]
     parts: list[str] = []
     for item in chat.chat(messages=messages):
@@ -109,8 +109,9 @@ def main() -> None:
     if not records:
         raise SystemExit(f"{data_dir / 'traces'} 里没有可评测的完成轮次")
 
-    chat = DeepSeekAgentChat(
+    chat = OpenAICompatibleChat(
         api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
+        provider=settings.text_provider, extra_body=settings.text_extra_body,
         total_timeout_seconds=settings.llm_total_timeout_seconds,
     )
     results, scored = [], {"faithfulness": [], "attribution": [], "usefulness": []}

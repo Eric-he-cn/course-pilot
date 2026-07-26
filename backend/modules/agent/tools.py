@@ -264,9 +264,12 @@ def capabilities_of(names: tuple[str, ...]) -> frozenset[str]:
 
 def profile_for_skill(allowed: tuple[str, ...]) -> ToolProfile:
     """skill 激活后能力恰好等于它声明的工具所需——声明即权限，多一分都没有。
-    "练习时不能出网"这类安全属性由 SKILL.md 不声明联网工具来表达，
-    并有测试盯着它不被悄悄加回来。"""
-    return ToolProfile(tools=allowed, capabilities=capabilities_of(allowed))
+    花钱工具的次数上限沿用主 profile，不让 skill 绕开预算。"""
+    return ToolProfile(
+        tools=allowed,
+        capabilities=capabilities_of(allowed),
+        per_tool_budget={name: limit for name, limit in MAIN.per_tool_budget.items() if name in allowed},
+    )
 
 
 def validate_profiles() -> list[str]:

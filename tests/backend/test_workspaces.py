@@ -15,7 +15,7 @@ def _settings(tmp_path) -> Settings:
     data_dir = tmp_path / "data"
     return Settings(
         data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
-        text_provider="deepseek", text_base_url="x", text_api_key="", text_model="m",
+        text_provider="example", text_base_url="x", text_api_key="", text_model="m",
         enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
     )
 

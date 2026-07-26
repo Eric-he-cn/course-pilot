@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import httpx
 
@@ -18,8 +18,14 @@ from contracts.llm import (
 )
 
 
-class DeepSeekAgentChat:
-    """DeepSeek Chat Completions adapter：多轮 messages + function calling，流式输出。"""
+_PROTOCOL_FIELDS = frozenset({"model", "messages", "stream", "tools", "max_tokens"})
+
+
+class OpenAICompatibleChat:
+    """OpenAI Chat Completions 兼容适配器：多轮 messages + function calling，流式输出。
+
+    只用标准字段，任何兼容该协议的服务都能接。厂商私有参数走 extra_body 传入。
+    """
 
     def __init__(
         self,
@@ -27,6 +33,8 @@ class DeepSeekAgentChat:
         api_key: str,
         base_url: str,
         model: str,
+        provider: str = "openai_compatible",
+        extra_body: Mapping[str, object] | None = None,
         connect_timeout_seconds: float = 10,
         total_timeout_seconds: float = 180,
         max_output_tokens: int = 8192,
@@ -34,8 +42,14 @@ class DeepSeekAgentChat:
         client: httpx.Client | None = None,
     ) -> None:
         if not api_key or not base_url or not model:
-            raise ValueError("DeepSeek adapter requires api_key, base_url and model")
+            raise ValueError("适配器需要 api_key、base_url 和 model")
         self._model = model
+        self._provider = provider or "openai_compatible"
+        self._extra_body = dict(extra_body or {})
+        # 覆盖这些字段会直接改坏协议本身，宁可启动就报错也不要留个难查的运行时故障。
+        clashing = sorted(self._extra_body.keys() & _PROTOCOL_FIELDS)
+        if clashing:
+            raise ValueError(f"extra_body 不能覆盖协议字段：{'、'.join(clashing)}")
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         self._max_output_tokens = max(256, max_output_tokens)
@@ -53,7 +67,7 @@ class DeepSeekAgentChat:
 
     @property
     def provider(self) -> str:
-        return "deepseek"
+        return self._provider
 
     @property
     def model(self) -> str:
@@ -63,11 +77,9 @@ class DeepSeekAgentChat:
         payload: dict[str, object] = {
             "model": self._model,
             "messages": self._to_wire(messages),
-            # DeepSeek V4 enables thinking by default. Tutor turns use the
-            # lower-latency non-thinking path unless a future policy opts in.
-            "thinking": {"type": "disabled"},
             "max_tokens": self._max_output_tokens,
             "stream": True,
+            **self._extra_body,
         }
         if tools:
             payload["tools"] = [
@@ -117,7 +129,7 @@ class DeepSeekAgentChat:
                     text = "".join(parts).strip()
                     if not text:
                         self._record_failure("invalid_response")
-                        raise LLMProviderError("invalid_response", "DeepSeek 返回了空回答", retryable=False)
+                        raise LLMProviderError("invalid_response", f"{self._provider} 返回了空回答", retryable=False)
                     self._record_success()
                     yield ChatFinal(text=text, finish_reason=finish_reason, provider=self.provider, model=self.model, mode=self.mode, usage=usage)
                     return
@@ -131,22 +143,22 @@ class DeepSeekAgentChat:
                     continue
                 code = f"http_{status}"
                 self._record_failure(code)
-                raise LLMProviderError(code, f"DeepSeek 请求失败（HTTP {status}）", retryable=retryable) from error
+                raise LLMProviderError(code, f"{self._provider} 请求失败（HTTP {status}）", retryable=retryable) from error
             except httpx.RequestError as error:
                 if emitted:
                     # 已输出增量后不重放整轮，避免重复文本（架构 §5.8）。
                     self._record_failure("stream_interrupted")
-                    raise LLMProviderError("stream_interrupted", "DeepSeek 流式响应中断", retryable=False) from error
+                    raise LLMProviderError("stream_interrupted", f"{self._provider} 流式响应中断", retryable=False) from error
                 if attempt < self._max_retries:
                     attempt += 1
                     time.sleep(0.2 * (2 ** (attempt - 1)))
                     continue
                 self._record_failure("network_error")
-                raise LLMProviderError("network_error", "暂时无法连接 DeepSeek", retryable=True) from error
+                raise LLMProviderError("network_error", f"暂时无法连接 {self._provider}", retryable=True) from error
             except json.JSONDecodeError as error:
                 code = "stream_interrupted" if emitted else "invalid_response"
                 self._record_failure(code)
-                raise LLMProviderError(code, "DeepSeek 返回了无法解析的流式数据", retryable=False) from error
+                raise LLMProviderError(code, f"{self._provider} 返回了无法解析的流式数据", retryable=False) from error
 
     def health(self) -> dict[str, object]:
         with self._state_lock:

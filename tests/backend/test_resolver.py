@@ -25,7 +25,7 @@ class Catalog:
 class Classifier:
     """记录调用次数：名字命中或有可沿用解析时，它一次都不该被调到。"""
 
-    mode, provider, model = "provider", "deepseek", "deepseek-v4-flash"
+    mode, provider, model = "provider", "example", "example-model"
 
     def __init__(self, reply: str = "none", raises: bool = False):
         self._reply, self._raises = reply, raises
@@ -35,7 +35,7 @@ class Classifier:
         self.calls.append(messages[-1].content)
         if self._raises:
             raise RuntimeError("上游炸了")
-        yield ChatFinal(self._reply, "stop", "deepseek", "deepseek-v4-flash", "provider")
+        yield ChatFinal(self._reply, "stop", "example", "example-model", "provider")
 
     def health(self):
         return {}

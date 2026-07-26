@@ -30,18 +30,19 @@ def test_schema_layer_hides_tools_the_profile_cannot_use():
     assert {"web_search", "web_fetch", "note_write", "calculator"} <= main_names
 
 
-def test_practice_skill_stays_offline():
-    """练习时能出网等于让用户查答案。这条安全属性由 practice 不声明联网工具来表达，
-    这个用例盯着它不被悄悄加回来。"""
+def test_skill_gets_exactly_its_declared_tools_and_inherits_spend_limits():
+    """skill 拿到的就是它声明的那些工具，没声明的（这里是写笔记）拿不到；
+    花钱工具的次数上限沿用主 profile，激活 skill 不是绕开预算的口子。"""
     from pathlib import Path
 
     from modules.agent.skills import load_skill
 
     practice = load_skill(Path(__file__).resolve().parents[2] / "skills" / "builtin" / "practice" / "SKILL.md")
-    granted = {spec.name for spec in specs_for(practice.allowed_tools, capabilities=capabilities_of(practice.allowed_tools))}
-    assert "web_search" not in granted and "web_fetch" not in granted
+    profile = profile_for_skill(practice.allowed_tools)
+    granted = {spec.name for spec in specs_for(profile.tools, capabilities=profile.capabilities)}
+    assert {"search_materials", "emit_evidence", "web_search"} <= granted
     assert "note_write" not in granted
-    assert "search_materials" in granted and "emit_evidence" in granted
+    assert profile.per_tool_budget["web_search"] == MAIN.per_tool_budget["web_search"]
 
 
 def test_skill_capabilities_are_exactly_what_it_declares():
@@ -207,13 +208,14 @@ def test_all_builtin_skills_load_and_declare_known_tools():
         assert skill.when_to_use and skill.description
 
 
-def test_only_research_skill_can_reach_the_network():
-    """联网是最该被显式限制的能力：除了 research，其余 skill 都不该拿到。"""
+def test_network_access_stays_an_explicit_per_skill_decision():
+    """哪些 skill 能出网写死在这里：research 要查教材外的资料，practice 要核对术语说法。
+    再给别的 skill 开联网，必须先改这条断言——不让它悄悄扩散。"""
     from modules.agent.skills import SkillRegistry
 
     registry = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
     online = {name for name in registry.builtin_names() if "network" in capabilities_of(registry.get(name).allowed_tools)}
-    assert online == {"research"}
+    assert online == {"research", "practice"}
 
 
 def test_every_skill_example_actually_triggers_its_own_pre_routing():
@@ -266,7 +268,7 @@ def test_notes_have_a_read_route(tmp_path):
     data_dir = tmp_path / "data"
     settings = Settings(
         data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
-        text_provider="deepseek", text_base_url="x", text_api_key="", text_model="m",
+        text_provider="example", text_base_url="x", text_api_key="", text_model="m",
         enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
     )
     with TestClient(create_app(settings=settings)) as client:
@@ -296,7 +298,7 @@ def test_memory_has_read_and_write_routes(tmp_path):
     data_dir = tmp_path / "data"
     settings = Settings(
         data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
-        text_provider="deepseek", text_base_url="x", text_api_key="", text_model="m",
+        text_provider="example", text_base_url="x", text_api_key="", text_model="m",
         enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
     )
     with TestClient(create_app(settings=settings)) as client:

@@ -17,8 +17,8 @@ def _settings(tmp_path) -> Settings:
     data_dir = tmp_path / "data"
     return Settings(
         data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
-        text_provider="deepseek", text_base_url="https://api.deepseek.com", text_api_key="",
-        text_model="deepseek-v4-flash", enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
+        text_provider="example", text_base_url="https://api.example.com/v1", text_api_key="",
+        text_model="example-model", enable_remote_llm=False, chunk_size=120, chunk_overlap=20, top_k_results=6,
     )
 
 
@@ -49,8 +49,8 @@ class ScriptedChat:
     """按预设脚本逐次响应；记录每次收到的 messages，用于断言上下文组装。"""
 
     mode = "provider"
-    provider = "deepseek"
-    model = "deepseek-v4-flash"
+    provider = "example"
+    model = "example-model"
 
     def __init__(self, script):
         self._script = list(script)
@@ -71,7 +71,7 @@ def test_model_search_loops_and_reuses_citation_numbering(client):
     session_id = _indexed_course_session(client, name="微积分", text="链式法则：复合函数求导时，先对外层求导，再乘以内层导数。")
     scripted = ScriptedChat([
         [ChatToolCalls((ToolCallRequest("c1", "search_materials", '{"query": "链式法则"}'),))],
-        [ChatDelta("先外层后内层。[1]"), ChatFinal("先外层后内层。[1]", "stop", "deepseek", "deepseek-v4-flash", "provider")],
+        [ChatDelta("先外层后内层。[1]"), ChatFinal("先外层后内层。[1]", "stop", "example", "example-model", "provider")],
     ])
     workspace(client).turns._responder = scripted
 
@@ -95,7 +95,7 @@ def test_model_search_loops_and_reuses_citation_numbering(client):
 def test_only_cited_evidence_is_persisted(client):
     text = "\n\n".join(f"第 {i} 节：向量范数用于衡量向量长度，编号 {i}。" for i in range(1, 6))
     session_id = _indexed_course_session(client, name="数值分析", text=text)
-    scripted = ScriptedChat([[ChatDelta("只用了第一条证据。[1]"), ChatFinal("只用了第一条证据。[1]", "stop", "deepseek", "deepseek-v4-flash", "provider")]])
+    scripted = ScriptedChat([[ChatDelta("只用了第一条证据。[1]"), ChatFinal("只用了第一条证据。[1]", "stop", "example", "example-model", "provider")]])
     workspace(client).turns._responder = scripted
 
     events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "cite-1", "message": "向量范数是什么？"}).text)
@@ -111,7 +111,7 @@ def test_prior_messages_are_injected_into_the_prompt(client):
     # 第一轮用默认 demo responder，产生历史。
     client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "h-1", "message": "行列式是什么？"})
 
-    scripted = ScriptedChat([[ChatDelta("好的。"), ChatFinal("好的。", "stop", "deepseek", "deepseek-v4-flash", "provider")]])
+    scripted = ScriptedChat([[ChatDelta("好的。"), ChatFinal("好的。", "stop", "example", "example-model", "provider")]])
     workspace(client).turns._responder = scripted
     client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "h-2", "message": "那它和特征值有关吗？"})
 
@@ -125,7 +125,7 @@ def test_plan_and_archive_tools_report_empty_state(client):
     session_id = _indexed_course_session(client, name="概率论", text="随机变量是样本空间到实数的可测函数。")
     scripted = ScriptedChat([
         [ChatToolCalls((ToolCallRequest("p1", "get_plan", "{}"), ToolCallRequest("a1", "get_archive", "{}")))],
-        [ChatDelta("暂无计划与记录。"), ChatFinal("暂无计划与记录。", "stop", "deepseek", "deepseek-v4-flash", "provider")],
+        [ChatDelta("暂无计划与记录。"), ChatFinal("暂无计划与记录。", "stop", "example", "example-model", "provider")],
     ])
     workspace(client).turns._responder = scripted
 
@@ -158,14 +158,14 @@ def test_tool_budget_is_bounded(client):
 
     class AlwaysCallsTools:
         mode = "provider"
-        provider = "deepseek"
-        model = "deepseek-v4-flash"
+        provider = "example"
+        model = "example-model"
 
         def chat(self, *, messages, tools=()):
             if tools:
                 yield ChatToolCalls((ToolCallRequest("x", "list_materials", "{}"),))
             else:
-                yield ChatFinal("已达检索步数上限。", "tool_budget_exhausted", "deepseek", "deepseek-v4-flash", "provider")
+                yield ChatFinal("已达检索步数上限。", "tool_budget_exhausted", "example", "example-model", "provider")
 
         def health(self):
             return {}

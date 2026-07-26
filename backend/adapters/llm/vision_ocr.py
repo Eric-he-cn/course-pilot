@@ -8,12 +8,12 @@ import httpx
 
 from contracts.llm import LLMProviderError, VisionTranscription
 
-# qwen-vl-ocr 的约定提示词：换成自定义中文提示词会返回坐标而不是文字。
+# 专用 OCR 模型往往只认这句约定提示词，换成自定义中文提示词可能返回坐标而不是文字。
 _OCR_PROMPT = "Read all the text in the image."
 
 
-class QwenOcrTranscriber:
-    """DashScope OpenAI-compatible 协议的 Qwen-OCR 适配器（vision 槽位）。"""
+class VisionOcrTranscriber:
+    """OpenAI 兼容的图片转录适配器（vision 槽位）：标准 image_url + base64。"""
 
     def __init__(
         self,
@@ -21,14 +21,16 @@ class QwenOcrTranscriber:
         api_key: str,
         base_url: str,
         model: str,
+        provider: str = "openai_compatible",
         connect_timeout_seconds: float = 10,
         total_timeout_seconds: float = 180,
         max_retries: int = 2,
         client: httpx.Client | None = None,
     ) -> None:
         if not api_key or not base_url or not model:
-            raise ValueError("Qwen-OCR adapter requires api_key, base_url and model")
+            raise ValueError("适配器需要 api_key、base_url 和 model")
         self._model = model
+        self._provider = provider or "openai_compatible"
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         self._max_retries = max(0, max_retries)
@@ -41,7 +43,7 @@ class QwenOcrTranscriber:
 
     @property
     def provider(self) -> str:
-        return "dashscope"
+        return self._provider
 
     @property
     def model(self) -> str:
@@ -87,17 +89,17 @@ class QwenOcrTranscriber:
                     continue
                 code = f"http_{status}"
                 self._record_failure(code)
-                raise LLMProviderError(code, f"Qwen-OCR 请求失败（HTTP {status}）", retryable=retryable) from error
+                raise LLMProviderError(code, f"{self._provider} 图片转录失败（HTTP {status}）", retryable=retryable) from error
             except httpx.RequestError as error:
                 if attempt < self._max_retries:
                     attempt += 1
                     time.sleep(0.2 * (2 ** (attempt - 1)))
                     continue
                 self._record_failure("network_error")
-                raise LLMProviderError("network_error", "暂时无法连接 Qwen-OCR", retryable=True) from error
+                raise LLMProviderError("network_error", f"暂时无法连接 {self._provider}", retryable=True) from error
             except ValueError as error:
                 self._record_failure("invalid_response")
-                raise LLMProviderError("invalid_response", "Qwen-OCR 返回了无法解析的响应", retryable=False) from error
+                raise LLMProviderError("invalid_response", f"{self._provider} 返回了无法解析的响应", retryable=False) from error
 
     def health(self) -> dict[str, object]:
         with self._state_lock:

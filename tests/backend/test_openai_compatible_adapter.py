@@ -6,7 +6,7 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from adapters.llm.deepseek import DeepSeekAgentChat
+from adapters.llm.openai_compatible import OpenAICompatibleChat
 from contracts.llm import ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, LLMProviderError, ToolCallRequest, ToolSpec
 
 _TOOLS = (
@@ -31,15 +31,41 @@ def _sse(*chunks: object) -> bytes:
     return "".join(frames).encode("utf-8")
 
 
-def _adapter(client: httpx.Client, *, max_retries: int = 0) -> DeepSeekAgentChat:
-    return DeepSeekAgentChat(
+def _adapter(client: httpx.Client, *, max_retries: int = 0) -> OpenAICompatibleChat:
+    return OpenAICompatibleChat(
         api_key="test-secret",
-        base_url="https://api.deepseek.com",
-        model="deepseek-v4-flash",
+        base_url="https://api.example.com/v1",
+        model="example-model",
         max_output_tokens=2048,
         max_retries=max_retries,
         client=client,
     )
+
+
+def test_extra_body_is_merged_and_cannot_break_the_protocol():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]}))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = OpenAICompatibleChat(
+            api_key="k", base_url="https://api.example.com/v1", model="m", provider="vendor-x",
+            extra_body={"thinking": {"type": "disabled"}, "reasoning_effort": "low"}, client=client,
+        )
+        final = list(adapter.chat(messages=_messages()))[-1]
+
+    body = captured["body"]
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["reasoning_effort"] == "low"
+    assert body["stream"] is True
+    assert isinstance(final, ChatFinal) and final.provider == "vendor-x"
+
+    # 覆盖协议字段会让流式解析崩在运行时，构造期就拦掉。
+    with pytest.raises(ValueError, match="messages"):
+        OpenAICompatibleChat(api_key="k", base_url="https://api.example.com/v1", model="m",
+                             extra_body={"messages": [], "stream": False})
 
 
 def test_streams_chat_completion_and_encodes_tools():
@@ -65,14 +91,15 @@ def test_streams_chat_completion_and_encodes_tools():
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         items = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))
 
-    assert captured["url"] == "https://api.deepseek.com/chat/completions"
+    assert captured["url"] == "https://api.example.com/v1/chat/completions"
     assert captured["authorization"] == "Bearer test-secret"
     body = captured["body"]
     assert isinstance(body, dict)
-    assert body["model"] == "deepseek-v4-flash"
-    assert body["thinking"] == {"type": "disabled"}
+    assert body["model"] == "example-model"
     assert body["max_tokens"] == 2048
     assert body["stream"] is True
+    # 默认只发标准字段，任何厂商私有参数都不该凭空出现在请求里。
+    assert set(body) == {"model", "messages", "max_tokens", "stream", "tools"}
     assert body["messages"][0]["role"] == "system"
     assert body["tools"][0]["function"]["name"] == "search_materials"
     assert body["tools"][0]["function"]["parameters"]["required"] == ["query"]
