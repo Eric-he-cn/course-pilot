@@ -155,12 +155,27 @@ export default function App() {
       setSessions(current => [session, ...current]); setActiveSession(session); setView('chat'); setMessages([])
     } catch (error) { setNotice(errorText(error)) } finally { setBusy(false) }
   }
-  async function renameSession(title: string) {
-    if (!activeSession) return
+  async function renameSession(title: string, sessionId?: string) {
+    const target = sessionId ?? activeSession?.id
+    if (!target) return
     try {
-      const updated = await api.renameSession(activeSession.id, title)
-      setActiveSession(updated)
+      const updated = await api.renameSession(target, title)
       setSessions(current => current.map(item => item.id === updated.id ? updated : item))
+      if (activeSession?.id === updated.id) setActiveSession(updated)
+    } catch (error) { setNotice(errorText(error)) }
+  }
+  function courseDeleted(courseId: string) {
+    setCourses(current => current.filter(item => item.id !== courseId))
+    // 当前正停在这门课的工作区就退回通用模式，否则界面还挂在一门不存在的课上。
+    if (workspace.courseId === courseId) switchWorkspace({ scope: 'general' })
+    void loadSessions()
+  }
+  async function deleteSession(session: SessionSummary) {
+    try {
+      await api.deleteSession(session.id)
+      setSessions(current => current.filter(item => item.id !== session.id))
+      // 删的是当前打开的那个就退回空白，否则界面还停在已经不存在的会话上。
+      if (activeSession?.id === session.id) { setActiveSession(null); setMessages([]) }
     } catch (error) { setNotice(errorText(error)) }
   }
   async function createCourse() {
@@ -196,9 +211,11 @@ export default function App() {
       </nav>
       <div className="sessions-head"><span>SESSIONS</span></div>
       <div className="session-list">
-        {sessions.length ? sessions.map(session => <button className={`session ${session.id === activeSession?.id ? 'active' : ''}`} key={session.id} onClick={() => { setActiveSession(session); setView('chat'); setSidebarOpen(false) }}>
-          <i title={session.scope_mode === 'general' ? '通用会话' : '课程会话'} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || '未命名会话'}</b><small>{timeLabel(session.updated_at)}</small></span>
-        </button>) : <p className="mini-empty">此工作区还没有会话。</p>}
+        {sessions.length ? sessions.map(session => <SessionRow key={session.id} session={session}
+          active={session.id === activeSession?.id}
+          onOpen={() => { setActiveSession(session); setView('chat'); setSidebarOpen(false) }}
+          onRename={async title => { await renameSession(title, session.id) }}
+          onDelete={async () => { await deleteSession(session) }} />) : <p className="mini-empty">此工作区还没有会话。</p>}
       </div>
       <button className="new-session" onClick={newSession} disabled={busy}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
       <div className="sidebar-foot">
@@ -306,7 +323,7 @@ export default function App() {
       {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
       {view === 'archive' && course && <ArchiveView course={course} onError={setNotice} />}
-      {view === 'settings' && <SettingsView courses={courses} onError={setNotice} />}
+      {view === 'settings' && <SettingsView courses={courses} onError={setNotice} onCourseDeleted={courseDeleted} />}
       {view === 'help' && <HelpView courses={courses} health={health} onError={setNotice} onTry={text => { setView('chat'); setDraftSeed(text) }} />}
       <footer className="statusbar">
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
@@ -554,6 +571,84 @@ function HelpView({ courses, health, onError, onTry }: { courses: Course[]; heal
   </div></section>
 }
 
+function CourseSettingRow({ course, onDelete, onError }: {
+  course: Course; onDelete: (courseId: string) => void; onError: (message: string) => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  return <div className="settings-course">
+    <i style={{ backgroundColor: course.color }} /><b>{course.name}</b>
+    <span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span>
+    <button className="text-button danger-text" onClick={() => setConfirming(true)}>删除</button>
+    {confirming && <DangerConfirm
+      what={`课程「${course.name}」`}
+      consequences={[
+        '这门课的全部教材、切块与索引',
+        '概念目录、掌握度与答题记录',
+        '学习计划及其改动历史',
+        '课程笔记、Wiki 页面与这门课的长期记忆',
+        '属于这门课的会话；不指定课程的会话会保留',
+      ]}
+      onConfirm={async () => {
+        setConfirming(false)
+        try { await api.deleteCourse(course.id); onDelete(course.id) }
+        catch (error) { onError(errorText(error)) }
+      }}
+      onCancel={() => setConfirming(false)} />}
+  </div>
+}
+
+function DangerConfirm({ what, consequences, onConfirm, onCancel }: {
+  what: string; consequences: string[]; onConfirm: () => void; onCancel: () => void
+}) {
+  return <div className="danger-confirm">
+    <b>删除{what}？</b>
+    <ul>{consequences.map(line => <li key={line}>{line}</li>)}</ul>
+    <div className="danger-actions">
+      <button className="danger" onClick={onConfirm}>确认删除</button>
+      <button onClick={onCancel}>取消</button>
+    </div>
+  </div>
+}
+
+function SessionRow({ session, active, onOpen, onRename, onDelete }: {
+  session: SessionSummary; active: boolean
+  onOpen: () => void; onRename: (title: string) => Promise<void>; onDelete: () => Promise<void>
+}) {
+  const [mode, setMode] = useState<'idle' | 'rename' | 'confirm'>('idle')
+  const [draft, setDraft] = useState(session.title)
+  useEffect(() => { setDraft(session.title); setMode('idle') }, [session.id, session.title])
+
+  if (mode === 'rename') return <div className="session-row editing">
+    <input className="session-rename" value={draft} autoFocus aria-label="会话标题"
+      onChange={event => setDraft(event.target.value)}
+      onBlur={() => setMode('idle')}
+      onKeyDown={event => {
+        if (event.key === 'Escape') setMode('idle')
+        if (event.key === 'Enter') {
+          const next = draft.trim()
+          setMode('idle')
+          if (next && next !== session.title) void onRename(next)
+        }
+      }} />
+  </div>
+
+  if (mode === 'confirm') return <div className="session-row confirming">
+    <span>删除这个会话？</span>
+    <button className="danger" onClick={() => { setMode('idle'); void onDelete() }}>删除</button>
+    <button onClick={() => setMode('idle')}>取消</button>
+  </div>
+
+  return <div className={`session-row ${active ? 'active' : ''}`}>
+    <button className="session" onClick={onOpen}>
+      <i title={session.scope_mode === 'general' ? '通用会话' : '课程会话'} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || '未命名会话'}</b><small>{timeLabel(session.updated_at)}</small></span>
+    </button>
+    <span className="session-actions">
+      <button aria-label="重命名会话" title="重命名" onClick={() => setMode('rename')}>✎</button>
+      <button aria-label="删除会话" title="删除" onClick={() => setMode('confirm')}>×</button>
+    </span>
+  </div>
+}
+
 type ModelOption = { key: string; label: string; model: string; thinking_default: string }
 
 // 档位名与后端 THINKING_TIERS 对应。深度只在「开」这一档有意义；
@@ -779,6 +874,10 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   const [tab, setTab] = useState<'rag' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
   const [ragBackend, setRagBackend] = useState<string>('')
   const reload = async () => { try { setMaterials(await api.materials(course.id)) } catch (error) { onError(errorText(error)) } }
+  const removeMaterial = async (materialId: string) => {
+    try { await api.deleteMaterial(materialId); await reload() }
+    catch (error) { onError(errorText(error)) }
+  }
   const indexedMaterials = materials.filter(item => (item.index_status ?? item.status) === 'indexed')
   useEffect(() => { api.health().then(payload => setRagBackend(((payload.rag as Record<string, unknown>)?.backend as string) ?? '')).catch(() => {}) }, [])
   useEffect(() => { setMaterials([]); setJobs({}); setResults([]); void reload() }, [course.id])
@@ -791,7 +890,7 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   const backendLabel = ragBackend === 'hybrid_bge' ? '语义 + 词面混合检索' : ragBackend ? '仅词面检索（语义向量未启用）' : ''
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课的教材、索引与检索都在这里。换课程用左栏。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>课程笔记</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
-    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{results.length > 0 && <article className="card results-card"><h2>检索结果</h2>{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}</> : <article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料，开始「提取目录 → 概念候选 → 页面草稿 → 待确认」。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
+    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{results.length > 0 && <article className="card results-card"><h2>检索结果</h2>{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}</> : <article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料，开始「提取目录 → 概念候选 → 页面草稿 → 待确认」。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
       const wikiJob = Object.values(jobs).find(item => item.material_id === material.id && item.type === 'wiki')
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
       return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? '未命名资料'}</b><small>{wikiJob ? (STAGE_LABELS[String(wikiJob.stage ?? wikiJob.status)] ?? String(wikiJob.status)) : '已索引，可独立解析到 Wiki'}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <small className="danger-text">{wikiJob.error}</small>}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? '重新解析到 Wiki' : '解析到 Wiki'}</button></div>
@@ -801,7 +900,8 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
 const STAGE_LABELS: Record<string, string> = { uploaded: '待索引', queued: '排队中', starting: '准备中', extracting: '解析文本', chunking: '切块', embedding: '生成语义向量', indexing: '建立索引', completed: '已索引', indexed: '已索引', indexing_failed: '失败', failed: '失败', reading_index: '读取索引', wiki_completed: 'Wiki 已生成' }
 const INDEX_PIPELINE: [string, string][] = [['extracting', '解析'], ['chunking', '切块'], ['embedding', '向量'], ['indexing', '索引']]
 
-function MaterialRow({ material, jobs, onReindex }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void }) {
+function MaterialRow({ material, jobs, onReindex, onDelete }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void; onDelete?: (materialId: string) => Promise<void> }) {
+  const [confirming, setConfirming] = useState(false)
   const job = Object.values(jobs).find(item => item.material_id === material.id)
   const rawStatus = job?.stage ?? job?.status ?? material.index_status ?? material.status ?? 'uploaded'
   const statusLabel = STAGE_LABELS[String(rawStatus)] ?? String(rawStatus)
@@ -823,7 +923,17 @@ function MaterialRow({ material, jobs, onReindex }: { material: Material; jobs: 
       {failed && job?.error && <small className="danger-text">{job.error}</small>}
     </div>
     {!jobActive && <button className="text-button" onClick={() => onReindex(material.id)}>{failed ? '重试索引' : '重建索引'}</button>}
+    {!jobActive && onDelete && <button className="text-button danger-text" onClick={() => setConfirming(true)}>删除</button>}
     <span className={`status-tag ${failed ? 'failed' : ''}`}>{statusLabel}</span>
+    {confirming && onDelete && <DangerConfirm
+      what={`教材「${material.filename ?? material.name ?? '未命名资料'}」`}
+      consequences={[
+        '这份教材的原文件、切块与索引',
+        '由它提取的概念，以及基于这些概念的掌握度',
+        '答题记录本身会保留，掌握度日后可以从记录重算',
+      ]}
+      onConfirm={() => { setConfirming(false); void onDelete(material.id) }}
+      onCancel={() => setConfirming(false)} />}
   </div>
 }
 function fileKind(material: Material) { const name = material.filename ?? material.name ?? ''; return name.split('.').pop()?.toUpperCase().slice(0, 4) || 'FILE' }
@@ -954,14 +1064,14 @@ function SkillsCard({ onError }: { onError: (message: string) => void }) {
   </article>
 }
 
-function SettingsView({ courses, onError }: { courses: Course[]; onError: (message: string) => void }) {
+function SettingsView({ courses, onError, onCourseDeleted }: { courses: Course[]; onError: (message: string) => void; onCourseDeleted: (courseId: string) => void }) {
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [loading, setLoading] = useState(false)
   async function check() { setLoading(true); try { setHealth(await api.health()) } catch (error) { onError(errorText(error)) } finally { setLoading(false) } }
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const rag = (health?.rag ?? null) as Record<string, unknown> | null
   const embedding = (rag?.embedding ?? null) as Record<string, unknown> | null
-  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、能力（Skill）与服务状态分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <div className="settings-course" key={course.id}><i style={{ backgroundColor: course.color }} /><b>{course.name}</b><span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span></div>) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、能力（Skill）与服务状态分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
     <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? '远端已启用' : '本地 Demo responder'}` : '未知'}</dd></div>
     <div><dt>检索方式</dt><dd>{rag?.backend === 'hybrid_bge' ? '语义 + 词面混合' : '仅词面'}</dd></div>
     {embedding && <div><dt>向量模型</dt><dd>{String(embedding.model)} · {embedding.error ? `加载失败：${String(embedding.error)}` : embedding.loaded ? '已加载' : '待首次使用时加载'}</dd></div>}

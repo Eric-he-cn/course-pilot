@@ -31,8 +31,8 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .side-label { padding:12px 8px 5px; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.1em }
 .workspace-card,.course-choice,.session,.main-nav button,.sidebar-foot button { border:1px solid transparent; color:inherit; text-align:left; background:transparent }
 .workspace-card { display:flex; width:100%; padding:8px; gap:9px; border-radius:6px }
-.workspace-card:hover,.course-choice:hover,.main-nav button:hover,.session:hover { background:var(--bg); border-color:var(--border) }
-.workspace-card.selected,.course-choice.selected,.session.active,.main-nav button.active { background:var(--bg); border-color:var(--border); box-shadow:var(--shadow) }
+.workspace-card:hover,.course-choice:hover,.main-nav button:hover { background:var(--bg); border-color:var(--border) }
+.workspace-card.selected,.course-choice.selected,.main-nav button.active { background:var(--bg); border-color:var(--border); box-shadow:var(--shadow) }
 .general-icon { display:grid; place-items:center; width:18px; margin-top:1px; color:var(--muted) }
 .workspace-card.selected .general-icon { color:var(--accent) }
 .workspace-copy { display:grid; line-height:1.35 }
@@ -54,7 +54,18 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .sessions-head { display:flex; align-items:center; justify-content:space-between; padding:12px 8px 5px; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.1em }
 .sessions-head button { border:0; background:transparent; color:var(--accent); font-size:17px; line-height:1 }
 .session-list { flex:1 1 auto; overflow-y:auto; min-height:48px }
+.session-row { position:relative; display:flex; align-items:center; border-radius:6px }
+.session-row.active,.session-row:hover { background:var(--bg); box-shadow:inset 0 0 0 1px var(--border) }
 .session { position:relative; display:grid; grid-template-columns:8px minmax(0,1fr); align-items:center; gap:8px; width:100%; padding:7px 8px; border-radius:6px }
+/* 悬停才出现的行内操作：常显会让侧栏很吵，而这两个动作都不是高频 */
+.session-actions { position:absolute; right:4px; display:none; gap:2px; background:var(--bg) }
+.session-row:hover .session-actions { display:flex }
+.session-actions button { border:0; background:transparent; color:var(--muted); padding:3px 5px; border-radius:4px; font-size:12px; line-height:1 }
+.session-actions button:hover { background:var(--panel); color:var(--text) }
+.session-rename { width:100%; padding:6px 8px; border:1px solid var(--accent); border-radius:6px; background:var(--bg); color:var(--text); font-size:12.5px }
+.session-row.confirming { gap:6px; padding:6px 8px; font-size:12px; color:var(--muted) }
+.session-row.confirming button { border:1px solid var(--border); border-radius:4px; background:var(--bg); color:var(--text); padding:2px 7px; font-size:11.5px }
+.session-row.confirming button.danger { border-color:#FCA5A5; color:var(--danger) }
 .session-text { display:grid; min-width:0; line-height:1.3 }
 .session-text b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; font-weight:500 }
 .session-text small { font-family:var(--mono); font-size:10px }
@@ -457,3 +468,13 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 
 /* 网页来源与教材来源同一排，用下划线区分「点开会离开本页」 */
 .citations .citation-web { text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px }
+
+/* 删除确认：连带影响必须列出来，用户才知道自己在删什么 */
+.danger-confirm { grid-column:1/-1; margin:8px 0 2px; padding:11px 13px; border:1px solid #FCA5A5; border-radius:6px; background:#FEF2F2; font-size:12.5px }
+.danger-confirm b { color:var(--danger) }
+.danger-confirm ul { margin:7px 0 10px; padding-left:18px; color:var(--text); line-height:1.7 }
+.danger-actions { display:flex; gap:8px }
+.danger-actions button { border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text); padding:4px 11px; font-size:12.5px }
+.danger-actions button.danger { border-color:var(--danger); background:var(--danger); color:#fff }
+.danger-text { color:var(--danger) }
+.settings-course { flex-wrap:wrap }
