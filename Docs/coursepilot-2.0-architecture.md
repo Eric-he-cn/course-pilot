@@ -356,6 +356,8 @@ RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿�
 - 导入时完成 schema、大小、重名与危险内容静态检查，生成不可变 `skill_version` 和内容 hash。更新创建新版本，正在进行的 turn 继续使用旧版本。
 - `use_skill` 只看到当前课程已启用的摘要。用户 Skill 与教材内容都视为不可信指令，不能覆盖系统提示、课程边界、Tutor 证据合约或工具 policy。
 
+当前实现只接受单个 `SKILL.md`（prompt-only，≤64 KiB），导入范围是全局而不区分课程；可授予的工具是一份白名单——读工具加练习相关的 artifact 与 `emit_evidence`，`memory_patch`、`plan_update`、`use_skill` 一律不授予。权限不足按上面的规则导入为 `permission_denied` 且不可启用。同名重新导入原地覆盖正文，不保证正在进行的 turn 继续用旧版本；zip、参考文件与多版本并存都还没做。
+
 ## 7. 提示词体系与 Skill 编写规范
 
 提示词是这个系统的核心工程资产，与代码同等对待：全部入 git、可 diff、trace 记录版本、judge 评分能归因到具体版本。
@@ -649,6 +651,8 @@ Tutor、practice 或经用户确认的图片点评输出结构化归因（概念
 - 投递稳定键是 `source_type + source_id + source_version + channel + scheduled_at`。发送前在 `deliveries` 预登记，成功后写回 channel receipt；重复 tick 返回旧回执。
 - **启动补投**：启动后执行同一条到期查询；当天漏发的补投一次，更早条目静默跳过。
 - 推送治理在渠道层实现：飞书每日条数上限、免打扰时段、一键退订指令。
+
+当前实现完成了计划的读写与版本化：`plan_update` 在单个写事务里校验 `expected_version`、日期不早于今天、概念 id 属于本课程，整批校验整批拒绝；重写范围限于今天及以后且仍为 `pending` 的条目，已开始的条目保留原状态与 id；每次写入升一版并落一条带 `turn_id` 的 `plan_revisions`。`get_plan` 同时给出弱项与 FSRS 到期概念，让排计划用的是掌握度投影的真实数值。写入的确认规则先用确定性闸门落地——本会话用户明确说过要排或改计划才放行，且判断只取用户键入的原文（图片转录不参与）；§10 要求的 confirm 交互与调度 tick、`deliveries` 都还没做。
 
 ## 13. 渠道层
 
