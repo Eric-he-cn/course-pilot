@@ -76,6 +76,12 @@ class LearningService:
         scored = [item for item in self.mastery(course_id=course_id) if item.score is not None]
         return sorted(scored, key=lambda item: item.score or 0.0)[:limit]
 
+    def due_concepts(self, *, course_id: str, limit: int = 5) -> list[ConceptMastery]:
+        """按 FSRS 排期已到期的概念，供排计划时优先安排复习。"""
+        now = utc_now()
+        due = [item for item in self.mastery(course_id=course_id) if item.due_at and item.due_at <= now]
+        return sorted(due, key=lambda item: item.due_at or "")[:limit]
+
     @staticmethod
     def min_objective_events() -> int:
         return MIN_OBJECTIVE_EVENTS

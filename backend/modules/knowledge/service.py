@@ -124,6 +124,10 @@ class KnowledgeService:
     def concepts(self, *, scope: ResolvedKnowledgeScope, limit: int = 60) -> list[ConceptRef]:
         return self.list_course_concepts(course_id=scope.course_id, limit=limit)
 
+    def concept_exists(self, course_id: str, concept_id: str) -> bool:
+        """按 id 精确判断，不受概念清单的展示上限影响。"""
+        return self._repository.concept_exists(course_id=course_id, concept_id=concept_id)
+
     def list_course_concepts(self, *, course_id: str, limit: int = 60) -> list[ConceptRef]:
         return [ConceptRef(row["id"], row["name"], row["page"]) for row in self._repository.list_concepts(course_id=course_id, limit=limit)]
 

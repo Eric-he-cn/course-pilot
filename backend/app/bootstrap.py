@@ -114,12 +114,12 @@ def build_application(settings: Settings) -> Application:
         queue_capacity=settings.background_job_queue_capacity,
     )
     learning = LearningService(LearningRepository(store))
-    planning = PlanningService(PlanningRepository(store))
+    planning = PlanningService(PlanningRepository(store), concept_exists=knowledge.concept_exists)
     # 内建 skill 目录随代码走（架构 §6）；用户导入的 skill 后续接同一形状。
     skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
-        evidence=learning, artifacts=ArtifactStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
+        plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
     )

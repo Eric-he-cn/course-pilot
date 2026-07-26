@@ -16,7 +16,7 @@ const nav: { id: View; num: string }[] = [
   { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
-const TOOL_LABELS: Record<string, string> = { search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', get_archive: '学习档案' }
+const TOOL_LABELS: Record<string, string> = { search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', plan_update: '写入计划', get_archive: '学习档案' }
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
 function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : '刚刚' }
@@ -297,8 +297,8 @@ function PlanView({ course, onError }: { course: Course; onError: (message: stri
     api.plan(course.id).then(payload => { setPlan(payload.plan); setLoaded(true) }).catch(error => onError(errorText(error)))
   }, [course.id])
   return <section className="page"><div className="page-inner">
-    <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>计划由服务端持久化并逐版本演化；修改未来条目需要确认，历史条目只读。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取计划…</p> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目</p></div></div>{plan.items.map(item => <div className="material-row" key={item.id}><div className="file-mark">{item.due_date.slice(5)}</div><div className="material-copy"><b>{item.title}</b><small>{item.status}</small></div></div>)}</article> : <article className="card"><h2>还没有学习计划</h2><p>该课程尚未创建计划。生成与调整计划的写接口将随规划功能开放；此页读取的是服务端持久化状态，不展示本地虚构数据。</p></article>}
+    <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>在对话里说要排计划或调整计划，助手会写入这里；每次改动升一个版本，历史条目不会被改写。</p></div></div>
+    {!loaded ? <p className="mini-empty">正在读取计划…</p> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div>{plan.items.map(item => <div className="material-row" key={item.id}><div className="file-mark">{item.due_date.slice(5)}</div><div className="material-copy"><b>{item.title}</b><small>{item.status}{item.concept_name ? ` · ${item.concept_name}` : ''}</small></div></div>)}</article> : <article className="card"><h2>还没有学习计划</h2><p>在对话里告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。此页只读服务端持久化状态，不展示本地虚构数据。</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {

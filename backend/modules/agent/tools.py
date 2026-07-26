@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope
 from contracts.llm import ToolSpec
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
-from modules.planning.api import PlanReaderPort
+from modules.planning.api import PlanConflictError, PlanReaderPort, PlanWriterPort
 from modules.memory.store import MemoryStore
 from modules.sessions.artifacts import ArtifactStore
 
@@ -37,6 +37,35 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="get_plan",
         description="读取当前课程的学习计划（由服务端持久化，可能不存在）。",
         parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="plan_update",
+        description=(
+            "重写学习计划里今天及以后的待办条目。必须先 get_plan 拿到 expected_version；"
+            "一次给出这段周期的完整条目（长期计划就一次给完），不要分多次追加。"
+            "只有用户在对话里明确要求排计划或调整计划时才可调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "expected_version": {"type": "integer", "description": "get_plan 报出的当前版本；还没有计划时传 0"},
+                "items": {
+                    "type": "array",
+                    "description": "今天及以后的全部条目，按日期升序",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "due_date": {"type": "string", "description": "YYYY-MM-DD，不能早于今天"},
+                            "title": {"type": "string", "description": "这天要做什么，一句话"},
+                            "concept_id": {"type": "string", "description": "来自 concept_search 的概念 id；确实不对应具体概念时可省略"},
+                        },
+                        "required": ["due_date", "title"],
+                    },
+                },
+                "note": {"type": "string", "description": "这次调整的原因，一句话，进改动记录"},
+            },
+            "required": ["expected_version", "items"],
+        },
     ),
     ToolSpec(
         name="get_archive",
@@ -127,7 +156,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
 
 # 工具 profile（架构 §9.2）：skill 激活后切换到它的完整集合，而不是在主集合上做并集。
 # search_materials / get_plan / get_archive 是 rag_search / plan_read / archive_query 的历史名。
-MAIN_PROFILE = ("search_materials", "list_materials", "get_plan", "get_archive", "concept_search", "emit_evidence", "memory_patch", "use_skill")
+MAIN_PROFILE = ("search_materials", "list_materials", "get_plan", "plan_update", "get_archive", "concept_search", "emit_evidence", "memory_patch", "use_skill")
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 
 
@@ -185,18 +214,23 @@ class ToolExecutor:
     """工具只吃服务端解析出的课程 scope；模型无法指定 course_id。"""
 
     def __init__(
-        self, *, knowledge: KnowledgeSearchPort, plans: PlanReaderPort, archive: ArchiveReaderPort,
-        evidence: EvidenceWriterPort, artifacts: ArtifactStore, skills: SkillRegistry, memory: MemoryStore,
+        self, *, knowledge: KnowledgeSearchPort, plans: PlanReaderPort, plan_writer: PlanWriterPort,
+        archive: ArchiveReaderPort, evidence: EvidenceWriterPort, artifacts: ArtifactStore,
+        skills: SkillRegistry, memory: MemoryStore,
     ) -> None:
         self._knowledge = knowledge
         self._plans = plans
+        self._plan_writer = plan_writer
         self._archive = archive
         self._evidence = evidence
         self._artifacts = artifacts
         self._skills = skills
         self._memory = memory
 
-    def execute(self, *, scope: ResolvedKnowledgeScope, session_id: str, name: str, arguments: str, registry: CitationRegistry, allowed: tuple[str, ...]) -> ToolOutcome:
+    def execute(
+        self, *, scope: ResolvedKnowledgeScope, session_id: str, name: str, arguments: str,
+        registry: CitationRegistry, allowed: tuple[str, ...], plan_intent: bool = False,
+    ) -> ToolOutcome:
         if name not in allowed:
             # 当轮最小权限：skill 激活期间看不到的工具，即使模型硬调也要拒绝。
             return ToolOutcome(text=f"当前不可使用工具 {name}。可用：" + "、".join(allowed), ok=False, summary="工具不可用")
@@ -214,6 +248,8 @@ class ToolExecutor:
                 return ToolOutcome(text="课程资料库文件：" + ("、".join(names) if names else "（尚未上传教材）"), ok=True, summary=f"{len(names)} 份资料")
             if name == "get_plan":
                 return self._plan(scope)
+            if name == "plan_update":
+                return self._plan_update(scope, parsed, plan_intent)
             if name == "get_archive":
                 return self._archive_events(scope)
             if name == "concept_search":
@@ -237,12 +273,14 @@ class ToolExecutor:
     def _concepts(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
         keyword = str(parsed.get("keyword") or "").strip().casefold()
         concepts = self._knowledge.concepts(scope=scope)
-        if keyword:
-            concepts = [item for item in concepts if keyword in item.name.casefold()]
         if not concepts:
             return ToolOutcome(text="当前课程还没有概念目录（教材索引后自动生成）。", ok=True, summary="无概念")
-        lines = [f"- {item.id} | {item.name}" + (f"（第 {item.page} 页）" if item.page else "") for item in concepts[:40]]
-        return ToolOutcome(text="概念目录（归因只能用这些 id）：\n" + "\n".join(lines), ok=True, summary=f"{len(concepts)} 个概念")
+        matched = [item for item in concepts if keyword in item.name.casefold()] if keyword else concepts
+        # 关键词没命中就退回全量：报"没有概念目录"会让调用方以为无从归因。
+        prefix = "概念目录（归因只能用这些 id）：" if matched else f"没有名称含「{keyword}」的概念，以下是全部概念："
+        listed = matched or concepts
+        lines = [f"- {item.id} | {item.name}" + (f"（第 {item.page} 页）" if item.page else "") for item in listed[:40]]
+        return ToolOutcome(text=f"{prefix}\n" + "\n".join(lines), ok=True, summary=f"{len(listed)} 个概念")
 
     def _emit_evidence(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
         kind = str(parsed.get("kind") or "").strip()
@@ -317,10 +355,51 @@ class ToolExecutor:
 
     def _plan(self, scope: ResolvedKnowledgeScope) -> ToolOutcome:
         plan = self._plans.get_plan(course_id=scope.course_id)
+        signals = self._plan_signals(scope.course_id)
         if plan is None:
-            return ToolOutcome(text="该课程还没有学习计划。", ok=True, summary="暂无计划")
+            return ToolOutcome(text="该课程还没有学习计划（plan_update 传 expected_version=0 即可新建）。" + signals, ok=True, summary="暂无计划")
         lines = [f"- {item.due_date} {item.title}（{item.status}）" for item in plan.items[:20]]
-        return ToolOutcome(text=f"当前计划（版本 v{plan.version}，共 {len(plan.items)} 项）：\n" + "\n".join(lines), ok=True, summary=f"计划 {len(plan.items)} 项")
+        return ToolOutcome(
+            text=f"当前计划 expected_version={plan.version}，共 {len(plan.items)} 项：\n" + "\n".join(lines) + signals,
+            ok=True, summary=f"计划 {len(plan.items)} 项",
+        )
+
+    def _plan_signals(self, course_id: str) -> str:
+        """排计划要用的客观信号：弱项与到期复习都取自掌握度投影，不靠模型印象。"""
+        def render(items) -> str:
+            return "、".join(f"{item.name}({item.concept_id})" for item in items) or "（暂无）"
+        weak = self._archive.weak_concepts(course_id=course_id, limit=5)
+        due = self._archive.due_concepts(course_id=course_id, limit=5)
+        return f"\n\n排计划参考——掌握度最弱：{render(weak)}；已到期待复习：{render(due)}"
+
+    def _plan_update(self, scope: ResolvedKnowledgeScope, parsed: dict, plan_intent: bool) -> ToolOutcome:
+        if not plan_intent:
+            # 写计划只在用户明确要求时放行（架构 §10）；模型自己推断出的调整先回去问用户。
+            return ToolOutcome(
+                text="计划修改需要用户明确要求。请先告诉用户你建议怎么调整，等他同意后再调用本工具。",
+                ok=False, summary="计划写入需用户确认",
+            )
+        items = parsed.get("items")
+        if not isinstance(items, list):
+            raise ValueError("items 必须是数组")
+        expected = parsed.get("expected_version")
+        if not isinstance(expected, int):
+            raise ValueError("expected_version 必须是整数，先用 get_plan 读当前版本")
+        try:
+            diff = self._plan_writer.update_plan(
+                course_id=scope.course_id, expected_version=expected, items=items,
+                note=str(parsed.get("note") or "").strip() or None, turn_id=scope.turn_id,
+            )
+        except PlanConflictError as error:
+            return ToolOutcome(
+                text=f"版本冲突：{error}。请重新 get_plan 读取最新条目，再基于新版本重算这次修改。",
+                ok=False, summary="计划版本冲突",
+            )
+        return ToolOutcome(
+            text=(f"计划已更新 v{diff.version_from} → v{diff.version_to}：写入 {diff.added} 条，"
+                  f"替换 {diff.removed} 条；保留过去条目 {diff.kept_past} 条、已开始的未来条目 {diff.kept_locked} 条。"),
+            ok=True, summary=f"计划 v{diff.version_to}（{diff.added} 条）",
+        )
 
     def _archive_events(self, scope: ResolvedKnowledgeScope) -> ToolOutcome:
         archive = self._archive.get_archive(course_id=scope.course_id, limit=20)

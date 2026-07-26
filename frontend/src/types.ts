@@ -103,6 +103,7 @@ export interface PlanItem {
   title: string
   status: string
   concept_id?: string | null
+  concept_name?: string | null
 }
 
 export interface Plan {
@@ -110,6 +111,7 @@ export interface Plan {
   course_id: string
   status: string
   version: number
+  updated_at: string
   items: PlanItem[]
 }
 

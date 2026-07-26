@@ -10,7 +10,7 @@ from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, Chat
 from core.common import utc_now
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.memory.store import MemoryStore
-from modules.planning.api import PlanReaderPort
+from modules.planning.api import PlanReaderPort, PlanWriterPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 from modules.sessions.artifacts import ArtifactStore
 
@@ -38,6 +38,16 @@ def _practice_reminder(missing: list[str], question_count: int | None, emitted: 
 # 而漏加载意味着这次练习不落 artifact、后续作答也无从批改。误命中的代价很小——
 # 规程第一步就是判断本轮该做什么。
 _PRACTICE_INTENT = re.compile(r"出\s*(?:几|[一二三四五六1-9])?\s*道|出题|出几题|练练|练习题|做几道|来[一两]道|小测|测测我|考考我|练一练")
+
+
+# 写计划的放行条件：只认用户键入的原话，图片转录不算——一张写着"复习计划"的
+# 教材照片不该获得写权限。排计划往往要先问考试日期，所以意图在本会话里粘住。
+_PLAN_INTENT = re.compile(r"计划|规划|复习安排|学习安排|安排一下|备考|日程|考试.{0,4}(准备|安排)")
+_TRANSCRIPTION_MARK = "[图片转录："
+
+
+def _has_plan_intent(text: str) -> bool:
+    return bool(_PLAN_INTENT.search(text.split(_TRANSCRIPTION_MARK)[0]))
 
 
 # 供应商偶尔会在工具预算耗尽后把 tool_call 当普通文本吐出来，这类内部标记不能进回答。
@@ -86,6 +96,7 @@ class TurnService:
         responder: AgentChatPort,
         fallback_responder: AgentChatPort,
         *,
+        plan_writer: PlanWriterPort,
         evidence: EvidenceWriterPort,
         artifacts: ArtifactStore,
         skills: SkillRegistry,
@@ -101,7 +112,7 @@ class TurnService:
         self._artifacts = artifacts
         self._memory = memory
         self._executor = ToolExecutor(
-            knowledge=knowledge, plans=plans, archive=archive,
+            knowledge=knowledge, plans=plans, plan_writer=plan_writer, archive=archive,
             evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
         )
         self._trace = trace
@@ -163,6 +174,9 @@ class TurnService:
                 message = f"{message}\n\n{blocks}"
             # 历史在写入本轮用户消息之前取，天然不含当前问题。
             history = [(item.role, item.content) for item in self._sessions.list_messages(session_id)]
+            plan_intent = _has_plan_intent(message) or any(
+                role == "user" and _has_plan_intent(content) for role, content in history
+            )
             turn, created = self._sessions.start_turn(session_id=session_id, client_request_id=client_request_id)
             yield self._event("turn_started", request_id=turn.id, session_id=session_id, scope_mode=session.scope_mode)
             if not created:
@@ -294,7 +308,7 @@ class TurnService:
                             for call in outcome.calls:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
-                                result = self._executor.execute(scope=scope, session_id=session_id, name=call.name, arguments=call.arguments, registry=registry, allowed=allowed_tools)
+                                result = self._executor.execute(scope=scope, session_id=session_id, name=call.name, arguments=call.arguments, registry=registry, allowed=allowed_tools, plan_intent=plan_intent)
                                 if call.name == "emit_evidence" and result.ok:
                                     evidence_count += 1
                                 if call.name == "artifact_append" and result.ok:

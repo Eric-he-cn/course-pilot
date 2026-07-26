@@ -162,6 +162,10 @@ class KnowledgeRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def concept_exists(self, *, course_id: str, concept_id: str) -> bool:
+        with self._store.read() as conn:
+            return conn.execute("SELECT 1 FROM concepts WHERE id = ? AND course_id = ?", (concept_id, course_id)).fetchone() is not None
+
     def load_course_embeddings(self, *, course_id: str) -> list[tuple[str, bytes]]:
         with self._store.read() as conn:
             rows = conn.execute("SELECT id, embedding FROM chunks WHERE course_id = ? AND embedding IS NOT NULL ORDER BY rowid", (course_id,)).fetchall()

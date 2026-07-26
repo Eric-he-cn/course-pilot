@@ -112,6 +112,15 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         CREATE INDEX IF NOT EXISTS idx_mastery_course ON concept_mastery(course_id, bkt_p);
         CREATE INDEX IF NOT EXISTS idx_mastery_due ON concept_mastery(course_id, due_at);
     """),
+    # 计划每次改版留一条 diff：条目可被重写，改动记录不可覆盖。
+    (15, """
+        CREATE TABLE IF NOT EXISTS plan_revisions (
+            id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES plans(id),
+            version INTEGER NOT NULL, turn_id TEXT, note TEXT,
+            diff_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revision_version ON plan_revisions(plan_id, version);
+    """),
 )
 
 class SQLiteStore:
