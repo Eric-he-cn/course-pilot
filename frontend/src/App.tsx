@@ -5,7 +5,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { ApiError, api } from './api'
-import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, ToolActivity } from './types'
+import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, SkillInfo, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -357,6 +357,48 @@ function ArchiveView({ course, onError }: { course: Course; onError: (message: s
   </div></section>
 }
 
+const SKILL_STATUS: Record<string, string> = { enabled: '已启用', draft: '未启用', permission_denied: '权限不足' }
+
+function SkillsCard({ onError }: { onError: (message: string) => void }) {
+  const [skills, setSkills] = useState<SkillInfo[] | null>(null)
+  const [importable, setImportable] = useState<string[]>([])
+  const [busy, setBusy] = useState(false)
+  const fileInput = useRef<HTMLInputElement>(null)
+  async function reload() {
+    try { const payload = await api.skills(); setSkills(payload.skills); setImportable(payload.importable_tools) }
+    catch (error) { setSkills([]); onError(errorText(error)) }
+  }
+  useEffect(() => { void reload() }, [])
+  async function run(action: () => Promise<unknown>) {
+    setBusy(true)
+    try { await action(); await reload() } catch (error) { onError(errorText(error)) } finally { setBusy(false) }
+  }
+  async function pick(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]; event.target.value = ''
+    if (file) await run(() => api.importSkill(file))
+  }
+  return <article className="card"><h2>能力（Skill）</h2>
+    <p>导入的 SKILL.md 默认不启用，预览后再打开。可授予的工具限于：{importable.join('、') || '—'}。</p>
+    {skills === null ? <p className="empty-inline">正在读取…</p> : skills.map(skill => <div className="skill-row" key={skill.name}>
+      <div className="skill-copy">
+        <b>{skill.name}<em>{skill.origin === 'builtin' ? '内建' : '导入'}</em></b>
+        <small>{skill.when_to_use}</small>
+        <small className="skill-tools">工具：{skill.allowed_tools.join('、') || '—'}</small>
+        {skill.denied_tools.length > 0 && <small className="skill-denied">被拒：{skill.denied_tools.join('、')} —— 修正 allowed_tools 后重新导入才能启用</small>}
+      </div>
+      <div className="skill-actions">
+        <span className={`skill-status ${skill.status}`}>{SKILL_STATUS[skill.status] ?? skill.status}</span>
+        {skill.origin === 'user' && <>
+          <button className="ghost-button" disabled={busy || skill.status === 'permission_denied'} onClick={() => void run(() => api.setSkillEnabled(skill.name, skill.status !== 'enabled'))}>{skill.status === 'enabled' ? '停用' : '启用'}</button>
+          <button className="ghost-button danger" disabled={busy} onClick={() => void run(() => api.deleteSkill(skill.name))}>删除</button>
+        </>}
+      </div>
+    </div>)}
+    <button className="ghost-button" disabled={busy} onClick={() => fileInput.current?.click()}>导入 SKILL.md</button>
+    <input ref={fileInput} type="file" accept=".md,text/markdown" hidden onChange={pick} />
+  </article>
+}
+
 function SettingsView({ courses, onError }: { courses: Course[]; onError: (message: string) => void }) {
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [loading, setLoading] = useState(false)
@@ -364,7 +406,7 @@ function SettingsView({ courses, onError }: { courses: Course[]; onError: (messa
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const rag = (health?.rag ?? null) as Record<string, unknown> | null
   const embedding = (rag?.embedding ?? null) as Record<string, unknown> | null
-  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、服务能力与后续的 Skills、飞书渠道设置分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <div className="settings-course" key={course.id}><i style={{ backgroundColor: course.color }} /><b>{course.name}</b><span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span></div>) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><article className="card"><h2>Skills</h2><p>Skill 上传与安装接口尚未列入 2.0 Demo API 契约。上传能力默认保持关闭，避免前端伪造安装状态。</p><button className="ghost-button" disabled>上传 Skill（等待接口）</button></article><article className="card"><h2>飞书渠道</h2><p>首版只有飞书渠道；飞书始终使用一个通用会话，不提供课程选择。密钥绝不在前端回显。</p><button className="ghost-button" disabled>配置飞书（等待接口）</button></article><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、能力（Skill）与服务状态分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <div className="settings-course" key={course.id}><i style={{ backgroundColor: course.color }} /><b>{course.name}</b><span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span></div>) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><SkillsCard onError={onError} /><article className="card"><h2>飞书渠道</h2><p>首版只有飞书渠道；飞书始终使用一个通用会话，不提供课程选择。密钥绝不在前端回显。</p><button className="ghost-button" disabled>配置飞书（等待接口）</button></article><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
     <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? '远端已启用' : '本地 Demo responder'}` : '未知'}</dd></div>
     <div><dt>检索方式</dt><dd>{rag?.backend === 'hybrid_bge' ? '语义 + 词面混合' : '仅词面'}</dd></div>
     {embedding && <div><dt>向量模型</dt><dd>{String(embedding.model)} · {embedding.error ? `加载失败：${String(embedding.error)}` : embedding.loaded ? '已加载' : '待首次使用时加载'}</dd></div>}

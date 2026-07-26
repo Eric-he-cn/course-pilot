@@ -40,6 +40,17 @@ export interface ToolActivity {
   ok?: boolean
 }
 
+export interface SkillInfo {
+  name: string
+  description: string
+  when_to_use: string
+  allowed_tools: string[]
+  denied_tools: string[]
+  origin: 'builtin' | 'user'
+  status: 'enabled' | 'draft' | 'permission_denied'
+  content_hash: string
+}
+
 export interface ContextUsage {
   segments: { label: string; chars: number }[]
   total_chars: number

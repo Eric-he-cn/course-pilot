@@ -121,6 +121,15 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revision_version ON plan_revisions(plan_id, version);
     """),
+    # 用户导入的 skill。allowed_tools 存原始声明，实际可用集合读时按白名单取交集。
+    (16, """
+        CREATE TABLE IF NOT EXISTS user_skills (
+            name TEXT PRIMARY KEY, content_hash TEXT NOT NULL, source_text TEXT NOT NULL,
+            description TEXT NOT NULL, when_to_use TEXT NOT NULL, allowed_tools_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('draft', 'enabled', 'permission_denied')),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+    """),
 )
 
 class SQLiteStore:

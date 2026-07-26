@@ -1,4 +1,4 @@
-import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode, TurnEvent } from './types'
+import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, SearchResult, SessionSummary, ScopeMode, SkillInfo, TurnEvent } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 type BackendCitation = Citation & { citation_id?: string; document?: string; snippet?: string }
@@ -22,6 +22,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch { /* response is not JSON */ }
     throw new ApiError(detail || `请求失败（${response.status}）`, response.status)
   }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 
@@ -55,6 +56,13 @@ export const api = {
     const body = new FormData(); body.set('file', file)
     return request<Attachment>(`/sessions/${sessionId}/attachments`, { method: 'POST', body })
   },
+  skills: () => request<{ skills: SkillInfo[]; importable_tools: string[] }>('/skills'),
+  importSkill: (file: File) => {
+    const body = new FormData(); body.set('file', file)
+    return request<SkillInfo>('/skills', { method: 'POST', body })
+  },
+  setSkillEnabled: (name: string, enabled: boolean) => request<{ name: string; status: string }>(`/skills/${name}`, json('PATCH', { enabled })),
+  deleteSkill: (name: string) => request<void>(`/skills/${name}`, { method: 'DELETE' }),
   indexMaterial: (materialId: string) => request<Job>(`/materials/${materialId}/index`, json('POST')),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   buildWiki: (materialId: string) => request<Job>(`/materials/${materialId}/wiki`, json('POST')),

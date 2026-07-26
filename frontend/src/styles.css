@@ -214,6 +214,19 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .demo-grid { grid-template-columns:repeat(3,minmax(0,1fr)) }
 .settings-course { display:flex; align-items:center; gap:9px; padding:9px 0; border-top:1px solid var(--border); font-size:13px }
 .settings-course span { margin-left:auto; color:var(--muted); font-size:12px }
+.skill-row { display:flex; align-items:flex-start; gap:12px; padding:10px 0; border-top:1px solid var(--border) }
+.skill-copy { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1 }
+.skill-copy b { display:flex; align-items:center; gap:6px; font-family:var(--mono); font-size:12.5px }
+.skill-copy em { padding:0 4px; border:1px solid var(--border); border-radius:4px; color:var(--muted); font-family:var(--sans,inherit); font-size:10px; font-style:normal }
+.skill-copy small { color:var(--muted); font-size:11.5px; line-height:1.5 }
+.skill-copy .skill-tools { font-family:var(--mono); font-size:10.5px }
+.skill-copy .skill-denied { color:var(--warning) }
+.skill-actions { display:flex; align-items:center; gap:6px; flex-shrink:0 }
+.skill-actions .ghost-button { padding:3px 8px; font-size:11.5px }
+.skill-actions .ghost-button.danger { color:var(--danger) }
+.skill-status { font-family:var(--mono); font-size:10.5px; color:var(--muted) }
+.skill-status.enabled { color:var(--accent) }
+.skill-status.permission_denied { color:var(--warning) }
 .health-card pre { overflow:auto; padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--panel); font-size:11px }
 .health-card dl { margin:12px 0 }
 .health-card dl div { display:flex; gap:10px; padding:7px 0; border-top:1px solid var(--border) }

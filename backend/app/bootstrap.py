@@ -7,7 +7,7 @@ from adapters.embedding import BgeEmbedder
 from adapters.llm import DeepSeekAgentChat, DemoAgentChat, QwenOcrTranscriber
 from contracts.llm import AgentChatPort, VisionTranscriberPort
 from modules.agent.service import TurnService
-from modules.agent.skills import SkillRegistry
+from modules.agent.skills import SkillRegistry, UserSkillStore
 from modules.agent.trace import TraceWriter
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
@@ -40,6 +40,7 @@ class Application:
     turns: TurnService
     learning: LearningService
     planning: PlanningService
+    skills: SkillRegistry
     vision: VisionTranscriberPort | None = None
 
     def llm_health(self) -> dict[str, object]:
@@ -115,8 +116,8 @@ def build_application(settings: Settings) -> Application:
     )
     learning = LearningService(LearningRepository(store))
     planning = PlanningService(PlanningRepository(store), concept_exists=knowledge.concept_exists)
-    # 内建 skill 目录随代码走（架构 §6）；用户导入的 skill 后续接同一形状。
-    skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin")
+    # 内建 skill 目录随代码走（架构 §6）；导入的 skill 存库，启用后并入同一注册表。
+    skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin", user_skills=UserSkillStore(store))
     turns = TurnService(
         sessions, knowledge, planning, learning, llm, fallback,
         plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
@@ -124,4 +125,4 @@ def build_application(settings: Settings) -> Application:
         history_token_budget=settings.agent_history_token_budget,
         context_char_limit=settings.agent_context_char_limit,
     )
-    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, vision)
+    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, vision)
