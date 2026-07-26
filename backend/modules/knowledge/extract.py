@@ -92,22 +92,44 @@ def _from_pptx(path: Path) -> list[tuple[int | None, str]]:
 
 
 def _from_pdf(path: Path) -> list[tuple[int | None, str]]:
+    """三级：pdfium → pypdf → 无依赖兜底。都拿不到文字的走 OCR 通道，见 scanned.py。"""
     raw = path.read_bytes()
-    try:
-        # 明显截断的数据不必交给 pypdf：它只会刷一堆告警，结果不会比下面的兜底更好。
-        if b"%%EOF" not in raw:
-            raise ValueError("incomplete PDF")
-        from pypdf import PdfReader
-
-        pages = [(number, (page.extract_text() or "").strip()) for number, page in enumerate(PdfReader(str(path)).pages, start=1)]
-        if any(text for _, text in pages):
-            return pages
-    except Exception:
-        # 图片版 PDF 与少见编码都会走到这里。扫描版应该走 OCR 通道，不是这条路。
-        pass
+    # 明显截断的数据不必交给解析库：只会刷一堆告警，结果不会比兜底更好。
+    if b"%%EOF" in raw:
+        for reader in (_pdfium_pages, _pypdf_pages):
+            try:
+                pages = reader(path)
+            except Exception:
+                continue
+            if any(text for _page, text in pages):
+                return pages
     # 不依赖任何库的兜底：认最常见的字面量文本算子。
     fragments = re.findall(rb"\(([^()]*)\)\s*(?:Tj|TJ)", raw)
     return [(None, "\n".join(fragment.decode("latin-1", errors="replace") for fragment in fragments).strip())]
+
+
+def _pdfium_pages(path: Path) -> list[tuple[int | None, str]]:
+    """首选 pdfium：中文字体解码更稳，而且会在中英与数字之间补空格。
+
+    实测 fudan-llm-tap.pdf 前 12 页——pypdf 抽出 14082 字、55 个私用区乱码字符，
+    pdfium 抽出 25706 字、0 个；正文里 pypdf 的「根据2016 年Google」在 pdfium 是
+    「根据 2016 年 Google」。粘在一起的词 FTS 分不开，也就检索不到。速度还快 2-4 倍。
+    """
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(str(path))
+    try:
+        return [(number, document[number - 1].get_textpage().get_text_range().strip())
+                for number in range(1, len(document) + 1)]
+    finally:
+        document.close()
+
+
+def _pypdf_pages(path: Path) -> list[tuple[int | None, str]]:
+    from pypdf import PdfReader
+
+    return [(number, (page.extract_text() or "").strip())
+            for number, page in enumerate(PdfReader(str(path)).pages, start=1)]
 
 
 def _markdown_table(rows: list[list[str]]) -> str:

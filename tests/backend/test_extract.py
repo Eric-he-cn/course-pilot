@@ -87,6 +87,33 @@ def test_legacy_doc_explains_what_is_missing_when_no_converter(tmp_path, monkeyp
         extract_pages(path, "material.doc")
 
 
+def test_pdf_extraction_falls_through_when_a_reader_fails(tmp_path, monkeypatch):
+    """pdfium 首选、pypdf 兜底。任一层抛异常都不该让整份教材提不出文字。"""
+    from modules.knowledge import extract as module
+
+    path = tmp_path / "book.pdf"
+    path.write_bytes(b"%PDF-1.4\n(fallback text) Tj\n%%EOF\n")
+
+    monkeypatch.setattr(module, "_pdfium_pages", lambda _p: (_ for _ in ()).throw(RuntimeError("pdfium 挂了")))
+    monkeypatch.setattr(module, "_pypdf_pages", lambda _p: [(1, "pypdf 兜底成功")])
+    assert extract_pages(path, "book.pdf") == [(1, "pypdf 兜底成功")]
+
+    # 两层都失败时走无依赖兜底，而不是抛异常
+    monkeypatch.setattr(module, "_pypdf_pages", lambda _p: (_ for _ in ()).throw(RuntimeError("pypdf 也挂了")))
+    assert "fallback text" in extract_pages(path, "book.pdf")[0][1]
+
+
+def test_a_reader_returning_only_blank_pages_is_not_accepted(tmp_path, monkeypatch):
+    """图片版 PDF 会让上层解析器返回一堆空串。这时要继续往下试，不能当成解析成功。"""
+    from modules.knowledge import extract as module
+
+    path = tmp_path / "scan.pdf"
+    path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    monkeypatch.setattr(module, "_pdfium_pages", lambda _p: [(1, ""), (2, "")])
+    monkeypatch.setattr(module, "_pypdf_pages", lambda _p: [(1, "pypdf 找到了字")])
+    assert extract_pages(path, "scan.pdf") == [(1, "pypdf 找到了字")]
+
+
 @pytest.mark.skipif(shutil.which("textutil") is None, reason="需要 macOS 自带的 textutil")
 def test_real_word_xml_from_a_converter_parses(tmp_path):
     """手写的 XML 只能验证自己的假设，这条拿真实转换器产出的 docx 走一遍。"""
