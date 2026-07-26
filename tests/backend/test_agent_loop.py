@@ -177,7 +177,8 @@ def test_tool_budget_is_bounded(client):
     events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "budget-1", "message": "有哪些资料？"}).text)
 
     assert events[-1][0] == "turn_completed"
-    assert events[-1][1]["tool_rounds"] == 6
+    # 断言「用满了上限」而不是写死数字，改配置时不用同步改这里
+    assert events[-1][1]["tool_rounds"] == workspace(client).turns._max_tool_rounds
     assert events[-1][1]["finish_reason"] == "tool_budget_exhausted"
 
 
@@ -295,8 +296,9 @@ def test_running_out_of_tool_budget_tells_the_model_to_wrap_up(client):
         def chat(self, *, messages, tools=()):
             seen.append([m.content for m in messages if m.role == "user"])
             self.calls += 1
-            if self.calls <= 8:
-                yield ChatToolCalls((ToolCallRequest(f"c{self.calls}", "search_materials", '{"query": "时间片"}'),))
+            # 每次换个查询，避免被同查询去重挡掉，好真的把轮次用满
+            if self.calls <= 14:
+                yield ChatToolCalls((ToolCallRequest(f"c{self.calls}", "search_materials", '{"query": "时间片%d"}' % self.calls),))
             else:
                 yield ChatFinal("时间片越长响应越差。[1]", "stop", self.provider, self.model, self.mode)
         def health(self): return {}
@@ -307,3 +309,48 @@ def test_running_out_of_tool_budget_tells_the_model_to_wrap_up(client):
 
     told = [msgs for msgs in seen if any("工具调用次数已用完" in m for m in msgs)]
     assert told, "预算耗尽后应该明确告诉模型收尾"
+
+
+def test_repeating_the_same_query_costs_no_budget(client):
+    """预算该挡的是原地打转，不是查得多。同一查询在一轮里重复调用复用上次结果，
+    不计预算、不再执行；换个查询才花额度。"""
+    from modules.agent.service import _args_key
+
+    # 归一化：键序、空白、大小写都不影响是否算同一次
+    assert _args_key('{"query": "Round  Robin"}') == _args_key('{"query": "round robin"}')
+    assert _args_key('{"a": 1, "b": 2}') == _args_key('{"b": 2, "a": 1}')
+    assert _args_key('{"query": "FIFO"}') != _args_key('{"query": "RR"}')
+
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    executed: list[str] = []
+    turns = workspace(client).turns
+    real_execute = turns._executor.execute
+
+    def counting(**kwargs):
+        if kwargs["name"] == "search_materials":
+            executed.append(kwargs["arguments"])
+        return real_execute(**kwargs)
+    turns._executor.execute = counting
+
+    class Repeater:
+        mode, provider, model = "provider", "example", "example-model"
+        def __init__(self): self.calls = 0
+        def chat(self, *, messages, tools=()):
+            self.calls += 1
+            queries = ['{"query": "时间片"}', '{"query": "时间片"}', '{"query": " 时间片 "}', '{"query": "响应时间"}']
+            if self.calls <= len(queries):
+                yield ChatToolCalls((ToolCallRequest(f"c{self.calls}", "search_materials", queries[self.calls - 1]),))
+            else:
+                yield ChatFinal("时间片越长响应越差。[1]", "stop", self.provider, self.model, self.mode)
+        def health(self): return {}
+        def close(self): pass
+
+    turns._responder = Repeater()
+    body = client.post(f"/api/v2/sessions/{session_id}/turns",
+                       json={"client_request_id": "dedupe-1", "message": "时间片太长会怎样？"}).text
+
+    # 模型发了四次调用、只有两个不同的查询，所以只真正执行两次
+    # （executed 第一项是服务端的种子检索，用的是用户原话）
+    model_queries = [item for item in executed if "太长会怎样" not in item]
+    assert len(model_queries) == 2, f"模型侧实际执行了 {model_queries}"
+    assert sum(1 for _, data in _events(body) if data.get("summary", "").endswith("已复用）")) == 2

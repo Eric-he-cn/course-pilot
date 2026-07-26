@@ -512,8 +512,8 @@ function HelpView({ courses, health, onError, onTry }: { courses: Course[]; heal
       <dl className="help-facts">
         <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)}${llm.enabled ? '' : '（远端未启用，走本地兜底，回答不带教材检索）'}` : '未知'}</dd></div>
         <div><dt>教材检索</dt><dd>{rag?.backend === 'hybrid_bge' ? '语义 + 词面混合' : '仅词面。中文问题命中英文教材效果差，可在知识仓库点一次「重建索引」'}</dd></div>
-        <div><dt>联网</dt><dd>{web && (web as Record<string, unknown>).enabled ? '已启用，每轮最多检索 3 次、抓取 3 次' : '未启用（缺 RESEARCH_SERPAPI_API_KEY 或未开远端调用）'}</dd></div>
-        <div><dt>硬限制</dt><dd>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB，一轮最多 6 次工具调用（加载能力后放宽到 12 次）</dd></div>
+        <div><dt>联网</dt><dd>{web && (web as Record<string, unknown>).enabled ? '已启用。每轮最多检索 5 次、抓取 5 次；同一个查询重复调用不占额度' : '未启用（缺 RESEARCH_SERPAPI_API_KEY 或未开远端调用）'}</dd></div>
+        <div><dt>硬限制</dt><dd>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB，一轮最多 10 次工具调用（加载能力后 16 次）</dd></div>
       </dl>
     </article>
 

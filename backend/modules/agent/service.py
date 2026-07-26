@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import replace
 from collections.abc import Callable, Iterator
 
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
@@ -87,6 +88,21 @@ def join_answer(segments: list[str]) -> str:
     return "\n\n".join(part.strip() for part in kept if part.strip())
 
 
+def _args_key(arguments: str) -> str:
+    """判断两次调用是不是同一件事。键序无关、空白折叠、大小写不敏感——
+    模型换个写法重复查同一个词不该再花一次预算。"""
+    try:
+        parsed = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return " ".join(arguments.split()).casefold()
+    if not isinstance(parsed, dict):
+        return " ".join(str(parsed).split()).casefold()
+    return json.dumps(
+        {key: " ".join(str(value).split()).casefold() for key, value in sorted(parsed.items())},
+        ensure_ascii=False, sort_keys=True,
+    )
+
+
 def _strip_provider_markup(answer: str) -> tuple[str, bool]:
     """整段回答都是内部标记时剥完就空了。这时候不能回退成原文——那等于把
     <｜｜DSML｜｜tool_calls> 这种东西直接摊给用户看。"""
@@ -99,8 +115,8 @@ class TurnService:
 
     # 心跳写库的最小间隔，需明显小于 SessionService.STALE_TURN_SECONDS。
     HEARTBEAT_SECONDS = 10
-    # skill 激活后的工具轮次上限：一次完整评分要读产物、查概念、逐题归因，6 轮不够。
-    SKILL_TOOL_ROUNDS = 12
+    # skill 激活后的工具轮次上限：一次完整评分要读产物、查概念、逐题归因，普通上限不够。
+    SKILL_TOOL_ROUNDS = 16
 
     def __init__(
         self,
@@ -121,7 +137,7 @@ class TurnService:
         notes: NoteStore | None = None,
         trace: TraceWriter | None = None,
         select_responder: Callable[[str | None, bool | None], AgentChatPort] | None = None,
-        max_tool_rounds: int = 6,
+        max_tool_rounds: int = 10,
         history_token_budget: int = 128_000,
         context_char_limit: int = 512_000,
         compact_threshold_ratio: float = 0.7,
@@ -354,6 +370,7 @@ class TurnService:
                 capabilities = MAIN.capabilities
                 tool_budget = MAIN.per_tool_budget
                 tool_used: dict[str, int] = {}
+                tool_results: dict[tuple[str, str], object] = {}
                 active_skill: str | None = None
                 max_rounds = self._max_tool_rounds
                 # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
@@ -458,13 +475,21 @@ class TurnService:
                             for call in outcome.calls:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
-                                result = self._executor.execute(
-                                    scope=scope, session_id=session_id, name=call.name, arguments=call.arguments,
-                                    registry=registry, allowed=allowed_tools, plan_intent=plan_intent,
-                                    capabilities=capabilities, budget=tool_budget, used=tool_used,
-                                )
-                                if result.reason is None:
-                                    tool_used[call.name] = tool_used.get(call.name, 0) + 1
+                                # 同一查询在一轮里重复调用直接复用上次结果，既不计预算也不再发请求。
+                                # 该挡的是原地打转；查得多但每次角度不同是正常的。
+                                repeat_key = (call.name, _args_key(call.arguments))
+                                cached = tool_results.get(repeat_key)
+                                if cached is not None:
+                                    result = replace(cached, new_citations=[], summary=f"{cached.summary}（与本轮上一次相同，已复用）")
+                                else:
+                                    result = self._executor.execute(
+                                        scope=scope, session_id=session_id, name=call.name, arguments=call.arguments,
+                                        registry=registry, allowed=allowed_tools, plan_intent=plan_intent,
+                                        capabilities=capabilities, budget=tool_budget, used=tool_used,
+                                    )
+                                    if result.reason is None:
+                                        tool_used[call.name] = tool_used.get(call.name, 0) + 1
+                                        tool_results[repeat_key] = result
                                 if call.name == "emit_evidence" and result.ok:
                                     evidence_count += 1
                                 if call.name == "artifact_append" and result.ok:

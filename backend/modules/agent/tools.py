@@ -251,7 +251,9 @@ MAIN = ToolProfile(
     ),
     capabilities=frozenset({READ_COURSE, WRITE_STATE, WRITE_NOTE, NETWORK, FREE}),
     # 只给花钱的工具设上限：其余都是本地读，轮次上限已经在管。
-    per_tool_budget={"web_search": 3, "web_fetch": 3, "plan_update": 1},
+    # 同一个查询在一轮里重复调用不计数（见 service 里的去重），所以这个额度花在
+    # 真正不同的检索上；难题往往需要换几个角度查。
+    per_tool_budget={"web_search": 5, "web_fetch": 5, "plan_update": 1},
 )
 MAIN_PROFILE = MAIN.tools
 
