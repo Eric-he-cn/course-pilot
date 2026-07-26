@@ -122,5 +122,6 @@ def build_application(settings: Settings) -> Application:
         plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), skills=skills, memory=MemoryStore(settings.data_dir),
         trace=TraceWriter(settings.data_dir / "traces"),
         history_token_budget=settings.agent_history_token_budget,
+        context_char_limit=settings.agent_context_char_limit,
     )
     return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, vision)

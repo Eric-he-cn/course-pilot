@@ -35,6 +35,11 @@ def _events(body: str) -> list[tuple[str, dict]]:
     return [(frame.splitlines()[0].removeprefix("event: "), json.loads(frame.splitlines()[1].removeprefix("data: "))) for frame in frames]
 
 
+def _first(events: list[tuple[str, dict]], name: str) -> dict:
+    """按事件名取数据，新增事件不会让下标断言连坐。"""
+    return next(data for event, data in events if event == name)
+
+
 @pytest.fixture
 def client(tmp_path):
     with TestClient(create_app(settings=_settings(tmp_path))) as test_client:
@@ -70,15 +75,15 @@ def test_general_turn_resolves_per_turn_and_uses_course_scoped_evidence(client):
     )
     assert response.status_code == 200
     events = _events(response.text)
-    assert [name for name, _ in events] == ["turn_started", "course_resolution", "tool_call", "citation", "tool_result", "text_delta", "turn_completed"]
-    assert events[0][1]["scope_mode"] == "general"
-    assert events[1][1]["status"] == "resolved"
-    assert events[1][1]["course_id"] == calculus["id"]
-    assert events[1][1]["resolved_course_id"] == calculus["id"]
-    assert events[2][1]["name"] == "search_materials"
-    assert events[2][1]["origin"] == "seed"
-    assert events[4][1]["ok"] is True
-    assert "Demo responder" in events[5][1]["text"]
+    assert [name for name, _ in events] == ["turn_started", "course_resolution", "tool_call", "citation", "tool_result", "context_usage", "text_delta", "turn_completed"]
+    assert _first(events, "turn_started")["scope_mode"] == "general"
+    assert _first(events, "course_resolution")["status"] == "resolved"
+    assert _first(events, "course_resolution")["course_id"] == calculus["id"]
+    assert _first(events, "course_resolution")["resolved_course_id"] == calculus["id"]
+    assert _first(events, "tool_call")["name"] == "search_materials"
+    assert _first(events, "tool_call")["origin"] == "seed"
+    assert _first(events, "tool_result")["ok"] is True
+    assert "Demo responder" in _first(events, "text_delta")["text"]
 
     messages = client.get(f"/api/v2/sessions/{session['id']}/messages").json()
     assert [item["role"] for item in messages["messages"]] == ["user", "assistant"]
@@ -163,8 +168,8 @@ def test_course_session_is_immutable_and_invalid_general_course_binding_is_rejec
     assert created.status_code == 201
     turn = client.post(f"/api/v2/sessions/{created.json()['id']}/turns", json={"client_request_id": "course-1", "message": "讲讲行列式"})
     events = _events(turn.text)
-    assert events[1][1]["status"] == "resolved"
-    assert events[1][1]["reason"] == "course_session"
+    assert _first(events, "course_resolution")["status"] == "resolved"
+    assert _first(events, "course_resolution")["reason"] == "course_session"
 
 
 def test_web_cannot_forge_feishu_source_and_feishu_service_session_is_singleton(client):
@@ -264,13 +269,13 @@ def test_provider_failure_emits_transparent_fallback_and_completes_turn(client):
     )
     events = _events(response.text)
     assert [name for name, _ in events] == [
-        "turn_started", "course_resolution", "tool_call", "citation", "tool_result", "provider_fallback", "text_delta", "turn_completed",
+        "turn_started", "course_resolution", "tool_call", "citation", "tool_result", "context_usage", "provider_fallback", "text_delta", "turn_completed",
     ]
-    assert events[5][1] == {
+    assert _first(events, "provider_fallback") == {
         "provider": "deepseek", "model": "deepseek-v4-flash", "error_code": "network_error", "retryable": True,
     }
-    assert "Demo responder" in events[6][1]["text"]
-    assert events[7][1]["responder_mode"] == "demo_fallback"
+    assert "Demo responder" in _first(events, "text_delta")["text"]
+    assert _first(events, "turn_completed")["responder_mode"] == "demo_fallback"
 
 
 def test_no_evidence_turn_still_answers_with_explicit_label(client):
@@ -278,11 +283,11 @@ def test_no_evidence_turn_still_answers_with_explicit_label(client):
     session = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()
     response = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "hello-1", "message": "你好"})
     events = _events(response.text)
-    assert [name for name, _ in events] == ["turn_started", "course_resolution", "tool_call", "tool_result", "text_delta", "turn_completed"]
-    answer = events[4][1]["text"]
+    assert [name for name, _ in events] == ["turn_started", "course_resolution", "tool_call", "tool_result", "context_usage", "text_delta", "turn_completed"]
+    answer = _first(events, "text_delta")["text"]
     assert "没有检索到" in answer
     assert "以下不是当前教材结论" in answer
-    assert events[5][1]["responder_mode"] == "demo_fallback"
+    assert _first(events, "turn_completed")["responder_mode"] == "demo_fallback"
 
 
 def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(client):
@@ -313,10 +318,10 @@ def test_mid_stream_provider_drop_keeps_partial_answer_and_marks_interrupted(cli
     response = client.post(f"/api/v2/sessions/{session['id']}/turns", json={"client_request_id": "drop-1", "message": "链式法则？"})
     events = _events(response.text)
     assert [name for name, _ in events] == [
-        "turn_started", "course_resolution", "tool_call", "citation", "tool_result", "text_delta", "stream_interrupted", "turn_failed",
+        "turn_started", "course_resolution", "tool_call", "citation", "tool_result", "context_usage", "text_delta", "stream_interrupted", "turn_failed",
     ]
-    assert events[6][1] == {"error_code": "stream_interrupted", "retryable": False}
-    assert events[7][1]["error_code"] == "stream_interrupted"
+    assert _first(events, "stream_interrupted") == {"error_code": "stream_interrupted", "retryable": False}
+    assert _first(events, "turn_failed")["error_code"] == "stream_interrupted"
 
     messages = client.get(f"/api/v2/sessions/{session['id']}/messages").json()["messages"]
     assert messages[-1]["content"] == "链式法则是复合函数"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from contracts.llm import ChatMessage, ToolCallRequest
 
@@ -72,6 +73,15 @@ def _material_lines(materials: Sequence[str]) -> str:
     return "\n".join("- 「" + re.sub(r"\s+", " ", name).strip()[:80] + "」" for name in materials)
 
 
+@dataclass(frozen=True)
+class AssembledContext:
+    """组装结果 + 各段占用，供前端展示本轮上下文构成。"""
+    messages: list[ChatMessage]
+    segments: list[tuple[str, int]]
+    dropped_history: int  # 因预算没进上下文的历史消息条数
+    clipped_history: int  # 进了上下文但被单条上限截断的消息条数
+
+
 def assemble_messages(
     *,
     course_name: str,
@@ -84,35 +94,59 @@ def assemble_messages(
     skill_summaries: str = "",
     practice_digest: str = "",
     memory: str = "",
-) -> list[ChatMessage]:
+) -> AssembledContext:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
     与模型自己调 search_materials 得到的形态一致）。"""
+    skills_block = skill_summaries or "（当前没有可加载的能力）"
+    practice_block = practice_digest or "（本会话还没有练习记录）"
+    memory_block = memory or "（还没有长期记忆）"
     system = _SYSTEM_PROMPT.format(
         course_name=course_name, materials=_material_lines(materials),
-        skills=skill_summaries or "（当前没有可加载的能力）",
-        practice_digest=practice_digest or "（本会话还没有练习记录）",
-        memory=memory or "（还没有长期记忆）",
+        skills=skills_block, practice_digest=practice_block, memory=memory_block,
     )
-    seed_call = ToolCallRequest(id=SEED_CALL_ID, name="search_materials", arguments=json.dumps({"query": seed_query}, ensure_ascii=False))
-    return [
+    kept, dropped, clipped = _budgeted_history(history, history_token_budget)
+    seed_arguments = json.dumps({"query": seed_query}, ensure_ascii=False)
+    seed_call = ToolCallRequest(id=SEED_CALL_ID, name="search_materials", arguments=seed_arguments)
+    messages = [
         ChatMessage(role="system", content=system),
-        *_budgeted_history(history, history_token_budget),
+        *kept,
         ChatMessage(role="user", content=question),
         ChatMessage(role="assistant", content="", tool_calls=(seed_call,)),
         ChatMessage(role="tool", content=seed_result_text, tool_call_id=SEED_CALL_ID),
     ]
+    # 三段动态内容也算在系统提示里，这里单独列出来，好看出记忆和练习状态占了多少。
+    segments = [
+        ("系统提示", len(system) - len(skills_block) - len(practice_block) - len(memory_block)),
+        ("能力摘要", len(skills_block)),
+        ("练习状态", len(practice_block)),
+        ("长期记忆", len(memory_block)),
+        ("会话历史", sum(len(item.content) for item in kept)),
+        ("当前问题", len(question) + len(seed_arguments)),
+        ("教材证据", len(seed_result_text)),
+    ]
+    return AssembledContext(messages, segments, dropped, clipped)
 
 
-def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: int) -> list[ChatMessage]:
+def message_chars(messages: Sequence[ChatMessage]) -> int:
+    """整份上下文的字符数，含工具循环里追加的内容。"""
+    return sum(len(item.content) + sum(len(call.arguments) for call in (item.tool_calls or ())) for item in messages)
+
+
+def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: int) -> tuple[list[ChatMessage], int, int]:
     kept: list[ChatMessage] = []
     remaining = history_token_budget
-    for role, content in reversed(history):
+    dropped = clipped = 0
+    for index, (role, content) in enumerate(reversed(history)):
         if role not in {"user", "assistant"} or not content.strip():
             continue
-        text = content if len(content) <= MESSAGE_MAX_CHARS else content[:MESSAGE_MAX_CHARS] + "…（已截断）"
+        text = content
+        if len(content) > MESSAGE_MAX_CHARS:
+            text = content[:MESSAGE_MAX_CHARS] + "…（已截断）"
+            clipped += 1
         if len(text) > remaining:
+            dropped = len(history) - index  # 更早的消息一律不再进上下文
             break
         remaining -= len(text)
         kept.append(ChatMessage(role=role, content=text))
     kept.reverse()
-    return kept
+    return kept, dropped, clipped

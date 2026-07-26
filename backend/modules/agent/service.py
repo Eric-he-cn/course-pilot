@@ -14,7 +14,7 @@ from modules.planning.api import PlanReaderPort, PlanWriterPort
 from modules.sessions.api import SessionBusyError, SessionUseCases
 from modules.sessions.artifacts import ArtifactStore
 
-from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages
+from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages, message_chars
 from .skills import SkillRegistry
 from .tools import MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, specs_for
 from .trace import TraceWriter
@@ -104,6 +104,7 @@ class TurnService:
         trace: TraceWriter | None = None,
         max_tool_rounds: int = 6,
         history_token_budget: int = 128_000,
+        context_char_limit: int = 512_000,
     ) -> None:
         self._sessions, self._knowledge = sessions, knowledge
         self._responder = responder
@@ -118,6 +119,7 @@ class TurnService:
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
+        self._context_char_limit = context_char_limit
 
     @staticmethod
     def _event(event_name: str, **data: object) -> dict[str, object]:
@@ -141,6 +143,18 @@ class TurnService:
     def _merge_usage(total: dict[str, int], extra: dict[str, int]) -> None:
         for key, value in extra.items():
             total[key] = total.get(key, 0) + value
+
+    def _context_usage(self, messages: list[ChatMessage], base: list[tuple[str, int]], assembled) -> dict[str, object]:
+        """本轮上下文构成。工具循环追加的内容算进"工具结果"，不然看不到真正的大头。"""
+        total = message_chars(messages)
+        segments = [*base, ("工具结果", max(0, total - sum(size for _, size in base)))]
+        return self._event(
+            "context_usage",
+            segments=[{"label": label, "chars": size} for label, size in segments if size > 0],
+            total_chars=total, limit_chars=self._context_char_limit,
+            history_budget_chars=self._history_token_budget,
+            dropped_history=assembled.dropped_history, clipped_history=assembled.clipped_history,
+        )
 
     @staticmethod
     def _display_args(raw: str) -> dict:
@@ -220,7 +234,7 @@ class TurnService:
                 yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, summary=seed.summary)
                 activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, "summary": seed.summary})
                 trace_tools.append({"origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, "summary": seed.summary, "duration_ms": int((time.monotonic() - seed_started) * 1000)})
-                messages = assemble_messages(
+                assembled = assemble_messages(
                     course_name=context.course_name or "当前课程",
                     materials=self._knowledge.material_names(scope=scope),
                     history=history,
@@ -232,6 +246,8 @@ class TurnService:
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
                     memory=self._memory_context(context.course_id),
                 )
+                messages = assembled.messages
+                base_segments = assembled.segments
                 responder = self._responder
                 allowed_tools = MAIN_PROFILE
                 active_skill: str | None = None
@@ -255,11 +271,13 @@ class TurnService:
                     trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": {"name": "practice"}, "ok": True, "summary": "自动加载", "duration_ms": 0})
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps({"name": "practice"})),)))
                     messages.append(ChatMessage(role="tool", content=f"# Skill: practice\n\n{practice_skill.body}", tool_call_id=call_id))
+                    base_segments = base_segments + [("skill 规程", len(practice_skill.body))]
                     active_skill, allowed_tools = "practice", practice_skill.allowed_tools
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                     trace_record["skill"] = {"name": "practice", "content_hash": practice_skill.content_hash, "activation": "auto"}
                 try:
                     while response is None:
+                        yield self._context_usage(messages, base_segments, assembled)
                         allow_tools = tool_rounds < max_rounds
                         segment_parts: list[str] = []
                         outcome: ChatToolCalls | ChatFinal | None = None

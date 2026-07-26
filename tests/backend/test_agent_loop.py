@@ -188,7 +188,7 @@ def test_material_names_cannot_inject_prompt_rules():
     system = assemble_messages(
         course_name="测试", materials=[hostile], history=[], question="q",
         seed_query="q", seed_result_text="e", history_token_budget=1000,
-    )[0].content
+    ).messages[0].content
     injected_line = [line for line in system.splitlines() if "PWNED" in line]
     assert len(injected_line) == 1  # 换行被压掉，没有额外成行
     assert injected_line[0].startswith("- 「") and injected_line[0].endswith("」")
@@ -203,9 +203,29 @@ def test_every_injected_section_reaches_the_system_prompt():
     system = assemble_messages(
         course_name="测试", materials=["a.md"], history=[], question="q",
         seed_query="q", seed_result_text="e", history_token_budget=1000, **marks,
-    )[0].content
+    ).messages[0].content
     for mark in marks.values():
         assert mark in system
+
+
+def test_context_segments_cover_the_whole_prompt_and_report_truncation():
+    """分段之和必须等于实际发出去的字符数，否则上下文视图会误导用户。"""
+    from modules.agent.context import assemble_messages, message_chars
+
+    history = [("user", "问题" * 500), ("assistant", "回答" * 500)] * 4
+    assembled = assemble_messages(
+        course_name="测试", materials=["a.md"], history=history, question="现在的问题",
+        seed_query="现在的问题", seed_result_text="教材证据", history_token_budget=3_000,
+        skill_summaries="- practice：练习", practice_digest="练习 #1", memory="偏好：先给结论",
+    )
+    assert sum(size for _, size in assembled.segments) == message_chars(assembled.messages)
+    assert assembled.dropped_history > 0  # 预算只放得下最近几条，更早的没进上下文
+
+    full = assemble_messages(
+        course_name="测试", materials=["a.md"], history=history, question="q",
+        seed_query="q", seed_result_text="e", history_token_budget=1_000_000,
+    )
+    assert full.dropped_history == 0
 
 
 def test_filler_segments_are_dropped_but_substance_is_kept():

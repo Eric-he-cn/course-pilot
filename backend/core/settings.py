@@ -54,6 +54,8 @@ class Settings:
     # Agent 历史预算，以字符数保守近似 token（按 1 字符 ≤ 1 token，宁少勿超窗）。
     # 默认对应 512K 软窗口里 128K 的历史份额。
     agent_history_token_budget: int = 128_000
+    # 整轮上下文的软窗口，同样以字符数近似 token（架构 §5.5 的 512K 软窗口）。
+    agent_context_char_limit: int = 512_000
 
     @property
     def remote_llm_configured(self) -> bool:
@@ -96,4 +98,5 @@ class Settings:
             max(1, int(value("ATTACHMENT_MAX_BYTES", str(10 * 1024 * 1024)))),
             max(1, int(value("ATTACHMENT_MAX_PIXELS", "12000000"))),
             max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
+            max(2048, int(value("AGENT_CONTEXT_CHAR_LIMIT", "512000"))),
         )

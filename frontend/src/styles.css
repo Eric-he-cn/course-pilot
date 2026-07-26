@@ -137,6 +137,17 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .composer-wrap>p { margin:7px 4px 0; color:var(--muted); font-size:11px }
 .attach-button { display:inline-flex; align-items:center; gap:5px; padding:4px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--muted); font-family:var(--mono); font-size:10px }
 .attach-button:hover:enabled { color:var(--accent); border-color:var(--accent) }
+.context-meter { margin-bottom:8px; border:1px solid var(--border); border-radius:8px; background:var(--panel) }
+.context-meter > button { display:flex; align-items:center; gap:10px; width:100%; padding:6px 10px; border:0; background:transparent; text-align:left }
+.context-meter .meter-bar { color:var(--accent); font-family:var(--mono); font-size:10px; letter-spacing:-.06em }
+.context-meter .meter-total { color:var(--text); font-family:var(--mono); font-size:11px }
+.context-meter .meter-hint { margin-left:auto; color:var(--muted); font-size:10.5px }
+.meter-detail { padding:2px 10px 8px; border-top:1px solid var(--border) }
+.meter-detail > div { display:flex; justify-content:space-between; padding:3px 0; font-size:11.5px }
+.meter-detail > div span { color:var(--muted) }
+.meter-detail > div b { color:var(--text); font-family:var(--mono); font-weight:500 }
+.meter-detail p { margin:6px 0 0; color:var(--muted); font-size:10.5px; line-height:1.5 }
+.meter-detail p.meter-warn { color:var(--warning) }
 .attach-list { display:flex; flex-direction:column; gap:6px; margin-bottom:8px }
 .attach-chip { display:flex; align-items:baseline; gap:10px; padding:7px 10px; border:1px solid var(--border); border-radius:6px; background:var(--panel); font-family:var(--mono); font-size:11px }
 .attach-chip .attach-name { flex:none; color:var(--accent); font-weight:600 }

@@ -5,7 +5,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { ApiError, api } from './api'
-import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, ToolActivity } from './types'
+import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, SessionSummary, ToolActivity } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -16,7 +16,11 @@ const nav: { id: View; num: string }[] = [
   { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
-const TOOL_LABELS: Record<string, string> = { search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', plan_update: '写入计划', get_archive: '学习档案' }
+const TOOL_LABELS: Record<string, string> = {
+  search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', plan_update: '写入计划',
+  get_archive: '学习档案', concept_search: '概念目录', emit_evidence: '记录学习证据', memory_patch: '更新记忆',
+  use_skill: '加载能力', artifact_read: '读取练习', artifact_append: '保存练习',
+}
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
 function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : '刚刚' }
@@ -36,6 +40,8 @@ export default function App() {
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [citation, setCitation] = useState<Citation | null>(null)
   const [turnResolution, setTurnResolution] = useState<TurnResolution | null>(null)
+  // 上下文构成来自服务端实际组装结果；换会话就清空，避免显示上一会话的数字。
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
 
   const course = useMemo(() => courses.find(item => item.id === workspace.courseId) ?? null, [courses, workspace.courseId])
   const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewNames[view]
@@ -46,7 +52,7 @@ export default function App() {
     api.courses().then(setCourses).catch(error => setNotice(errorText(error)))
   }, [])
   useEffect(() => { void loadSessions() }, [workspace.scope, workspace.courseId])
-  useEffect(() => { setTurnResolution(null); if (activeSession) void loadMessages(activeSession.id) }, [activeSession?.id])
+  useEffect(() => { setTurnResolution(null); setContextUsage(null); if (activeSession) void loadMessages(activeSession.id) }, [activeSession?.id])
 
   async function loadSessions() {
     try {
@@ -59,7 +65,7 @@ export default function App() {
     try { setMessages(await api.messages(id)) } catch (error) { setMessages([]); setNotice(errorText(error)) }
   }
   function switchWorkspace(next: Workspace) {
-    setWorkspace(next); setView('chat'); setSidebarOpen(false); setCitation(null); setTurnResolution(null)
+    setWorkspace(next); setView('chat'); setSidebarOpen(false); setCitation(null); setTurnResolution(null); setContextUsage(null)
   }
   async function newSession() {
     setBusy(true)
@@ -113,7 +119,7 @@ export default function App() {
         <div className="title-area"><b>{heading}</b><span className="crumb"><i style={{ backgroundColor: course?.color ?? '#D4D4D8' }} /> {workspaceName}</span></div>
       </header>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label="关闭错误提示" onClick={() => setNotice('')}>×</button></div>}
-      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} onCitation={setCitation} onUpload={async file => {
+      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} contextUsage={contextUsage} onCitation={setCitation} onUpload={async file => {
         try {
           let targetSession = activeSession
           if (!targetSession) {
@@ -143,6 +149,9 @@ export default function App() {
             setTurnResolution({ sessionId: targetSession.id, status: payload.status ?? 'unresolved', courseId: resolvedId, courseName: isResolved ? payload.course_name ?? null : null })
             setActiveSession(current => current ? { ...current, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? current.course_name : null, course_color: isResolved ? payload.course_color ?? current.course_color : null } : current)
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
+          }
+          if (payload.type === 'context_usage' && payload.segments) {
+            setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0 })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
             activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin })
@@ -181,7 +190,7 @@ export default function App() {
   </div>
 }
 
-function ChatView({ session, messages, workspaceName, scope, turnResolution, onCitation, onUpload, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
+function ChatView({ session, messages, workspaceName, scope, turnResolution, contextUsage, onCitation, onUpload, onSend, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
   const [draft, setDraft] = useState(''); const composer = useRef<HTMLTextAreaElement>(null)
   const [attachments, setAttachments] = useState<Attachment[]>([]); const [uploading, setUploading] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
@@ -215,6 +224,7 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, onC
       {messages.filter(item => item.role !== 'system').map(message => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope} />)}
     </div>
     <form className="composer-wrap" onSubmit={submit}>
+      {contextUsage && <ContextMeter usage={contextUsage} />}
       {(attachments.length > 0 || uploading) && <div className="attach-list">
         {attachments.map(item => <div className={item.needs_confirmation ? 'attach-chip warn' : 'attach-chip'} key={item.id}>
           <span className="attach-name">IMG · {item.filename}</span>
@@ -227,6 +237,26 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, onC
       <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={pickFile} />
       <p>回答优先依据当前课程的可检索资料；没有命中教材时会明确标注“以下不是当前教材结论”。</p></form>
   </section>
+}
+
+function ContextMeter({ usage }: { usage: ContextUsage }) {
+  const [open, setOpen] = useState(false)
+  const k = (chars: number) => chars >= 1000 ? `${(chars / 1000).toFixed(1)}K` : String(chars)
+  const percent = Math.min(100, Math.round((usage.total_chars / usage.limit_chars) * 100))
+  const filled = Math.round(percent / 5)
+  return <div className="context-meter">
+    <button type="button" onClick={() => setOpen(!open)} aria-expanded={open}>
+      <span className="meter-bar" aria-hidden>{'▓'.repeat(filled)}{'░'.repeat(20 - filled)}</span>
+      <span className="meter-total">{percent}% · {k(usage.total_chars)} / {k(usage.limit_chars)}</span>
+      <span className="meter-hint">上下文 · 字符数估算</span>
+    </button>
+    {open && <div className="meter-detail">
+      {usage.segments.map(segment => <div key={segment.label}><span>{segment.label}</span><b>{k(segment.chars)}</b></div>)}
+      <p>按字符数近似 token（未接真实 tokenizer，实际占用通常更小）。历史预算 {k(usage.history_budget_chars)}。</p>
+      {usage.dropped_history > 0 && <p className="meter-warn">更早的 {usage.dropped_history} 条消息未进入本轮上下文。</p>}
+      {usage.clipped_history > 0 && <p className="meter-warn">有 {usage.clipped_history} 条超长消息被截断后才进入上下文。</p>}
+    </div>}
+  </div>
 }
 
 function MessageCard({ message, onCitation, showResolution }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean }) {

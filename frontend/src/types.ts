@@ -40,6 +40,37 @@ export interface ToolActivity {
   ok?: boolean
 }
 
+export interface ContextUsage {
+  segments: { label: string; chars: number }[]
+  total_chars: number
+  limit_chars: number
+  history_budget_chars: number
+  dropped_history: number
+  clipped_history: number
+}
+
+/** SSE 事件负载：字段随事件类型而异，所以都是可选的。 */
+export interface TurnEvent extends Partial<ContextUsage> {
+  type?: string
+  event?: string
+  status?: string
+  delta?: string
+  content?: string
+  text?: string
+  error?: string
+  error_code?: string
+  resolved_course_id?: string | null
+  course_id?: string | null
+  course_name?: string | null
+  course_color?: string | null
+  call_id?: string
+  name?: string
+  summary?: string
+  ok?: boolean
+  origin?: string
+  finish_reason?: string
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
