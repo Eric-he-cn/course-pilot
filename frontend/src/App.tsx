@@ -182,7 +182,7 @@ export default function App() {
       <div className="side-label">WORKSPACE</div>
       <button className={`workspace-card ${workspace.scope === 'general' ? 'selected' : ''}`} onClick={() => switchWorkspace({ scope: 'general' })}>
         <span className="general-icon" aria-hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M12 3v18M3 12h18" opacity=".35" /></svg></span>
-        <span className="workspace-copy"><b>不指定课程</b><small>按问题自动判断</small></span>
+        <span className="workspace-copy"><b>通用模式</b><small>按问题自动判断课程</small></span>
       </button>
       <div className="course-switcher">
         {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id} onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
