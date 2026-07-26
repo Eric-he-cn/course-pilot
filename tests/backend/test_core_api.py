@@ -173,18 +173,13 @@ def test_course_session_is_immutable_and_invalid_general_course_binding_is_rejec
     assert _first(events, "course_resolution")["reason"] == "course_session"
 
 
-def test_web_cannot_forge_feishu_source_and_feishu_service_session_is_singleton(client):
-    rejected = client.post("/api/v2/sessions", json={"scope_mode": "general", "source": "feishu"})
+def test_web_cannot_forge_the_session_source(client):
+    rejected = client.post("/api/v2/sessions", json={"scope_mode": "general", "source": "im"})
     assert rejected.status_code == 422
+    assert client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()["source"] == "web"
 
-    sessions = workspace(client).sessions
-    first = sessions.create_session(scope_mode="general", course_id=None, title="飞书入口", source="feishu", owner_id="owner-a")
-    second = sessions.create_session(scope_mode="general", course_id=None, title="重复投递", source="feishu", owner_id="owner-a")
-    another_owner = sessions.create_session(scope_mode="general", course_id=None, title="另一位用户", source="feishu", owner_id="owner-b")
-    assert first.id == second.id
-    assert another_owner.id != first.id
-    assert first.source == "feishu"
-    assert first.course_id is None
+    with pytest.raises(ValueError):
+        workspace(client).sessions.create_session(scope_mode="general", course_id=None, title="外部渠道", source="im")
 
 
 def test_wiki_job_requires_explicit_flag_and_completed_index(client):
@@ -219,7 +214,7 @@ def test_errors_use_a_stable_envelope(client):
     response = client.get("/api/v2/jobs/not-a-job")
     assert response.status_code == 404
     assert response.json()["error"] == {"code": "not_found", "message": "任务不存在", "retryable": False}
-    invalid = client.post("/api/v2/sessions", json={"scope_mode": "general", "source": "feishu"})
+    invalid = client.post("/api/v2/sessions", json={"scope_mode": "general", "source": "im"})
     assert invalid.status_code == 422
     assert invalid.json()["error"]["code"] == "invalid_request"
 

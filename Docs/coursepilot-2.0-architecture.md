@@ -27,7 +27,7 @@
 | 复习排期 | py-fsrs | FSRS 官方 Python 实现，不自研排期算法 |
 | BKT | 自实现（约 30 行贝叶斯更新） | 固定参数的经典四参数 BKT 就是几行公式，pyBKT 是为拟合大数据集设计的，用不上 |
 | 定时调度 | APScheduler 单一 interval tick（无持久化 job store） | 每分钟扫描到期条目，计划变更不需要增删大量 job；SQLite 中的计划与 delivery 才是真源 |
-| 飞书渠道 | lark-oapi SDK，WebSocket 长连接模式 | 长连接不需要公网回调地址，本地部署可直接跑 |
+| IM 渠道 | IM 平台官方 SDK，WebSocket 长连接模式 | 长连接不需要公网回调地址，本地部署可直接跑 |
 | 前端 | React + Vite + TypeScript（SPA） | 替换 Streamlit；会话列表、wiki 浏览、计划视图需要真实前端；构建产物由 FastAPI 静态托管 |
 | OCR | Vision LLM 结构化转录 + 文本主模型讲解 | 转录与推理分步，便于置信度门控、用户确认和独立评测 |
 | Trace | 自研薄封装，JSONL 落盘 | 单用户本地产品不上 OpenTelemetry 全家桶 |
@@ -38,7 +38,7 @@
 ┌────────────────────── 单 Python 进程（asyncio） ──────────────────────┐
 │                                                                      │
 │  FastAPI HTTP/SSE ──┐                                                │
-│  飞书长连接 client ──┼──→ 渠道抽象层 ──→ 通用/课程会话 → Agent 核心 │
+│  IM 长连接 client ──┼──→ 渠道抽象层 ──→ 通用/课程会话 → Agent 核心 │
 │                              │              │            ├ RAG 服务   │
 │  Scheduler tick ─────────────┘              │            ├ 档案服务   │
 │  （每分钟扫描到期项并进入隐藏系统会话）          │            ├ 计划服务   │
@@ -48,8 +48,8 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-- 飞书长连接作为 asyncio task 与 FastAPI 同进程运行，随进程启停；其他 IM 只保留 `Channel` 接口，不在首版实现。
-- 渠道入站消息必须先解析到 `session_id + scope_mode`。Web 默认创建通用会话，也可进入固定课程工作区；飞书每个用户只使用一个通用会话。通用会话在每轮 Agent 执行前解析相关课程，解析不唯一时进入澄清回复，不执行课程工具。
+- IM 渠道的长连接作为 asyncio task 与 FastAPI 同进程运行，随进程启停；首版只接一个 IM，其余渠道只保留 `Channel` 接口。
+- 渠道入站消息必须先解析到 `session_id + scope_mode`。Web 默认创建通用会话，也可进入固定课程工作区；IM 渠道每个用户只使用一个通用会话。通用会话在每轮 Agent 执行前解析相关课程，解析不唯一时进入澄清回复，不执行课程工具。
 - Scheduler 每分钟执行一次 tick，查询到期且未投递的计划/复习项；它不直接调 LLM，而是把系统消息投进每门课程唯一的隐藏系统会话。系统会话不出现在用户会话列表、使用独立 turn lock，因此不会与用户正在聊天的 session 抢锁。
 - FAISS 查询、GitPython 操作和 sqlite3 调用使用 `asyncio.to_thread`；PDF 解析、切块与索引构建进入 `ProcessPoolExecutor(max_workers=1)`。任何可能超过 100 ms 的同步调用都不得直接运行在事件循环。
 - 服务器化路径：同一进程部署到服务器 + 前端改为纯静态托管，代码不变。
@@ -57,7 +57,7 @@
 ### 3.1 模块边界与依赖方向
 
 ```text
-app / web / feishu / scheduler
+app / web / im / scheduler
               ↓
        application use cases
               ↓
@@ -243,7 +243,7 @@ APP_LOG_LEVEL=INFO
 - 主 Agent、规划、practice 和 wiki 工具链显式传 `thinking.disabled`，保证延迟可控且无需保存隐式推理；离线 judge 可用 `thinking.enabled + reasoning_effort=high`。是否为具体 Skill 开启 thinking 必须先过 A/B eval。
 - 非思考模式按任务设置温度：Tutor/评分/Wiki 为 `0.2`，练习题创作为 `0.7`；thinking 模式不发送 `temperature / top_p / presence_penalty / frequency_penalty`，因为官方说明这些参数无效。
 - DeepSeek context cache 默认开启。上下文组装保持“稳定系统提示 → 稳定课程信息 → 动态历史/RAG”的顺序，并记录 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
-- 请求传入内部用户 ID 的 HMAC 作为 `user_id`，用于 provider 侧 KV cache 与调度隔离，不发送邮箱、飞书 open_id 等隐私标识。
+- 请求传入内部用户 ID 的 HMAC 作为 `user_id`，用于 provider 侧 KV cache 与调度隔离，不发送邮箱、IM 用户标识等隐私标识。
 
 ### 5.6 DeepSeek 与千问 OCR 结论
 
@@ -567,7 +567,7 @@ class ToolCallContext:
 
 无法可靠归因时允许提交 `concept_id=null + topic_hint`，事件进入未归因队列且不更新掌握度；这不等于允许模型编造概念 ID。
 
-`confirm` 返回包含工具名、参数摘要、可读 diff、影响范围和过期时间的 approval artifact。运行时在内存中等待最多 120 秒，Web/飞书提交审批后 resolve future 并继续同一 turn；连接断开、超时或进程重启均视为 deny，不持久化 Agent checkpoint。确认只用于少数副作用场景。
+`confirm` 返回包含工具名、参数摘要、可读 diff、影响范围和过期时间的 approval artifact。运行时在内存中等待最多 120 秒，Web / IM 渠道提交审批后 resolve future 并继续同一 turn；连接断开、超时或进程重启均视为 deny，不持久化 Agent checkpoint。确认只用于少数副作用场景。
 
 ### 9.5 写入、结果与并发合约
 
@@ -613,7 +613,7 @@ SQLite 单文件（`data/coursepilot.db`，WAL），核心表：
 | `mastery` | 投影 | 每概念当前 BKT/FSRS 投影、样本数与 `algorithm_version`；可从 evidence_events 重建 |
 | `review_queue` | 投影 | FSRS card state 和下次复习时间 |
 | `plans` / `plan_items` / `plan_revisions` | 可变 / append-only | 当前计划、条目与每次变更 diff；历史条目不覆盖 |
-| `channel_bindings` / `deliveries` | 可变 / append-oriented | 外部用户身份映射与推送去重回执；飞书不保存当前课程 |
+| `channel_bindings` / `deliveries` | 可变 / append-oriented | 外部用户身份映射与推送去重回执；IM 渠道不保存当前课程 |
 | `domain_outbox` | append-oriented | 带版本领域事件、投递状态、attempt 与 next_attempt_at；模块间可靠异步联动，不引入外部消息队列 |
 | `tool_audits` | append-only | 工具可见性、policy、审批、幂等与执行审计 |
 
@@ -650,7 +650,7 @@ Tutor、practice 或经用户确认的图片点评输出结构化归因（概念
 - `plan_items` 每次变更生成新 `plan_version`，只改变未来条目；历史条目和已发送回执不修改。
 - 投递稳定键是 `source_type + source_id + source_version + channel + scheduled_at`。发送前在 `deliveries` 预登记，成功后写回 channel receipt；重复 tick 返回旧回执。
 - **启动补投**：启动后执行同一条到期查询；当天漏发的补投一次，更早条目静默跳过。
-- 推送治理在渠道层实现：飞书每日条数上限、免打扰时段、一键退订指令。
+- 推送治理在渠道层实现：IM 渠道每日条数上限、免打扰时段、一键退订指令。
 
 当前实现完成了计划的读写与版本化：`plan_update` 在单个写事务里校验 `expected_version`、日期不早于今天、概念 id 属于本课程，整批校验整批拒绝；重写范围限于今天及以后且仍为 `pending` 的条目，已开始的条目保留原状态与 id；每次写入升一版并落一条带 `turn_id` 的 `plan_revisions`。`get_plan` 同时给出弱项与 FSRS 到期概念，让排计划用的是掌握度投影的真实数值。写入的确认规则先用确定性闸门落地——本会话用户明确说过要排或改计划才放行，且判断只取用户键入的原文（图片转录不参与）；§10 要求的 confirm 交互与调度 tick、`deliveries` 都还没做。
 
@@ -662,10 +662,10 @@ class Channel(Protocol):
     def on_receive(self, handler) -> None   # 文本/图片统一为 InboundMessage
 ```
 
-- 首版实现 `WebChannel`（SSE）与 `FeishuChannel`（长连接）。其他渠道只保留 `Channel` 协议和 adapter 测试夹具，不进入运行时配置。
-- `ChannelBinding` 只映射 `provider + external_user_id -> user_id`。外部 ID 经 HMAC 后记 trace，不直接作为内部用户主键；飞书不保存 `active_course_id`。
-- 入站消息归一化并取得会话 scope 后才进 Agent；课程会话直接建立本轮 context，通用会话先走 Resolver。Agent 不感知渠道差异；出站消息按渠道能力降级（飞书消息卡片、Web 组件或纯文本）。
-- Web 与飞书可以绑定同一个内部 `user_id`。Web 支持通用/课程会话；飞书对每个用户取得或创建唯一的 `source=feishu, scope_mode=general` 会话，通过每轮解析确定课程，不按课程拆会话。
+- 首版实现 `WebChannel`（SSE）与 `ImChannel`（长连接）。其他渠道只保留 `Channel` 协议和 adapter 测试夹具，不进入运行时配置。
+- `ChannelBinding` 只映射 `provider + external_user_id -> user_id`。外部 ID 经 HMAC 后记 trace，不直接作为内部用户主键；IM 渠道不保存 `active_course_id`。
+- 入站消息归一化并取得会话 scope 后才进 Agent；课程会话直接建立本轮 context，通用会话先走 Resolver。Agent 不感知渠道差异；出站消息按渠道能力降级（IM 消息卡片、Web 组件或纯文本）。
+- Web 与 IM 渠道可以绑定同一个内部 `user_id`。Web 支持通用/课程会话；IM 渠道对每个用户取得或创建唯一的 `source=im, scope_mode=general` 会话，通过每轮解析确定课程，不按课程拆会话。
 - 首版不做语音输入，也不配置 `asr` 槽位；未来新增时通过独立 ASR adapter 接入，不改变 `Channel` 或 Agent 合约。
 
 ## 14. HTTP API 与 SSE 合约
@@ -737,7 +737,7 @@ turn_failed       {error_code, retryable, partial_message_id?}
 - FastAPI 默认只监听 `127.0.0.1`，前端与 API 同源托管；CORS 不使用 `* + credentials`。如显式暴露到局域网或服务器，必须开启 Bearer/API token 校验。
 - 教材与图片按扩展名、MIME、文件头、大小和页数/像素上限校验，流式写入随机生成的内部文件名，不使用用户文件名拼路径。
 - 教材、RAG 片段、Wiki 与 OCR 转录均视为不可信内容；其中的“忽略系统指令”等文本不能改变工具权限或课程边界。ToolPolicy 只信任服务端上下文和注册的 Schema。
-- 飞书、LLM 和 Git 凭据只从环境变量/密钥环读取；日志过滤 `Authorization`、API Key、bot token 和带签名的图片 URL。
+- IM 渠道、LLM 和 Git 凭据只从环境变量/密钥环读取；日志过滤 `Authorization`、API Key、bot token 和带签名的图片 URL。
 
 ## 15. 前端
 
@@ -809,7 +809,7 @@ course-pilot/
 │  ├─ store/                    # SQLite + migrations
 │  ├─ git/
 │  ├─ scheduler/                # 单 interval tick
-│  └─ channels/feishu/
+│  └─ channels/im/
 ├─ skills/builtin/              # practice / wiki_curator
 ├─ frontend/                    # React SPA
 ├─ trace/
@@ -843,7 +843,7 @@ course-pilot/
 - **归因质量**：证据事件的概念归因是 LLM 输出，归因错误会写入错误概念的掌握度。缓解：归因微提示词限定概念列表 + schema 校验挡住幻觉概念 + 未归因队列 + judge 抽检。
 - **用户 Skill 的提示注入与权限膨胀**：导入内容可能要求越权调用。缓解：只允许 prompt-only 文件、权限取交集、默认禁用、版本预览；系统提示与 ToolPolicy 优先级不可覆盖。
 - **Wiki 构建质量不稳定**：自动生成页面可能重复或错链。缓解：默认关闭、按教材显式触发、独立 job、可预览/回滚，不影响 RAG 主链路。
-- **飞书联调**：首版唯一外部渠道，卡片回调、长连接重连和幂等回执仍需真实环境验证；其他渠道不占首版工期。
+- **IM 渠道联调**：首版唯一外部渠道，卡片回调、长连接重连和幂等回执仍需真实环境验证；其他渠道不占首版工期。
 - **前端从 Streamlit 换 React 的工作量**：四个页面中 wiki 与计划视图是新增工作量的主体，可按"对话 → 管理 → wiki → 计划"顺序分批交付。
 - **OCR 不阻塞主线**：视觉槽位未配置时禁用图片入口，文本学习、练习和计划正常工作。后续选型以真实手写公式样本评测为准。
 
@@ -857,7 +857,7 @@ course-pilot/
 4. **Practice skill**：引入通用 artifact 读写与 `practice` SKILL.md，覆盖文本出题、作答、评分、讲评、变式题和对象歧义；不增加阶段状态机，再退役 QuizMaster / Grader 旧链路。
 5. **学习档案**：完成 EvidenceEvent、未归因队列、BKT/FSRS 投影与 replay；掌握度只消费已归因事件。
 6. **可选 Wiki**：实现课程开关、按教材触发的 `wiki_build_job`、页面预览/回滚和读时掌握度渲染；关闭时不影响 RAG、Tutor 与练习。
-7. **主动化与飞书**：实现内建规划规则、`plan_read / plan_update`、版本化 plan item、单调度 tick、隐藏 system session 与 Web 通知；本地幂等和补投稳定后接飞书。其他渠道仅保留协议。
+7. **主动化与 IM 渠道**：实现内建规划规则、`plan_read / plan_update`、版本化 plan item、单调度 tick、隐藏 system session 与 Web 通知；本地幂等和补投稳定后接 IM 渠道。其他渠道仅保留协议。
 8. **OCR（可选）**：实现视觉槽位、attachment API、`VisionTranscriptionV1` 预处理和系统提示中的图片确认规则；未配置时不影响前七步交付。
 
 每个切片只在 contract tests + smoke + 相关 1.0 baseline 通过后默认开启；旧代码在新切片稳定一轮后再删除，不边写边删回退路径。

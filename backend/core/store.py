@@ -22,12 +22,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
     # These partial indexes make the local single-process policies durable if a
     # second server process is accidentally pointed at the same SQLite file.
     (3, "CREATE UNIQUE INDEX IF NOT EXISTS idx_active_turn_per_session ON turn_requests(session_id) WHERE status = 'running';"),
-    (4, "CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_general_session ON sessions(source) WHERE source = 'feishu' AND scope_mode = 'general' AND kind = 'user';"),
     (5, """
-        DROP INDEX IF EXISTS idx_feishu_general_session;
         ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local-web';
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_general_per_owner ON sessions(source, owner_id)
-            WHERE source = 'feishu' AND scope_mode = 'general' AND kind = 'user';
         CREATE TABLE IF NOT EXISTS channel_bindings (
             provider TEXT NOT NULL, external_user_id TEXT NOT NULL, owner_id TEXT NOT NULL,
             active_session_id TEXT REFERENCES sessions(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,

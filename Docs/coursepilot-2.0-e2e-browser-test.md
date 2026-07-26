@@ -195,7 +195,7 @@ TEXT_API_KEY=sk-invalid STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
 ## 4. 这条测试不覆盖
 
 `client_request_id` 幂等重放、`stream_interrupted`（需要在流中途切断供应商）、100 MiB 上限校验、
-飞书渠道。这些留给后端测试与手工验证。
+IM 渠道。这些留给后端测试与手工验证。
 
 ## 5. 验收项对照
 

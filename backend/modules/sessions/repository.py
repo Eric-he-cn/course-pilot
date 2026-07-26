@@ -11,8 +11,6 @@ class SessionRepository:
         with self._store.read() as c: return c.execute(f"SELECT * FROM sessions WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC", params).fetchall()
     def get_session_row(self, session_id: str):
         with self._store.read() as c: return c.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    def get_source_session_row(self, *, source: str, scope_mode: str, owner_id: str):
-        with self._store.read() as c: return c.execute("SELECT * FROM sessions WHERE source = ? AND scope_mode = ? AND owner_id = ? AND kind = 'user' ORDER BY created_at ASC LIMIT 1", (source, scope_mode, owner_id)).fetchone()
     def insert_session(self, *, session_id: str, title: str, scope_mode: str, course_id: str | None, source: str, owner_id: str, timestamp: str) -> None:
         with self._store.write() as c: c.execute("INSERT INTO sessions(id, title, scope_mode, course_id, source, owner_id, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?)", (session_id, title, scope_mode, course_id, source, owner_id, timestamp, timestamp))
     def list_message_rows(self, session_id: str):

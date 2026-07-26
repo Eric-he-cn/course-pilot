@@ -80,8 +80,7 @@ def create_core_router() -> APIRouter:
     @router.post("/sessions", status_code=201)
     def create_session(request: SessionCreateRequest, application: Application = Depends(current_workspace)):
         try:
-            # HTTP is the Web channel.  Channel adapters call the use case
-            # directly, so a browser cannot impersonate the Feishu source.
+            # HTTP 固定是 Web 渠道；其他渠道由适配器直接调服务，浏览器伪造不出别的来源。
             return asdict(application.sessions.create_session(scope_mode=request.scope_mode, course_id=request.course_id, title=request.title, source="web"))
         except LookupError as exc:
             raise _not_found(exc) from exc

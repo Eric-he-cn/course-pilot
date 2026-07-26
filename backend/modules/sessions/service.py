@@ -26,20 +26,9 @@ class SessionService:
         if scope_mode == "course" and not course_id: raise ValueError("课程会话必须指定 course_id")
         if scope_mode == "general" and course_id is not None: raise ValueError("通用会话不能指定 course_id")
         if course_id and not self._courses.get_course(course_id): raise LookupError("课程不存在")
-        if source not in {"web", "feishu"}: raise ValueError("不支持的会话来源")
-        if source == "feishu":
-            if scope_mode != "general": raise ValueError("飞书首版只能创建通用会话")
-            if not owner_id.strip(): raise ValueError("飞书会话必须绑定 owner")
-            existing = self._repository.get_source_session_row(source="feishu", scope_mode="general", owner_id=owner_id)
-            if existing: return self._summary(existing)
+        if source != "web": raise ValueError("不支持的会话来源")
         session_id, timestamp = new_id("session"), utc_now()
-        try:
-            self._repository.insert_session(session_id=session_id, title=(title or self.DEFAULT_TITLE).strip()[:120] or self.DEFAULT_TITLE, scope_mode=scope_mode, course_id=course_id, source=source, owner_id=owner_id, timestamp=timestamp)
-        except sqlite3.IntegrityError:
-            # The Feishu uniqueness index resolves a concurrent first delivery.
-            existing = self._repository.get_source_session_row(source="feishu", scope_mode="general", owner_id=owner_id)
-            if existing: return self._summary(existing)
-            raise
+        self._repository.insert_session(session_id=session_id, title=(title or self.DEFAULT_TITLE).strip()[:120] or self.DEFAULT_TITLE, scope_mode=scope_mode, course_id=course_id, source=source, owner_id=owner_id, timestamp=timestamp)
         return self.get_session(session_id)  # type: ignore[return-value]
     def rename_session(self, *, session_id: str, title: str) -> SessionSummary:
         cleaned = " ".join(title.split())[:120]
