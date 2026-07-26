@@ -329,7 +329,9 @@ RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿�
 - 导入时完成 schema、大小、重名与危险内容静态检查，生成不可变 `skill_version` 和内容 hash。更新创建新版本，正在进行的 turn 继续使用旧版本。
 - `use_skill` 只看到当前课程已启用的摘要。用户 Skill 与教材内容都视为不可信指令，不能覆盖系统提示、课程边界、Tutor 证据合约或工具 policy。
 
-当前实现只接受单个 `SKILL.md`（prompt-only，≤64 KiB），导入范围是全局而不区分课程；可授予的工具是一份白名单——读工具加练习相关的 artifact 与 `emit_evidence`，`memory_patch`、`plan_update`、`use_skill` 一律不授予。权限不足按上面的规则导入为 `permission_denied` 且不可启用。同名重新导入原地覆盖正文，不保证正在进行的 turn 继续用旧版本；zip、参考文件与多版本并存都还没做。
+当前实现接受单个 `SKILL.md`、含它的 zip，或浏览器直接选一个目录（前端把相对路径写进文件名）。导入时把这一份 skill 压成单份文本：`SKILL.md` 打头，其余 UTF-8 文本文件（`.md / .txt / .json / .yaml / .csv`）按相对路径追加在后面并标出出处，合起来仍受 64 KiB 限制。脚本与二进制文件跳过并回报给用户——平台不执行命令，收下只会让人误以为整份都生效了。附带资料随规程一起注入，没有按需读取，上限就是那 64 KiB。
+
+导入范围是全局而不区分课程；可授予的工具是一份白名单——读工具加练习相关的 artifact 与 `emit_evidence`，`memory_patch`、`plan_update`、`use_skill` 一律不授予。权限不足按上面的规则导入为 `permission_denied` 且不可启用。同名重新导入原地覆盖正文，不保证正在进行的 turn 继续用旧版本；多版本并存还没做。
 
 ## 7. 提示词体系与 Skill 编写规范
 

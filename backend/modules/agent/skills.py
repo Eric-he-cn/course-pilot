@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
+import zipfile
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from core.common import utc_now
 from core.store import SQLiteStore
@@ -14,6 +16,13 @@ _REQUIRED = ("name", "description", "when_to_use", "allowed_tools")
 _FRONTMATTER = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 SOURCE_MAX_BYTES = 64 * 1024
+
+# 一个 skill 目录/压缩包的收件上限，挡住压缩炸弹与误传整个仓库
+BUNDLE_MAX_FILES = 40
+BUNDLE_MAX_BYTES = 8 * 1024 * 1024
+# 附带资料随正文一起进上下文，所以只收文本。这里没有 shell，脚本收了也执行不了。
+BUNDLE_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml", ".csv")
+_ENTRY_NAME = "skill.md"
 
 # 导入的 skill 只能拿到读工具与练习相关的写工具（架构 §6.1 的 policy 项）：
 # 长期记忆、学习计划与加载别的 skill 都不在可授予范围内。
@@ -76,6 +85,71 @@ def parse_skill(text: str, *, source: str = "上传内容") -> SkillDefinition:
 
 def load_skill(path: Path) -> SkillDefinition:
     return parse_skill(path.read_text(encoding="utf-8"), source=str(path))
+
+
+def read_zip(raw: bytes) -> list[tuple[str, bytes]]:
+    """把压缩包解到内存，不落盘。声明的体积不可信，按上限逐个截断读，超了就拒。"""
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        raise ValueError("不是有效的 ZIP 文件") from None
+    entries = [item for item in archive.infolist() if not item.is_dir()]
+    if len(entries) > BUNDLE_MAX_FILES:
+        raise ValueError(f"压缩包里有 {len(entries)} 个文件，超过 {BUNDLE_MAX_FILES} 个的上限")
+    members, total = [], 0
+    for item in entries:
+        with archive.open(item) as handle:
+            data = handle.read(BUNDLE_MAX_BYTES + 1)
+        total += len(data)
+        if total > BUNDLE_MAX_BYTES:
+            raise ValueError(f"压缩包解压后超过 {BUNDLE_MAX_BYTES // 1024 // 1024} MiB")
+        members.append((item.filename, data))
+    return members
+
+
+def _clean_path(name: str) -> str | None:
+    """路径只用于展示，但仍挡掉绝对路径与 ..，不给它们进正文的机会。"""
+    normalized = name.replace("\\", "/")
+    parts = [part for part in PurePosixPath(normalized).parts if part != "."]
+    if not parts or normalized.startswith("/") or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def merge_bundle(members: list[tuple[str, bytes]]) -> tuple[str, tuple[str, ...]]:
+    """把一份 skill 目录压成单份文本：SKILL.md 打头，其余文本文件按路径追加在后面。
+
+    附带资料是随规程一起注入的，没有按需读取——正文里 `references/x.md` 这类指路
+    因此依然成立。代价是全部内容都占上下文，用 SOURCE_MAX_BYTES 兜住。
+    """
+    files = {path: raw for path, raw in ((_clean_path(name), raw) for name, raw in members) if path}
+    entry = min(
+        (path for path in files if path.lower().endswith(_ENTRY_NAME)),
+        key=lambda path: (path.count("/"), path), default=None,
+    )
+    if entry is None:
+        raise ValueError("这份 skill 里找不到 SKILL.md")
+    try:
+        text = files[entry].decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("SKILL.md 不是 UTF-8 文本") from None
+
+    root = entry.rsplit("/", 1)[0] + "/" if "/" in entry else ""
+    sections, skipped = [], []
+    for path in sorted(path for path in files if path != entry):
+        label = path[len(root):] if path.startswith(root) else path
+        if not label.lower().endswith(BUNDLE_SUFFIXES):
+            skipped.append(label)
+            continue
+        try:
+            content = files[path].decode("utf-8").strip()
+        except UnicodeDecodeError:
+            skipped.append(label)
+            continue
+        if content:
+            sections.append(f"\n\n## 附带文件：{label}\n\n{content}")
+    # 只有一个文件时原样交出去，让 frontmatter 的校验口径跟单文件导入完全一致
+    return (text.rstrip() + "".join(sections) if sections else text), tuple(skipped)
 
 
 class UserSkillStore:

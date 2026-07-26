@@ -1029,6 +1029,8 @@ function SkillsCard({ onError }: { onError: (message: string) => void }) {
   const [importable, setImportable] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
+  const folderInput = useRef<HTMLInputElement>(null)
+  const [skipped, setSkipped] = useState<string[]>([])
   async function reload() {
     try { const payload = await api.skills(); setSkills(payload.skills); setImportable(payload.importable_tools) }
     catch (error) { setSkills([]); onError(errorText(error)) }
@@ -1039,11 +1041,13 @@ function SkillsCard({ onError }: { onError: (message: string) => void }) {
     try { await action(); await reload() } catch (error) { onError(errorText(error)) } finally { setBusy(false) }
   }
   async function pick(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]; event.target.value = ''
-    if (file) await run(() => api.importSkill(file))
+    const files = [...event.target.files ?? []]; event.target.value = ''
+    if (!files.length) return
+    setSkipped([])
+    await run(async () => { setSkipped((await api.importSkill(files)).skipped_files ?? []) })
   }
   return <article className="card"><h2>能力（Skill）</h2>
-    <p>导入的 SKILL.md 默认关着，预览之后再打开。能授予的工具只有：{importable.join('、') || '—'}。</p>
+    <p>导入的 skill 默认关着，预览之后再打开。能授予的工具只有：{importable.join('、') || '—'}。</p>
     {skills === null ? <p className="empty-inline">正在读取…</p> : skills.map(skill => <div className="skill-row" key={skill.name}>
       <div className="skill-copy">
         <b>{skill.name}<em>{skill.origin === 'builtin' ? '内建' : '导入'}</em></b>
@@ -1059,8 +1063,14 @@ function SkillsCard({ onError }: { onError: (message: string) => void }) {
         </>}
       </div>
     </div>)}
-    <button className="ghost-button" disabled={busy} onClick={() => fileInput.current?.click()}>导入 SKILL.md</button>
-    <input ref={fileInput} type="file" accept=".md,text/markdown" hidden onChange={pick} />
+    <div className="skill-import">
+      <button className="ghost-button" disabled={busy} onClick={() => fileInput.current?.click()}>导入文件（.md / .zip）</button>
+      <button className="ghost-button" disabled={busy} onClick={() => folderInput.current?.click()}>导入文件夹</button>
+    </div>
+    <small className="help-note">规程带的参考文件（.md / .txt / .json / .yaml / .csv）会一起并进规程；脚本与二进制文件跳过——这里不执行命令。</small>
+    {skipped.length > 0 && <small className="skill-denied">已跳过：{skipped.join('、')}</small>}
+    <input ref={fileInput} type="file" accept=".md,.zip,text/markdown,application/zip" hidden onChange={pick} />
+    <input ref={folderInput} type="file" hidden multiple onChange={pick} {...{ webkitdirectory: '' }} />
   </article>
 }
 

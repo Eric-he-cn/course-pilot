@@ -102,9 +102,11 @@ export const api = {
     return request<Attachment>(`/sessions/${sessionId}/attachments`, { method: 'POST', body })
   },
   skills: () => request<{ skills: SkillInfo[]; importable_tools: string[] }>('/skills'),
-  importSkill: (file: File) => {
-    const body = new FormData(); body.set('file', file)
-    return request<SkillInfo>('/skills', { method: 'POST', body })
+  importSkill: (files: File[]) => {
+    const body = new FormData()
+    // 选目录时相对路径只在 webkitRelativePath 上，得显式当文件名传，服务端才知道 SKILL.md 在哪一层
+    for (const file of files) body.append('file', file, file.webkitRelativePath || file.name)
+    return request<SkillInfo & { skipped_files?: string[] }>('/skills', { method: 'POST', body })
   },
   setSkillEnabled: (name: string, enabled: boolean) => request<{ name: string; status: string }>(`/skills/${name}`, json('PATCH', { enabled })),
   deleteSkill: (name: string) => request<void>(`/skills/${name}`, { method: 'DELETE' }),

@@ -309,5 +309,5 @@ judge 的评分按 `prompt_version` 聚合，改提示词后新旧版本分别�
 | [产品设计](coursepilot-2.0.md) | 定位、功能模块、分期规划、非目标 |
 | [技术架构](coursepilot-2.0-architecture.md) | 模块边界、LLM 接入层、Skill 体系、存储、掌握度实现、评测分层 |
 | [前端设计](coursepilot-2.0-frontend-design.md) | 视觉方案、信息架构、核心页面、组件与状态 |
-| [开发中](开发中.md) | 当前进度、任务清单与优先级、开发工作流与踩过的坑 |
+| [开发中](development.md) | 当前进度、任务清单与优先级、开发工作流与踩过的坑 |
 | [端到端测试](coursepilot-2.0-e2e-browser-test.md) | 浏览器回归清单，20 个步骤覆盖全部验收项 |

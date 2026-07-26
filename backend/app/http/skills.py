@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from app.bootstrap import Application
 from app.http.deps import current_workspace
-from modules.agent.skills import IMPORTABLE_TOOLS, SOURCE_MAX_BYTES
+from modules.agent.skills import (
+    BUNDLE_MAX_BYTES, IMPORTABLE_TOOLS, SOURCE_MAX_BYTES, merge_bundle, read_zip,
+)
 
 
 def build_skills_router() -> APIRouter:
@@ -19,16 +21,25 @@ def build_skills_router() -> APIRouter:
         return {"skills": application.skills.catalog(), "importable_tools": list(IMPORTABLE_TOOLS)}
 
     @router.post("/skills", status_code=201)
-    async def import_skill(file: UploadFile, application: Application = Depends(current_workspace)) -> dict[str, object]:
-        if not (file.filename or "").lower().endswith(".md"):
-            raise fail(422, "unsupported_media_type", "只接受 .md 文件（首版仅支持 prompt-only skill）")
-        raw = await file.read()
-        if len(raw) > SOURCE_MAX_BYTES:
-            raise fail(413, "payload_too_large", f"SKILL.md 超过 {SOURCE_MAX_BYTES // 1024} KiB")
+    async def import_skill(
+        file: list[UploadFile] = File(...), application: Application = Depends(current_workspace),
+    ) -> dict[str, object]:
+        """收单个 SKILL.md、一个 ZIP，或整个目录（前端按 file 字段重复上传，文件名带相对路径）。"""
+        members, total = [], 0
+        for item in file:
+            raw = await item.read()
+            total += len(raw)
+            if total > BUNDLE_MAX_BYTES:
+                raise fail(413, "payload_too_large", f"一次导入超过 {BUNDLE_MAX_BYTES // 1024 // 1024} MiB")
+            members.append((item.filename or "", raw))
         try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raise fail(422, "invalid_encoding", "文件不是 UTF-8 文本") from None
+            if len(members) == 1 and members[0][0].lower().endswith(".zip"):
+                members = read_zip(members[0][1])
+            text, skipped = merge_bundle(members)
+        except ValueError as error:
+            raise fail(422, "invalid_skill", str(error)) from None
+        if len(text.encode("utf-8")) > SOURCE_MAX_BYTES:
+            raise fail(413, "payload_too_large", f"规程与附带资料合起来超过 {SOURCE_MAX_BYTES // 1024} KiB")
         try:
             definition = application.skills.import_skill(text)
         except ValueError as error:
@@ -36,7 +47,7 @@ def build_skills_router() -> APIRouter:
         return {
             "name": definition.name, "status": definition.status, "origin": "user",
             "allowed_tools": list(definition.allowed_tools), "denied_tools": list(definition.denied_tools),
-            "content_hash": definition.content_hash,
+            "content_hash": definition.content_hash, "skipped_files": list(skipped),
         }
 
     @router.patch("/skills/{name}")

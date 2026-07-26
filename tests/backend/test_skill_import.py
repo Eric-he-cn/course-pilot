@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import zipfile
+
 import pytest
 from conftest import workspace
 from fastapi.testclient import TestClient
@@ -83,8 +86,65 @@ def test_invalid_uploads_are_rejected(client, text, expected):
     assert expected in response.json()["error"]["message"]
 
 
-def test_only_markdown_is_accepted(client):
-    assert _upload(client, _skill(), filename="skill.zip").status_code == 422
+def _zip(entries: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in entries.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+def _upload_zip(client, entries: dict[str, str]):
+    return client.post("/api/v2/skills", files={"file": ("skill.zip", _zip(entries), "application/zip")})
+
+
+def test_zip_bundle_merges_reference_files_into_the_procedure(client):
+    """多文件 skill 的附带资料要真进正文，否则规程里的指路指向空气。"""
+    created = _upload_zip(client, {
+        "exam_drill/SKILL.md": _skill(),
+        "exam_drill/references/rubric.md": "# 评分档位\n\nA 档：证据完整。",
+    })
+    assert created.status_code == 201
+    body = workspace(client).skills._user_skills.get("exam_drill").body
+    assert "评分档位" in body
+    assert "references/rubric.md" in body  # 标出出处，模型才对得上规程里写的路径
+
+
+def test_zip_without_a_skill_md_is_rejected(client):
+    response = _upload_zip(client, {"exam_drill/README.md": "# 说明"})
+    assert response.status_code == 422
+    assert "SKILL.md" in response.json()["error"]["message"]
+
+
+def test_executables_are_skipped_and_reported(client):
+    """这里没有 shell，脚本收了也跑不了——跳过并说出来，别让用户以为整份都生效了。"""
+    body = _upload_zip(client, {
+        "SKILL.md": _skill(), "scripts/grade.py": "print(1)", "assets/logo.png": "\x00\x01",
+    }).json()
+    assert body["skipped_files"] == ["assets/logo.png", "scripts/grade.py"]
+    assert "grade.py" not in workspace(client).skills._user_skills.get("exam_drill").body
+
+
+def test_zip_paths_escaping_the_bundle_are_dropped(client):
+    body = _upload_zip(client, {"SKILL.md": _skill(), "../../etc/passwd.md": "root:x:0:0"}).json()
+    assert body["status"] == "draft"
+    assert "root:x" not in workspace(client).skills._user_skills.get("exam_drill").body
+
+
+def test_folder_upload_sends_files_with_relative_paths(client):
+    """浏览器选目录时逐个文件上传，相对路径写在文件名里。"""
+    response = client.post("/api/v2/skills", files=[
+        ("file", ("exam_drill/SKILL.md", _skill(), "text/markdown")),
+        ("file", ("exam_drill/references/notes.md", "# 补充\n\n随堂笔记要点。", "text/markdown")),
+    ])
+    assert response.status_code == 201
+    assert "随堂笔记要点" in workspace(client).skills._user_skills.get("exam_drill").body
+
+
+def test_broken_archive_is_rejected(client):
+    response = client.post("/api/v2/skills", files={"file": ("skill.zip", b"not a zip", "application/zip")})
+    assert response.status_code == 422
+    assert "ZIP" in response.json()["error"]["message"]
 
 
 def test_delete_removes_an_enabled_skill_from_the_registry(client):
