@@ -38,6 +38,9 @@ export interface ToolActivity {
   origin?: string
   summary?: string
   ok?: boolean
+  // 仅流式期间有值：用于显示"这一步已经跑了多久"
+  started_at?: number
+  elapsed_ms?: number
 }
 
 export interface SkillInfo {
@@ -81,6 +84,9 @@ export interface TurnEvent extends Partial<ContextUsage> {
   ok?: boolean
   origin?: string
   finish_reason?: string
+  responder_mode?: string
+  provider?: string
+  model?: string
 }
 
 export interface Message {
@@ -97,6 +103,8 @@ export interface Message {
   // 本轮"查了什么"：流式期间来自 SSE，回读消息后来自服务端持久化记录。
   activity?: ToolActivity[]
   artifact?: { kind: string; visibility?: string; payload?: unknown }
+  // 本轮切到本地兜底模型的说明；有值就必须显示，否则降级回答会被当成正常回答
+  degraded?: string
 }
 
 export interface Attachment {

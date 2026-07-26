@@ -209,7 +209,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .status-tag { border:1px solid var(--border); border-radius:5px; padding:2px 7px; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.04em; white-space:nowrap }
 .status-tag.failed,.danger-text { border-color:#FCA5A5; color:var(--danger) }
 .job-progress { height:4px; margin-top:5px; overflow:hidden; border-radius:2px; background:var(--border) }
-.job-progress i { display:block; height:100%; background:var(--accent) }
+.job-progress i { transition:width .4s linear; display:block; height:100%; background:var(--accent) }
 .pipeline { display:flex; gap:5px; margin-top:6px }
 .pipeline-step { padding:2px 8px; border:1px solid var(--border); border-radius:5px; color:var(--muted); font-family:var(--mono); font-size:10px }
 .pipeline-step.done { border-color:#D4D4D8; color:var(--text) }
@@ -346,3 +346,26 @@ button:disabled { cursor:not-allowed; opacity:.5 }
   .welcome { padding-top:12vh }
 }
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; transition-duration:.01ms!important; animation-duration:.01ms!important } }
+
+/* ---- 进行中的活体感：唯一被允许的循环动画位（视觉方案 §6.1 的低频呼吸） ---- */
+@keyframes cp-breathe { 0%,100% { opacity:.3 } 50% { opacity:1 } }
+@keyframes cp-caret { 50% { opacity:0 } }
+.tool-chip.pending i { animation:cp-breathe 1.6s ease-in-out infinite }
+.message-content.streaming > *:last-child::after { content:'\258D'; margin-left:2px; color:var(--accent); animation:cp-caret 1s steps(1) infinite }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0 }
+
+/* 降级提示：兜底模型的回答不能伪装成正常回答 */
+.degraded-notice { margin:0 0 10px; padding:8px 11px; border:1px solid var(--warning); border-radius:6px; background:#FFFBEB; color:var(--warning); font-size:12px; line-height:1.55 }
+
+/* 长内容溢出：表格、行间公式、无空格长串都会横向撑破对话列 */
+.message-content .table-scroll { overflow-x:auto; margin:10px 0 }
+.message-content .katex-display { overflow-x:auto; overflow-y:hidden; padding-bottom:2px }
+.user-message>div,.message-content { overflow-wrap:anywhere }
+
+/* 全局 reduced-motion 只压时长，不关无限循环——0.01ms 的无限动画仍在每帧合成，
+   对光敏用户是真实风险。这里显式关掉新增的循环动画。 */
+@media (prefers-reduced-motion:reduce) {
+  .tool-chip.pending i { animation:none !important; opacity:1 }
+  .message-content.streaming > *:last-child::after { animation:none !important }
+  .citation-drawer { animation:none !important }
+}

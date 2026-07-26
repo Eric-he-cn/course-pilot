@@ -158,7 +158,7 @@ export default function App() {
         const optimistic: Message = { id: `pending-user-${Date.now()}`, role: 'user', content }
         const pendingId = `pending-assistant-${Date.now()}`
         const activity: ToolActivity[] = []
-        setMessages(current => [...current, optimistic, { id: pendingId, role: 'assistant', content: '' }]); setBusy(true)
+        setMessages(current => [...current, optimistic, { id: pendingId, role: 'assistant', content: '', status: 'streaming' }]); setBusy(true)
         try { await api.turn(targetSession.id, content, payload => {
           const resolved = payload.type === 'course_resolution' || payload.event === 'course_resolution'
           if (resolved) {
@@ -172,16 +172,23 @@ export default function App() {
             setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
-            activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin })
+            activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin, started_at: Date.now() })
             setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           if (payload.type === 'tool_result' && payload.call_id) {
             const entry = activity.find(item => item.call_id === payload.call_id)
-            if (entry) { entry.summary = payload.summary; entry.ok = payload.ok }
+            if (entry) { entry.summary = payload.summary; entry.ok = payload.ok; entry.elapsed_ms = entry.started_at ? Date.now() - entry.started_at : undefined }
             setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
-          const delta = payload.delta ?? payload.content ?? payload.text ?? ''
-          if (delta) setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
+          if (payload.type === 'text_delta' && payload.text) {
+            const delta = payload.text
+            setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
+          }
+          if (payload.type === 'provider_fallback') {
+            // 远端模型不可用时会静默切到本地兜底（无工具、无检索）。不上屏的话，
+            // 用户会把质量完全不同的回答当成正常回答。
+            setMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: `远端模型 ${payload.provider ?? ''} 不可用，本次已切换到本地兜底模型` } : item))
+          }
           if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice('回答达到长度上限，内容可能不完整。')
         }, attachmentIds); await loadMessages(targetSession.id); await loadSessions() }
         catch (error) {
@@ -310,6 +317,36 @@ const markdownComponents = {
     if (props.className?.includes('language-mermaid')) return <Mermaid code={code} />
     return <code className={props.className}>{props.children as never}</code>
   },
+  // 宽表格会横向撑破对话列，套一层滚动容器。
+  table(props: { children?: unknown }) {
+    return <div className="table-scroll"><table>{props.children as never}</table></div>
+  },
+}
+
+function ToolChip({ entry }: { entry: ToolActivity }) {
+  const pending = !entry.summary
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!pending || !entry.started_at) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [pending, entry.started_at])
+  // 耗时不是装饰：reduced-motion 下呼吸动效会被关掉，这是唯一还能说明"在动"的线索。
+  const seconds = pending
+    ? (entry.started_at ? Math.floor((now - entry.started_at) / 1000) : 0)
+    : Math.round((entry.elapsed_ms ?? 0) / 100) / 10
+  const timing = pending ? (seconds >= 2 ? ` · ${seconds}s` : '') : (entry.elapsed_ms && entry.elapsed_ms >= 1000 ? ` · ${seconds}s` : '')
+  return <span className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${pending ? 'pending' : 'done'}`}>
+    <i aria-hidden>{pending ? '⋯' : entry.ok === false ? '×' : '✓'}</i>
+    <span className="sr-only">{pending ? '进行中：' : entry.ok === false ? '失败：' : '完成：'}</span>
+    {TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}{timing}
+  </span>
+}
+
+function RetryCard({ title, message, onRetry }: { title: string; message: string; onRetry: () => void }) {
+  return <article className="card"><h2>{title}</h2><p>{message}</p>
+    <button className="ghost-button" onClick={onRetry}>重新读取</button>
+  </article>
 }
 
 function SessionTitle({ session, onRename }: { session: SessionSummary; onRename: (title: string) => Promise<void> }) {
@@ -363,7 +400,8 @@ function MessageCard({ message, onCitation, showResolution }: { message: Message
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
-  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <span key={entry.call_id} className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${entry.summary ? 'done' : 'pending'}`}><i aria-hidden>{entry.summary ? (entry.ok === false ? '×' : '✓') : '…'}</i>{TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}</span>)}</div>}<div className="message-content">{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
+    {message.degraded && <div className="degraded-notice">{message.degraded}。本次回答不使用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <span className="typing">正在生成回答…</span>}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted">回答已中断。已生成的内容会保留，重新发送可继续学习。</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <button key={`${item.id ?? item.chunk_id ?? index}`} onClick={() => onCitation(item)}><i>[{item.number ?? index + 1}]</i>{item.material_name ?? '资料'}{item.page ? `:${item.page}` : ''}</button>)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
@@ -421,24 +459,27 @@ function fileKind(material: Material) { const name = material.filename ?? materi
 function PlanView({ course, onError }: { course: Course; onError: (message: string) => void }) {
   const [plan, setPlan] = useState<Plan | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState('')
   useEffect(() => {
-    setPlan(null); setLoaded(false)
-    api.plan(course.id).then(payload => { setPlan(payload.plan); setLoaded(true) }).catch(error => onError(errorText(error)))
+    setPlan(null); setLoaded(false); setError('')
+    api.plan(course.id).then(payload => setPlan(payload.plan)).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
   }, [course.id])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>在对话里说要排计划或调整计划，助手会写入这里；每次改动升一个版本，历史条目不会被改写。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取计划…</p> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div>{plan.items.map(item => <div className="material-row" key={item.id}><div className="file-mark">{item.due_date.slice(5)}</div><div className="material-copy"><b>{item.title}</b><small>{item.status}{item.concept_name ? ` · ${item.concept_name}` : ''}</small></div></div>)}</article> : <article className="card"><h2>还没有学习计划</h2><p>在对话里告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。此页只读服务端持久化状态，不展示本地虚构数据。</p></article>}
+    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div>{plan.items.map(item => <div className="material-row" key={item.id}><div className="file-mark">{item.due_date.slice(5)}</div><div className="material-copy"><b>{item.title}</b><small>{item.status}{item.concept_name ? ` · ${item.concept_name}` : ''}</small></div></div>)}</article> : <article className="card"><h2>还没有学习计划</h2><p>在对话里告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。此页只读服务端持久化状态，不展示本地虚构数据。</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {
   const [archive, setArchive] = useState<ArchiveSummary | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState('')
   useEffect(() => {
-    setArchive(null)
-    api.archive(course.id).then(setArchive).catch(error => onError(errorText(error)))
+    setArchive(null); setLoaded(false); setError('')
+    api.archive(course.id).then(setArchive).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
   }, [course.id])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习档案</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>掌握度由 append-only 证据事件流投影而来；此页展示服务端已持久化的事件。</p></div></div>
-    {!archive ? <p className="mini-empty">正在读取档案…</p> : <>
+    {!loaded ? <p className="mini-empty">正在读取档案…</p> : error ? <RetryCard title="档案读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : !archive ? <p className="mini-empty">暂无档案数据。</p> : <>
       <article className="card"><div className="card-heading"><div><h2>概念掌握度</h2><p>BKT 后验 × 遗忘曲线；证据不足的概念不给强弱判断</p></div></div>
         {archive.mastery.length ? archive.mastery.map(item => <div className="material-row" key={item.concept_id}>
           <div className="file-mark">{item.insufficient_evidence ? '—' : `${Math.round((item.score ?? 0) * 100)}`}</div>
