@@ -704,6 +704,29 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
   </div>
 }
 
+function PlanGantt({ items }: { items: Plan['items'] }) {
+  const today = new Date().toLocaleDateString('sv')
+  const sorted = [...items].sort((a, b) => a.due_date.localeCompare(b.due_date))
+  const start = sorted.length ? Date.parse(sorted[0].due_date) : 0
+  const rows: string[] = []
+  let week = -1
+  for (const item of sorted) {
+    // 三十多条一路铺下来读不动，按周切段
+    const index = Math.floor((Date.parse(item.due_date) - start) / 604800000)
+    if (index !== week) { week = index; rows.push(`    section 第 ${index + 1} 周`) }
+    // mermaid 用冒号和逗号分隔字段，而计划标题里这两样都很常见——不换掉整张图都画不出来。
+    const label = item.title.replace(/[:：,，#;]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 16) || '待办'
+    const state = item.status === 'done' ? 'done'
+      : item.due_date === today ? 'active'
+      : item.due_date < today ? 'crit' : ''
+    rows.push(`    ${label} :${state}${state ? ', ' : ''}${item.due_date}, 1d`)
+  }
+  if (!rows.length) return null
+  const code = ['gantt', '    dateFormat YYYY-MM-DD', '    axisFormat %m/%d',
+                '    todayMarker stroke:#059669,stroke-width:2px', ...rows].join('\n')
+  return <div className="plan-gantt"><Mermaid code={code} /></div>
+}
+
 function PlanDays({ items }: { items: Plan['items'] }) {
   const today = new Date().toLocaleDateString('sv')   // sv locale 就是 YYYY-MM-DD
   const days = new Map<string, Plan['items']>()
@@ -796,7 +819,7 @@ function PlanView({ course, onError }: { course: Course; onError: (message: stri
   }, [course.id])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>在对话里说要排计划或改计划，助手就会写到这里。每次改动升一个版本，过去的条目不动。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div><PlanDays items={plan.items} /></article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
+    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div><PlanGantt items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {

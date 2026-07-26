@@ -450,3 +450,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 /* 分组之后每行不再需要日期标记那一列，否则标题会落进 40px 里被压成省略号 */
 .plan-day .material-row { grid-template-columns:minmax(0,1fr) auto; padding:10px 2px }
 .plan-day .material-copy b { white-space:normal; overflow:visible }
+
+/* 甘特图是计划总览，放在明细之前；条目多时横向滚动，不要压缩整页 */
+.plan-gantt { margin:6px 0 18px; padding-bottom:6px; overflow-x:auto }
+.plan-gantt svg { max-width:none }
