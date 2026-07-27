@@ -475,7 +475,7 @@ const markdownComponents = {
 const CAPABILITY_GROUPS: { key: string; label: string; hint: string }[] = [
   { key: 'read_course', label: '只读你的课程数据', hint: '检索教材、查概念目录、读计划与档案、读笔记' },
   { key: 'write_state', label: '会改学习状态', hint: '写证据事件、改学习计划、更新长期记忆' },
-  { key: 'write_note', label: '会新建课程笔记', hint: '把整理好的内容写进 data/notes/' },
+  { key: 'write_note', label: '会新建课程笔记', hint: '把整理好的内容写进你这个用户的 notes 目录' },
   { key: 'network', label: '会访问外部网络', hint: '联网检索与抓取网页，每轮有次数上限' },
   { key: 'free', label: '无副作用', hint: '算术求值、加载能力、读跨轮产物' },
 ]
@@ -732,7 +732,7 @@ function NotesPanel({ course, onError }: { course: Course; onError: (message: st
   }
   return <article className="card">
     <div className="card-heading"><div><h2>课程笔记</h2>
-      <p>助手整理并存下的内容，落在 <code>data/notes/{course.id.slice(0, 14)}…/</code>。说「做成学习卡片」「存下来」，就会写到这里。</p></div></div>
+      <p>助手整理并存下的内容，按课程分目录存在你这个用户的工作区里。说「做成学习卡片」「存下来」，就会写到这里。</p></div></div>
     {notes === null ? <p className="mini-empty">正在读取…</p> : notes.length === 0
       ? <div className="empty-inline"><b>还没有笔记</b><p>让助手把内容整理成学习卡片或概念梳理，它会存到这里。</p></div>
       : notes.map(note => <div className="material-row" key={note.title}>
@@ -1002,6 +1002,9 @@ function MaterialRow({ material, jobs, onReindex, onDelete, onOcr }: { material:
 function fileKind(material: Material) { const name = material.filename ?? material.name ?? ''; return name.split('.').pop()?.toUpperCase().slice(0, 4) || 'FILE' }
 
 const thousands = (value: number) => value.toLocaleString('en-US')
+/** 几页教材的外推耗时不到一分钟，四舍五入会显示成「约 0 分钟」。 */
+const duration = (seconds: number | undefined, minutes: number) =>
+  seconds !== undefined && seconds < 60 ? `约 ${Math.max(1, seconds)} 秒` : `约 ${minutes} 分钟`
 
 /** OCR 账单。取样那行是真跑出来的，全书那行是按页数外推的——两者要分开写，
  *  否则会让人以为外推值也是实测。 */
@@ -1016,7 +1019,7 @@ function OcrEstimatePanel({ filename, estimate, running, onConfirm, onCancel }: 
       <tr><th>页数</th><td>{estimate.pages} 页</td></tr>
       <tr><th>实测取样</th><td>{estimate.sampled_pages} 页 · {thousands(estimate.sample_prompt_tokens + estimate.sample_completion_tokens)} token · {estimate.sample_seconds}s</td></tr>
       <tr><th>全书预计</th><td><b>{thousands(estimate.projected_total_tokens)} token</b>（输入 {thousands(estimate.projected_prompt_tokens)} ＋ 输出 {thousands(estimate.projected_completion_tokens)}）</td></tr>
-      <tr><th>预计耗时</th><td>约 {estimate.projected_minutes} 分钟</td></tr>
+      <tr><th>预计耗时</th><td>{duration(estimate.projected_seconds, estimate.projected_minutes)}</td></tr>
     </tbody></table>}
     <small className="help-note">全书数字按取样线性外推，实际随页面繁简浮动。折算成钱要按你自己那家的计价乘一下。</small>
     <div className="danger-actions">

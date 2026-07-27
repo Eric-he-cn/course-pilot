@@ -53,6 +53,7 @@ class OcrEstimate:
             "projected_prompt_tokens": self.projected_prompt_tokens,
             "projected_completion_tokens": self.projected_completion_tokens,
             "projected_total_tokens": self.projected_prompt_tokens + self.projected_completion_tokens,
+            "projected_seconds": round(self.projected_seconds),
             "projected_minutes": round(self.projected_seconds / 60, 1),
         }
 

@@ -155,6 +155,7 @@ export interface OcrEstimate {
   projected_prompt_tokens: number
   projected_completion_tokens: number
   projected_total_tokens: number
+  projected_seconds?: number
   projected_minutes: number
 }
 
