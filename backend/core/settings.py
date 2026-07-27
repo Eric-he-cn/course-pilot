@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from core import hardware
+
 
 def _read_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -173,6 +175,8 @@ class Settings:
     text_extra_body: dict[str, object] = field(default_factory=dict)
     # 可选的对话模型。第一项等同上面那组 text_* 字段，界面按它们的顺序给用户切换。
     text_models: tuple[ModelChoice, ...] = ()
+    # 本机探测结果。配置写 auto 时按它选模型；写死模型名时它只用于健康上报。
+    hardware: dict[str, object] = field(default_factory=dict)
 
     def for_workspace(self, workspace_dir: Path) -> "Settings":
         """某个用户工作区的 Settings。三个路径字段必须一起换——只改 data_dir
@@ -214,7 +218,10 @@ class Settings:
         data_dir = Path(value("STORAGE_DATA_DIR", str(root / "data")))
         if not data_dir.is_absolute():
             data_dir = root / data_dir
-        reranker_model = value("RAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+        # 配置写 auto 时按本机内存与加速器分档，见 core/hardware.py。写死模型名就照配置来。
+        machine = hardware.probe()
+        embedding_model = hardware.resolve("embedding", value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"), machine)
+        reranker_model = hardware.resolve("reranker", value("RAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"), machine)
         return cls(
             data_dir, data_dir / "coursepilot.db", data_dir / "materials",
             value("TEXT_PROVIDER", "openai_compatible"), value("TEXT_BASE_URL"),
@@ -229,7 +236,7 @@ class Settings:
             max(1.0, float(value("LLM_TOTAL_TIMEOUT_SECONDS", "180"))),
             max(0, int(value("LLM_MAX_RETRIES", "2"))),
             max(256, int(value("AGENT_MAX_OUTPUT_TOKENS", "8192"))),
-            value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"),
+            embedding_model,
             value("RAG_EMBEDDING_DEVICE", "auto"),
             max(1, int(value("RAG_EMBEDDING_BATCH_SIZE", "256"))),
             min(1.0, max(0.0, float(value("RAG_MIN_SIMILARITY", "0")))),
@@ -251,4 +258,5 @@ class Settings:
             max(1.0, float(value("WEB_TIMEOUT_SECONDS", "20"))),
             _parse_extra_body(value("TEXT_EXTRA_BODY")),
             _read_models(value),
+            machine.as_dict(),
         )

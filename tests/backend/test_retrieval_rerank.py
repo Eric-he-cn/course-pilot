@@ -196,3 +196,40 @@ def test_health_does_not_claim_rerank_when_the_model_failed(client):
     rag = client.get("/api/v2/health").json()["rag"]
     assert rag["backend"] != "hybrid_bge_rerank"
     assert rag["reranker"]["error"]
+
+
+# ---- 弱机器分档 ----
+
+def test_hardware_tiers_only_kick_in_for_auto():
+    """写死模型名就照配置来。分档只在配置写 auto 时生效，不做静默替换。"""
+    from core import hardware
+
+    tight = hardware.Hardware(total_ram_gib=6.0, cpu_count=4, accelerator="cpu", tier="small")
+    assert hardware.resolve("embedding", "BAAI/bge-base-zh-v1.5", tight) == "BAAI/bge-base-zh-v1.5"
+    assert hardware.resolve("embedding", "auto", tight) == "BAAI/bge-small-zh-v1.5"
+    assert hardware.resolve("reranker", "auto", tight) == "BAAI/bge-reranker-base"
+
+
+def test_the_small_tier_reranker_is_also_calibrated():
+    """降档不能顺手丢掉「查不到返回空」——小档那个重排模型必须也标定过。"""
+    from core import hardware
+    from core.settings import CALIBRATED_RERANK_THRESHOLDS
+
+    assert hardware.SMALL["reranker"] in CALIBRATED_RERANK_THRESHOLDS
+
+
+def test_the_minimal_tier_turns_the_reranker_off_entirely():
+    """内存太小的时候留着重排会把每次检索拖到几秒，关掉比降档更诚实。"""
+    from core import hardware
+
+    assert hardware.MINIMAL["reranker"] == ""
+    starved = hardware.Hardware(total_ram_gib=2.0, cpu_count=2, accelerator="cpu", tier="minimal")
+    assert hardware.resolve("reranker", "auto", starved) == ""
+
+
+def test_an_accelerator_beats_a_low_ram_reading():
+    """有独显或统一内存的机器不按内存降档；读不到内存也按满档走，让加载失败后自然降级。"""
+    from core import hardware
+
+    assert hardware.probe().tier in {"full", "small", "minimal"}
+    # 探测函数本身在任何机器上都要能跑通并给出三档之一

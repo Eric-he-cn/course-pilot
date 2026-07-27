@@ -304,6 +304,9 @@ class KnowledgeService:
         except Exception as error:
             database = {"ok": False, "error": str(error)}
         rag: dict[str, object] = {"ok": bool(database["ok"]), "backend": "sqlite_fts_fallback"}
+        # 本机探测结果一并上报：弱机器上模型选型是自动降档的，看不到就没法判断慢是不是这个原因。
+        if self._settings.hardware:
+            rag["hardware"] = self._settings.hardware
         if self._embedder is not None:
             status = self._embedder.status()
             rag["embedding"] = status
