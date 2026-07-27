@@ -86,11 +86,16 @@ export default function App() {
   const [workspace, setWorkspace] = useState<Workspace>({ scope: 'general' })
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [activeSession, setActiveSession] = useState<SessionSummary | null>(null)
+  // 流是异步的，用户随时可能切走。回调里要拿「此刻」在看哪个会话，闭包捕获的值不行。
+  const activeSessionRef = useRef<SessionSummary | null>(null)
+  activeSessionRef.current = activeSession
   const [messages, setMessages] = useState<Message[]>([])
   const [view, setView] = useState<View>('chat')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('cp-sidebar-collapsed') === 'true')
-  const [busy, setBusy] = useState(false)
+  // 生成回答与新建课程/会话分开：一次回答要跑一分钟，这一分钟里不该连侧栏都点不动。
+  const [streaming, setStreaming] = useState(false)
+  const [creating, setCreating] = useState(false)
   const [notice, setNotice] = useState('')
   const [apiOnline, setApiOnline] = useState<boolean | null>(null)
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
@@ -140,7 +145,9 @@ export default function App() {
     } catch (error) { setSessions([]); setActiveSession(null); setNotice(errorText(error)) }
   }
   async function loadMessages(id: string) {
-    try { setMessages(await api.messages(id)) } catch (error) { setMessages([]); setNotice(errorText(error)) }
+    // 请求回来时用户可能已经切走：先发的请求后到，会把别的会话的消息盖上去。
+    try { const loaded = await api.messages(id); if (activeSessionRef.current?.id === id) setMessages(loaded) }
+    catch (error) { if (activeSessionRef.current?.id === id) setMessages([]); setNotice(errorText(error)) }
   }
   // keepView：从某个页面内选课程时留在当前页，不要弹回对话。
   function switchWorkspace(next: Workspace, options: { keepView?: boolean } = {}) {
@@ -149,11 +156,11 @@ export default function App() {
     setSidebarOpen(false); setCitation(null); setTurnResolution(null); setContextUsage(null)
   }
   async function newSession() {
-    setBusy(true)
+    setCreating(true)
     try {
       const session = await api.createSession(workspace.scope, workspace.courseId)
       setSessions(current => [session, ...current]); setActiveSession(session); setView('chat'); setMessages([])
-    } catch (error) { setNotice(errorText(error)) } finally { setBusy(false) }
+    } catch (error) { setNotice(errorText(error)) } finally { setCreating(false) }
   }
   async function renameSession(title: string, sessionId?: string) {
     const target = sessionId ?? activeSession?.id
@@ -180,9 +187,9 @@ export default function App() {
   }
   async function createCourse() {
     const name = window.prompt('课程名称')?.trim(); if (!name) return
-    setBusy(true)
+    setCreating(true)
     try { const created = await api.createCourse(name); setCourses(current => [...current, created]); switchWorkspace({ scope: 'course', courseId: created.id }) }
-    catch (error) { setNotice(errorText(error)) } finally { setBusy(false) }
+    catch (error) { setNotice(errorText(error)) } finally { setCreating(false) }
   }
 
   if (!username) return <LoginView onLogin={name => { setCurrentUser(name); setUsername(name); window.location.reload() }} />
@@ -203,7 +210,7 @@ export default function App() {
         {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id} onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
           <i style={{ backgroundColor: item.color }} /><span>{item.name}</span>{item.wiki_enabled && <em>Wiki</em>}
         </button>)}
-        <button className="text-button add-course" onClick={createCourse} disabled={busy}>＋ 新建课程</button>
+        <button className="text-button add-course" onClick={createCourse} disabled={creating}>＋ 新建课程</button>
       </div>
       <div className="side-label">NAV</div>
       <nav className="main-nav" aria-label="学习导航">
@@ -217,7 +224,7 @@ export default function App() {
           onRename={async title => { await renameSession(title, session.id) }}
           onDelete={async () => { await deleteSession(session) }} />) : <p className="mini-empty">此工作区还没有会话。</p>}
       </div>
-      <button className="new-session" onClick={newSession} disabled={busy}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
+      <button className="new-session" onClick={newSession} disabled={creating}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
       <div className="sidebar-foot">
         <button onClick={() => { setView('help'); setSidebarOpen(false) }}>? <span>使用说明</span></button>
         <button onClick={() => { clearCurrentUser(); window.location.reload() }} title={`当前：${username}`}>⇄ <span>切换用户（{username}）</span></button>
@@ -248,16 +255,22 @@ export default function App() {
       }} onSend={async (content, attachmentIds) => {
         let targetSession = activeSession
         if (!targetSession) {
-          setBusy(true)
+          setStreaming(true)
           try {
             targetSession = await api.createSession(workspace.scope, workspace.courseId)
+            // ref 同步跟上：setActiveSession 要等下一次渲染，中间到达的流式片段会被守卫误丢。
+            activeSessionRef.current = targetSession
             setSessions(current => [targetSession!, ...current]); setActiveSession(targetSession); setView('chat'); setMessages([])
-          } catch (error) { setNotice(errorText(error)); setBusy(false); return }
+          } catch (error) { setNotice(errorText(error)); setStreaming(false); return }
         }
         const optimistic: Message = { id: `pending-user-${Date.now()}`, role: 'user', content }
         const pendingId = `pending-assistant-${Date.now()}`
         const activity: ToolActivity[] = []
-        setMessages(current => [...current, optimistic, { id: pendingId, role: 'assistant', content: '', status: 'streaming' }]); setBusy(true)
+        // 这一轮的产出只属于 targetSession。用户中途切走后，界面上是别的会话，
+        // 再往 messages 里写就成了「B 的标题配 A 的对话」。
+        const onThisSession = () => activeSessionRef.current?.id === targetSession.id
+        const patchMessages: typeof setMessages = updater => { if (onThisSession()) setMessages(updater) }
+        setMessages(current => [...current, optimistic, { id: pendingId, role: 'assistant', content: '', status: 'streaming' }]); setStreaming(true)
         const controller = new AbortController()
         abortRef.current = controller
         stoppedRef.current = false
@@ -267,36 +280,36 @@ export default function App() {
             const isResolved = payload.status === 'resolved'
             const resolvedId = isResolved ? payload.resolved_course_id ?? payload.course_id ?? null : null
             setTurnResolution({ sessionId: targetSession.id, status: payload.status ?? 'unresolved', courseId: resolvedId, courseName: isResolved ? payload.course_name ?? null : null })
-            setActiveSession(current => current ? { ...current, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? current.course_name : null, course_color: isResolved ? payload.course_color ?? current.course_color : null } : current)
+            if (onThisSession()) setActiveSession(current => current ? { ...current, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? current.course_name : null, course_color: isResolved ? payload.course_color ?? current.course_color : null } : current)
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
           }
           if (payload.type === 'context_usage' && payload.segments) {
-            setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
+            if (onThisSession()) setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
             activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin, started_at: Date.now() })
-            setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
+            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           if (payload.type === 'tool_result' && payload.call_id) {
             const entry = activity.find(item => item.call_id === payload.call_id)
             if (entry) { entry.summary = payload.summary; entry.ok = payload.ok; entry.elapsed_ms = entry.started_at ? Date.now() - entry.started_at : undefined }
-            setMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
+            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           if (payload.type === 'text_delta' && payload.text) {
             const delta = payload.text
-            setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
+            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content + delta } : item))
           }
           if (payload.type === 'provider_fallback') {
             // 远端模型不可用时会静默切到本地兜底（无工具、无检索）。不上屏的话，
             // 用户会把质量完全不同的回答当成正常回答。
-            setMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: `远端模型 ${payload.provider ?? ''} 不可用，本次已切换到本地兜底模型` } : item))
+            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: `远端模型 ${payload.provider ?? ''} 不可用，本次已切换到本地兜底模型` } : item))
           }
           if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice('回答达到长度上限，内容可能不完整。')
         }, attachmentIds, controller.signal)
           if (stoppedRef.current) {
             // 客户端断连时服务端生成器可能挂在 yield 上不进 finally，部分回答不一定落盘，
             // 所以保留本地已渲染的内容并标明它没有保存。
-            setMessages(current => current.map(item => item.id === pendingId
+            patchMessages(current => current.map(item => item.id === pendingId
               ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）' }
               : item))
             await loadSessions()
@@ -306,7 +319,7 @@ export default function App() {
         }
         catch (error) {
           if (stoppedRef.current) {
-            setMessages(current => current.map(item => item.id === pendingId
+            patchMessages(current => current.map(item => item.id === pendingId
               ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）' }
               : item))
             void loadSessions()
@@ -315,10 +328,10 @@ export default function App() {
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
           try { await loadMessages(targetSession.id); await loadSessions() }
-          catch { setMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '回答中断了，重发一次。', artifact: { kind: 'interrupted' } } : item)) }
+          catch { patchMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '回答中断了，重发一次。', artifact: { kind: 'interrupted' } } : item)) }
         }
-        finally { setBusy(false); abortRef.current = null }
-      }} busy={busy} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
+        finally { setStreaming(false); abortRef.current = null }
+      }} busy={streaming} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
       {!['chat', 'settings', 'help'].includes(view) && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId }, { keepView: true })} onCreate={createCourse} />}
       {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
@@ -329,7 +342,7 @@ export default function App() {
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
         {/* 掉线时这些都是缓存的旧值，留着会让人以为服务还在 */}
         {apiOnline !== false && healthLlm && <ModelPicker llm={healthLlm} />}
-        {apiOnline !== false && healthRag && <span className="statusbar-detail">{String(healthRag.backend).includes('bge') ? '混合检索' : '关键词检索'}</span>}
+        {apiOnline !== false && healthRag && <span className="statusbar-detail">{retrievalLabel(healthRag.backend as string | undefined, true)}</span>}
         {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">回答优先用当前课程的资料，没命中教材会标注出来</span>}
         <span className="right">CoursePilot v2.0</span>
       </footer>
@@ -361,19 +374,21 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
     setDraft(''); setAttachments([]); await onSend(text, ids)
   }
   const scroller = useRef<HTMLDivElement>(null)
+  // 用户是否还贴着底部。要在滚动时记，不能等到 effect 里量：那时新消息已经把
+  // 容器撑高了，一条长回答会被误判成「用户翻上去了」。
+  const following = useRef(true)
   const lastContent = messages.length ? messages[messages.length - 1].content.length : 0
   // 换会话就贴到最新一条：不控制的话滚动位置由渲染时序决定，同一个会话两次进去可能停在不同地方。
   useEffect(() => {
     const box = scroller.current
     if (box) box.scrollTop = box.scrollHeight
-  }, [session?.id, messages.length])
-  // 流式追加时跟随，但用户手动往上翻了就别把他拽回来。
+    following.current = true
+  }, [session?.id])
+  // 新消息与流式追加都跟着走，但用户手动往上翻了就别把他拽回来。
   useEffect(() => {
     const box = scroller.current
-    if (!box) return
-    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120
-    if (nearBottom) box.scrollTop = box.scrollHeight
-  }, [lastContent])
+    if (box && following.current) box.scrollTop = box.scrollHeight
+  }, [messages.length, lastContent])
 
   const contextNote = !session ? '发送第一条消息会自动创建会话。'
     : session.scope_mode !== 'general' ? ''
@@ -385,7 +400,8 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
   return <section className="chat-view">
     {/* 课程会话的会话名与课程顶栏已经显示了，这里只留通用会话才有的逐轮解析结果。 */}
     {contextNote && <div className="session-context">{contextNote}</div>}
-    <div className="messages" aria-live="polite" ref={scroller}>
+    <div className="messages" aria-live="polite" ref={scroller}
+      onScroll={event => { const box = event.currentTarget; following.current = box.scrollHeight - box.scrollTop - box.clientHeight < 120 }}>
       {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式每轮按问题解析课程。直接说出课程名最准。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
       {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope}
         onRetry={busy ? undefined : (() => {
@@ -783,11 +799,13 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
   </article>
 }
 
-/** 检索方式的显示名。集中一处：加新档位时只改这里，免得某个页面掉进「仅词面」。 */
-function retrievalLabel(backend: string | undefined): string {
-  if (backend === 'hybrid_bge_rerank') return '语义 + 词面混合，并做重排'
-  if (backend === 'hybrid_bge') return '语义 + 词面混合（未启用重排）'
-  return '仅词面。中文问题命中英文教材效果差，可在知识仓库点一次「重建索引」'
+/** 检索方式的显示名。三档判定只在这里做，short 供状态栏这类窄位置用。
+ *  后端没上报 backend 时返回空串，由调用方决定不显示。 */
+function retrievalLabel(backend: string | undefined, short = false): string {
+  if (!backend) return ''
+  if (backend === 'hybrid_bge_rerank') return short ? '混合检索 + 重排' : '语义 + 词面混合，并做重排'
+  if (backend === 'hybrid_bge') return short ? '语义 + 词面混合检索' : '语义 + 词面混合（未启用重排）'
+  return short ? '仅词面检索' : '仅词面。中文问题命中英文教材效果差，可在知识仓库点一次「重建索引」'
 }
 
 function RetryCard({ title, message, onRetry }: { title: string; message: string; onRetry: () => void }) {
@@ -947,7 +965,7 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   // Wiki 页列表要在构建结束后重新拉一次，否则新写的页要刷新整页才看得到
   const wikiDone = Object.values(jobs).filter(job => job.type === 'wiki' && job.status === 'completed').length
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)); setSearched(searchQuery) } catch (error) { onError(errorText(error)); setResults([]); setSearched('') } finally { setLoading(false) } }
-  const backendLabel = ragBackend === 'hybrid_bge_rerank' ? '混合检索 + 重排' : ragBackend === 'hybrid_bge' ? '语义 + 词面混合检索' : ragBackend ? '仅词面检索（语义向量未启用）' : ''
+  const backendLabel = retrievalLabel(ragBackend, true)
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课的教材、索引与检索都在这里。换课程用左栏。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>课程笔记</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
     {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、Word、PowerPoint、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><p className="upload-hint">扫描版（图片版）PDF 也能传：识别出没有文字层时会先估算 OCR 要花多少额度，等你确认再开始转录。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{searched && <article className="card results-card"><h2>检索结果</h2>{results.length === 0 && <div className="empty-inline"><b>没有匹配到内容</b><p>「{searched}」在这门课的资料里找不到足够相关的片段。重排分低于阈值的片段会被丢掉，所以这里宁可返回空，也不给你一堆不相关的原文。换个说法或换个更具体的术语再试。</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? '这份 PDF'} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : <><article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料生成知识页：按这份教材抽出的概念逐个写，每页只用检索到的原文。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
@@ -962,7 +980,8 @@ const INDEX_PIPELINE: [string, string][] = [['extracting', '解析'], ['chunking
 
 function MaterialRow({ material, jobs, onReindex, onDelete, onOcr }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void; onDelete?: (materialId: string) => Promise<void>; onOcr?: (materialId: string) => void }) {
   const [confirming, setConfirming] = useState(false)
-  const job = Object.values(jobs).find(item => item.material_id === material.id)
+  // 只看索引任务，且取最后一个：jobs 只增不删，wiki 任务与上一次重建都在里面。
+  const job = Object.values(jobs).filter(item => item.material_id === material.id && item.type !== 'wiki').at(-1)
   const rawStatus = job?.stage ?? job?.status ?? material.index_status ?? material.status ?? 'uploaded'
   const statusLabel = STAGE_LABELS[String(rawStatus)] ?? String(rawStatus)
   const failed = String(job?.status ?? rawStatus).toLowerCase().includes('fail')
@@ -980,7 +999,7 @@ function MaterialRow({ material, jobs, onReindex, onDelete, onOcr }: { material:
     <div className="material-copy">
       <b>{material.filename ?? material.name ?? '未命名资料'}</b>
       <small>{[material.size_bytes ? `${Math.ceil(material.size_bytes / 1024 / 1024)} MiB` : null, productSummary].filter(Boolean).join(' · ') || statusLabel}</small>
-      {jobActive && job?.type !== 'wiki' && <div className="pipeline">{INDEX_PIPELINE.map(([stage, label], position) => <span key={stage} className={`pipeline-step ${stageIndex > position ? 'done' : stageIndex === position ? 'current' : ''}`}>{label}</span>)}</div>}
+      {jobActive && <div className="pipeline">{INDEX_PIPELINE.map(([stage, label], position) => <span key={stage} className={`pipeline-step ${stageIndex > position ? 'done' : stageIndex === position ? 'current' : ''}`}>{label}</span>)}</div>}
       {job && !failed && <div className="job-progress"><i style={{ width: `${job.progress ?? 15}%` }} /></div>}
       {failed && job?.error && <small className="danger-text">{job.error}</small>}
     </div>
