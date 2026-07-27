@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from adapters.cloud_retrieval import CloudEmbedder, CloudReranker
 from adapters.embedding import BgeEmbedder
 from adapters.reranker import CrossEncoderReranker
 from adapters.web import HttpWebAccess
@@ -125,11 +126,47 @@ class SharedRuntime:
     responders: dict[tuple[str, str], AgentChatPort] = field(default_factory=dict)
 
     def close(self) -> None:
-        for item in (self.llm, self.fallback, self.classifier, self.vision, self.chat_vision, *self.responders.values()):
+        for item in (self.llm, self.fallback, self.classifier, self.vision, self.chat_vision,
+                     self.embedder, self.reranker, *self.responders.values()):
             close = getattr(item, "close", None)
             if callable(close):
                 try: close()
                 except Exception: pass
+
+
+CLOUD_PREFIX = "cloud:"
+
+
+def _build_embedder(settings: Settings):
+    name = settings.rag_embedding_model
+    if not name:
+        return None
+    if name.startswith(CLOUD_PREFIX):
+        if not settings.rag_cloud_configured:
+            print("[rag] 配了云端嵌入但缺 RAG_CLOUD_BASE_URL / RAG_CLOUD_API_KEY，语义检索关闭")
+            return None
+        return CloudEmbedder(
+            api_key=settings.rag_cloud_api_key, base_url=settings.rag_cloud_base_url,
+            model=name[len(CLOUD_PREFIX):], timeout_seconds=settings.llm_total_timeout_seconds,
+        )
+    return BgeEmbedder(
+        model_name=name, device=settings.rag_embedding_device, batch_size=settings.rag_embedding_batch_size,
+    )
+
+
+def _build_reranker(settings: Settings):
+    name = settings.rag_reranker_model
+    if not name:
+        return None
+    if name.startswith(CLOUD_PREFIX):
+        if not (settings.rag_cloud_configured and settings.rag_cloud_rerank_url):
+            print("[rag] 配了云端重排但缺 RAG_CLOUD_RERANK_URL / 凭据，重排关闭")
+            return None
+        return CloudReranker(
+            api_key=settings.rag_cloud_api_key, url=settings.rag_cloud_rerank_url,
+            model=name[len(CLOUD_PREFIX):], timeout_seconds=settings.llm_total_timeout_seconds,
+        )
+    return CrossEncoderReranker(model_name=name, device=settings.rag_embedding_device)
 
 
 def build_shared_runtime(settings: Settings) -> SharedRuntime:
@@ -186,14 +223,10 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=settings.web_timeout_seconds,
         )
-    embedder = (
-        BgeEmbedder(model_name=settings.rag_embedding_model, device=settings.rag_embedding_device, batch_size=settings.rag_embedding_batch_size)
-        if settings.rag_embedding_model else None
-    )
-    reranker = (
-        CrossEncoderReranker(model_name=settings.rag_reranker_model, device=settings.rag_embedding_device)
-        if settings.rag_reranker_model else None
-    )
+    # 模型名写成 cloud:xxx 就走云端适配器，其余照旧本地加载。用一个前缀而不是另加一个
+    # provider 开关：模型与它在哪跑是同一件事，分成两个配置项迟早会互相矛盾。
+    embedder = _build_embedder(settings)
+    reranker = _build_reranker(settings)
     return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, chat_vision=chat_vision, web=web, embedder=embedder, reranker=reranker, responders=responders)
 
 

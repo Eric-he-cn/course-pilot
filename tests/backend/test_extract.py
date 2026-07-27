@@ -41,10 +41,31 @@ def _pptx(tmp_path, slides: list[str], notes: dict[int, str] | None = None):
     return path
 
 
-def test_docx_paragraphs_carry_no_page_number(tmp_path):
-    """Word 不存真实分页，页码留空——错的 p.N 比没有页码更糟。"""
+_RENDERED_BREAK = "<w:r><w:lastRenderedPageBreak/></w:r>"
+_MANUAL_BREAK = '<w:r><w:br w:type="page"/></w:r>'
+
+
+def test_docx_without_pagination_info_leaves_the_page_empty(tmp_path):
+    """两个分页信号都没有时（不渲染的产出器）页码留空——错的 p.N 比没有页码更糟。"""
     path = _docx(tmp_path, _paragraph("CPU 调度概览") + _paragraph("时间片过长退化成 FCFS。"))
     assert extract_pages(path, "material.docx") == [(None, "CPU 调度概览\n\n时间片过长退化成 FCFS。")]
+
+
+def test_docx_uses_the_last_rendered_pagination(tmp_path):
+    """ECMA-376 §17.3.3.13：这个元素记的就是上次分页保存时页在哪断开。Word 与 LibreOffice 都写。"""
+    body = _paragraph("第一页") + "<w:p>" + _RENDERED_BREAK + "<w:r><w:t>第二页</w:t></w:r></w:p>"
+    assert extract_pages(_docx(tmp_path, body), "material.docx") == [(1, "第一页"), (2, "第二页")]
+
+
+def test_docx_counts_author_inserted_page_breaks(tmp_path):
+    body = _paragraph("前言") + "<w:p>" + _MANUAL_BREAK + "<w:r><w:t>正文</w:t></w:r></w:p>"
+    assert extract_pages(_docx(tmp_path, body), "material.docx") == [(1, "前言"), (2, "正文")]
+
+
+def test_docx_splits_a_paragraph_that_straddles_a_page_break(tmp_path):
+    """分页可以落在段落中间，那半句该归下一页，不能整段算起始页。"""
+    body = "<w:p><w:r><w:t>上页结尾</w:t></w:r>" + _RENDERED_BREAK + "<w:r><w:t>下页开头</w:t></w:r></w:p>"
+    assert extract_pages(_docx(tmp_path, body), "material.docx") == [(1, "上页结尾"), (2, "下页开头")]
 
 
 def test_docx_tables_keep_their_rows_and_columns(tmp_path):

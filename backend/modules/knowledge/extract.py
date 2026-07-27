@@ -55,22 +55,46 @@ def _convert_legacy(path: Path, suffix: str) -> Path:
 
 
 def _from_docx(path: Path) -> list[tuple[int | None, str]]:
-    """Word 不存真实分页，页码一律留空——宁可只显示文件名，也不给一个错的 p.N。"""
+    """Word 文档的页码来自两个信号，都没有就留空。
+
+    `w:lastRenderedPageBreak` 是规范里专门用来记「上次被会分页的程序保存时页在哪断开」的
+    元素（ECMA-376 §17.3.3.13），Word 与 LibreOffice 都会写；`w:br w:type="page"` 是作者
+    手动插的分页符。两者都没有时（textutil、python-docx 这类不渲染的产出器）页码留空，
+    不去猜——一个对不上的 p.N 比没有页码更糟。
+    """
     with zipfile.ZipFile(path) as archive:
         root = ElementTree.fromstring(archive.read("word/document.xml"))
-    blocks: list[str] = []
+    pages: dict[int, list[str]] = {}
+    page, paginated = 1, False
+
+    def add(text: str) -> None:
+        if text.strip():
+            pages.setdefault(page, []).append(text.strip())
+
     for node in root.iter():
         if node.tag == f"{_W}p":
-            line = "".join(run.text or "" for run in node.iter(f"{_W}t")).strip()
-            if line:
-                blocks.append(line)
+            buffer = ""
+            for item in node.iter():
+                if item.tag == f"{_W}t":
+                    buffer += item.text or ""
+                elif item.tag == f"{_W}lastRenderedPageBreak" or (
+                    item.tag == f"{_W}br" and item.get(f"{_W}type") == "page"
+                ):
+                    # 分页可能落在段落中间，所以要就地切开而不是整段归给起始页
+                    add(buffer)
+                    buffer = ""
+                    page += 1
+                    paginated = True
+            add(buffer)
         elif node.tag == f"{_W}tbl":
-            blocks.append(_markdown_table([
+            add(_markdown_table([
                 [" ".join(cell.itertext()).strip() for cell in row.findall(f"{_W}tc")]
                 for row in node.findall(f"{_W}tr")
             ]))
     # 表格里的段落会被上面的 w:p 分支再收一次，重复无害：检索多命中一次，不丢内容
-    return [(None, "\n\n".join(block for block in blocks if block).strip())]
+    if not paginated:
+        return [(None, "\n\n".join(block for blocks in pages.values() for block in blocks).strip())]
+    return [(number, "\n\n".join(blocks).strip()) for number, blocks in sorted(pages.items())]
 
 
 def _from_pptx(path: Path) -> list[tuple[int | None, str]]:

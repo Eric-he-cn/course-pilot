@@ -74,6 +74,10 @@ class ModelChoice:
 CALIBRATED_RERANK_THRESHOLDS: dict[str, float] = {
     "BAAI/bge-reranker-v2-m3": 0.3,
     "BAAI/bge-reranker-base": 0.3,
+    # 云端模型的尺度和本地完全不同：同一批用例下 gte-rerank-v2 的正例中位只有 0.45、
+    # 负例最高 0.143，套 0.3 会把大半正例也滤掉。间距 0.027 比本地的 0.118 窄得多，
+    # 也就是分离能力更弱——云端是给跑不动本地模型的机器用的，不是更好的选择。
+    "cloud:gte-rerank-v2": 0.17,
 }
 
 
@@ -177,6 +181,11 @@ class Settings:
     text_models: tuple[ModelChoice, ...] = ()
     # 本机探测结果。配置写 auto 时按它选模型；写死模型名时它只用于健康上报。
     hardware: dict[str, object] = field(default_factory=dict)
+    # 云端检索：模型名写成 cloud:xxx 时用这组凭据。给跑不动本地模型的机器留的路，
+    # 代价是每次检索多一个网络往返，而且教材内容会发到服务商那里。
+    rag_cloud_base_url: str = ""
+    rag_cloud_api_key: str = ""
+    rag_cloud_rerank_url: str = ""
 
     def for_workspace(self, workspace_dir: Path) -> "Settings":
         """某个用户工作区的 Settings。三个路径字段必须一起换——只改 data_dir
@@ -204,6 +213,10 @@ class Settings:
     @property
     def web_search_configured(self) -> bool:
         return bool(self.web_search_api_key)
+
+    @property
+    def rag_cloud_configured(self) -> bool:
+        return bool(self.rag_cloud_api_key and self.rag_cloud_base_url)
 
     @property
     def vision_configured(self) -> bool:
@@ -259,4 +272,7 @@ class Settings:
             _parse_extra_body(value("TEXT_EXTRA_BODY")),
             _read_models(value),
             machine.as_dict(),
+            value("RAG_CLOUD_BASE_URL"),
+            value("RAG_CLOUD_API_KEY"),
+            value("RAG_CLOUD_RERANK_URL"),
         )

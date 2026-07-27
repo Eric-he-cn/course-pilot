@@ -85,7 +85,9 @@ class KnowledgeEnv:
     responder: object | None = None
 
     def wait_terminal(self, job_id: str):
-        deadline = time.monotonic() + 2
+        # 别卡得太紧：索引要读 PDF、切块、抽概念，机器上有别的负载时 2 秒会超时，
+        # 表现成一条看不出原因的偶发失败。真坏了任务会很快落到 failed，不靠这个超时发现。
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             job = self.service.get_job(job_id=job_id)
             if job and job.status in {"completed", "failed"}:
