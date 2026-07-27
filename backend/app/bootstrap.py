@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -124,6 +125,20 @@ class SharedRuntime:
     reranker: object | None = None
     # (模型 key, 是否开思考) → 适配器。空表示没配远端，一律走 fallback。
     responders: dict[tuple[str, str], AgentChatPort] = field(default_factory=dict)
+
+    def warm(self) -> None:
+        """后台预热检索模型。两个都是首次用到才加载，实测嵌入 36s、重排 60s，
+        而首轮检索两个都要碰——不预热就是让用户的第一个问题替我们等这一分钟。"""
+        def load() -> None:
+            for model, call in ((self.embedder, lambda m: m.embed_documents(["预热"])),
+                                (self.reranker, lambda m: m.rerank(query="预热", documents=["预热"]))):
+                if model is None:
+                    continue
+                try:
+                    call(model)
+                except Exception as error:  # 预热失败不该拖住启动，真正调用时还会再试一次
+                    print(f"[warmup] {type(model).__name__} 预热失败：{error}")
+        threading.Thread(target=load, name="model-warmup", daemon=True).start()
 
     def close(self) -> None:
         for item in (self.llm, self.fallback, self.classifier, self.vision, self.chat_vision,

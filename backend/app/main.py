@@ -29,6 +29,9 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     async def lifespan(_app: FastAPI):
         # 失活恢复与 job worker 启动改成随工作区懒建（见 Workspaces.for_id）：
         # 进程启动时还不知道有哪些用户。
+        # 预热放这里而不是 Workspaces：模块级的 app = create_app() 在测试里也会跑，
+        # 那条路径不该去加载几个 GB 的模型。
+        workspaces.shared.warm()
         try:
             yield
         finally:

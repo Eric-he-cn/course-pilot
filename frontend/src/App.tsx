@@ -16,6 +16,8 @@ const nav: { id: View; num: string }[] = [
   { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
+// 会用到本地嵌入/重排模型的工具：只有这几个会因为模型加载而变慢。
+const RETRIEVAL_TOOLS = ['search_materials', 'concept_search']
 const TOOL_LABELS: Record<string, string> = {
   search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', plan_update: '写入计划',
   get_archive: '学习档案', concept_search: '概念目录', emit_evidence: '记录学习证据', memory_patch: '更新记忆',
@@ -197,6 +199,15 @@ export default function App() {
   const workspaceName = workspace.scope === 'general' ? '通用模式' : course?.name ?? '课程工作区'
   const healthLlm = (health?.llm ?? null) as Record<string, unknown> | null
   const healthRag = (health?.rag ?? null) as Record<string, unknown> | null
+  // 冷启动时首次检索要等模型加载（实测嵌入 36s、重排 60s）。不说清楚，用户只看到
+  // 「正在检索教材」干等一分钟，会当成检索本身慢。配了但还没加载好的才算。
+  const modelNote = (['embedding', 'reranker'] as const)
+    .filter(key => {
+      const slot = healthRag?.[key] as { model?: string; loaded?: boolean; error?: string | null } | undefined
+      return !!slot?.model && slot.loaded === false && !slot.error
+    })
+    .map(key => (key === 'embedding' ? '嵌入模型' : '重排模型'))
+    .join('、')
   return <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
     {sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label="课程与会话">
@@ -243,7 +254,7 @@ export default function App() {
         </div>
       </header>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label="关闭错误提示" onClick={() => setNotice('')}>×</button></div>}
-      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} turnResolution={turnResolution} contextUsage={contextUsage} draftSeed={draftSeed} onSeedUsed={() => setDraftSeed('')} onCitation={setCitation} onUpload={async file => {
+      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} modelNote={modelNote} turnResolution={turnResolution} contextUsage={contextUsage} draftSeed={draftSeed} onSeedUsed={() => setDraftSeed('')} onCitation={setCitation} onUpload={async file => {
         try {
           let targetSession = activeSession
           if (!targetSession) {
@@ -270,6 +281,15 @@ export default function App() {
         // 再往 messages 里写就成了「B 的标题配 A 的对话」。
         const onThisSession = () => activeSessionRef.current?.id === targetSession.id
         const patchMessages: typeof setMessages = updater => { if (onThisSession()) setMessages(updater) }
+        // 停止/失败时没有 tool_result 收尾，chip 会一直停在 pending 上自己数秒。
+        const sealActivity = () => {
+          activity.forEach(item => {
+            if (item.summary) return
+            item.summary = '已停止'
+            item.elapsed_ms = item.started_at ? Date.now() - item.started_at : undefined
+          })
+          return [...activity]
+        }
         setMessages(current => [...current, optimistic, { id: pendingId, role: 'assistant', content: '', status: 'streaming' }]); setStreaming(true)
         const controller = new AbortController()
         abortRef.current = controller
@@ -310,7 +330,7 @@ export default function App() {
             // 客户端断连时服务端生成器可能挂在 yield 上不进 finally，部分回答不一定落盘，
             // 所以保留本地已渲染的内容并标明它没有保存。
             patchMessages(current => current.map(item => item.id === pendingId
-              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）' }
+              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）', activity: sealActivity() }
               : item))
             await loadSessions()
           } else {
@@ -320,7 +340,7 @@ export default function App() {
         catch (error) {
           if (stoppedRef.current) {
             patchMessages(current => current.map(item => item.id === pendingId
-              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）' }
+              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）', activity: sealActivity() }
               : item))
             void loadSessions()
             return
@@ -328,7 +348,7 @@ export default function App() {
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
           try { await loadMessages(targetSession.id); await loadSessions() }
-          catch { patchMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '回答中断了，重发一次。', artifact: { kind: 'interrupted' } } : item)) }
+          catch { patchMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '回答中断了，重发一次。', artifact: { kind: 'interrupted' }, activity: sealActivity() } : item)) }
         }
         finally { setStreaming(false); abortRef.current = null }
       }} busy={streaming} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
@@ -351,7 +371,7 @@ export default function App() {
   </div>
 }
 
-function ChatView({ session, messages, workspaceName, scope, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, onStop, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onStop: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
+function ChatView({ session, messages, workspaceName, scope, modelNote, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, onStop, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; modelNote?: string; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onStop: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
   const [draft, setDraft] = useState(''); const composer = useRef<HTMLTextAreaElement>(null)
   useEffect(() => { if (draftSeed) { setDraft(draftSeed); onSeedUsed(); composer.current?.focus() } }, [draftSeed])
   const [attachments, setAttachments] = useState<Attachment[]>([]); const [uploading, setUploading] = useState(false)
@@ -404,7 +424,7 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
     <div className="messages" aria-live="polite" ref={scroller}
       onScroll={event => { const box = event.currentTarget; following.current = box.scrollHeight - box.scrollTop - box.clientHeight < 120 }}>
       {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式每轮按问题解析课程。直接说出课程名最准。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
-      {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} showResolution={!isCourseScope}
+      {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} modelNote={modelNote} showResolution={!isCourseScope}
         onRetry={busy ? undefined : (() => {
           // 重发这条回答对应的那句提问——往前找最近的一条 user 消息
           const asked = [...list.slice(0, index)].reverse().find(item => item.role === 'user')
@@ -709,11 +729,13 @@ function ModelPicker({ llm }: { llm: Record<string, unknown> }) {
   </>
 }
 
-function ThinkingHint({ activity }: { activity?: ToolActivity[] }) {
+function ThinkingHint({ activity, modelNote }: { activity?: ToolActivity[]; modelNote?: string }) {
   // 工具跑完到第一个字之间有一段空档，这里不说话用户就以为卡在上一个工具上。
   const running = activity?.find(entry => !entry.summary)
   const label = running ? `正在${TOOL_LABELS[running.name] ?? running.name}` : activity?.length ? '正在思考' : '正在准备'
-  return <span className="typing">{label}<i aria-hidden /><i aria-hidden /><i aria-hidden /></span>
+  // 检索类工具在等模型加载时把原因说出来，别让用户以为是检索慢。
+  const reason = modelNote && running && RETRIEVAL_TOOLS.includes(running.name) ? `（${modelNote}载入中）` : ''
+  return <span className="typing">{label}{reason}<i aria-hidden /><i aria-hidden /><i aria-hidden /></span>
 }
 
 function ToolChip({ entry }: { entry: ToolActivity }) {
@@ -925,14 +947,14 @@ function CitationChip({ item, fallbackNumber, onOpen }: { item: Citation; fallba
   return <button onClick={() => onOpen(item)}>{label}</button>
 }
 
-function MessageCard({ message, onCitation, showResolution, onRetry }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void }) {
+function MessageCard({ message, onCitation, showResolution, onRetry, modelNote }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void; modelNote?: string }) {
   if (message.role === 'user') return <article className="message user-message"><div>{message.content}</div></article>
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
     {message.status === 'stopped' && <div className="degraded-notice"><span>已停止。上面的内容没有存进会话记录。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}
-    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
