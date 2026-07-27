@@ -197,7 +197,7 @@ class KnowledgeRepository:
     def list_concepts(self, *, course_id: str, limit: int = 60) -> list[dict]:
         with self._store.read() as conn:
             rows = conn.execute(
-                "SELECT id, name, page, mention_count FROM concepts WHERE course_id = ? ORDER BY mention_count DESC, name LIMIT ?",
+                "SELECT id, name, page, mention_count FROM concepts WHERE course_id = ? ORDER BY mention_count DESC, page, name LIMIT ?",
                 (course_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -206,10 +206,14 @@ class KnowledgeRepository:
         """按提及次数排序：Wiki 页数有上限，先写这份教材里讲得最多的概念。"""
         with self._store.read() as conn:
             rows = conn.execute(
-                "SELECT id, name, page FROM concepts WHERE material_id = ? ORDER BY mention_count DESC, name LIMIT ?",
+                "SELECT id, name, page FROM concepts WHERE material_id = ? ORDER BY mention_count DESC, page, name LIMIT ?",
                 (material_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def concept_ids(self, *, course_id: str) -> set[str]:
+        with self._store.read() as conn:
+            return {row["id"] for row in conn.execute("SELECT id FROM concepts WHERE course_id = ?", (course_id,))}
 
     def concept_exists(self, *, course_id: str, concept_id: str) -> bool:
         with self._store.read() as conn:

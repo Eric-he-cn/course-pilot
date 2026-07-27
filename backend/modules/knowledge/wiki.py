@@ -28,8 +28,11 @@ _ALLOWED = re.compile(r"[^\w一-鿿\-_.]", re.UNICODE)
 _SYSTEM = """你在为一门课的知识库写一页概念说明，读者是正在学这门课的学生。
 
 只依据下面给出的教材片段来写。规则：
-- 每个结论后面标出它来自哪一段，格式 [p.页码]。片段没写页码的标 [出处未标页]。
-- 教材片段没有覆盖到的部分，直接写「教材未覆盖」，不要用你自己的知识补。
+- 每个结论后面标出出处。每段片段的开头都给了它的标签（形如【p.12】或【笔记.docx】），
+  照抄那个标签放进方括号里，例如 [p.12]、[笔记.docx]。不要自己编 [p.未标页] 这类写法。
+- 教材片段没有覆盖到的内容，**整条不要写**。宁可少写一条，也不要写「教材未覆盖」之后再
+  用你自己的知识补一句——那样读者分不清哪句有出处。确实需要提醒读者教材没讲到的地方时，
+  只写一句「教材未覆盖」并就此收住。
 - 不要复述整段原文，用自己的话把概念讲清楚。
 - 用 markdown。结构：一句话定义 → 关键点（3-6 条）→ 常见误解或易错点（有就写，没有就省略）。
 - 不要写标题行（# 概念名），调用方会加。
@@ -123,6 +126,20 @@ class WikiStore:
                 source_hash=field("source_hash"), updated_at=field("updated_at"), chars=path.stat().st_size,
             ))
         return pages
+
+    def prune(self, *, course_id: str, valid_concept_ids: set[str]) -> list[str]:
+        """删掉概念已经不存在的页。
+
+        重建索引会换掉概念列表（比如从刮标题改成读目录书签），旧概念的页文件不会自己消失，
+        于是知识页里混着一堆已经不存在的概念——看上去就是这个功能坏了。概念表是真源。
+        """
+        directory = self._course_dir(course_id)
+        removed = []
+        for path in sorted(directory.glob("*.md")) if directory.is_dir() else []:
+            if path.stem not in valid_concept_ids:
+                path.unlink(missing_ok=True)
+                removed.append(path.stem)
+        return removed
 
     def delete_course(self, *, course_id: str) -> None:
         directory = self._course_dir(course_id)

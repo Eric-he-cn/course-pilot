@@ -14,9 +14,9 @@ from contracts.llm import ChatFinal
 from contracts.reranker import RerankerPort
 
 from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
-from .concepts import extract_candidates
+from .concepts import extract_candidates, from_outline
 from . import scanned, wiki
-from .extract import SUPPORTED_SUFFIXES, extract_pages
+from .extract import SUPPORTED_SUFFIXES, extract_pages, pdf_outline
 from .wiki import WikiStore
 from .models import Job, Material
 from .repository import KnowledgeRepository
@@ -164,12 +164,19 @@ class KnowledgeService:
             def progress(done: int, total: int) -> None:
                 self._repository.update_job(job.id, status="running", stage=f"wiki {done}/{total}", progress=10 + int(85 * done / total))
 
+            # 概念列表可能在上次重建索引时变过，先把孤儿页清掉再生成
+            orphans = self._wiki.prune(
+                course_id=material.course_id,
+                valid_concept_ids=self._repository.concept_ids(course_id=material.course_id),
+            )
             counts = wiki.build_pages(
                 course_id=material.course_id, concepts=concepts, store=self._wiki, now=utc_now(),
                 search=lambda query: self.search_course(course_id=material.course_id, query=query, limit=6),
                 ask=self._ask_once, on_progress=progress,
             )
-            summary = f"新增 {counts['written']} 页，跳过 {counts['skipped']} 页（证据未变），{counts['ungrounded']} 个概念检索不到证据"
+            summary = (f"新增 {counts['written']} 页，跳过 {counts['skipped']} 页（证据未变），"
+                       f"{counts['ungrounded']} 个概念检索不到证据"
+                       + (f"，清掉 {len(orphans)} 个已失效的旧页" if orphans else ""))
             return self._repository.update_job(job.id, status="completed", stage="wiki_completed", progress=100, error_message=summary)
         except Exception as error:
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error))
@@ -343,13 +350,25 @@ class KnowledgeService:
             self._repository.update_job(job.id, status="running", stage="concepts", progress=95)
             self._repository.replace_material_concepts(
                 course_id=material.course_id, material_id=material.id,
-                candidates=extract_candidates([(page, content) for page, content in chunks]),
+                candidates=self._concepts_for(path, material.filename, chunks),
             )
             self._repository.set_material_status(material.id, "indexed")
             return self._repository.update_job(job.id, status="completed", stage="completed", progress=100, retrieval_backend=backend)
         except Exception as error:
             self._repository.set_material_status(material.id, "failed")
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error), retrieval_backend="sqlite_fts")
+
+    def _concepts_for(self, path: Path, filename: str, chunks: list[tuple[int | None, str]]) -> list[dict]:
+        """有目录书签就用它，没有才从正文刮标题。
+
+        刮标题在代码和表格多的教材上假阳性很高——markdown 标题正则会命中 Python 注释，
+        编号标题正则会命中表格行，页码还常常指到目录页。书签是作者写的，这些问题都没有。
+        """
+        if Path(filename).suffix.lower() == ".pdf":
+            candidates = from_outline(pdf_outline(path))
+            if candidates:
+                return candidates
+        return extract_candidates([(page, content) for page, content in chunks])
 
     def _needs_ocr(self, material: Material, segments: list[tuple[int | None, str]], path: Path) -> bool:
         """判定要不要 OCR：只对没批准过的 PDF、且确实提不出文字时成立。"""

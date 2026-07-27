@@ -221,6 +221,9 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .card-heading { display:flex; justify-content:space-between; gap:10px }
 .material-row { display:grid; grid-template-columns:40px minmax(0,1fr) auto auto; align-items:center; gap:12px; padding:13px 0; border-top:1px solid var(--border) }
 .material-row:first-of-type { margin-top:10px }
+/* 资料行最多有三个尾部元素（动作按钮 ×2 + 状态标签）。列数不够时第 5 个会折到
+   第二行最左边，看着像跑到行外。只在这张卡上放宽列数，不动其他用到这个类的地方。 */
+.material-card .material-row { grid-template-columns:40px minmax(0,1fr) auto auto auto }
 .file-mark { display:grid; width:36px; height:41px; place-items:center; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--muted); font-family:var(--mono); font-size:9px; font-weight:700 }
 .material-copy { display:grid; min-width:0; gap:3px }
 .material-copy b { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:13.5px }
@@ -486,3 +489,4 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .ocr-card .ocr-estimate th { width:88px; padding:5px 0; color:var(--muted); font-weight:400; text-align:left; vertical-align:top }
 .ocr-card .ocr-estimate td { padding:5px 0 }
 .ocr-card .danger-actions { margin-top:12px }
+.upload-card .upload-hint { margin-top:-4px; color:var(--muted); font-size:12px; line-height:1.6 }

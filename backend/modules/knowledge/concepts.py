@@ -57,6 +57,44 @@ def _acceptable(name: str) -> bool:
     return True
 
 
+# 书签标题里的章节编号很规整（"2.1.1 嵌入表示层"），剥掉它才是概念名。
+# 与 _STRIP_PREFIX 分开：那个会把「16 位浮点数」的 16 也啃掉，只在刮正文时用。
+_OUTLINE_SECTION_NO = re.compile(
+    r"^(?:\d+(?:\.\d+)*|[IVXLC]+|第\s*[0-9一二三四五六七八九十]+\s*[章节讲部篇])[.、\s]+"
+)
+# 前言目录索引这类不是概念
+_FRONT_MATTER = re.compile(
+    r"^(前沿|前言|序言?|目\s*录|索\s*引|附\s*录|参考文献|数学符号|符号|致谢|版权|后记|扉页|安装|环境配置"
+    r"|preface|foreword|contents|index|bibliography|references|notation|appendix"
+    r"|acknowledge?ments?|about\s+the\s+authors?|installation|colophon)\b",
+    re.IGNORECASE,
+)
+# 层级换成权重：越浅越靠前。列表按 mention_count 倒序取，所以整本书的章节会排在细节小节之前。
+_OUTLINE_MAX_LEVEL_WEIGHT = 10
+
+
+def from_outline(rows: list[tuple[int, str, int | None]], *, limit: int = 200) -> list[dict]:
+    """把目录书签整理成概念候选。同名只留最浅、最靠前那一个。"""
+    seen: dict[str, dict] = {}
+    for level, title, page in sorted(rows, key=lambda row: (row[0], row[2] if row[2] is not None else 0)):
+        name = _normalize_outline(title)
+        if not name or _FRONT_MATTER.match(name) or not _acceptable(name):
+            continue
+        seen.setdefault(name, {
+            "name": name,
+            "mention_count": max(1, _OUTLINE_MAX_LEVEL_WEIGHT - min(level, _OUTLINE_MAX_LEVEL_WEIGHT - 1)),
+            "page": page,
+        })
+    ordered = sorted(seen.values(), key=lambda item: (-item["mention_count"], item["page"] or 0, item["name"]))
+    return ordered[:limit]
+
+
+def _normalize_outline(raw: str) -> str:
+    text = re.sub(r"\s+", " ", raw).strip()
+    text = _OUTLINE_SECTION_NO.sub("", text).strip()
+    return text.strip(" .·—-:：")
+
+
 def concept_id_for(course_id: str, name: str) -> str:
     """同名概念在同一课程里始终得到同一个 id，重放与增量 diff 都不会改动它。"""
     digest = hashlib.sha1(f"{course_id}\n{name.casefold()}".encode()).hexdigest()[:16]
