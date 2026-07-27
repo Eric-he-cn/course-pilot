@@ -282,11 +282,11 @@ export default function App() {
         const onThisSession = () => activeSessionRef.current?.id === targetSession.id
         const patchMessages: typeof setMessages = updater => { if (onThisSession()) setMessages(updater) }
         // 停止/失败时没有 tool_result 收尾，chip 会一直停在 pending 上自己数秒。
+        // 换成新对象而不是原地改：chip 的重渲染就不必依赖「没人给它加 memo」。
         const sealActivity = () => {
-          activity.forEach(item => {
+          activity.forEach((item, index) => {
             if (item.summary) return
-            item.summary = '已停止'
-            item.elapsed_ms = item.started_at ? Date.now() - item.started_at : undefined
+            activity[index] = { ...item, summary: '已停止', elapsed_ms: item.started_at ? Date.now() - item.started_at : undefined }
           })
           return [...activity]
         }
