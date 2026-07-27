@@ -117,6 +117,7 @@ class SharedRuntime:
     fallback: AgentChatPort
     classifier: AgentChatPort | None
     vision: VisionTranscriberPort | None
+    chat_vision: VisionTranscriberPort | None
     web: WebSearchPort | None
     embedder: object | None
     reranker: object | None = None
@@ -124,7 +125,7 @@ class SharedRuntime:
     responders: dict[tuple[str, str], AgentChatPort] = field(default_factory=dict)
 
     def close(self) -> None:
-        for item in (self.llm, self.fallback, self.classifier, self.vision, *self.responders.values()):
+        for item in (self.llm, self.fallback, self.classifier, self.vision, self.chat_vision, *self.responders.values()):
             close = getattr(item, "close", None)
             if callable(close):
                 try: close()
@@ -164,14 +165,20 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
             total_timeout_seconds=6, max_output_tokens=256, max_retries=0,
         )
     vision: VisionTranscriberPort | None = None
+    chat_vision: VisionTranscriberPort | None = None
     if settings.enable_remote_llm and settings.vision_configured:
-        vision = VisionOcrTranscriber(
-            api_key=settings.vision_api_key, base_url=settings.vision_base_url, model=settings.vision_model,
-            provider=settings.vision_provider,
-            connect_timeout_seconds=settings.llm_connect_timeout_seconds,
-            total_timeout_seconds=settings.llm_total_timeout_seconds,
-            max_retries=settings.llm_max_retries,
-        )
+        def _vision(model: str, *, understand: bool) -> VisionTranscriberPort:
+            return VisionOcrTranscriber(
+                api_key=settings.vision_api_key, base_url=settings.vision_base_url, model=model,
+                provider=settings.vision_provider, understand=understand,
+                connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+                total_timeout_seconds=settings.llm_total_timeout_seconds,
+                max_retries=settings.llm_max_retries,
+            )
+
+        vision = _vision(settings.vision_model, understand=False)
+        # 拍照提问单独一个槽位；没配就复用上面那个，行为与以前一致。
+        chat_vision = _vision(settings.vision_chat_model, understand=True) if settings.vision_chat_model else vision
     web: WebSearchPort | None = None
     if settings.enable_remote_llm and settings.web_search_configured:
         web = HttpWebAccess(
@@ -187,7 +194,7 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
         CrossEncoderReranker(model_name=settings.rag_reranker_model, device=settings.rag_embedding_device)
         if settings.rag_reranker_model else None
     )
-    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, web=web, embedder=embedder, reranker=reranker, responders=responders)
+    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, chat_vision=chat_vision, web=web, embedder=embedder, reranker=reranker, responders=responders)
 
 
 def build_application(settings: Settings, shared: SharedRuntime | None = None) -> Application:
@@ -195,6 +202,7 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     runtime = shared or build_shared_runtime(settings)
     llm, fallback, classifier = runtime.llm, runtime.fallback, runtime.classifier
     vision, web, embedder, reranker = runtime.vision, runtime.web, runtime.embedder, runtime.reranker
+    chat_vision = runtime.chat_vision or vision
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(settings.database_path)
     store.migrate()
@@ -220,7 +228,7 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     resolver = CourseResolver(courses, classifier=classifier)
     sessions = SessionService(
         session_repository, courses, resolver,
-        vision=vision,
+        vision=chat_vision,
         attachment_max_bytes=settings.attachment_max_bytes,
         attachment_max_pixels=settings.attachment_max_pixels,
     )

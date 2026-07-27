@@ -11,6 +11,19 @@ from contracts.llm import LLMProviderError, VisionTranscription
 # 专用 OCR 模型往往只认这句约定提示词，换成自定义中文提示词可能返回坐标而不是文字。
 _OCR_PROMPT = "Read all the text in the image."
 
+# 拍照提问走的是通用多模态模型，任务不是抄字而是看懂这一页。同一张教材照片实测：
+#   qwen3.5-ocr   「A B C / Figure 7.6: SJSF Again」——只抄字，还把 SJF 抄成 SJSF
+#   qwen-vl-ocr   「关于响应时间的两个示例」——泛泛
+#   qwen3-vl-plus 「两种调度策略下三个任务的时序执行图」——看懂了结构
+#   qwen3.7-flash 「教材《Three Easy Pieces》关于调度的一页，用甘特图对比 SJF…」——最好
+_UNDERSTAND_PROMPT = (
+    "看这张图，用中文把它讲清楚，供后续问答使用：\n"
+    "1. 图上的文字全部照录，公式用 LaTeX 写（行内 $...$）。\n"
+    "2. 如果是题目，把题干、条件、选项完整写出来，不要作答。\n"
+    "3. 如果有图表、示意图、代码，说明它在表达什么、各部分的关系。\n"
+    "4. 只描述图里真实存在的内容，看不清的地方直接说看不清，不要补测。"
+)
+
 
 class VisionOcrTranscriber:
     """OpenAI 兼容的图片转录适配器（vision 槽位）：标准 image_url + base64。"""
@@ -22,6 +35,8 @@ class VisionOcrTranscriber:
         base_url: str,
         model: str,
         provider: str = "openai_compatible",
+        # 纯抄字（扫描版逐页）用 OCR 提示词；拍照提问要模型看懂整页，换另一条。
+        understand: bool = False,
         connect_timeout_seconds: float = 10,
         total_timeout_seconds: float = 180,
         max_retries: int = 2,
@@ -30,6 +45,7 @@ class VisionOcrTranscriber:
         if not api_key or not base_url or not model:
             raise ValueError("适配器需要 api_key、base_url 和 model")
         self._model = model
+        self._prompt = _UNDERSTAND_PROMPT if understand else _OCR_PROMPT
         self._provider = provider or "openai_compatible"
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -58,7 +74,7 @@ class VisionOcrTranscriber:
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image}"}},
-                        {"type": "text", "text": _OCR_PROMPT},
+                        {"type": "text", "text": self._prompt},
                     ],
                 }
             ],

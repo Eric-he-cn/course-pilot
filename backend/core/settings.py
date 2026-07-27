@@ -150,7 +150,11 @@ class Settings:
     vision_provider: str = ""
     vision_base_url: str = ""
     vision_api_key: str = ""
+    # 扫描版 PDF 逐页转录用：专用 OCR 模型最便宜，量大
     vision_model: str = ""
+    # 拍照提问用：留空则复用上面那个。两件事对模型的要求不同——转录只要抄字，
+    # 拍题要看懂手写、图表与版面，专用 OCR 模型在这上面明显更差。
+    vision_chat_model: str = ""
     attachment_max_bytes: int = 10 * 1024 * 1024
     attachment_max_pixels: int = 12_000_000
     # Agent 历史预算，以字符数保守近似 token（按 1 字符 ≤ 1 token，宁少勿超窗）。
@@ -236,6 +240,7 @@ class Settings:
             value("VISION_BASE_URL"),
             value("VISION_API_KEY"),
             value("VISION_MODEL"),
+            value("VISION_CHAT_MODEL"),
             max(1, int(value("ATTACHMENT_MAX_BYTES", str(10 * 1024 * 1024)))),
             max(1, int(value("ATTACHMENT_MAX_PIXELS", "12000000"))),
             max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
