@@ -9,7 +9,6 @@ _BLOCK = "<!-- agent:managed:{section} -->\n{content}\n<!-- /agent:managed:{sect
 _BLOCK_PATTERN = "<!-- agent:managed:{section} -->.*?<!-- /agent:managed:{section} -->"
 _SECTION_NAME = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 _MAX_SECTION_CHARS = 2000
-_MAX_FILE_CHARS = 40_000
 _MAX_FILE_CHARS = 20_000
 
 _USER_HEADER = """# 用户画像
@@ -87,8 +86,9 @@ class MemoryStore:
             body = existing or header.strip()
             pattern = re.compile(_BLOCK_PATTERN.format(section=re.escape(section)), re.DOTALL)
             if pattern.search(body):
-                body, replaced = pattern.subn(block, body), True
-                body = body[0]
+                # 用 lambda 给出替换文本：内容里的 \d、\1 会被当成分组引用，
+                # 而记忆里写 LaTeX 是常态。
+                body, replaced = pattern.sub(lambda _: block, body), True
             else:
                 body, replaced = f"{body}\n\n{block}", False
             if len(body) > _MAX_FILE_CHARS:

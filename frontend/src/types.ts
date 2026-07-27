@@ -5,7 +5,6 @@ export interface Course {
   name: string
   color: string
   wiki_enabled?: boolean
-  archived?: boolean
 }
 
 export interface SessionSummary {

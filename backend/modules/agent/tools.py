@@ -231,6 +231,14 @@ TOOL_CAPABILITY: dict[str, str] = {
     "calculator": FREE, "use_skill": FREE, "artifact_read": FREE,
 }
 
+# 同一轮里重复调用可以复用上次结果的能力。写工具不在其中：参数相同不代表
+# 是同一次事件——连答三道同概念的题，emit_evidence 的参数就是逐字相同的。
+REPEATABLE_CAPABILITIES: frozenset[str] = frozenset({READ_COURSE, NETWORK, FREE})
+
+
+def is_repeatable(name: str) -> bool:
+    return TOOL_CAPABILITY.get(name) in REPEATABLE_CAPABILITIES
+
 
 @dataclass(frozen=True)
 class ToolProfile:
@@ -382,7 +390,9 @@ class ToolExecutor:
         archive: ArchiveReaderPort, evidence: EvidenceWriterPort, artifacts: ArtifactStore,
         skills: SkillRegistry, memory: MemoryStore,
         web: WebSearchPort | None = None, notes: NoteStore | None = None,
+        search_limit: int = SEARCH_LIMIT,
     ) -> None:
+        self._search_limit = search_limit
         self._web = web
         self._notes = notes
         self._knowledge = knowledge
@@ -535,7 +545,7 @@ class ToolExecutor:
         query = str(parsed.get("query") or "").strip()
         if not query:
             return ToolOutcome(text="search_materials 需要非空的 query 参数。", ok=False, summary="缺少查询词")
-        hits = self._knowledge.search(scope=scope, query=query, limit=SEARCH_LIMIT)
+        hits = self._knowledge.search(scope=scope, query=query, limit=self._search_limit)
         if not hits:
             return ToolOutcome(text="（本课程资料里这次没有匹配到相关内容，教材已索引；可换关键词或换个说法再查一次。确实没有就按通用知识回答，并说明来源不是教材）", ok=True, summary=f"检索「{_clip(query, 24)}」未命中")
         blocks, new_citations = [], []
@@ -659,7 +669,7 @@ class ToolExecutor:
             # 写计划只在用户明确要求时放行（架构 §10）；模型自己推断出的调整先回去问用户。
             return ToolOutcome(
                 text="计划修改需要用户明确要求。请先告诉用户你建议怎么调整，等他同意后再调用本工具。",
-                ok=False, summary="计划写入需用户确认",
+                ok=False, summary="计划写入需用户确认", reason="needs_user_confirmation",
             )
         items = parsed.get("items")
         if not isinstance(items, list):
@@ -675,7 +685,7 @@ class ToolExecutor:
         except PlanConflictError as error:
             return ToolOutcome(
                 text=f"版本冲突：{error}。请重新 get_plan 读取最新条目，再基于新版本重算这次修改。",
-                ok=False, summary="计划版本冲突",
+                ok=False, summary="计划版本冲突", reason="version_conflict",
             )
         return ToolOutcome(
             text=(f"计划已更新 v{diff.version_from} → v{diff.version_to}：写入 {diff.added} 条，"

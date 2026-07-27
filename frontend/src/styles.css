@@ -209,7 +209,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .tabs { display:flex; gap:6px; margin-bottom:16px; border-bottom:1px solid var(--border) }
 .tabs button { border:0; border-bottom:2px solid transparent; margin-bottom:-1px; padding:8px 11px; background:transparent; color:var(--muted); font-size:13.5px }
 .tabs .active { border-color:var(--accent); color:var(--text); font-weight:650 }
-.library-grid,.demo-grid,.settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px }
+.library-grid,.settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px }
 .card { padding:16px; border:1px solid var(--border); border-radius:8px; background:var(--bg) }
 .card h2 { margin:0 0 6px; font-size:15px; font-weight:600 }
 .card p { margin:5px 0; color:var(--muted); line-height:1.6; font-size:13px }
@@ -255,7 +255,6 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 
 /* ---- 设置与健康 ---- */
 .settings-grid { grid-template-columns:repeat(2,minmax(0,1fr)) }
-.demo-grid { grid-template-columns:repeat(3,minmax(0,1fr)) }
 .settings-course { display:flex; align-items:center; gap:9px; padding:9px 0; border-top:1px solid var(--border); font-size:13px }
 .settings-course span { margin-left:auto; color:var(--muted); font-size:12px }
 .skill-row { display:flex; align-items:flex-start; gap:12px; padding:10px 0; border-top:1px solid var(--border) }
@@ -307,7 +306,6 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 /* ---- 会话上下文条 ---- */
 .course-heading { display:flex; align-items:center; gap:10px }
 .course-heading i { display:inline-block; flex:0 0 auto; width:11px; height:11px; border-radius:50% }
-.connection { display:none }
 
 /* ---- 助手消息的 Markdown 正文 ---- */
 .message-content { white-space:normal }
@@ -350,7 +348,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
   .page { padding:22px 16px }
   .hero { display:block }
   .hero-actions { margin:14px 0 0 }
-  .library-grid,.settings-grid,.demo-grid { grid-template-columns:1fr }
+  .library-grid,.settings-grid { grid-template-columns:1fr }
   .citation-drawer { top:46px }
   .user-message>div { max-width:88% }
 }

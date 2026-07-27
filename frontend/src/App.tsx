@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import { ApiError, api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
+import { api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity, WikiPageSummary } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
@@ -1035,26 +1035,29 @@ function PlanView({ course, onError }: { course: Course; onError: (message: stri
   const [plan, setPlan] = useState<Plan | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState('')
+  // 重试计数进依赖，否则「重新读取」不会重新发请求，界面永远停在 loading。
+  const [attempt, setAttempt] = useState(0)
   useEffect(() => {
     setPlan(null); setLoaded(false); setError('')
     api.plan(course.id).then(payload => setPlan(payload.plan)).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
-  }, [course.id])
+  }, [course.id, attempt])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>在对话里说要排计划或改计划，助手就会写到这里。每次改动升一个版本，过去的条目不动。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div><PlanGantt items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
+    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => setAttempt(n => n + 1)} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div><PlanGantt items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {
   const [archive, setArchive] = useState<ArchiveSummary | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState('')
+  const [attempt, setAttempt] = useState(0)
   useEffect(() => {
     setArchive(null); setLoaded(false); setError('')
     api.archive(course.id).then(setArchive).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
-  }, [course.id])
+  }, [course.id, attempt])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">学习档案</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>答题记录只增不改，掌握度由这些记录算出。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取档案…</p> : error ? <RetryCard title="档案读取失败" message={error} onRetry={() => { setLoaded(false); setError('') }} /> : !archive ? <p className="mini-empty">暂无档案数据。</p> : <>
+    {!loaded ? <p className="mini-empty">正在读取档案…</p> : error ? <RetryCard title="档案读取失败" message={error} onRetry={() => setAttempt(n => n + 1)} /> : !archive ? <p className="mini-empty">暂无档案数据。</p> : <>
       <article className="card"><div className="card-heading"><div><h2>概念掌握度</h2><p>BKT 后验 × 遗忘曲线；证据不足的概念不给判断</p></div></div>
         {archive.mastery.length ? archive.mastery.map(item => <div className="material-row" key={item.concept_id}>
           <div className="file-mark">{item.insufficient_evidence ? '—' : `${Math.round((item.score ?? 0) * 100)}`}</div>

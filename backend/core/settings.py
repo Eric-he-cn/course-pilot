@@ -151,7 +151,8 @@ class Settings:
     # 送进 rerank 的候选数（词面 top-N ∪ 语义 top-N 去重后截断）
     rag_rerank_candidates: int = 20
     # rerank 分下限，逐条过滤，全部低于它就等于这次没搜到。标定见 adapters/reranker.py
-    rag_min_rerank_score: float = 0.2
+    # 默认 0（不过滤），与 _rerank_threshold 对未标定模型的处置一致。
+    rag_min_rerank_score: float = 0.0
     # vision 槽位（OCR）：未配置时附件上传返回 feature_disabled。
     vision_provider: str = ""
     vision_base_url: str = ""

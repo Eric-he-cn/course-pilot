@@ -408,3 +408,80 @@ def test_no_reminder_when_the_model_already_wrote_memory(client):
     client.post(f"/api/v2/sessions/{session_id}/turns",
                 json={"client_request_id": "mem-2", "message": "记住我喜欢先给摘要"})
     assert not any("还没有写进长期记忆" in p for p in prompts)
+
+
+def test_repeated_writes_are_not_deduplicated_as_repeats(client):
+    """同轮去重只针对读工具。写工具参数相同也是两次不同的事件——
+    连答三道同概念的题，emit_evidence 的参数就是逐字相同的。"""
+    course = client.post("/api/v2/courses", json={"name": "线性代数"}).json()
+    session_id = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()["id"]
+    same = '{"kind": "attempt_correct", "topic_hint": "矩阵求逆"}'
+
+    class AnswersThree:
+        mode, provider, model = "provider", "example", "example-model"
+        def __init__(self): self.calls = 0
+        def chat(self, *, messages, tools=()):
+            self.calls += 1
+            if self.calls <= 3:
+                yield ChatToolCalls((ToolCallRequest(f"e{self.calls}", "emit_evidence", same),))
+            else:
+                yield ChatFinal("三道都对。", "stop", self.provider, self.model, self.mode)
+
+    workspace(client).turns._responder = AnswersThree()
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "ev-3", "message": "再来三道矩阵求逆"})
+    archive = client.get(f"/api/v2/courses/{course['id']}/archive").json()
+    assert archive["evidence_count"] == 3, f"三次作答只落了 {archive['evidence_count']} 条证据"
+
+
+def test_version_conflict_leaves_the_plan_budget_for_the_retry(client):
+    """plan_update 每轮只有一次额度。冲突文案要求模型重读再重算，
+    这次失败就不能记进预算，否则重试直接撞「已用满」，计划永远改不动。"""
+    course = client.post("/api/v2/courses", json={"name": "概率论"}).json()
+    session_id = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()["id"]
+    items = '[{"due_date": "2026-08-01", "title": "第一章"}]'
+
+    class ConflictsThenRetries:
+        mode, provider, model = "provider", "example", "example-model"
+        def __init__(self): self.calls, self.results = 0, []
+        def chat(self, *, messages, tools=()):
+            self.results.extend(m.content for m in messages if m.role == "tool")
+            self.calls += 1
+            if self.calls == 1:  # 用过期版本号，必然冲突
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 7, "items": {items}}}'),))
+            elif self.calls == 2:  # 按提示重读后用正确版本号重算
+                yield ChatToolCalls((ToolCallRequest("p2", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                yield ChatFinal("计划排好了。", "stop", self.provider, self.model, self.mode)
+
+    responder = ConflictsThenRetries()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-retry", "message": "帮我排一份复习计划"})
+    assert not any("用满" in text for text in responder.results), f"重试被预算挡住了：{responder.results}"
+    assert client.get(f"/api/v2/courses/{course['id']}/plan").json()["plan"], "重算后计划仍未写入"
+
+
+def test_top_k_results_limits_what_search_materials_returns(tmp_path):
+    """RAG_TOP_K_RESULTS 是文档里写明会生效的旋钮，检索条数必须真的跟着它走。"""
+    data_dir = tmp_path / "data"
+    settings = Settings(
+        data_dir=data_dir, database_path=data_dir / "coursepilot.db", uploads_dir=data_dir / "materials",
+        text_provider="example", text_base_url="https://api.example.com/v1", text_api_key="",
+        text_model="example-model", enable_remote_llm=False, chunk_size=60, chunk_overlap=0, top_k_results=2,
+    )
+    with TestClient(create_app(settings=settings)) as client:
+        text = "".join(f"第{n}节讲梯度下降的步长选择，步长过大会震荡。" for n in range(1, 9))
+        session_id = _indexed_course_session(client, name="最优化", text=text)
+
+        class AnswersDirectly:
+            """不自己检索，这样引用只来自开场那次 seed 检索，条数可直接断言。"""
+            mode, provider, model = "provider", "example", "example-model"
+            def chat(self, *, messages, tools=()):
+                yield ChatFinal("见教材。", "stop", self.provider, self.model, self.mode)
+
+        workspace(client).turns._responder = AnswersDirectly()
+        body = client.post(f"/api/v2/sessions/{session_id}/turns",
+                           json={"client_request_id": "topk", "message": "步长怎么选"}).text
+        cited = {data["citation_id"] for name, data in _events(body) if name == "citation"}
+        assert 0 < len(cited) <= 2, f"top_k_results=2 却返回了 {len(cited)} 条引用"

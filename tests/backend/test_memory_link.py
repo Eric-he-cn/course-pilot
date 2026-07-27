@@ -122,9 +122,9 @@ def test_written_memory_comes_back_in_the_next_turn_prompt(client):
     assert "讲解先给摘要再展开。" in system
 
 
-def test_tool_result_never_reports_success_without_a_real_write(client):
-    """skill 激活会把工具集换成它声明的那套，memory_patch 可能整个不在里面。
-    无论放行还是拒绝，工具结果与用户读到的内容必须一致，不能出现静默失败。"""
+def test_memory_patch_survives_skill_activation(client):
+    """skill 激活会整体替换工具集，基座工具必须跟着一起进去——否则
+    「记住…」在任何 skill 执行期间都写不进去。工具结果也要与实际写入一致。"""
     _, session_id = _course_session(client, name="微积分", text="链式法则：先对外层求导，再乘内层导数。")
     events, _ = _patch_turn(
         client, session_id, request_id="mem-skill",
@@ -134,6 +134,18 @@ def test_tool_result_never_reports_success_without_a_real_write(client):
     patched = [data for name, data in events if name == "tool_result" and data["name"] == "memory_patch"]
     stored = "喜欢先看结论。" in client.get("/api/v2/memory").json()["content"]
     assert patched and patched[0]["ok"] == stored, f"工具结果与实际写入不符：{patched}，stored={stored}"
+    assert stored, f"flashcards 激活后 memory_patch 被拒了：{patched}"
+
+
+def test_patch_keeps_backslashes_verbatim(tmp_path):
+    """记忆里写 LaTeX 是常态。覆盖既有区块时内容是替换文本，
+    \\d、\\1 这类序列必须原样落盘，不能被当成分组引用。"""
+    from modules.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path)
+    store.patch(scope="user", section="notes", content="先写个占位。")
+    store.patch(scope="user", section="notes", content=r"梯度记作 \delta，第 \1 章讲过。")
+    assert r"\delta" in store.read_user() and r"\1" in store.read_user()
 
 
 def test_prompt_requires_calling_memory_patch_when_asked_to_remember():

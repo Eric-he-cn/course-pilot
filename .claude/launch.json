@@ -10,8 +10,8 @@
     {
       "name": "coursepilot-e2e",
       "runtimeExecutable": "env",
-      "runtimeArgs": ["STORAGE_DATA_DIR=data/e2e", "./scripts/dev.sh"],
-      "port": 5173
+      "runtimeArgs": ["CP_PORT_OFFSET=1", "STORAGE_DATA_DIR=testdata/e2e", "./scripts/dev.sh"],
+      "port": 5174
     }
   ]
 }

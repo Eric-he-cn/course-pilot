@@ -293,6 +293,7 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), compactions=CompactionStore(store), skills=skills, memory=memory,
         web=web, notes=notes,
         trace=TraceWriter(settings.data_dir / "traces"),
+        search_limit=settings.top_k_results,
         history_token_budget=settings.agent_history_token_budget,
         context_char_limit=settings.agent_context_char_limit,
         compact_threshold_ratio=settings.agent_compact_threshold_ratio,

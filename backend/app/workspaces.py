@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 
 from core.identity import workspace_id
 from core.settings import Settings
@@ -63,7 +62,3 @@ class Workspaces:
                 except Exception: pass
             self._cache.clear()
         self._shared.close()
-
-
-def workspace_root(settings: Settings) -> Path:
-    return settings.data_dir / "users"

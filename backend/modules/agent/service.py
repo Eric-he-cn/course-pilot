@@ -21,7 +21,7 @@ from contracts.web import WebSearchPort
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
 from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages, message_chars
 from .skills import SkillRegistry
-from .tools import MAIN, MAIN_PROFILE, CitationRegistry, ToolExecutor, cited_only, profile_for_skill, specs_for
+from .tools import MAIN, MAIN_PROFILE, SEARCH_LIMIT, CitationRegistry, ToolExecutor, cited_only, is_repeatable, profile_for_skill, specs_for
 from .trace import TraceWriter
 
 
@@ -142,6 +142,7 @@ class TurnService:
         trace: TraceWriter | None = None,
         select_responder: Callable[[str | None, str | None], AgentChatPort] | None = None,
         max_tool_rounds: int = 10,
+        search_limit: int = SEARCH_LIMIT,
         history_token_budget: int = 128_000,
         context_char_limit: int = 512_000,
         compact_threshold_ratio: float = 0.7,
@@ -158,7 +159,7 @@ class TurnService:
         self._executor = ToolExecutor(
             knowledge=knowledge, plans=plans, plan_writer=plan_writer, archive=archive,
             evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
-            web=web, notes=notes,
+            web=web, notes=notes, search_limit=search_limit,
         )
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
@@ -409,8 +410,9 @@ class TurnService:
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps(arguments)),)))
                     messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{auto_skill.body}", tool_call_id=call_id))
                     base_segments = base_segments + [("skill 规程", len(auto_skill.body))]
-                    active_skill, allowed_tools = auto_skill.name, auto_skill.allowed_tools
-                    capabilities = profile_for_skill(auto_skill.allowed_tools).capabilities
+                    skill_profile = profile_for_skill(auto_skill.allowed_tools)
+                    active_skill, allowed_tools = auto_skill.name, skill_profile.tools
+                    capabilities = skill_profile.capabilities
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                     trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
                 try:
@@ -493,8 +495,9 @@ class TurnService:
                                 call_started = time.monotonic()
                                 # 同一查询在一轮里重复调用直接复用上次结果，既不计预算也不再发请求。
                                 # 该挡的是原地打转；查得多但每次角度不同是正常的。
+                                # 只对读工具生效——写工具参数相同也是两次不同的事件。
                                 repeat_key = (call.name, _args_key(call.arguments))
-                                cached = tool_results.get(repeat_key)
+                                cached = tool_results.get(repeat_key) if is_repeatable(call.name) else None
                                 if cached is not None:
                                     result = replace(cached, new_citations=[], summary=f"{cached.summary}（与本轮上一次相同，已复用）")
                                 else:
@@ -517,8 +520,9 @@ class TurnService:
                                     active_skill = result.activated_skill
                                     skill = self._skills.get(active_skill)
                                     if skill:
-                                        allowed_tools = skill.allowed_tools
-                                        capabilities = profile_for_skill(skill.allowed_tools).capabilities
+                                        skill_profile = profile_for_skill(skill.allowed_tools)
+                                        allowed_tools = skill_profile.tools
+                                        capabilities = skill_profile.capabilities
                                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                                     trace_record["skill"] = {"name": active_skill, "content_hash": skill.content_hash if skill else None, "activation": "model"}
                                 for citation in result.new_citations:
