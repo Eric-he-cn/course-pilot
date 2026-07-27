@@ -371,6 +371,7 @@ function ChatView({ session, messages, workspaceName, scope, turnResolution, con
     event?.preventDefault(); const text = draft.trim()
     if (!text || busy || uploading) return
     const ids = attachments.map(item => item.id)
+    following.current = true  // 自己刚发的消息一定要看得见，哪怕之前翻上去过
     setDraft(''); setAttachments([]); await onSend(text, ids)
   }
   const scroller = useRef<HTMLDivElement>(null)

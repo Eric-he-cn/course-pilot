@@ -328,14 +328,15 @@ class KnowledgeService:
             if path is None or not path.is_file():
                 raise ValueError("教材文件不存在")
             segments = extract_pages(path, material.filename)
-            if self._needs_ocr(material, segments, path):
+            scanned_pdf = self._is_scanned_pdf(material, path)
+            if scanned_pdf and not material.ocr_approved:
                 # 图片版 PDF 走不通普通提取。停在这里等用户看过账单再确认，不擅自花钱。
                 self._repository.set_material_status(material.id, "needs_ocr")
                 return self._repository.update_job(
                     job.id, status="failed", stage="needs_ocr", progress=100,
                     error_message="这份 PDF 没有文字层（扫描版）。OCR 要花模型额度，先看估算再确认。",
                 )
-            if material.ocr_approved and not any(text for _page, text in segments):
+            if scanned_pdf and material.ocr_approved:
                 segments = self._ocr_pages(job, path)
             self._repository.update_job(job.id, status="running", stage="chunking", progress=40)
             chunks = [(page, piece) for page, text in segments for piece in self._chunk(text)]
@@ -373,13 +374,12 @@ class KnowledgeService:
                 return candidates
         return extract_candidates([(page, content) for page, content in chunks])
 
-    def _needs_ocr(self, material: Material, segments: list[tuple[int | None, str]], path: Path) -> bool:
-        """判定要不要 OCR：只对没批准过的 PDF、且确实提不出文字时成立。"""
-        if material.ocr_approved or Path(material.filename).suffix.lower() != ".pdf":
+    def _is_scanned_pdf(self, material: Material, path: Path) -> bool:
+        """扫描版判定只认文字层的页中位数（见 scanned.TEXT_LAYER_MIN_CHARS）。
+        「提出任意文字就算文字版」会漏掉带页码或文字封面的扫描件。"""
+        if Path(material.filename).suffix.lower() != ".pdf" or self._transcriber is None:
             return False
-        if any(text for _page, text in segments):
-            return False
-        return self._transcriber is not None and scanned.probe_text_layer(path).is_scanned
+        return scanned.probe_text_layer(path).is_scanned
 
     def _ocr_pages(self, job: Job, path: Path) -> list[tuple[int | None, str]]:
         def transcribe(image: bytes) -> str:

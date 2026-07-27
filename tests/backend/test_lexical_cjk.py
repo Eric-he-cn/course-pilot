@@ -77,7 +77,18 @@ def test_cjk_runs_are_split_into_trigrams():
     """英文词整体保留；中文长串切成三字滑窗；不足三字的原样留给 LIKE 兜底。"""
     assert KnowledgeRepository._fts_terms(["链式法则"]) == ["链式法", "式法则"]
     assert KnowledgeRepository._fts_terms(["gradient"]) == ["gradient"]
-    assert KnowledgeRepository._fts_terms(["步长"]) == ["步长"]
+    # 不足三字的词在 trigram 索引里注定 0 命中，剔掉交给 LIKE 兜底，中英同理。
+    assert KnowledgeRepository._fts_terms(["步长"]) == []
+    assert KnowledgeRepository._fts_terms(["AI", "极限"]) == []
+    assert KnowledgeRepository._fts_terms(["AI", "梯度下降"]) == ["梯度下", "度下降"]
+
+
+def test_short_only_query_falls_back_instead_of_erroring(repository):
+    """全是短词时 FTS 表达式为空。这一路没得查，但检索本身不能因此报错或返回空。"""
+    hits = repository.search(course_id=repository.course_id, query="极限 AI", limit=5)
+    assert isinstance(hits, list)
+    steps = repository.search(course_id=repository.course_id, query="步长", limit=5)
+    assert steps and "步长" in steps[0].content, "两字词该由 LIKE 兜底命中"
 
 
 def test_migration_rebuilds_the_index_from_existing_chunks(tmp_path):

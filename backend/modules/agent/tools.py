@@ -431,7 +431,7 @@ class ToolExecutor:
             if not isinstance(parsed, dict):
                 raise ValueError("arguments 必须是 JSON 对象")
         except (json.JSONDecodeError, ValueError):
-            return ToolOutcome(text="工具参数不是合法的 JSON 对象，请修正后重试。", ok=False, summary="参数无效")
+            return ToolOutcome(text="工具参数不是合法的 JSON 对象，请修正后重试。", ok=False, summary="参数无效", reason="invalid_args")
         try:
             if name == "search_materials":
                 return self._search(scope, parsed, registry)
@@ -544,7 +544,7 @@ class ToolExecutor:
     def _search(self, scope: ResolvedKnowledgeScope, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
         query = str(parsed.get("query") or "").strip()
         if not query:
-            return ToolOutcome(text="search_materials 需要非空的 query 参数。", ok=False, summary="缺少查询词")
+            return ToolOutcome(text="search_materials 需要非空的 query 参数。", ok=False, summary="缺少查询词", reason="invalid_args")
         hits = self._knowledge.search(scope=scope, query=query, limit=self._search_limit)
         if not hits:
             return ToolOutcome(text="（本课程资料里这次没有匹配到相关内容，教材已索引；可换关键词或换个说法再查一次。确实没有就按通用知识回答，并说明来源不是教材）", ok=True, summary=f"检索「{_clip(query, 24)}」未命中")

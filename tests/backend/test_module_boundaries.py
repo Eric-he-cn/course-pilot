@@ -18,17 +18,20 @@ LEGACY_CROSSINGS = {
     ("agent", "memory", "store"),
     ("agent", "notes", "store"),
 }
-CROSS_IMPORT = re.compile(r"^\s*from\s+modules\.([a-z_]+)\.([a-z_]+)\s+import\b", re.MULTILINE)
+# 三种写法都要认：from modules.X.Y import Z、from modules.X import Y、import modules.X.Y
+CROSS_IMPORT = re.compile(
+    r"^\s*(?:from|import)\s+modules\.([a-z_]+)(?:\.([a-z_]+))?(?:\s+import\s+(.+))?$", re.MULTILINE)
 
 
 def test_feature_modules_only_reach_each_other_through_api():
     modules = BACKEND / "modules"
     for source in modules.rglob("*.py"):
         own = source.relative_to(modules).parts[0]
-        for other, submodule in CROSS_IMPORT.findall(source.read_text(encoding="utf-8")):
-            if other == own or submodule == "api":
+        for other, submodule, imported in CROSS_IMPORT.findall(source.read_text(encoding="utf-8")):
+            reached = submodule or imported.split(",")[0].strip()
+            if other == own or reached == "api":
                 continue
-            assert (own, other, submodule) in LEGACY_CROSSINGS, (
+            assert (own, other, reached) in LEGACY_CROSSINGS, (
                 f"{source.relative_to(BACKEND)} 越过 modules.{other}.api 直接 import 了 "
                 f"modules.{other}.{submodule}；请在 {other}/api.py 里补 Port"
             )

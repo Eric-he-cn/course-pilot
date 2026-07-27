@@ -188,3 +188,32 @@ def test_one_failing_page_does_not_lose_the_whole_book(client, tmp_path):
     job = _wait_for_job(client, client.post(f"/api/v2/materials/{material['id']}/ocr").json()["id"])
     assert job["status"] == "completed"
     assert client.post(f"/api/v2/courses/{course['id']}/knowledge/search", json={"query": "调度策略"}).json()
+
+
+def _mixed_pdf(tmp_path, *, scanned_pages: int = 4):
+    """扫描件夹一页有文字层的：封面、版权页、或每页都嵌了页码，现实里很常见。"""
+    from pypdf import PdfReader, PdfWriter
+    from test_knowledge_service import _pdf_with_pages
+
+    writer = PdfWriter()
+    for page in PdfReader(str(_scanned_pdf(tmp_path, scanned_pages))).pages:
+        writer.add_page(page)
+    text_pdf = tmp_path / "cover.pdf"
+    text_pdf.write_bytes(_pdf_with_pages(["Preface"]))
+    writer.add_page(PdfReader(str(text_pdf)).pages[0])
+    path = tmp_path / "mixed.pdf"
+    writer.write(str(path))
+    return path
+
+
+def test_one_text_page_does_not_cancel_the_scan_detection(client, tmp_path):
+    """判定看文字层的页中位数，不看「有没有任意文字」。夹一页封面就放行的话，
+    整本扫描件会被当成文字版索引成空的，用户后面什么都查不到。"""
+    workspace(client).knowledge._transcriber = FakeTranscriber()
+    course = client.post("/api/v2/courses", json={"name": "操作系统"}).json()
+    material = client.post(
+        f"/api/v2/courses/{course['id']}/materials",
+        files={"file": ("扫描带封面.pdf", _mixed_pdf(tmp_path).read_bytes(), "application/pdf")},
+    ).json()
+    job = _wait_for_job(client, client.post(f"/api/v2/materials/{material['id']}/index").json()["id"])
+    assert job["stage"] == "needs_ocr", f"夹一页文字就漏判成文字版：{job}"

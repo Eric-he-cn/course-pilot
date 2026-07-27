@@ -262,11 +262,13 @@ class KnowledgeRepository:
         # OR + bm25：混合语言查询里注定缺席的词（如中文串之于英文书）不应否决整次检索。
         fts_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in self._fts_terms(tokens))
         with self._store.read() as conn:
+            rows = []
             try:
-                rows = conn.execute(
-                    "SELECT c.*, m.filename, bm25(chunks_fts) AS rank FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.chunk_id JOIN materials m ON m.id = c.material_id WHERE chunks_fts.course_id = ? AND chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (course_id, fts_query, limit),
-                ).fetchall()
+                if fts_query:  # 全是短词时这一路没得查，直接落兜底
+                    rows = conn.execute(
+                        "SELECT c.*, m.filename, bm25(chunks_fts) AS rank FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.chunk_id JOIN materials m ON m.id = c.material_id WHERE chunks_fts.course_id = ? AND chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+                        (course_id, fts_query, limit),
+                    ).fetchall()
             except Exception:
                 rows = []
             if not rows:
@@ -299,10 +301,14 @@ class KnowledgeRepository:
     @staticmethod
     def _fts_terms(tokens: list[str]) -> list[str]:
         """trigram 索引只存三字滑窗，查询侧也要同样切开：整串「链式法则怎么用」
-        当短语匹配，命中不了只写着「链式法则」的段落。不足三字的留给 LIKE 兜底。"""
+        当短语匹配，命中不了只写着「链式法则」的段落。
+        不足三字的词（中文的「极限」、英文的 AI/ML）在 trigram 索引里注定 0 命中，
+        直接剔掉，交给 LIKE 兜底，别让它们白占一个 OR 分支。"""
         terms: list[str] = []
         for token in tokens:
-            if _CJK.match(token) and len(token) > _FTS_GRAM:
+            if len(token) < _FTS_GRAM:
+                continue
+            if _CJK.match(token):
                 terms.extend(token[index:index + _FTS_GRAM] for index in range(len(token) - _FTS_GRAM + 1))
             else:
                 terms.append(token)
