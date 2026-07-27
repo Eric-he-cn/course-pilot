@@ -154,7 +154,9 @@ def test_wiki_requires_explicit_course_flag_and_keeps_rag_independent(env):
     env.run_job(env.service.enqueue_index(material_id=material.id).id)
     with pytest.raises(KnowledgeFeatureDisabledError):
         env.service.enqueue_wiki_build(material_id=material.id)
-    assert len(env.service.search_course(course_id=env.math.id, query="极限")) == 1
+    # 两块都含「极限」：标题那块，以及句中提到它的「连续性建立在极限之上」。
+    # 这里要的是「Wiki 关掉不影响 RAG」，检索本身照常返回全部命中。
+    assert len(env.service.search_course(course_id=env.math.id, query="极限")) == 2
 
     env.wiki_enabled = True
     job = env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)

@@ -141,6 +141,15 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
     # 扫描版 PDF 的 OCR 批准。OCR 要花模型额度，所以要有一条「用户看过估算并同意」的记录；
     # 留在库里，重新索引就不必再问一次。
     (18, "ALTER TABLE materials ADD COLUMN ocr_approved INTEGER NOT NULL DEFAULT 0;"),
+    # 默认的 unicode61 把整段中文当成一个 token，中文这一路的 BM25 等于没在工作。
+    # trigram 按三字滑窗切，中英文都能命中；索引从 chunks 重建，不必重新切块或嵌入。
+    (19, """
+        DROP TABLE IF EXISTS chunks_fts;
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            chunk_id UNINDEXED, course_id UNINDEXED, content, tokenize='trigram'
+        );
+        INSERT INTO chunks_fts(chunk_id, course_id, content) SELECT id, course_id, content FROM chunks;
+    """),
 )
 
 class SQLiteStore:

@@ -11,6 +11,10 @@ from .concepts import concept_id_for
 from .models import Chunk, Job, Material
 
 
+_CJK = re.compile(r"[一-鿿]")
+# 与 chunks_fts 的 trigram 分词器保持一致（core/store.py 迁移 19）。
+_FTS_GRAM = 3
+
 _MATERIAL_SELECT = """
     SELECT m.*,
         (SELECT count(*) FROM chunks c WHERE c.material_id = m.id) AS chunk_count,
@@ -256,7 +260,7 @@ class KnowledgeRepository:
             return []
         # Quote tokens to avoid FTS syntax injection.  FTS is an optimization; LIKE remains the deterministic fallback.
         # OR + bm25：混合语言查询里注定缺席的词（如中文串之于英文书）不应否决整次检索。
-        fts_query = " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
+        fts_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in self._fts_terms(tokens))
         with self._store.read() as conn:
             try:
                 rows = conn.execute(
@@ -291,6 +295,18 @@ class KnowledgeRepository:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _fts_terms(tokens: list[str]) -> list[str]:
+        """trigram 索引只存三字滑窗，查询侧也要同样切开：整串「链式法则怎么用」
+        当短语匹配，命中不了只写着「链式法则」的段落。不足三字的留给 LIKE 兜底。"""
+        terms: list[str] = []
+        for token in tokens:
+            if _CJK.match(token) and len(token) > _FTS_GRAM:
+                terms.extend(token[index:index + _FTS_GRAM] for index in range(len(token) - _FTS_GRAM + 1))
+            else:
+                terms.append(token)
+        return list(dict.fromkeys(terms))
 
     @staticmethod
     def _fallback_terms(tokens: list[str]) -> list[str]:
