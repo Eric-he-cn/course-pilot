@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import threading
 from pathlib import Path
 
@@ -36,6 +37,10 @@ class MemoryStore:
 
     def _course_path(self, course_id: str) -> Path:
         return self._data_dir / "courses" / course_id / "memory.md"
+
+    def delete_course(self, *, course_id: str) -> None:
+        """删课程时由组装根调用。目录布局是本模块自己的事，别处不该知道。"""
+        shutil.rmtree(self._course_path(course_id).parent, ignore_errors=True)
 
     def read_user(self) -> str:
         return self._read(self._user_path())

@@ -191,3 +191,23 @@ def test_deleting_missing_ids_returns_404(client):
     assert client.delete("/api/v2/sessions/session_missing").status_code == 404
     assert client.delete("/api/v2/materials/material_missing").status_code == 404
     assert client.delete("/api/v2/courses/course_missing").status_code == 404
+
+
+def test_deleting_a_course_takes_its_files_with_it(client, tmp_path):
+    """笔记、Wiki 页、课程记忆是用户的私人内容，删课程后不该静默留在磁盘上。
+    这三处的目录布局各归各的模块，组装根只负责把 delete_course 串起来叫一遍。"""
+    course_id = client.post("/api/v2/courses", json={"name": "线性代数"}).json()["id"]
+    application = workspace(client)
+    application.notes.write(course_id=course_id, title="卡片", content="秩等于主元个数")
+    application.memory.patch(scope="course", course_id=course_id, section="focus", content="期末只考前四章")
+    wiki = application.knowledge._wiki
+    wiki.write(course_id=course_id, concept_id="rank", concept_name="秩", body="正文",
+               source_hash="h", source_refs=[], updated_at="2026-07-27T00:00:00+00:00")
+
+    written = [application.notes._course_dir(course_id), wiki._course_dir(course_id),
+               application.memory._course_path(course_id).parent]
+    assert all(path.exists() for path in written), f"前置写入没落盘：{written}"
+
+    client.delete(f"/api/v2/courses/{course_id}")
+    leftover = [str(path) for path in written if path.exists()]
+    assert not leftover, f"删课程后这些目录还在：{leftover}"

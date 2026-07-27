@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,10 @@ class NoteStore:
 
     def _course_dir(self, course_id: str) -> Path:
         return self._root / _safe_component(course_id)
+
+    def delete_course(self, *, course_id: str) -> None:
+        """删课程时由组装根调用。目录布局是本模块自己的事，别处不该知道。"""
+        shutil.rmtree(self._course_dir(course_id), ignore_errors=True)
 
     def _path(self, *, course_id: str, title: str) -> Path:
         """落点必须仍在本课程笔记目录内，且不能是符号链接。"""

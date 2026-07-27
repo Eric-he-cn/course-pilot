@@ -240,12 +240,15 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     store = SQLiteStore(settings.database_path)
     store.migrate()
     knowledge_repository, session_repository = KnowledgeRepository(store), SessionRepository(store)
+    # 三个落盘 store 要先于 courses 建好：删课程要连带清掉它们的目录。
+    notes, memory, wiki_store = NoteStore(settings.data_dir), MemoryStore(settings.data_dir), WikiStore(settings.data_dir)
     courses = CourseService(
-        CourseRepository(store), data_dir=settings.data_dir,
+        CourseRepository(store),
         # 删课程要连带清掉会话与教材，清理动作由各自的仓库提供，courses 只编排顺序。
         purge_sessions=session_repository.delete_course_sessions,
         purge_materials=knowledge_repository.delete_course_materials,
         purge_material=knowledge_repository.delete_material,
+        purge_course_files=(notes.delete_course, wiki_store.delete_course, memory.delete_course),
     )
     knowledge = KnowledgeService(
         repository=knowledge_repository,
@@ -255,7 +258,7 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         reranker=reranker,
         # 扫描版 PDF 的逐页 OCR 复用对话里那个 vision 槽位，不额外配一份
         transcriber=vision,
-        wiki_store=WikiStore(settings.data_dir),
+        wiki_store=wiki_store,
         responder=llm,
     )
     resolver = CourseResolver(courses, classifier=classifier)
@@ -270,8 +273,6 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         workers=settings.background_job_workers,
         queue_capacity=settings.background_job_queue_capacity,
     )
-    notes = NoteStore(settings.data_dir)
-    memory = MemoryStore(settings.data_dir)
     learning = LearningService(LearningRepository(store))
     planning = PlanningService(PlanningRepository(store), concept_exists=knowledge.concept_exists)
     # 内建 skill 目录随代码走（架构 §6）；导入的 skill 存库，启用后并入同一注册表。

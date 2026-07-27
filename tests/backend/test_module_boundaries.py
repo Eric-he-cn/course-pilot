@@ -8,14 +8,30 @@ from contracts.knowledge import KnowledgeSearchPort
 BACKEND = Path(__file__).resolve().parents[2] / "backend"
 
 
-def test_feature_modules_do_not_import_other_feature_internals():
+# 模块之间只能通过 api 子模块往来，那里放的是 Port。默认拒绝，例外必须写在这里，
+# 这样新增的越界会被挡下，而不是像按名字列黑名单那样只挡住恰好想到的两个。
+# 下面四条是历史遗留：agent 直接拿了别的模块的具体存储类，其中前两个内部是裸 SQL。
+# 它们应当收敛成 Port，在那之前先冻在这里，不让同类越界再增加。
+LEGACY_CROSSINGS = {
+    ("agent", "sessions", "artifacts"),
+    ("agent", "sessions", "compactions"),
+    ("agent", "memory", "store"),
+    ("agent", "notes", "store"),
+}
+CROSS_IMPORT = re.compile(r"^\s*from\s+modules\.([a-z_]+)\.([a-z_]+)\s+import\b", re.MULTILINE)
+
+
+def test_feature_modules_only_reach_each_other_through_api():
     modules = BACKEND / "modules"
-    for feature_dir in (path for path in modules.iterdir() if path.is_dir()):
-        for source in feature_dir.glob("*.py"):
-            text = source.read_text(encoding="utf-8")
-            for other in (path.name for path in modules.iterdir() if path.is_dir() and path.name != feature_dir.name):
-                assert f"modules.{other}.repository" not in text, f"{source} crosses into {other} repository"
-                assert f"modules.{other}.service" not in text, f"{source} crosses into {other} service"
+    for source in modules.rglob("*.py"):
+        own = source.relative_to(modules).parts[0]
+        for other, submodule in CROSS_IMPORT.findall(source.read_text(encoding="utf-8")):
+            if other == own or submodule == "api":
+                continue
+            assert (own, other, submodule) in LEGACY_CROSSINGS, (
+                f"{source.relative_to(BACKEND)} 越过 modules.{other}.api 直接 import 了 "
+                f"modules.{other}.{submodule}；请在 {other}/api.py 里补 Port"
+            )
 
 
 def test_lower_layers_do_not_import_upward():

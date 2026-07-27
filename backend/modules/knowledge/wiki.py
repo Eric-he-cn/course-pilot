@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -142,9 +143,8 @@ class WikiStore:
         return removed
 
     def delete_course(self, *, course_id: str) -> None:
-        directory = self._course_dir(course_id)
-        for path in directory.glob("*.md") if directory.is_dir() else []:
-            path.unlink(missing_ok=True)
+        """删课程时由组装根调用。目录布局是本模块自己的事，别处不该知道。"""
+        shutil.rmtree(self._course_dir(course_id), ignore_errors=True)
 
 
 def _evidence(hits: Iterable[KnowledgeHit]) -> tuple[str, list[str], str]:
