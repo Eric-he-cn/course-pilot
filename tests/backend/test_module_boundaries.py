@@ -10,15 +10,7 @@ BACKEND = Path(__file__).resolve().parents[2] / "backend"
 
 # 模块之间只能通过 api 子模块往来，那里放的是 Port。默认拒绝，例外必须写在这里，
 # 这样新增的越界会被挡下，而不是像按名字列黑名单那样只挡住恰好想到的两个。
-# 下面四条是历史遗留：agent 直接拿了别的模块的具体存储类，其中前两个内部是裸 SQL。
-# 它们应当收敛成 Port，在那之前先冻在这里，不让同类越界再增加。
-LEGACY_CROSSINGS = {
-    ("agent", "sessions", "artifacts"),
-    ("agent", "sessions", "compactions"),
-    ("agent", "memory", "store"),
-    ("agent", "notes", "store"),
-}
-# 三种写法都要认：from modules.X.Y import Z、from modules.X import Y、import modules.X.Y
+LEGACY_CROSSINGS: set[tuple[str, str, str]] = set()
 CROSS_IMPORT = re.compile(
     r"^\s*(?:from|import)\s+modules\.([a-z_]+)(?:\.([a-z_]+))?(?:\s+import\s+(.+))?$", re.MULTILINE)
 

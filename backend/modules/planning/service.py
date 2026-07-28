@@ -37,6 +37,9 @@ class PlanningService:
         today = date.today().isoformat()
         cleaned = self._validate(course_id=course_id, items=items, today=today)
         timestamp = utc_now()
+        # SQL 留在 service 这一处是有意的：版本检查、保留过去条目、算 diff、写改动记录
+        # 必须在同一个事务里，而这些规则本身就是业务规则。拆成一串收 connection 的
+        # 仓储方法只是把语句搬走，事务边界与规则还在这里，读起来反而更绕。
         with self._repository.write() as connection:
             row = connection.execute("SELECT * FROM plans WHERE course_id = ? AND status = 'active'", (course_id,)).fetchone()
             current_version = row["version"] if row is not None else 0

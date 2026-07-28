@@ -91,11 +91,6 @@ def test_delete_session_removes_messages_turns_and_artifacts(client):
     _compact(client, session["id"])
     application = workspace(client)
     ArtifactStore(application.store).append(course_id=course["id"], session_id=session["id"], kind="practice", visibility="user_visible", payload={"practice_id": "p1"})
-    with application.store.write() as connection:
-        connection.execute(
-            "INSERT INTO channel_bindings(provider, external_user_id, owner_id, active_session_id, created_at, updated_at)"
-            " VALUES ('demo', 'u1', 'local-web', ?, 'now', 'now')", (session["id"],),
-        )
     assert _count(client, "SELECT count(*) FROM messages WHERE session_id = ?", (session["id"],)) == 2
 
     assert client.delete(f"/api/v2/sessions/{session['id']}").status_code == 204
@@ -105,8 +100,6 @@ def test_delete_session_removes_messages_turns_and_artifacts(client):
     for table in ("messages", "turn_requests", "attachments", "artifacts", "session_compactions"):
         assert _count(client, f"SELECT count(*) FROM {table} WHERE session_id = ?", (session["id"],)) == 0
     assert _count(client, "SELECT count(*) FROM turn_course_context") == 0
-    # 渠道绑定只清指针，绑定关系本身留着。
-    assert _count(client, "SELECT count(*) FROM channel_bindings WHERE active_session_id IS NULL") == 1
     # 课程不受连带影响。
     assert client.get("/api/v2/courses").json()[0]["id"] == course["id"]
 

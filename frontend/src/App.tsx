@@ -23,7 +23,7 @@ const TOOL_LABELS: Record<string, string> = {
   get_archive: '学习档案', concept_search: '概念目录', emit_evidence: '记录学习证据', memory_patch: '更新记忆',
   use_skill: '加载能力', artifact_read: '读取练习', artifact_append: '保存练习',
   web_search: '联网检索', web_fetch: '读取网页', note_write: '写入笔记', note_read: '读取笔记',
-  calculator: '计算',
+  calculator: '计算', ask_user: '请你选择',
 }
 
 const TOOL_CAPABILITY_HINT: Record<string, string> = {
@@ -32,7 +32,7 @@ const TOOL_CAPABILITY_HINT: Record<string, string> = {
   emit_evidence: 'write_state', plan_update: 'write_state', memory_patch: 'write_state',
   artifact_append: 'write_state', note_write: 'write_note',
   web_search: 'network', web_fetch: 'network',
-  calculator: 'free', use_skill: 'free', artifact_read: 'free',
+  calculator: 'free', use_skill: 'free', artifact_read: 'free', ask_user: 'free',
 }
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
@@ -324,6 +324,10 @@ export default function App() {
             // 用户会把质量完全不同的回答当成正常回答。
             patchMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: `远端模型 ${payload.provider ?? ''} 不可用，本次已切换到本地兜底模型` } : item))
           }
+          if (payload.type === 'choices' && payload.options?.length) {
+            const options = payload.options
+            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, choices: options } : item))
+          }
           if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice('回答达到长度上限，内容可能不完整。')
         }, attachmentIds, controller.signal)
           if (stoppedRef.current) {
@@ -424,7 +428,7 @@ function ChatView({ session, messages, workspaceName, scope, modelNote, turnReso
     <div className="messages" aria-live="polite" ref={scroller}
       onScroll={event => { const box = event.currentTarget; following.current = box.scrollHeight - box.scrollTop - box.clientHeight < 120 }}>
       {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式每轮按问题解析课程。直接说出课程名最准。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
-      {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} modelNote={modelNote} showResolution={!isCourseScope}
+      {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} modelNote={modelNote} onChoose={busy ? undefined : text => void onSend(text, [])} showResolution={!isCourseScope}
         onRetry={busy ? undefined : (() => {
           // 重发这条回答对应的那句提问——往前找最近的一条 user 消息
           const asked = [...list.slice(0, index)].reverse().find(item => item.role === 'user')
@@ -947,19 +951,20 @@ function CitationChip({ item, fallbackNumber, onOpen }: { item: Citation; fallba
   return <button onClick={() => onOpen(item)}>{label}</button>
 }
 
-function MessageCard({ message, onCitation, showResolution, onRetry, modelNote }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void; modelNote?: string }) {
+function MessageCard({ message, onCitation, showResolution, onRetry, modelNote, onChoose }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void; modelNote?: string; onChoose?: (text: string) => void }) {
   if (message.role === 'user') return <article className="message user-message"><div>{message.content}</div></article>
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
   return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
     {message.status === 'stopped' && <div className="degraded-notice"><span>已停止。上面的内容没有存进会话记录。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}
-    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}</article>
+    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}{message.choices && message.choices.length > 0 && onChoose && <div className="choices">{message.choices.map(option => <button type="button" className="choice" key={option} onClick={() => onChoose(option)}>{option}</button>)}</div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
   const [tab, setTab] = useState<'rag' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [searched, setSearched] = useState(''); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
   const [ragBackend, setRagBackend] = useState<string>('')
+  const polling = useRef(false)
   const [ocrTarget, setOcrTarget] = useState<string>(''); const [ocrEstimate, setOcrEstimate] = useState<OcrEstimate | null>(null); const [ocrRunning, setOcrRunning] = useState(false)
   const reload = async () => { try { setMaterials(await api.materials(course.id)) } catch (error) { onError(errorText(error)) } }
   const removeMaterial = async (materialId: string) => {
@@ -969,7 +974,29 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   const indexedMaterials = materials.filter(item => (item.index_status ?? item.status) === 'indexed')
   useEffect(() => { api.health().then(payload => setRagBackend(((payload.rag as Record<string, unknown>)?.backend as string) ?? '')).catch(() => {}) }, [])
   useEffect(() => { setMaterials([]); setJobs({}); setResults([]); setSearched(''); void reload() }, [course.id])
-  useEffect(() => { const active = Object.values(jobs).some(job => ['queued', 'running', 'pending'].includes(job.status)); if (!active) return; const interval = window.setInterval(() => { void (async () => { try { const entries = await Promise.all(Object.entries(jobs).map(async ([id]) => [id, await api.job(id)] as const)); setJobs(Object.fromEntries(entries)); await reload() } catch (error) { onError(errorText(error)) } })() }, 1500); return () => window.clearInterval(interval) }, [jobs])
+  // 只轮询未终态的 job：jobs 只增不删，把已完成的也一起问一遍是白跑。
+  // polling 挡重入——一轮超过 1.5s 时两轮会重叠，慢的那轮回来会覆盖掉新结果。
+  useEffect(() => {
+    const active = Object.values(jobs).filter(job => job.status === 'queued' || job.status === 'running')
+    if (!active.length) return
+    const interval = window.setInterval(() => {
+      if (polling.current) return
+      polling.current = true
+      // 看门狗：请求永不 settle（代理挂住、休眠唤醒）时 finally 不会执行，
+      // 锁就永久卡住、轮询彻底停摆。到点无条件放锁，最坏是多跑一轮。
+      const unlock = window.setTimeout(() => { polling.current = false }, 10_000)
+      void (async () => {
+        try {
+          const fresh = await Promise.all(active.map(job => api.job(job.id)))
+          // 合并而非整表替换：这一轮等待期间用户可能又发起了新的索引任务。
+          setJobs(current => ({ ...current, ...Object.fromEntries(fresh.map(job => [job.id, job])) }))
+          await reload()
+        } catch (error) { onError(errorText(error)) }
+        finally { window.clearTimeout(unlock); polling.current = false }
+      })()
+    }, 1500)
+    return () => window.clearInterval(interval)
+  }, [jobs])
   async function upload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; if (file.size > MAX_MATERIAL_BYTES) { onError('教材文件超过 100 MiB 上限。'); return } setLoading(true); try { const material = await api.uploadMaterial(course.id, file); setMaterials(current => [material, ...current]); const job = await api.indexMaterial(material.id); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } finally { setLoading(false); event.target.value = '' } }
   async function toggleWiki() { try { onCourseChange(await api.updateCourse(course.id, { wiki_enabled: !course.wiki_enabled })) } catch (error) { onError(errorText(error)) } }
   async function reindex(materialId: string) { try { const job = await api.indexMaterial(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
@@ -992,7 +1019,8 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课的教材、索引与检索都在这里。换课程用左栏。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>课程笔记</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
     {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、Word、PowerPoint、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><p className="upload-hint">扫描版（图片版）PDF 也能传：识别出没有文字层时会先估算 OCR 要花多少额度，等你确认再开始转录。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{searched && <article className="card results-card"><h2>检索结果</h2>{results.length === 0 && <div className="empty-inline"><b>没有匹配到内容</b><p>「{searched}」在这门课的资料里找不到足够相关的片段。重排分低于阈值的片段会被丢掉，所以这里宁可返回空，也不给你一堆不相关的原文。换个说法或换个更具体的术语再试。</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? '这份 PDF'} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : <><article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料生成知识页：按这份教材抽出的概念逐个写，每页只用检索到的原文。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
-      const wikiJob = Object.values(jobs).find(item => item.material_id === material.id && item.type === 'wiki')
+      // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
+      const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
       return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? '未命名资料'}</b><small>{wikiJob ? (STAGE_LABELS[String(wikiJob.stage ?? wikiJob.status)] ?? String(wikiJob.status)) : '已索引，可独立解析到 Wiki'}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <small className="danger-text">{wikiJob.error}</small>}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? '重新解析到 Wiki' : '解析到 Wiki'}</button></div>
     }) : <div className="empty-inline">请先上传并完成至少一份资料的索引。</div>}</> : <div className="empty-inline"><b>Wiki 尚未启用</b><p>Wiki 用来浏览教材生成的知识页。不开也不影响提问与检索。</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} />}</>}</div></section>

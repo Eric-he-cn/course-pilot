@@ -98,6 +98,8 @@ export interface TurnEvent extends Partial<ContextUsage> {
   responder_mode?: string
   provider?: string
   model?: string
+  /** ask_user 给出的选项 */
+  options?: string[]
 }
 
 export interface Message {
@@ -114,6 +116,8 @@ export interface Message {
   // 本轮"查了什么"：流式期间来自 SSE，回读消息后来自服务端持久化记录。
   activity?: ToolActivity[]
   artifact?: { kind: string; visibility?: string; payload?: unknown }
+  /** 反问给出的选项：点一下等于把这句话作为新的用户消息发出去 */
+  choices?: string[]
   // 本轮切到本地兜底模型的说明；有值就必须显示，否则降级回答会被当成正常回答
   degraded?: string
 }

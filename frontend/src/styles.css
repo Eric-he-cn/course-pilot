@@ -130,6 +130,9 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .tool-chip.done i { color:var(--accent) }
 .tool-chip.warn i { color:var(--warning) }
 .citations button i { font-style:normal; color:var(--accent) }
+.choices { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px }
+.choice { padding:7px 12px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-family:inherit; font-size:13px; cursor:pointer; text-align:left }
+.choice:hover { border-color:var(--primary); color:var(--primary) }
 .artifact-card,.interrupted { margin-top:12px; padding:9px 12px; border:1px solid var(--border); border-radius:8px; background:var(--panel); font-size:12px }
 .artifact-card { display:flex; justify-content:space-between }
 .interrupted { color:var(--warning); border-color:#FDE68A; background:#FFFBEB }

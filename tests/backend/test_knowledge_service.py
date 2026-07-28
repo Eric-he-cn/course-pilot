@@ -354,3 +354,60 @@ def test_restart_recovers_queued_and_marks_running_failed(env):
         assert "重启" in (interrupted.error_message or "")
     finally:
         restarted.shutdown()
+
+
+def test_wiki_prune_removes_pages_whose_concept_is_gone(env):
+    """重建索引会换掉概念列表（比如从刮标题改成读目录书签）。旧概念的页文件不会
+    自己消失，知识页里就混着一堆不存在的概念——看上去像功能坏了。"""
+    store = WikiStore(env.settings.data_dir)
+    for concept_id in ("keep", "stale_a", "stale_b"):
+        store.write(course_id=env.math.id, concept_id=concept_id, concept_name=concept_id,
+                    body="正文", source_hash="h", source_refs=[], updated_at="2026-07-28T00:00:00+00:00")
+    assert len(store.list_pages(course_id=env.math.id)) == 3
+
+    removed = store.prune(course_id=env.math.id, valid_concept_ids={"keep"})
+    assert sorted(removed) == ["stale_a", "stale_b"]
+    assert [page.concept_id for page in store.list_pages(course_id=env.math.id)] == ["keep"]
+    # 概念全在时不该动任何文件
+    assert store.prune(course_id=env.math.id, valid_concept_ids={"keep"}) == []
+
+
+def test_a_full_queue_rejects_instead_of_leaving_the_job_queued(env, monkeypatch):
+    """队列满时必须把 job 标成 failed 并说清原因。留在 queued 的话前端会一直
+    转圈等一个永远不会被执行的任务。容量是 max(workers, queue_capacity)，
+    所以要真占满一个槽位才测得到这条路径。"""
+    import threading
+
+    release = threading.Event()
+    original = env.service.run_job
+    monkeypatch.setattr(env.service, "run_job", lambda *, job_id: release.wait(10) and original(job_id=job_id))
+
+    worker = KnowledgeJobWorker(env.service, workers=1, queue_capacity=1)
+    worker.start()
+    try:
+        jobs = []
+        for name in ("first.md", "second.md"):
+            material = env.service.upload_material(
+                course_id=env.math.id, filename=name, mime_type="text/markdown", content=b"a",
+            )
+            jobs.append(env.service.enqueue_index(material_id=material.id))
+        assert worker.submit(jobs[0].id) is True, "第一个应该占住唯一的槽位"
+        assert worker.submit(jobs[1].id) is False, "槽位被占满，第二个必须被拒"
+        rejected = env.service.get_job(job_id=jobs[1].id)
+        assert rejected.status == "failed" and "队列已满" in (rejected.error_message or "")
+    finally:
+        release.set()
+        worker.shutdown()
+
+
+def test_a_shutting_down_worker_rejects_new_jobs(env):
+    """关闭中还收任务，等于收下一个不会被执行的承诺。"""
+    worker = KnowledgeJobWorker(env.service, workers=1, queue_capacity=4)
+    worker.start()
+    worker.shutdown()
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="late.md", mime_type="text/markdown", content=b"a",
+    )
+    job = env.service.enqueue_index(material_id=material.id)
+    assert worker.submit(job.id) is False
+    assert env.service.get_job(job_id=job.id).status == "failed"

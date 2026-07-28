@@ -492,6 +492,8 @@ model tool call
 
 skill 激活时切换到其完整 profile，而不是在默认工具上做无限并集；退出该轮后恢复主 Agent profile。这与对话阶段无关，只是当轮最小权限。
 
+`memory_patch` 与 `ask_user` 是基座工具，每份 profile 都补上，不由各 skill 自己声明：整体替换意味着不兜住就会在 skill 激活后消失，而「记下值得长期记住的事」和「把选项摆给用户挑」在任何规程执行期间都可能需要，两者又都不碰课程数据。`ask_user` 只把选项挂到本轮消息上就收住，用户点击等于发一条新的用户消息，不占住当前 turn 等人。
+
 不向模型暴露通用 Shell、任意文件路径、SQLite、Git、`schedule_job` 或 `send_to_channel`。Git commit、调度 tick 和渠道发送由确定性服务执行。图片点评也不注册模型工具：附件处理器把 `VisionTranscriptionV1` 作为结构化上下文交给主 Agent。
 
 ### 9.3 注册合约与调用上下文

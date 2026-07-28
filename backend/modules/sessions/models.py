@@ -15,6 +15,8 @@ class Message:
     resolved_course_color: str | None = None
     resolution_reason: str | None = None
     activity: list[dict] = field(default_factory=list)
+    # 反问给出的选项，前端渲染成按钮；点一下等于用户发了那句话
+    choices: list[str] = field(default_factory=list)
 @dataclass(frozen=True)
 class Attachment:
     id: str; session_id: str; filename: str; mime_type: str; byte_size: int; width: int; height: int
@@ -29,3 +31,5 @@ class ResolvedCourseContext:
     candidates: tuple[str, ...] = ()
     # 学科分类器的执行情况，只进 trace，不落库也不进 SSE
     classifier: dict | None = None
+    # 未解析时的全部课程名：通用回答里要让用户从这些里挑，不该由 TurnService 再去查一遍目录
+    all_courses: tuple[str, ...] = ()

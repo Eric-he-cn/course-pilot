@@ -19,6 +19,8 @@ testdata/
 *.log
 
 .claude/settings.local.json
+# 交接文档：记的是当前进行中的工作状态，只给接手的 AI 看，不进仓库
+CLAUDE.md
 .playwright-mcp/
 
 # 探索期的工作目录：调研笔记、标定数据、临时脚本，不进仓库

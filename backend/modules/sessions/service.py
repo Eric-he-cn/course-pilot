@@ -21,14 +21,14 @@ class SessionService:
     def list_sessions(self, *, scope_mode: str | None = None, course_id: str | None = None) -> list[SessionSummary]: return [self._summary(row) for row in self._repository.list_session_rows(scope_mode=scope_mode, course_id=course_id)]
     def get_session(self, session_id: str) -> SessionSummary | None:
         row = self._repository.get_session_row(session_id); return self._summary(row) if row else None
-    def create_session(self, *, scope_mode: str, course_id: str | None, title: str | None, source: str, owner_id: str = "local-web") -> SessionSummary:
+    def create_session(self, *, scope_mode: str, course_id: str | None, title: str | None, source: str) -> SessionSummary:
         if scope_mode not in {"general", "course"}: raise ValueError("scope_mode 必须是 general 或 course")
         if scope_mode == "course" and not course_id: raise ValueError("课程会话必须指定 course_id")
         if scope_mode == "general" and course_id is not None: raise ValueError("通用会话不能指定 course_id")
         if course_id and not self._courses.get_course(course_id): raise LookupError("课程不存在")
         if source != "web": raise ValueError("不支持的会话来源")
         session_id, timestamp = new_id("session"), utc_now()
-        self._repository.insert_session(session_id=session_id, title=(title or self.DEFAULT_TITLE).strip()[:120] or self.DEFAULT_TITLE, scope_mode=scope_mode, course_id=course_id, source=source, owner_id=owner_id, timestamp=timestamp)
+        self._repository.insert_session(session_id=session_id, title=(title or self.DEFAULT_TITLE).strip()[:120] or self.DEFAULT_TITLE, scope_mode=scope_mode, course_id=course_id, source=source, timestamp=timestamp)
         return self.get_session(session_id)  # type: ignore[return-value]
     def rename_session(self, *, session_id: str, title: str) -> SessionSummary:
         cleaned = " ".join(title.split())[:120]
@@ -44,7 +44,7 @@ class SessionService:
         messages = []
         for row in self._repository.list_message_rows(session_id):
             resolved_course = self._courses.get_course(row["resolved_course_id"]) if row["resolved_course_id"] else None
-            messages.append(Message(row["id"], row["turn_id"], row["role"], row["content"], json.loads(row["citations_json"]), row["status"], row["created_at"], row["resolution_status"], row["resolved_course_id"], resolved_course.name if resolved_course else None, resolved_course.color if resolved_course else None, row["resolution_reason"], json.loads(row["activity_json"] or "[]")))
+            messages.append(Message(row["id"], row["turn_id"], row["role"], row["content"], json.loads(row["citations_json"]), row["status"], row["created_at"], row["resolution_status"], row["resolved_course_id"], resolved_course.name if resolved_course else None, resolved_course.color if resolved_course else None, row["resolution_reason"], json.loads(row["activity_json"] or "[]"), json.loads(row["choices_json"] or "[]")))
         return messages
     def start_turn(self, *, session_id: str, client_request_id: str) -> tuple[Turn, bool]:
         if not self.get_session(session_id): raise LookupError("会话不存在")
@@ -62,13 +62,13 @@ class SessionService:
         session = self.get_session(turn.session_id)
         if not session: raise LookupError("会话不存在")
         context = self._resolver.resolve(turn_id=turn.id, session=session, message=message); self._repository.save_course_context(turn_id=turn.id, resolution_status=context.status, resolved_course_id=context.course_id, resolver_version=context.resolver_version, reason=context.reason, timestamp=utc_now()); self._repository.update_last_resolved_course(session_id=turn.session_id, course_id=context.course_id); return context
-    def append_message(self, *, session_id: str, turn_id: str | None, role: str, content: str, citations: list[dict] | None = None, status: str = "complete", activity: list[dict] | None = None) -> Message:
-        message_id, timestamp = new_id("message"), utc_now(); safe = citations or []; self._repository.insert_message(message_id=message_id, session_id=session_id, turn_id=turn_id, role=role, content=content, citations=safe, status=status, timestamp=timestamp, activity=activity)
+    def append_message(self, *, session_id: str, turn_id: str | None, role: str, content: str, citations: list[dict] | None = None, status: str = "complete", activity: list[dict] | None = None, choices: list[str] | None = None) -> Message:
+        message_id, timestamp = new_id("message"), utc_now(); safe = citations or []; self._repository.insert_message(message_id=message_id, session_id=session_id, turn_id=turn_id, role=role, content=content, citations=safe, status=status, timestamp=timestamp, activity=activity, choices=choices)
         if role == "user":
             derived = " ".join(content.split())[:30]
             # 仍是默认标题的会话用首条用户消息命名，会话列表可辨认。
             if derived: self._repository.set_title_if_default(session_id=session_id, title=derived, default=self.DEFAULT_TITLE, timestamp=timestamp)
-        return Message(message_id, turn_id, role, content, safe, status, timestamp, activity=activity or [])
+        return Message(message_id, turn_id, role, content, safe, status, timestamp, activity=activity or [], choices=choices or [])
     def create_attachment(self, *, session_id: str, filename: str, mime_type: str, content: bytes) -> Attachment:
         if not self.get_session(session_id): raise LookupError("会话不存在")
         if self._vision is None: raise VisionFeatureDisabledError("图片转录未启用：请配置 VISION_* 环境变量")

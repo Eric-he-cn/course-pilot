@@ -7,13 +7,10 @@ from __future__ import annotations
 
 import threading
 
-from core.identity import workspace_id
+from core.identity import LEGACY_MARKERS, workspace_id
 from core.settings import Settings
 
 from .bootstrap import Application, SharedRuntime, build_application, build_shared_runtime
-
-# 旧布局：改造前所有数据直接放在 data/ 下。
-LEGACY_MARKERS = ("coursepilot.db", "materials", "traces")
 
 
 class Workspaces:

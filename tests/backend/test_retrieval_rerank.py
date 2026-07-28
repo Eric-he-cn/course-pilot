@@ -227,9 +227,18 @@ def test_the_minimal_tier_turns_the_reranker_off_entirely():
     assert hardware.resolve("reranker", "auto", starved) == ""
 
 
-def test_an_accelerator_beats_a_low_ram_reading():
-    """有独显或统一内存的机器不按内存降档；读不到内存也按满档走，让加载失败后自然降级。"""
+@pytest.mark.parametrize("ram, accelerator, expected", [
+    (2.0, "cpu", "minimal"),      # 内存不够，两个模型都不加载
+    (6.0, "cpu", "small"),        # 够跑小模型
+    (32.0, "cpu", "full"),
+    (2.0, "mps", "full"),         # 统一内存/独显不按内存降档
+    (2.0, "cuda", "full"),
+    (0.0, "cpu", "full"),         # 读不到内存宁可按满档，让加载失败后自然降级
+])
+def test_tier_is_decided_by_ram_unless_there_is_an_accelerator(monkeypatch, ram, accelerator, expected):
+    """分档判定本身要测到每一档。断言 tier 落在三档取值域里是恒真的，测不出任何东西。"""
     from core import hardware
 
-    assert hardware.probe().tier in {"full", "small", "minimal"}
-    # 探测函数本身在任何机器上都要能跑通并给出三档之一
+    monkeypatch.setattr(hardware, "_total_ram_gib", lambda: ram)
+    monkeypatch.setattr(hardware, "_accelerator", lambda: accelerator)
+    assert hardware.probe().tier == expected

@@ -5,12 +5,14 @@ Office 的新格式（docx / pptx）是 zip 包着 XML，用标准库拆就够�
 """
 from __future__ import annotations
 
+import posixpath
 import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 from xml.etree import ElementTree
 
 TEXT_SUFFIXES = {".txt", ".md"}
@@ -20,12 +22,20 @@ SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md", ".docx", ".pptx", *LEGACY_SUFFIXES}
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
 
 def extract_pages(path: Path, filename: str) -> list[tuple[int | None, str]]:
     suffix = Path(filename).suffix.lower()
     if suffix in LEGACY_SUFFIXES:
-        path, suffix = _convert_legacy(path, suffix), LEGACY_SUFFIXES[suffix]
+        # 转换产物是用户教材的完整副本，读完就删，不留在 /tmp 里。
+        with tempfile.TemporaryDirectory() as workdir:
+            converted = _convert_legacy(path, suffix, Path(workdir))
+            return _extract(converted, LEGACY_SUFFIXES[suffix])
+    return _extract(path, suffix)
+
+
+def _extract(path: Path, suffix: str) -> list[tuple[int | None, str]]:
     if suffix in TEXT_SUFFIXES:
         return [(None, path.read_bytes().decode("utf-8", errors="replace").strip())]
     if suffix == ".docx":
@@ -35,9 +45,10 @@ def extract_pages(path: Path, filename: str) -> list[tuple[int | None, str]]:
     return _from_pdf(path)
 
 
-def _convert_legacy(path: Path, suffix: str) -> Path:
-    """.doc / .ppt 是 OLE2 二进制，自己解析不现实。有系统转换器就转，没有就说清楚缺什么。"""
-    target = Path(tempfile.mkdtemp()) / f"converted{LEGACY_SUFFIXES[suffix]}"
+def _convert_legacy(path: Path, suffix: str, workdir: Path) -> Path:
+    """.doc / .ppt 是 OLE2 二进制，自己解析不现实。有系统转换器就转，没有就说清楚缺什么。
+    产物落在调用方给的临时目录里，由调用方负责清理。"""
+    target = workdir / f"converted{LEGACY_SUFFIXES[suffix]}"
     if shutil.which("soffice"):
         subprocess.run(
             ["soffice", "--headless", "--convert-to", LEGACY_SUFFIXES[suffix].lstrip("."),
@@ -107,12 +118,28 @@ def _from_pptx(path: Path) -> list[tuple[int | None, str]]:
         pages: list[tuple[int | None, str]] = []
         for number, name in enumerate(slides, start=1):
             parts = [ElementTree.fromstring(archive.read(name))]
-            notes = f"ppt/notesSlides/notesSlide{number}.xml"
-            if notes in archive.namelist():
+            notes = _notes_target(archive, name)
+            if notes:
                 parts.append(ElementTree.fromstring(archive.read(notes)))
             lines = [text.strip() for part in parts for node in part.iter(f"{_A}t") if (text := node.text or "")]
             pages.append((number, "\n".join(line for line in lines if line)))
     return pages
+
+
+def _notes_target(archive: zipfile.ZipFile, slide_name: str) -> str | None:
+    """备注页顺着 slide 的 _rels 找。按序号拼 notesSlideN.xml 的话，删过幻灯片的
+    pptx（slide1/slide2/slide4）会把备注挂到相邻那页上，页码跟着错且不报错。"""
+    rels = f"ppt/slides/_rels/{Path(slide_name).name}.rels"
+    if rels not in archive.namelist():
+        return None
+    for node in ElementTree.fromstring(archive.read(rels)).iter(f"{_REL}Relationship"):
+        if node.get("Type", "").endswith("/notesSlide"):
+            # Target 可以是相对的，也可以是 OPC 的绝对 part name（带前导斜杠）；
+            # zip 成员名不带斜杠，不剥掉就永远匹配不上、备注静默丢失。
+            raw = unquote(node.get("Target", ""))
+            target = posixpath.normpath(posixpath.join("ppt/slides", raw)).lstrip("/")
+            return target if target in archive.namelist() else None
+    return None
 
 
 def _from_pdf(path: Path) -> list[tuple[int | None, str]]:

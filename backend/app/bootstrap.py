@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,7 @@ from contracts.llm import AgentChatPort, VisionTranscriberPort
 from contracts.web import WebSearchPort
 from modules.agent.service import TurnService
 from modules.agent.skills import SkillRegistry, UserSkillStore
+from modules.agent.tools import validate_profiles
 from modules.agent.trace import TraceWriter
 from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
@@ -34,6 +36,8 @@ from modules.sessions.service import SessionService
 
 from core.settings import Settings
 from core.store import SQLiteStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,12 +108,10 @@ THINKING_TIERS: dict[str, dict[str, object]] = {
     "high": {"thinking": {"type": "enabled", "effort": "high"}},
     "max": {"thinking": {"type": "enabled", "effort": "max"}},
 }
-DEFAULT_TIER = "off"
-
-
 def _with_thinking(extra_body: dict[str, object], tier: str) -> dict[str, object]:
-    """档位覆盖配置里的 thinking 字段，其余私有参数原样保留。"""
-    return {**extra_body, **THINKING_TIERS.get(tier, THINKING_TIERS[DEFAULT_TIER])}
+    """档位覆盖配置里的 thinking 字段，其余私有参数原样保留。
+    tier 由调用方保证合法（遍历 THINKING_TIERS 或写死 off），拿不到就该报错而不是静默降档。"""
+    return {**extra_body, **THINKING_TIERS[tier]}
 
 
 @dataclass(frozen=True)
@@ -137,7 +139,7 @@ class SharedRuntime:
                 try:
                     call(model)
                 except Exception as error:  # 预热失败不该拖住启动，真正调用时还会再试一次
-                    print(f"[warmup] {type(model).__name__} 预热失败：{error}")
+                    logger.warning("%s 预热失败：%s", type(model).__name__, error)
         threading.Thread(target=load, name="model-warmup", daemon=True).start()
 
     def close(self) -> None:
@@ -158,7 +160,7 @@ def _build_embedder(settings: Settings):
         return None
     if name.startswith(CLOUD_PREFIX):
         if not settings.rag_cloud_configured:
-            print("[rag] 配了云端嵌入但缺 RAG_CLOUD_BASE_URL / RAG_CLOUD_API_KEY，语义检索关闭")
+            logger.warning("配了云端嵌入但缺 RAG_CLOUD_BASE_URL / RAG_CLOUD_API_KEY，语义检索关闭")
             return None
         return CloudEmbedder(
             api_key=settings.rag_cloud_api_key, base_url=settings.rag_cloud_base_url,
@@ -175,7 +177,7 @@ def _build_reranker(settings: Settings):
         return None
     if name.startswith(CLOUD_PREFIX):
         if not (settings.rag_cloud_configured and settings.rag_cloud_rerank_url):
-            print("[rag] 配了云端重排但缺 RAG_CLOUD_RERANK_URL / 凭据，重排关闭")
+            logger.warning("配了云端重排但缺 RAG_CLOUD_RERANK_URL / 凭据，重排关闭")
             return None
         return CloudReranker(
             api_key=settings.rag_cloud_api_key, url=settings.rag_cloud_rerank_url,
@@ -254,6 +256,10 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(settings.database_path)
     store.migrate()
+    # 工具表与 profile 的一致性自检本来只在测试里跑，等于线上不设防：
+    # 新加工具忘了归类能力，要到模型调用时才以「能力未开放」的形式冒出来。
+    if problems := validate_profiles():
+        raise RuntimeError("工具 profile 配置有问题：" + "；".join(problems))
     knowledge_repository, session_repository = KnowledgeRepository(store), SessionRepository(store)
     # 三个落盘 store 要先于 courses 建好：删课程要连带清掉它们的目录。
     notes, memory, wiki_store = NoteStore(settings.data_dir), MemoryStore(settings.data_dir), WikiStore(settings.data_dir)

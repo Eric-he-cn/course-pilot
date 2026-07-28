@@ -36,6 +36,10 @@ examples: 出三道题考考我 | 我觉得答案是 B | 讲讲我刚才那道�
 2. 对准备考的概念用 `search_materials` 取证据。没有教材证据的概念不要出题。
 3. 默认 3 道、由易到难，每道题标出处编号。题干必须能用教材内容判定对错，
    不要出开放讨论题——无法判定的题不产生证据事件，等于白练。
+   **只出一道选择题时（用户说「出一道」「出1道选择题」都算），选项必须走 `ask_user`**：
+   `options` 放「A」「B」「C」「D」四个短标签，用户点按钮就是作答，比让他打字快。
+   题干和 A-D 的完整内容照常写在正文里——界面不显示 `question`，正文缺了题干他只看到四个字母。
+   多道题一次问不了，正常写在正文里就行。
 4. 用 `artifact_append` 写两条：
    - `kind=practice`、`visibility=user_visible`：`practice_id`、每道题的题号与题干、引用编号
    - `kind=practice_key`、`visibility=model_private`：每道题的标准答案、评分要点、

@@ -16,6 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from core.identity import sole_workspace  # noqa: E402
+
 from adapters.llm.openai_compatible import OpenAICompatibleChat  # noqa: E402
 from contracts.llm import ChatDelta, ChatMessage  # noqa: E402
 from core.settings import Settings  # noqa: E402
@@ -93,13 +95,12 @@ def judge(chat: OpenAICompatibleChat, case: str) -> dict:
 
 
 def user_database(data_dir: Path) -> Path:
-    """库在 <data>/users/<user_id>/ 下。指向 <data>/coursepilot.db 会拿到一个不存在或空的库。"""
-    candidates = sorted(Path(data_dir).glob("users/*/coursepilot.db"))
-    if not candidates:
-        raise SystemExit(f"{data_dir} 下没有找到用户库")
-    if len(candidates) > 1:
-        raise SystemExit(f"{data_dir} 下有多个用户库，用 --data-dir 指定到一个：{[str(p) for p in candidates]}")
-    return candidates[0]
+    return sole_workspace(data_dir) / "coursepilot.db"
+
+
+def traces_dir(data_dir: Path) -> Path:
+    """trace 也在工作区里，不在 <data>/ 根上。"""
+    return sole_workspace(data_dir) / "traces"
 
 
 def main() -> None:
@@ -115,9 +116,9 @@ def main() -> None:
     if not settings.remote_llm_configured:
         raise SystemExit("judge 需要配置 TEXT_API_KEY / TEXT_BASE_URL / TEXT_MODEL")
 
-    records = load_records(data_dir / "traces", limit=args.limit, seed=args.seed)
+    records = load_records(traces_dir(data_dir), limit=args.limit, seed=args.seed)
     if not records:
-        raise SystemExit(f"{data_dir / 'traces'} 里没有可评测的完成轮次")
+        raise SystemExit(f"{traces_dir(data_dir)} 里没有可评测的完成轮次")
 
     chat = OpenAICompatibleChat(
         api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,

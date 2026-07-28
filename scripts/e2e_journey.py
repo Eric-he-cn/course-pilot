@@ -24,6 +24,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "testdata" / "fixtures"
+sys.path.insert(0, str(ROOT / "backend"))
+
+from core.identity import sole_workspace  # noqa: E402
 
 results: list[tuple[str, bool, str]] = []
 
@@ -108,17 +111,8 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
 
 
 def workspace(data_dir: Path) -> Path:
-    """库、笔记、trace 都在 <data>/users/<user_id>/ 下，不在 <data>/ 根上。
-
-    直接按根目录找会拿到空结果，然后以「一条都没有」的样子失败——那种报错看不出是
-    路径不对还是功能没生效，所以这里一次解析清楚。
-    """
-    candidates = sorted(path.parent for path in data_dir.glob("users/*/coursepilot.db"))
-    if not candidates:
-        raise SystemExit(f"{data_dir} 下没有找到用户工作区，先让实例跑起来并发一次请求")
-    if len(candidates) > 1:
-        raise SystemExit(f"{data_dir} 下有多个用户工作区，换一个干净的数据目录再跑：{[str(p) for p in candidates]}")
-    return candidates[0]
+    """库、笔记、trace 都在 <data>/users/<user_id>/ 下，不在 <data>/ 根上。"""
+    return sole_workspace(data_dir)
 
 
 def db(data_dir: Path) -> sqlite3.Connection:
@@ -238,8 +232,13 @@ def journey(base: str, data_dir: Path) -> None:
     general = call(base, "/sessions", {"scope_mode": "general"})
     inferred = ask(base, general["id"], "卷积神经网络的池化层有什么用？", "j-infer")
     check("通用会话按学科解析到深度学习", inferred.course_name == "深度学习", str(inferred.course_name))
+    # 认不出课程时按通用知识聊，不再回一句「请说明课程名称」；但也不能凭空取证。
     vague = ask(base, call(base, "/sessions", {"scope_mode": "general"})["id"], "帮我复习一下", "j-vague")
-    check("含糊提问不乱取证", vague.finish_reason == "course_unresolved", vague.finish_reason)
+    check("认不出课程也正常作答", vague.finish_reason == "stop" and len(vague.answer) > 10, vague.finish_reason)
+    check("含糊提问不乱取证", not vague.named("citation"), f"{len(vague.named('citation'))} 条引用")
+    both = ask(base, call(base, "/sessions", {"scope_mode": "general"})["id"],
+               "深度学习和操作系统哪个更该先学？", "j-both")
+    check("一句话点了两门课就问清楚", both.finish_reason == "course_unresolved", both.finish_reason)
 
     # ---- 第 10 步：会话改名与压缩 ----
     print("\n[10] 会话管理")

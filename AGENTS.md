@@ -89,6 +89,7 @@ Claude Code 里可以直接用 `.claude/launch.json` 里的 `coursepilot-dev` �
 - 改完跑 `./scripts/check.sh`，别只跑一部分。
 - 后端测试要 `PYTHONPATH=backend`，项目里没有 pytest 配置文件。
 - 数据库 schema 改动一律新增 migration，写在 `backend/core/store.py` 的 `MIGRATIONS` 末尾，
-  不要改已有条目。
+  不要改已有条目。增删列例外：走同一文件里的 `ADDED_COLUMNS` / `RETIRED_COLUMNS` 按现存结构对账。
+  `ALTER` 不幂等，写成编号迁移一旦中途失败，版本号没落库而 DDL 已提交，工作区就再也起不来。
 - 组装只在 `backend/app/bootstrap.py` 一处发生，模块自己不 new 仓储和适配器。
 - 项目不含任何发布或部署操作，也不要加。

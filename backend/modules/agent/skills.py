@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import hashlib
 import io
 import json
@@ -10,6 +11,8 @@ from pathlib import Path, PurePosixPath
 
 from core.common import utc_now
 from core.store import SQLiteStore
+
+logger = logging.getLogger(__name__)
 
 # frontmatter 必填字段（架构 §7.2）；缺一个就不注册，避免半成品 skill 被路由到。
 _REQUIRED = ("name", "description", "when_to_use", "allowed_tools")
@@ -216,7 +219,7 @@ class SkillRegistry:
             try:
                 skill = load_skill(path)
             except ValueError as error:
-                print(f"[skill] 跳过 {path}: {error}")
+                logger.warning("跳过 %s：%s", path, error)
                 continue
             definitions[skill.name] = skill
         return cls(definitions, user_skills=user_skills)

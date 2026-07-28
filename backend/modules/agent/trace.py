@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import json
-import sys
 import threading
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # 超过这个长度的字段搬进 payload 文件，主 JSONL 只留 ref（架构 §16.1）。
 _INLINE_MAX_CHARS = 200
@@ -37,7 +39,7 @@ class TraceWriter:
                 with (self._directory / f"{day}.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(index, ensure_ascii=False) + "\n")
         except Exception as error:
-            print(f"trace write failed: {error}", file=sys.stderr)
+            logger.warning("trace 写入失败：%s", error)
 
     @staticmethod
     def _split(record: dict, *, turn_id: str) -> tuple[dict, dict]:

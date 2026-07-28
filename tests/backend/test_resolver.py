@@ -23,7 +23,7 @@ class Catalog:
 
 
 class Classifier:
-    """记录调用次数：名字命中或有可沿用解析时，它一次都不该被调到。"""
+    """记录调用次数：名字命中、真歧义或课程会话时，它一次都不该被调到。"""
 
     mode, provider, model = "provider", "example", "example-model"
 
@@ -58,7 +58,6 @@ def _resolve(resolver, message, session=None):
     [
         ("深度学习里的反向传播", {}, "消息里出现课程名"),
         ("随便问点什么", {"scope_mode": "course", "course_id": DEEP.id}, "课程会话固定课程"),
-        ("那它和特征值有关吗", {"resolved_course_id": DEEP.id}, "有可沿用的解析"),
     ],
 )
 def test_classifier_is_not_called_when_cheaper_signals_suffice(message, session_kwargs, why):
@@ -94,14 +93,22 @@ def test_unusable_classification_falls_through_without_failing_the_turn(classifi
     assert context.classifier["status"] == expected_status
 
 
-def test_classification_falls_back_to_recent_resolution_first():
-    """分类器排在沿用之后：解析结果会写成会话的粘性课程，
-    不能让最不可靠的信号去写最持久的状态。"""
-    classifier = Classifier(reply=LLM.id)
+def test_a_followup_without_subject_signal_keeps_the_recent_resolution():
+    """判不出学科时输出 none，这一轮就沿用上次的课——追问不该把会话甩到别的课上。"""
+    classifier = Classifier(reply="none")
     resolver = CourseResolver(Catalog([DEEP, LLM]), classifier=classifier)
     context = _resolve(resolver, "再讲讲", _session(resolved_course_id=DEEP.id))
     assert (context.course_id, context.reason) == (DEEP.id, "recent_resolution")
-    assert classifier.calls == []
+    assert len(classifier.calls) == 1, "沿用之前要判一次，否则会话永远卡在第一次认定的课上"
+
+
+def test_a_clear_subject_switch_overrides_the_recent_resolution():
+    """实测过的代价：会话粘在 LLM 上，问操作系统的内容拿到的是没有依据的通用回答，
+    而资料就在隔壁课里。所以分类器明确指向另一门课时要切走。"""
+    classifier = Classifier(reply=LLM.id)
+    resolver = CourseResolver(Catalog([DEEP, LLM]), classifier=classifier)
+    context = _resolve(resolver, "换个话题，说说指令微调", _session(resolved_course_id=DEEP.id))
+    assert (context.course_id, context.reason) == (LLM.id, "llm_inferred")
 
 
 def test_ambiguous_names_short_circuit_before_the_classifier():

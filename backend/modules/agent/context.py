@@ -10,7 +10,12 @@ from contracts.llm import ChatMessage, ToolCallRequest
 
 SEED_CALL_ID = "call_seed_search"
 # 提示词版本：改动系统提示词就要 +1，trace 里据此区分不同版本的效果。
-PROMPT_VERSION = "tutor_v9"
+PROMPT_VERSION = "tutor_v12"
+
+# 没配联网时这半句要撤掉：工具表里已经没有 web_search，提示词还在推荐，
+# 模型就会口头答应去查而实际查不到。
+_WEB_HINT = ("教材里没有而用户想要最新资料时，可以用 web_search 联网查，再按同样方式标注"
+             "——网络内容永远不算教材结论，并要给出来源链接。")
 # ponytail: 字符数保守近似 token（1 字符 ≤ 1 token）；接入真实 tokenizer 前不做精确计数。
 # 单条消息上限，防止一条超长消息吃掉整个历史预算。
 MESSAGE_MAX_CHARS = 20_000
@@ -29,8 +34,7 @@ _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课�
    也不要编造不存在的来源。
 3. 教材中确实没有相关内容时：先用一句话说明当前课程资料中没有找到，然后另起一段，
    以「以下不是当前教材结论：」开头，用通用知识正常回答。不要拒绝回答，
-   也不要把通用知识伪装成教材结论。教材里没有而用户想要最新资料时，可以用 web_search
-   联网查，再按同样方式标注——网络内容永远不算教材结论，并要给出来源链接。
+   也不要把通用知识伪装成教材结论。{web_hint}
 
 工具：
 4. 系统已用用户原话检索过一次。证据不足、用户追问、或需要换关键词（例如中英互译、
@@ -44,6 +48,9 @@ _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课�
 6. 不要写"让我再搜索一下""我来查一下"这类过渡语。需要补查就直接调用工具，
    界面会展示检索过程；你的回答只写结论本身。
 7. 只承诺系统当前具备的能力，不要声称自己能做工具清单以外的事。
+7.1 两种情况用 ask_user 把 2-4 个选项摆给用户挑，然后这一轮收住等他点：需求缺了关键信息、
+    按不同理解会做出完全不同结果时；以及只出一道选择题时（选项就是 A/B/C/D，他点一下即作答）。
+    需求本身明确、又不是在出单道选择题，就直接做——多问一轮比直接答更烦人。
 8. 用户说"记住/记一下/以后都这样"，或出现别的值得长期记住的事实，必须调用 memory_patch
    写下来：讲解偏好与长期目标写 user，学到哪一章、遗留问题、与用户的约定写 course。
    掌握度数值、错题与复习排期不写记忆，它们由证据事件维护。
@@ -108,6 +115,7 @@ def assemble_messages(
     memory: str = "",
     conversation_summary: str = "",
     today: str = "",
+    web_available: bool = True,
 ) -> AssembledContext:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
     与模型自己调 search_materials 得到的形态一致）。"""
@@ -118,6 +126,7 @@ def assemble_messages(
     system = _SYSTEM_PROMPT.format(
         course_name=course_name, materials=_material_lines(materials),
         skills=skills_block, practice_digest=practice_block, memory=memory_block,
+        web_hint=_WEB_HINT if web_available else "",
         conversation_summary=summary_block,
         today=today or date.today().isoformat(),
     )
@@ -168,3 +177,58 @@ def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: 
         kept.append(ChatMessage(role=role, content=text))
     kept.reverse()
     return kept, dropped, clipped
+
+
+# 通用模式里问题跟任何课程都不相关时用这份。不谈教材、不谈引用编号——套用课程提示词
+# 会让模型对着「你好」回一句「当前课程资料中没有找到」。
+_GENERAL_SYSTEM_PROMPT = """你是 CoursePilot 的学习助手。今天是 {today}。
+
+这一轮没有关联到具体课程，手上也没有教材资料，所以按通用知识正常回答就行。
+
+1. 用中文，直接回答，简洁清楚；需要推导或例子再展开。
+2. 数学公式一律用 $ 包裹：行内 $x^2$，独立成行 $$...$$，不要用 \\( 或 \\[。
+3. 不要说"我找不到课程资料"这类话，也不要要求用户先指定课程——他要是想问某门课的内容，
+   自己会提课程名或切到那门课的工作区。
+4. 用户问的是课程内容、学习计划或学习记录，但没说是哪门课时，报出下面的课程列表让他挑，
+   不要自己选一门。跟课程无关的问题（打招呼、通用知识）直接答，不要提课程的事。
+
+他已有的课程：
+{courses}
+
+长期记忆（这就是已存的全部内容）：
+{memory}
+
+之前对话的摘要（更早的消息已压缩成这份摘要，其中提到的内容视为你自己讲过的）：
+{conversation_summary}
+"""
+
+
+def assemble_general_messages(
+    *,
+    courses: Sequence[str],
+    history: Sequence[tuple[str, str]],
+    question: str,
+    history_token_budget: int,
+    memory: str = "",
+    conversation_summary: str = "",
+    today: str = "",
+) -> AssembledContext:
+    """没有课程 scope 的一轮：没有教材段，也不注入种子检索。"""
+    memory_block = memory or "（还没有长期记忆）"
+    summary_block = conversation_summary or "（没有更早的对话）"
+    courses_block = "、".join(f"「{name}」" for name in courses) or "（还没有课程）"
+    system = _GENERAL_SYSTEM_PROMPT.format(
+        courses=courses_block, memory=memory_block, conversation_summary=summary_block,
+        today=today or date.today().isoformat(),
+    )
+    kept, dropped, clipped = _budgeted_history(history, history_token_budget)
+    messages = [ChatMessage(role="system", content=system), *kept, ChatMessage(role="user", content=question)]
+    segments = [
+        ("系统提示", len(system) - len(courses_block) - len(memory_block) - len(summary_block)),
+        ("课程列表", len(courses_block)),
+        ("长期记忆", len(memory_block)),
+        ("对话摘要", len(summary_block)),
+        ("会话历史", sum(len(item.content) for item in kept)),
+        ("当前问题", len(question)),
+    ]
+    return AssembledContext(messages, segments, dropped, clipped)

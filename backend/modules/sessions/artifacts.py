@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from core.common import new_id, utc_now
 from core.store import SQLiteStore
 
 # envelope 由服务端硬校验，payload 交给 skill 自行约定（架构 §7.4）。
 VISIBILITIES = ("user_visible", "model_private")
+
+
+class LatestPractice(NamedTuple):
+    """最近一次练习的事实。具名的：调用方按下标取值时，加字段或换序会静默错位。"""
+    practice_id: str
+    question_count: int
+    graded: bool
+    created_at: str
 MAX_PAYLOAD_BYTES = 64 * 1024
 
 
@@ -53,8 +62,7 @@ class ArtifactStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._artifact(row) for row in rows]
 
-    def latest_practice(self, *, session_id: str) -> tuple[str, int, bool, str] | None:
-        """最近一次练习的事实：(practice_id, 题目数, 是否已批改, 出题时间)。"""
+    def latest_practice(self, *, session_id: str) -> LatestPractice | None:
         recent = self.recent(session_id=session_id, kind="practice", limit=1)
         if not recent:
             return None
@@ -66,7 +74,7 @@ class ArtifactStore:
             str(item.payload.get("practice_id") or "") == practice_id
             for item in self.recent(session_id=session_id, kind="practice_result", limit=5)
         )
-        return practice_id, count, graded, latest.created_at
+        return LatestPractice(practice_id, count, graded, latest.created_at)
 
     def practice_digest(self, *, session_id: str) -> str:
         """本会话最近练习的事实摘要，注入上下文供模型判断本轮该出题还是评分。

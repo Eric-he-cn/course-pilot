@@ -150,6 +150,23 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
         INSERT INTO chunks_fts(chunk_id, course_id, content) SELECT id, course_id, content FROM chunks;
     """),
+    # IM 渠道层去掉之后剩下的空壳（见迁移 5）：channel_bindings 生产代码从不写入，
+    # sessions.owner_id 恒为 'local-web'、kind 恒为 'user' 且没人读。留着只会让下一个
+    # 人以为还有别的会话来源。
+    (20, "DROP TABLE IF EXISTS channel_bindings;"),
+)
+
+# 靠 ALTER 增删的列，以及依赖它们的残留索引。ALTER 没有 IF EXISTS，写成编号迁移的话，
+# 同一批里后面一句失败会让版本号没落库，下次重跑必撞 duplicate column / no such column，
+# 工作区就再也起不来。这里按 PRAGMA 现存结构对账，重复执行天然安全。
+ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # 反问时给的选项。跟消息走而不是进 artifacts：artifacts.course_id 是 NOT NULL，
+    # 而最需要反问的通用模式恰恰没有课程。
+    ("messages", "choices_json", "TEXT"),
+)
+RETIRED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("sessions", "owner_id"),  # IM 渠道层去掉后恒为 'local-web'
+    ("sessions", "kind"),      # 恒为 'user'，全仓无读取
 )
 
 class SQLiteStore:
@@ -162,8 +179,29 @@ class SQLiteStore:
             connection.execute("PRAGMA journal_mode=WAL"); connection.execute("PRAGMA foreign_keys=ON"); connection.execute("PRAGMA busy_timeout=5000"); connection.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
             for version, sql in MIGRATIONS:
-                if version not in applied: connection.executescript(sql); connection.execute("INSERT INTO schema_migrations(version) VALUES (?)", (version,))
+                # 版本号写进同一个 script：executescript 逐句提交，分两次写会在中间失败时只落一半。
+                if version not in applied: connection.executescript(f"{sql}\nINSERT INTO schema_migrations(version) VALUES ({version});")
+            for table, column, declaration in ADDED_COLUMNS:
+                if column not in self._columns(connection, table):
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            for table, column in RETIRED_COLUMNS:
+                if column in self._columns(connection, table):
+                    self._drop_dependent_indexes(connection, table, column)
+                    connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
             connection.commit()
+    @staticmethod
+    def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    @staticmethod
+    def _drop_dependent_indexes(connection: sqlite3.Connection, table: str, column: str) -> None:
+        """DROP COLUMN 不提前检查依赖，删到重建索引那一步才报错。这里按 sqlite_master
+        反查而不是写死索引名：老库里可能有早已从迁移列表删掉的索引。"""
+        names = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql LIKE ?",
+            (table, f"%{column}%"),
+        )]
+        for name in names:
+            connection.execute(f"DROP INDEX IF EXISTS {name}")
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect()

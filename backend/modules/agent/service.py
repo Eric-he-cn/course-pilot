@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import replace
@@ -10,19 +11,21 @@ from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
 from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest
 from core.common import utc_now
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
-from modules.memory.store import MemoryStore
+from modules.memory.api import MemoryStorePort
 from modules.planning.api import PlanReaderPort, PlanWriterPort
-from modules.sessions.api import SessionBusyError, SessionUseCases
-from modules.sessions.artifacts import ArtifactStore
-from modules.notes.store import NoteStore
-from modules.sessions.compactions import CompactionStore
+from modules.notes.api import NoteStorePort
+from modules.sessions.api import (
+    ArtifactStorePort, CompactionStorePort, LatestPractice, SessionBusyError, SessionUseCases,
+)
 from contracts.web import WebSearchPort
 
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
-from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_messages, message_chars
+from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_general_messages, assemble_messages, message_chars
 from .skills import SkillRegistry
-from .tools import MAIN, MAIN_PROFILE, SEARCH_LIMIT, CitationRegistry, ToolExecutor, cited_only, is_repeatable, profile_for_skill, specs_for
+from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, CitationRegistry, ToolExecutor, cited_only, is_repeatable, profile_for_skill, specs_for
 from .trace import TraceWriter
+
+logger = logging.getLogger(__name__)
 
 
 # practice 规程要求的副作用：漏一项就意味着这次练习断链（作答不进档案、
@@ -56,7 +59,9 @@ _SKILL_INTENT = {
 
 # 写计划的放行条件：只认用户键入的原话，图片转录不算——一张写着"复习计划"的
 # 教材照片不该获得写权限。排计划往往要先问考试日期，所以意图在本会话里粘住。
-_PLAN_INTENT = re.compile(r"计划|规划|复习安排|学习安排|安排一下|备考|日程|考试.{0,4}(准备|安排)")
+# 关键词表必然有漏，宁可漏也不能误放：命中就等于拿到写权限，所以只收进指向明确的说法
+# （"进系统"覆盖排进/写进/存进），不收"排""冲刺"这类会撞上教材术语的词。
+_PLAN_INTENT = re.compile(r"计划|规划|复习安排|学习安排|安排一下|备考|日程|课表|进系统|考试.{0,4}(准备|安排)")
 
 # 要求记住某件事的说法。模型不会主动调 memory_patch，却照样回答「已记住」——
 # 用户因此看到空的 user.md。命中这个又没真写成，就补一轮让它补上。
@@ -64,8 +69,27 @@ _MEMORY_INTENT = re.compile(r"记住|记一下|记下来|别忘|以后都|下次
 _TRANSCRIPTION_MARK = "[图片转录："
 
 
+def _typed_text(message: str) -> str:
+    """只取用户亲手键入的那部分，丢掉后面并进来的图片转录。
+
+    授予写权限的意图判断必须用它：一张写着「复习计划」的教材照片不该获得写计划的权限。
+    加载 skill 的意图判断则**故意**用整条 message——拍照上传的作答要和打字作答走同一条路。
+    """
+    return message.split(_TRANSCRIPTION_MARK)[0]
+
+
+# 一道选择题的特征：A-D 每个字母只出现一次。三道题会出现三个「A.」，
+# 那种情况一次 ask_user 问不了，选项留在正文里是对的。
+_CHOICE_LINE = re.compile(r"^\s*\*{0,2}([A-D])[.、)\s]", re.MULTILINE)
+
+
+def _single_choice_question(text: str) -> bool:
+    letters = _CHOICE_LINE.findall(text)
+    return len(letters) >= 3 and len(letters) == len(set(letters))
+
+
 def _has_plan_intent(text: str) -> bool:
-    return bool(_PLAN_INTENT.search(text.split(_TRANSCRIPTION_MARK)[0]))
+    return bool(_PLAN_INTENT.search(_typed_text(text)))
 
 
 # 供应商偶尔会在工具预算耗尽后把 tool_call 当普通文本吐出来，这类内部标记不能进回答。
@@ -114,6 +138,65 @@ def _strip_provider_markup(answer: str) -> tuple[str, bool]:
     return cleaned, cleaned != answer.rstrip()
 
 
+class _PracticeState:
+    """practice 规程的服务端保障：预路由、漏步骤补一轮、收尾闭合。
+
+    这些状态原先散在 run() 的五处，加一个有副作用要求的 skill 就要同步改五处，
+    而导入的 skill 永远享受不到这套照顾。收在一起，至少让「还缺哪些步骤」只有一个定义。
+    """
+
+    def __init__(self, artifacts: ArtifactStorePort, message: str) -> None:
+        self._artifacts = artifacts
+        self.pending: LatestPractice | None = None
+        self.awaiting_grade = False
+        self.wants_practice = bool(_PRACTICE_INTENT.search(message))
+        self.evidence_count = 0
+        self.artifact_written = False
+        self.reminded = False
+
+    def load(self, *, session_id: str) -> None:
+        """解析到课程之后才读：没有课程就谈不上练习。"""
+        self.pending = self._artifacts.latest_practice(session_id=session_id)
+        self.awaiting_grade = self.pending is not None and not self.pending.graded
+
+    @property
+    def question_count(self) -> int | None:
+        return self.pending.question_count if self.pending else None
+
+    def note_tool(self, name: str) -> None:
+        """只统计真正成功的调用；调用方已按 result.ok 过滤。"""
+        if name == "emit_evidence":
+            self.evidence_count += 1
+        elif name == "artifact_append":
+            self.artifact_written = True
+
+    def missing_steps(self) -> list[str]:
+        """规程要求的副作用里还缺哪些。归因数少于题目数也算缺——模型常只写第一道就收尾。"""
+        missing = []
+        # 用 is None 而不是 or 1：题目数为 0（payload 没带 questions）时原本不提醒，
+        # 写成 or 1 会让 evidence_count == 0 也补一轮，白花一次工具轮次。
+        expected = self.question_count if self.question_count is not None else 1
+        if self.awaiting_grade and self.evidence_count < expected:
+            missing.append("emit_evidence")
+        if (self.wants_practice or self.awaiting_grade) and not self.artifact_written:
+            missing.append("artifact_append")
+        return missing
+
+    def close(self, *, session_id: str, course_id: str) -> None:
+        """状态闭合不能依赖模型写 artifact：漏写会让后续每轮都被当成作答重复归因。"""
+        if not (self.awaiting_grade and self.evidence_count > 0 and self.pending is not None):
+            return
+        try:
+            self._artifacts.append(
+                course_id=course_id, session_id=session_id, kind="practice_result",
+                visibility="user_visible",
+                payload={"practice_id": self.pending.practice_id, "graded_at": utc_now(),
+                         "evidence_events": self.evidence_count, "closed_by": "server"},
+            )
+        except Exception:
+            logger.exception("练习收尾写 artifact 失败 session=%s", session_id)
+
+
 class TurnService:
     """Agent loop：组装历史与种子证据，供模型带工具多轮推进，直到给出最终回答。"""
 
@@ -133,12 +216,12 @@ class TurnService:
         *,
         plan_writer: PlanWriterPort,
         evidence: EvidenceWriterPort,
-        artifacts: ArtifactStore,
-        compactions: CompactionStore,
+        artifacts: ArtifactStorePort,
+        compactions: CompactionStorePort,
         skills: SkillRegistry,
-        memory: MemoryStore,
+        memory: MemoryStorePort,
         web: WebSearchPort | None = None,
-        notes: NoteStore | None = None,
+        notes: NoteStorePort | None = None,
         trace: TraceWriter | None = None,
         select_responder: Callable[[str | None, str | None], AgentChatPort] | None = None,
         max_tool_rounds: int = 10,
@@ -161,6 +244,11 @@ class TurnService:
             evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
             web=web, notes=notes, search_limit=search_limit,
         )
+        # 没配联网就不下发 network 类工具。下发了模型也只会拿回 not_configured，
+        # 白烧一轮工具（core/settings.py 的 web_search_api_key 注释写的就是这条约定）。
+        # bootstrap 只在配了 key 时才建 web 适配器，所以「有没有它」就是唯一判据。
+        # 不去调 health()：把工作区能不能建起来挂在一个端口方法上太脆。
+        self._offline = frozenset() if web is not None else frozenset({NETWORK})
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
@@ -320,24 +408,50 @@ class TurnService:
                 course_color=context.course_color, reason=context.reason, resolver_version=context.resolver_version,
             )
             registry = CitationRegistry()
+            choices: list[str] = []
+            choices_reminded = False
             response: ChatFinal | None = None
             answer_parts: list[str] = []
             answer_segments: list[str] = []
             usage_total: dict[str, int] = {}
             tool_rounds = 0
             seq = 0
-            # practice 状态在分支外也要读（收尾时的状态闭合），所以先初始化。
-            pending: tuple | None = None
-            awaiting_grade = False
-            evidence_count = 0
+            # 收尾时也要读，所以在进入分支前就建好。
+            practice = _PracticeState(self._artifacts, message)
             if context.status != "resolved" or context.course_id is None:
                 if context.candidates:
+                    # 真有歧义：问题同时提到几门课，问清楚比替他猜一门更有用。
                     answer = "你的问题同时提到了" + "、".join(f"「{name}」" for name in context.candidates) + "，我不确定该用哪一门的资料。说明是哪一门，我就接着答。"
+                    finish_reason, responder_mode, provider, model = "course_unresolved", "local_guardrail", "system", "none"
+                    seq += 1
+                    yield self._event("text_delta", seq=seq, text=answer)
                 else:
-                    answer = "我还不能确定要使用哪门课程的资料。请在问题中说明课程名称，或先进入具体课程工作区。"
-                finish_reason, responder_mode, provider, model = "course_unresolved", "local_guardrail", "system", "none"
-                seq += 1
-                yield self._event("text_delta", seq=seq, text=answer)
+                    # 跟任何课程都不相关（打招呼、通用问题）。这里以前一律回一句
+                    # 「请说明课程名称」——把闸门当成了回答。没有教材可引就按通用知识答。
+                    assembled = assemble_general_messages(
+                        courses=context.all_courses, history=history, question=message,
+                        history_token_budget=self._history_token_budget,
+                        memory=self._memory.read_user(),
+                        conversation_summary=summary.summary_text if summary else "",
+                    )
+                    messages = assembled.messages
+                    yield self._context_usage(messages, assembled.segments, assembled, summary)
+                    responder = self._responder
+                    if self._select_responder and (model_key is not None or thinking is not None):
+                        responder = self._select_responder(model_key, thinking)
+                    for item in responder.chat(messages=messages, tools=()):
+                        if isinstance(item, ChatDelta):
+                            answer_parts.append(item.text)
+                            seq += 1
+                            yield self._event("text_delta", seq=seq, text=item.text)
+                            last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
+                        elif isinstance(item, ChatFinal):
+                            response = item
+                            self._merge_usage(usage_total, item.usage)
+                    answer = "".join(answer_parts) or (response.text if response else "")
+                    finish_reason = response.finish_reason if response else "stop"
+                    responder_mode = response.mode if response else "unknown"
+                    provider, model = (response.provider, response.model) if response else ("system", "none")
             else:
                 scope = ResolvedKnowledgeScope(turn_id=turn.id, course_id=context.course_id, resolver_version=context.resolver_version)
                 # 种子检索：先查课程证据是系统行为，不依赖模型自觉；
@@ -356,6 +470,7 @@ class TurnService:
                     materials=self._knowledge.material_names(scope=scope),
                     history=history,
                     question=message,
+                    web_available=NETWORK not in self._offline,
                     seed_query=message,
                     seed_result_text=seed.text,
                     history_token_budget=self._history_token_budget,
@@ -372,31 +487,29 @@ class TurnService:
                     responder = self._select_responder(model_key, thinking)
                 allowed_tools = MAIN_PROFILE
                 budget_notified = False
-                capabilities = MAIN.capabilities
+                capabilities = MAIN.capabilities - self._offline
                 tool_budget = MAIN.per_tool_budget
                 tool_used: dict[str, int] = {}
                 tool_results: dict[tuple[str, str], object] = {}
                 # 只认用户键入的原话：一张写着「记住」的教材照片不该触发。
-                wants_memory = bool(_MEMORY_INTENT.search(message.split(_TRANSCRIPTION_MARK)[0]))
+                wants_memory = bool(_MEMORY_INTENT.search(_typed_text(message)))
                 memory_written = memory_reminded = False
                 active_skill: str | None = None
                 max_rounds = self._max_tool_rounds
                 # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
                 # 而漏批改意味着这次作答不进学习档案。加载后仍由规程自己判断本轮做什么。
-                pending = self._artifacts.latest_practice(session_id=session_id)
+                practice.load(session_id=session_id)
                 practice_skill = self._skills.get("practice")
-                awaiting_grade = pending is not None and not pending[2]
-                artifact_written = False
-                practice_reminded = False
-                # message 此时已并入图片转录，所以拍照上传的作答与打字作答走同一条判断。
-                wants_practice = bool(_PRACTICE_INTENT.search(message))
                 auto_skill, auto_reason = None, ""
-                if practice_skill is not None and awaiting_grade:
-                    auto_skill, auto_reason = practice_skill, f"练习 {pending[0]} 待批改"
-                elif practice_skill is not None and wants_practice:
+                if practice_skill is not None and practice.awaiting_grade:
+                    auto_skill, auto_reason = practice_skill, f"练习 {practice.pending.practice_id} 待批改"
+                elif practice_skill is not None and practice.wants_practice:
                     auto_skill, auto_reason = practice_skill, "用户要练题"
                 else:
                     for name, pattern in _SKILL_INTENT.items():
+                        # 没配联网时 research 的大半工具都会失败，加载它只是白费一轮。
+                        if name == "research" and NETWORK in self._offline:
+                            continue
                         if pattern.search(message) and (candidate := self._skills.get(name)) is not None:
                             auto_skill, auto_reason = candidate, "命中意图"
                             break
@@ -412,7 +525,7 @@ class TurnService:
                     base_segments = base_segments + [("skill 规程", len(auto_skill.body))]
                     skill_profile = profile_for_skill(auto_skill.allowed_tools)
                     active_skill, allowed_tools = auto_skill.name, skill_profile.tools
-                    capabilities = skill_profile.capabilities
+                    capabilities = skill_profile.capabilities - self._offline
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                     trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
                 try:
@@ -451,12 +564,8 @@ class TurnService:
                         if isinstance(outcome, ChatFinal):
                             answer_segments.append("".join(segment_parts))
                             missing_steps = []
-                            if active_skill == "practice" and not practice_reminded and tool_rounds < max_rounds:
-                                # 归因数少于题目数就提醒一次：模型常只写第一道就收尾。
-                                if awaiting_grade and evidence_count < (pending[1] if pending else 1):
-                                    missing_steps.append("emit_evidence")
-                                if (wants_practice or awaiting_grade) and not artifact_written:
-                                    missing_steps.append("artifact_append")
+                            if active_skill == "practice" and not practice.reminded and tool_rounds < max_rounds:
+                                missing_steps = practice.missing_steps()
                             if not missing_steps and wants_memory and not memory_written and not memory_reminded and tool_rounds < max_rounds:
                                 # 用户明确要求记住，但这一轮没有一次成功的 memory_patch：
                                 # 模型会照样说「已记住」，用户下次打开长期记忆却是空的。
@@ -466,12 +575,24 @@ class TurnService:
                                 messages.append(ChatMessage(role="user", content="用户要求记住的内容你还没有写进长期记忆。现在只调用 memory_patch 补上，不要重复输出正文。"))
                                 trace_record["memory_reminder"] = True
                                 continue
-                            if missing_steps:
-                                # 规程有步骤没做完就补一轮，只补一次。
-                                practice_reminded = True
+                            # 判据要看所有段落：题目常常出在某个工具轮之前，只看最后一段会漏掉。
+                            # 不能用 join_answer——它带着展示用的过滤，会把没有引用的短段丢掉。
+                            if (not missing_steps and not choices and not choices_reminded
+                                    and _single_choice_question("\n".join(answer_segments)) and tool_rounds < max_rounds):
+                                # 出了一道选择题却没走 ask_user：选项只是正文里的文字，
+                                # 用户没得可点。提示词两版都压不住，只能服务端补一轮。
+                                choices_reminded = True
                                 self._merge_usage(usage_total, outcome.usage)
                                 messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
-                                messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, pending[1] if pending else None, evidence_count)))
+                                messages.append(ChatMessage(role="user", content="这道选择题的选项还没有变成可点的按钮。现在只调用 ask_user（question 放题干，options 放 A、B、C、D 四个短标签），不要重复输出正文。"))
+                                trace_record["choices_reminder"] = True
+                                continue
+                            if missing_steps:
+                                # 规程有步骤没做完就补一轮，只补一次。
+                                practice.reminded = True
+                                self._merge_usage(usage_total, outcome.usage)
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, practice.question_count, practice.evidence_count)))
                                 trace_record["practice_reminder"] = missing_steps
                                 continue
                             response = outcome
@@ -511,10 +632,12 @@ class TurnService:
                                         tool_results[repeat_key] = result
                                 if call.name == "memory_patch" and result.ok:
                                     memory_written = True
-                                if call.name == "emit_evidence" and result.ok:
-                                    evidence_count += 1
-                                if call.name == "artifact_append" and result.ok:
-                                    artifact_written = True
+                                if result.ok:
+                                    practice.note_tool(call.name)
+                                if result.choices:
+                                    # 选项跟着本轮消息走；流式过程中先发一个事件让按钮立刻出现。
+                                    choices = result.choices
+                                    yield self._event("choices", options=choices)
                                 if result.activated_skill and active_skill is None:
                                     # 一轮只激活一个前台 skill，激活后工具集收窄到它声明的范围。
                                     active_skill = result.activated_skill
@@ -522,7 +645,7 @@ class TurnService:
                                     if skill:
                                         skill_profile = profile_for_skill(skill.allowed_tools)
                                         allowed_tools = skill_profile.tools
-                                        capabilities = skill_profile.capabilities
+                                        capabilities = skill_profile.capabilities - self._offline
                                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                                     trace_record["skill"] = {"name": active_skill, "content_hash": skill.content_hash if skill else None, "activation": "model"}
                                 for citation in result.new_citations:
@@ -567,6 +690,9 @@ class TurnService:
                             break
                     if response is None:
                         raise LLMProviderError("invalid_response", "本地 responder 没有给出终态响应", retryable=False)
+                # 三层各覆盖一条路径，都不是冗余：主路按轮次收段落进 answer_segments；
+                # 降级到 fallback responder 时只往 answer_parts 追加、不收段落；
+                # 完全不发增量、只给一条终态文本的供应商则只有 response.text。
                 answer, leaked = _strip_provider_markup(join_answer(answer_segments) or "".join(answer_parts) or response.text)
                 if leaked:
                     trace_record["provider_markup_stripped"] = True
@@ -581,18 +707,9 @@ class TurnService:
                 trace_record.update(status="failed", error_code="turn_superseded")
                 yield self._event("turn_failed", error_code="turn_superseded", retryable=False)
                 return
-            if awaiting_grade and evidence_count > 0 and pending is not None:
-                # 状态闭合不能依赖模型写 artifact：漏写会让后续每轮都被当成作答重复归因。
-                try:
-                    self._artifacts.append(
-                        course_id=context.course_id or "", session_id=session_id, kind="practice_result",
-                        visibility="user_visible",
-                        payload={"practice_id": pending[0], "graded_at": utc_now(), "evidence_events": evidence_count, "closed_by": "server"},
-                    )
-                except Exception:
-                    pass
+            practice.close(session_id=session_id, course_id=context.course_id or "")
             citations = cited_only(answer, registry.citations)
-            assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations, activity=activity)
+            assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations, activity=activity, choices=choices)
             self._sessions.complete_turn(turn.id, status="completed")
             finalized = True
             trace_record.update(status="completed", answer_chars=len(answer), citations=len(citations), citations_retrieved=len(registry.citations), responder={"mode": responder_mode, "provider": provider, "model": model}, usage=usage_total, tool_rounds=tool_rounds)
@@ -615,6 +732,8 @@ class TurnService:
             trace_record.update(status="failed", error_code="session_busy")
             yield self._event("turn_failed", error_code="session_busy", retryable=True)
         except Exception as error:
+            # trace 只在 turn_id 已存在时落盘，start_turn 之前出错就一点痕迹都没有。
+            logger.exception("turn 失败 session=%s request=%s", session_id, client_request_id)
             trace_record.setdefault("status", "failed")
             trace_record.setdefault("error_code", f"unhandled:{type(error).__name__}")
             yield self._event("turn_failed", error_code="turn_failed", retryable=False)
@@ -625,7 +744,7 @@ class TurnService:
                 try:
                     self._sessions.complete_turn(turn.id, status="failed")
                 except Exception:
-                    pass
+                    logger.exception("收尾标记 turn 失败 turn=%s", turn.id)
             if self._trace is not None and trace_record.get("turn_id"):
                 trace_record.setdefault("status", "failed" if not finalized else "completed")
                 if trace_record["status"] == "failed":

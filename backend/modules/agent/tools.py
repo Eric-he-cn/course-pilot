@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import json
 import re
 from dataclasses import dataclass, field
@@ -8,16 +9,23 @@ from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowl
 from contracts.llm import ToolSpec
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.planning.api import PlanConflictError, PlanReaderPort, PlanWriterPort
-from modules.memory.store import MemoryStore
-from modules.sessions.artifacts import ArtifactStore
+from modules.memory.api import MemoryStorePort
+from modules.sessions.api import ArtifactStorePort
 
 from contracts.web import WebAccessError, WebSearchPort
-from modules.notes.store import NoteStore
+from modules.notes.api import NoteStorePort
 
 from .calculator import CalculationError, evaluate
 from .skills import SkillRegistry
 
+logger = logging.getLogger(__name__)
+
 SEARCH_LIMIT = 6
+# 反问最多给几个选项：再多就不是「挑一个」而是又一道阅读题。
+_MAX_CHOICES = 4
+# 选项必须是答案。模型很容易把好几个待确认的问题一起塞进 options，用户点一下就等于
+# 把问题原样问回给自己——所以带问号的选项一律打回，让它重新组织成一问多答。
+_QUESTION_MARK = re.compile(r"[?？]")
 
 # 网页与检索结果是用户可控的外部内容，和教材证据、OCR 转录同一档：只作资料。
 # 声明放在正文之前——后置声明会被长正文推走。
@@ -183,6 +191,33 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         },
     ),
     ToolSpec(
+        name="ask_user",
+        description=(
+            "把几个选项摆给用户挑，界面会渲染成按钮。两种用法："
+            "一是需求不明确、按不同理解会做出完全不同结果时，让他选一个方向；"
+            "二是出选择题时，把 A/B/C/D 作为选项给出，他点一下就是作答。"
+            "一次只问一个问题：options 是这个问题的候选答案，不能塞进别的问题。"
+            "要确认的事有好几件就先问最关键的那件。"
+            "界面上只显示这些按钮，不显示 question——所以完整题干（选择题还要带上各选项的具体内容）"
+            "照常写在正文里，按钮只是替他省下打字。"
+            "用户点一下等于回你一句话，你在下一轮才会看到他的选择——"
+            "所以调完它就把问题写完收住，不要在同一轮里替他选一个继续做。"
+            "需求本身明确、又不是在出选择题时不要用，多问一轮比直接答更烦人。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "要问的那一句。只回给你自己作记录，界面不显示它"},
+                "options": {
+                    "type": "array",
+                    "description": "2 到 4 个选项，都是上面那个问题的候选答案，写成用户能直接说出口的短标签",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["question", "options"],
+        },
+    ),
+    ToolSpec(
         name="calculator",
         description="算术求值，用于需要准确数字的地方（周转时间、概率、矩阵元素等）。只支持 + - * / // % ** 与括号。",
         parameters={
@@ -228,7 +263,7 @@ TOOL_CAPABILITY: dict[str, str] = {
     "artifact_append": WRITE_STATE,
     "note_write": WRITE_NOTE,
     "web_search": NETWORK, "web_fetch": NETWORK,
-    "calculator": FREE, "use_skill": FREE, "artifact_read": FREE,
+    "calculator": FREE, "use_skill": FREE, "artifact_read": FREE, "ask_user": FREE,
 }
 
 # 同一轮里重复调用可以复用上次结果的能力。写工具不在其中：参数相同不代表
@@ -255,7 +290,7 @@ MAIN = ToolProfile(
     tools=(
         "search_materials", "list_materials", "get_plan", "plan_update", "get_archive",
         "concept_search", "emit_evidence", "memory_patch", "note_write", "note_read",
-        "web_search", "web_fetch", "calculator", "use_skill",
+        "web_search", "web_fetch", "calculator", "use_skill", "ask_user",
     ),
     capabilities=frozenset({READ_COURSE, WRITE_STATE, WRITE_NOTE, NETWORK, FREE}),
     # 只给花钱的工具设上限：其余都是本地读，轮次上限已经在管。
@@ -268,9 +303,11 @@ MAIN_PROFILE = MAIN.tools
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 
 # 基座工具：不需要每份 SKILL.md 重复声明，也不该被某个规程收窄掉。
-# 记忆是跨 skill 的记事本——任何规程执行期间都可能出现值得长期记住的事，
-# 而 profile 是整体替换而不是并集，不在这里兜住，skill 一激活它就从工具集里消失。
-BASELINE_TOOLS: tuple[str, ...] = ("memory_patch",)
+# profile 是整体替换而不是并集，不在这里兜住，skill 一激活它就从工具集里消失。
+# memory_patch 是跨 skill 的记事本——任何规程执行期间都可能出现值得长期记住的事。
+# ask_user 同理：出选择题、问要哪种图型、问卡片覆盖到哪章，都是「让用户挑一个」，
+# 而它不碰任何数据（FREE），普遍下发没有代价。
+BASELINE_TOOLS: tuple[str, ...] = ("memory_patch", "ask_user")
 
 
 def capabilities_of(names: tuple[str, ...]) -> frozenset[str]:
@@ -380,6 +417,8 @@ class ToolOutcome:
     activated_skill: str | None = None  # use_skill 成功时带回，用于当轮切换工具 profile
     # 只进 trace，不进面向用户的 activity——"预算耗尽"对用户没有意义。
     reason: str | None = None
+    # ask_user 给出的选项，由 TurnService 挂到本轮消息上
+    choices: list[str] = field(default_factory=list)
 
 
 class ToolExecutor:
@@ -387,9 +426,9 @@ class ToolExecutor:
 
     def __init__(
         self, *, knowledge: KnowledgeSearchPort, plans: PlanReaderPort, plan_writer: PlanWriterPort,
-        archive: ArchiveReaderPort, evidence: EvidenceWriterPort, artifacts: ArtifactStore,
-        skills: SkillRegistry, memory: MemoryStore,
-        web: WebSearchPort | None = None, notes: NoteStore | None = None,
+        archive: ArchiveReaderPort, evidence: EvidenceWriterPort, artifacts: ArtifactStorePort,
+        skills: SkillRegistry, memory: MemoryStorePort,
+        web: WebSearchPort | None = None, notes: NoteStorePort | None = None,
         search_limit: int = SEARCH_LIMIT,
     ) -> None:
         self._search_limit = search_limit
@@ -433,6 +472,8 @@ class ToolExecutor:
         except (json.JSONDecodeError, ValueError):
             return ToolOutcome(text="工具参数不是合法的 JSON 对象，请修正后重试。", ok=False, summary="参数无效", reason="invalid_args")
         try:
+            if name == "ask_user":
+                return self._ask_user(parsed)
             if name == "search_materials":
                 return self._search(scope, parsed, registry)
             if name == "list_materials":
@@ -471,6 +512,8 @@ class ToolExecutor:
         except WebAccessError as error:
             return ToolOutcome(text=f"联网失败：{error}", ok=False, summary="联网失败", reason=error.code)
         except Exception:
+            # 回执只能给模型一句「执行失败」，真实堆栈只有日志留得住。
+            logger.exception("工具 %s 执行失败", name)
             return ToolOutcome(text=f"工具 {name} 执行失败，请基于已有信息回答。", ok=False, summary="执行失败", reason="execution_failed")
         return ToolOutcome(text=f"没有名为 {name} 的工具。可用工具：" + "、".join(allowed), ok=False, summary="未知工具", reason="tool_unknown")
 
@@ -485,6 +528,28 @@ class ToolExecutor:
         listed = matched or concepts
         lines = [f"- {item.id} | {item.name}" + (f"（第 {item.page} 页）" if item.page else "") for item in listed[:40]]
         return ToolOutcome(text=f"{prefix}\n" + "\n".join(lines), ok=True, summary=f"{len(listed)} 个概念")
+
+    @staticmethod
+    def _ask_user(parsed: dict) -> ToolOutcome:
+        """只把选项带回去，不等用户——回合等人会被心跳判失活（见架构里的单活跃 turn 约束）。
+        选项经 ToolOutcome.choices 挂到本轮消息上，用户点击等于发一条普通用户消息。"""
+        question = str(parsed.get("question") or "").strip()
+        raw = parsed.get("options")
+        options = [text for item in (raw if isinstance(raw, list) else []) if (text := str(item).strip())]
+        if not question or len(options) < 2:
+            return ToolOutcome(text="ask_user 需要一个问题和至少两个选项。", ok=False, summary="选项不足", reason="invalid_args")
+        if any(_QUESTION_MARK.search(option) for option in options):
+            return ToolOutcome(
+                text="options 放的是让用户点的答案，不能是问题。一次只问一个问题："
+                     "question 放那句问题，options 放它的几个候选答案（短标签）。要问的事情有好几件就先问最关键的一件。",
+                ok=False, summary="选项写成了问题", reason="invalid_args",
+            )
+        options = list(dict.fromkeys(options))[:_MAX_CHOICES]
+        return ToolOutcome(
+            text=f"已把这 {len(options)} 个选项摆成按钮，等他这一轮结束后点选。"
+                 "界面上不显示 question，所以现在把完整题干（选择题连各选项的内容一起）写进正文再收住，不要替他选。",
+            ok=True, summary=f"请用户选择（{len(options)} 项）", choices=options,
+        )
 
     def _emit_evidence(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
         kind = str(parsed.get("kind") or "").strip()

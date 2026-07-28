@@ -20,6 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
+from core.identity import sole_workspace  # noqa: E402
+
 from modules.learning.mastery import ALGORITHM_VERSION, mastery_score, replay  # noqa: E402
 
 
@@ -58,13 +60,7 @@ def curves(database: Path) -> dict[str, dict]:
 
 
 def user_database(data_dir: Path) -> Path:
-    """库在 <data>/users/<user_id>/ 下。指向 <data>/coursepilot.db 会拿到一个不存在或空的库。"""
-    candidates = sorted(Path(data_dir).glob("users/*/coursepilot.db"))
-    if not candidates:
-        raise SystemExit(f"{data_dir} 下没有找到用户库")
-    if len(candidates) > 1:
-        raise SystemExit(f"{data_dir} 下有多个用户库，用 --data-dir 指定到一个：{[str(p) for p in candidates]}")
-    return candidates[0]
+    return sole_workspace(data_dir) / "coursepilot.db"
 
 
 def main() -> None:

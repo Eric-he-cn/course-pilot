@@ -147,3 +147,22 @@ def test_concurrent_first_requests_do_not_double_build(client):
 def test_health_reports_legacy_data_state(client):
     body = client.get("/api/v2/health").json()
     assert "workspace" in body and "legacy_data_pending" in body["workspace"]
+
+
+def test_workspace_items_cover_everything_the_stores_create(tmp_path):
+    """WORKSPACE_ITEMS 是从旧布局迁移时要搬的清单。哪个模块新增了按用户隔离的
+    目录却没登记，迁移就会把它落在原地——数据还在，新工作区读不到，且不报错。"""
+    from core.identity import WORKSPACE_ITEMS
+    from modules.knowledge.wiki import WikiStore
+    from modules.memory.store import MemoryStore
+    from modules.notes.store import NoteStore
+
+    root = tmp_path / "ws"
+    NoteStore(root).write(course_id="c1", title="卡片", content="正文")
+    MemoryStore(root).patch(scope="user", section="goals", content="期末 85")
+    MemoryStore(root).patch(scope="course", course_id="c1", section="focus", content="前四章")
+    WikiStore(root).write(course_id="c1", concept_id="k1", concept_name="秩", body="正文",
+                          source_hash="h", source_refs=[], updated_at="2026-07-28T00:00:00+00:00")
+    created = {path.name for path in root.iterdir()}
+    missing = created - set(WORKSPACE_ITEMS)
+    assert not missing, f"这些落盘目录没登记进 WORKSPACE_ITEMS：{sorted(missing)}"

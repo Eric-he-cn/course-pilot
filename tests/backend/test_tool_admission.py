@@ -56,6 +56,22 @@ def test_skill_gets_its_declared_tools_plus_the_baseline():
     assert "plan_update" not in names and "web_search" not in names and "use_skill" not in names
 
 
+def test_every_builtin_skill_keeps_the_baseline_tools():
+    """基座工具在任何 skill 激活后都要在。profile 是整体替换，漏一个就等于该功能
+    在那个规程里静默消失——memory_patch 与 ask_user 都真实发生过这件事。"""
+    from modules.agent.skills import load_skill
+    from modules.agent.tools import BASELINE_TOOLS
+
+    builtin = sorted((Path(__file__).resolve().parents[2] / "skills" / "builtin").glob("*/SKILL.md"))
+    assert builtin, "找不到内建 skill，测试本身有问题"
+    for path in builtin:
+        skill = load_skill(path)
+        profile = profile_for_skill(skill.allowed_tools)
+        granted = {spec.name for spec in specs_for(profile.tools, capabilities=profile.capabilities)}
+        missing = set(BASELINE_TOOLS) - granted
+        assert not missing, f"{path.parent.name} 激活后丢了基座工具：{sorted(missing)}"
+
+
 def test_privileged_tools_are_not_importable_by_user_skills():
     """能力集合推不出导入白名单：write_state 里就有 plan_update / memory_patch。"""
     from modules.agent.skills import IMPORTABLE_TOOLS
@@ -86,7 +102,9 @@ def test_fetch_refuses_non_public_addresses(url, why):
     web = HttpWebAccess(api_key="k")
     with pytest.raises(WebAccessError) as error:
         web.fetch(url=url)
-    assert error.value.code in {"blocked_address", "dns_failed"}, why
+    # 必须是 blocked_address。放过 dns_failed 的话，断网机器上这批用例全绿而
+    # is_global 那道校验一次都没执行过——这些地址都不需要外部 DNS。
+    assert error.value.code == "blocked_address", why
 
 
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://example.com/x", "gopher://example.com"])

@@ -18,13 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from core.identity import workspace_id  # noqa: E402
-
-# 库要连 WAL 的边车文件一起搬：只搬主文件会丢掉已提交事务的尾部。
-ITEMS = (
-    "coursepilot.db", "coursepilot.db-wal", "coursepilot.db-shm",
-    "materials", "notes", "wiki", "traces", "courses", "user.md",
-)
+from core.identity import WORKSPACE_ITEMS, workspace_id  # noqa: E402
 
 
 def instance_running(port: int) -> bool:
@@ -61,7 +55,7 @@ def main() -> int:
 
     root = (Path(__file__).resolve().parent.parent / args.data_dir).resolve()
     target = root / "users" / workspace_id(args.user)
-    present = [name for name in ITEMS if (root / name).exists()]
+    present = [name for name in WORKSPACE_ITEMS if (root / name).exists()]
     if not present:
         print(f"{root} 下没有旧布局的数据，无需迁移。")
         return 0

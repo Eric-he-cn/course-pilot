@@ -25,14 +25,28 @@ def _paragraph(text: str) -> str:
     return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
 
 
-def _pptx(tmp_path, slides: list[str], notes: dict[int, str] | None = None):
+_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_NOTES_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
+
+
+def _pptx(tmp_path, slides: list[str], notes: dict[int, str] | None = None, numbers: list[int] | None = None):
+    """numbers 指定 slide 的文件编号，默认 1..N；给断号就能模拟删过幻灯片的 pptx。
+    备注页按真实结构挂在 slide 的 _rels 上，PowerPoint 就是这么存的。"""
     path = tmp_path / "material.pptx"
+    numbers = numbers or list(range(1, len(slides) + 1))
     with zipfile.ZipFile(path, "w") as archive:
-        for number, text in enumerate(slides, start=1):
+        for number, text in zip(numbers, slides):
             archive.writestr(
                 f"ppt/slides/slide{number}.xml",
                 f'<?xml version="1.0"?><p:sld {_A}><a:t>{text}</a:t></p:sld>',
             )
+            if number in (notes or {}):
+                archive.writestr(
+                    f"ppt/slides/_rels/slide{number}.xml.rels",
+                    f'<?xml version="1.0"?><Relationships xmlns="{_RELS_NS}">'
+                    f'<Relationship Id="rId1" Type="{_NOTES_REL}" '
+                    f'Target="../notesSlides/notesSlide{number}.xml"/></Relationships>',
+                )
         for number, text in (notes or {}).items():
             archive.writestr(
                 f"ppt/notesSlides/notesSlide{number}.xml",
@@ -144,3 +158,54 @@ def test_real_word_xml_from_a_converter_parses(tmp_path):
     subprocess.run(["textutil", "-convert", "docx", "-output", str(target), str(source)], check=True, capture_output=True)
     text = extract_pages(target, "real.docx")[0][1]
     assert "CPU 调度概览" in text and "FCFS" in text
+
+
+def test_legacy_conversion_leaves_nothing_in_tmp(monkeypatch):
+    """.doc / .ppt 的转换产物是用户教材的完整副本，读完必须删——
+    留在 /tmp 里等于把别人的教材摊在共享目录下，而且永不回收。
+
+    盯住转换用的那个目录本身，不比对整个 gettempdir()：后者会被同机其他进程干扰，
+    报错还会指向无关文件。"""
+    import tempfile
+    from pathlib import Path
+
+    from modules.knowledge import extract as module
+
+    if not (shutil.which("soffice") or shutil.which("textutil")):
+        pytest.skip("本机没有 .doc 转换器")
+    seen: list[Path] = []
+    original = module._convert_legacy
+    monkeypatch.setattr(module, "_convert_legacy",
+                        lambda path, suffix, workdir: (seen.append(workdir), original(path, suffix, workdir))[1])
+    with tempfile.TemporaryDirectory() as holder:
+        source = Path(holder) / "讲义.doc"
+        source.write_text("第一节 导数的定义。", encoding="utf-8")
+        pages = extract_pages(source, "讲义.doc")
+    assert pages and pages[0][1], f"转换后没取到文本：{pages}"
+    assert seen, "没走到 legacy 转换分支，测试本身有问题"
+    assert not seen[0].exists(), f"转换产物残留：{seen[0]}"
+
+
+def test_pptx_notes_follow_rels_not_file_numbering(tmp_path):
+    """删过幻灯片的 pptx 文件名会断号（slide1/slide2/slide4）。备注按 enumerate 序号
+    拼 notesSlideN.xml 的话，第三页会去取属于别人的备注，或者干脆丢掉自己的。"""
+    path = _pptx(tmp_path, ["第一页", "第二页", "第三页"], numbers=[1, 2, 4],
+                 notes={1: "讲稿一", 4: "讲稿三"})
+    assert extract_pages(path, "material.pptx") == [
+        (1, "第一页\n讲稿一"), (2, "第二页"), (3, "第三页\n讲稿三"),
+    ]
+
+
+def test_pptx_notes_found_when_rels_use_an_absolute_part_name(tmp_path):
+    """OPC 的 Target 可以是绝对 part name（带前导斜杠），部分生成器就这么写。
+    不剥掉斜杠就永远匹配不上 zip 成员名，讲稿整段丢失且不报错。"""
+    path = tmp_path / "material.pptx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("ppt/slides/slide1.xml", f'<?xml version="1.0"?><p:sld {_A}><a:t>正文页</a:t></p:sld>')
+        archive.writestr(
+            "ppt/slides/_rels/slide1.xml.rels",
+            f'<?xml version="1.0"?><Relationships xmlns="{_RELS_NS}">'
+            f'<Relationship Id="rId1" Type="{_NOTES_REL}" Target="/ppt/notesSlides/notesSlide1.xml"/></Relationships>',
+        )
+        archive.writestr("ppt/notesSlides/notesSlide1.xml", f'<?xml version="1.0"?><p:notes {_A}><a:t>讲稿内容</a:t></p:notes>')
+    assert extract_pages(path, "material.pptx") == [(1, "正文页\n讲稿内容")]

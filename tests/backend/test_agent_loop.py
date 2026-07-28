@@ -210,16 +210,56 @@ def test_every_injected_section_reaches_the_system_prompt():
         assert mark in system
 
 
-def test_unresolved_course_turn_completes_instead_of_failing(client):
-    """未解析课程走的是护栏分支，收尾时读到的 practice 状态必须已初始化。"""
+def test_unresolved_course_turn_still_answers(client):
+    """没解析到课程时照样过模型回答，不再拿护栏文案当回答。
+
+    以前这里短路成一句写死的「请说明课程名称」，连「你好」都会撞上。挑哪门课交给
+    模型判断——提示词里带了课程清单，它该问的时候会问。
+    """
     for name in ("热力学", "电磁学"):
         client.post("/api/v2/courses", json={"name": name})
     session_id = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()["id"]
+    prompts: list[str] = []
 
-    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "vague-1", "message": "帮我复习一下"}).text)
+    class Records:
+        mode, provider, model = "provider", "example", "example-model"
+        def chat(self, *, messages, tools=()):
+            prompts.append(messages[0].content)
+            assert not tools, "没有课程 scope 时不该下发需要 course_id 的工具"
+            yield ChatDelta("你想复习哪一门？")
+            yield ChatFinal("你想复习哪一门？", "stop", self.provider, self.model, self.mode)
+
+    workspace(client).turns._responder = Records()
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "vague-1", "message": "帮我复习一下"}).text)
 
     assert events[-1][0] == "turn_completed"
-    assert events[-1][1]["finish_reason"] == "course_unresolved"
+    assert [name for name, _ in events].count("text_delta") >= 1, "要有真实回答的增量"
+    assert prompts, "应该真的调了模型"
+    # 提示词里要有课程清单，否则模型没法让用户挑
+    assert "热力学" in prompts[0] and "电磁学" in prompts[0]
+    assert "教材证据" not in prompts[0], "没有课程就不该谈教材引用"
+    persisted = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"]
+    assert persisted[-1]["content"] == "你想复习哪一门？"
+
+
+def test_greeting_in_general_mode_is_not_a_course_prompt(client):
+    """「你好」不该换来一句「请说明课程名称」——那是把闸门当成了回答。"""
+    client.post("/api/v2/courses", json={"name": "热力学"})
+    client.post("/api/v2/courses", json={"name": "电磁学"})
+    session_id = client.post("/api/v2/sessions", json={"scope_mode": "general"}).json()["id"]
+
+    class Greets:
+        mode, provider, model = "provider", "example", "example-model"
+        def chat(self, *, messages, tools=()):
+            yield ChatDelta("你好，想聊什么？")
+            yield ChatFinal("你好，想聊什么？", "stop", self.provider, self.model, self.mode)
+
+    workspace(client).turns._responder = Greets()
+    client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "hi-1", "message": "你好"})
+    answer = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"][-1]["content"]
+    assert answer == "你好，想聊什么？"
+    assert "课程名称" not in answer and "课程工作区" not in answer
 
 
 def test_context_segments_cover_the_whole_prompt_and_report_truncation():
@@ -434,6 +474,20 @@ def test_repeated_writes_are_not_deduplicated_as_repeats(client):
     assert archive["evidence_count"] == 3, f"三次作答只落了 {archive['evidence_count']} 条证据"
 
 
+def test_plan_write_permission_reads_the_users_own_words():
+    """写计划的放行只认用户原话。漏放的代价是任务直接做不成——多轮实测里
+    「直接排进系统，不用再问我」被挡住，模型只能回去问用户；误放的代价更大，
+    所以撞教材术语的词一律不收。"""
+    from modules.agent.service import _has_plan_intent
+
+    for text in ("帮我排个复习计划", "给我安排一下这周看什么", "我 8 月 20 号考，直接排进系统，不用再问我",
+                 "把这些写进系统吧", "排个课表", "备考时间不多了，怎么安排", "记到日程里"):
+        assert _has_plan_intent(text), f"该放行却挡住了：{text}"
+    for text in ("讲讲倒排索引", "学习率的调度策略是什么", "冲刺阶段该看哪几章",
+                 "排序算法怎么选", "[图片转录：本周复习计划：周一第三章]"):
+        assert not _has_plan_intent(text), f"该挡住却放行了：{text}"
+
+
 def test_version_conflict_leaves_the_plan_budget_for_the_retry(client):
     """plan_update 每轮只有一次额度。冲突文案要求模型重读再重算，
     这次失败就不能记进预算，否则重试直接撞「已用满」，计划永远改不动。"""
@@ -485,3 +539,119 @@ def test_top_k_results_limits_what_search_materials_returns(tmp_path):
                            json={"client_request_id": "topk", "message": "步长怎么选"}).text
         cited = {data["citation_id"] for name, data in _events(body) if name == "citation"}
         assert 0 < len(cited) <= 2, f"top_k_results=2 却返回了 {len(cited)} 条引用"
+
+
+def test_network_tools_are_not_offered_without_a_search_key(client):
+    """没配 SerpAPI 时不下发 web_search / web_fetch。下发了模型也只会拿回
+    not_configured，白烧一轮工具轮次，而轮次是这一轮回答质量的硬上限。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    offered: list[str] = []
+
+    class RecordsTools:
+        mode, provider, model = "provider", "example", "example-model"
+        def chat(self, *, messages, tools=()):
+            offered.extend(getattr(spec, "name", str(spec)) for spec in tools)
+            yield ChatFinal("时间片越长响应越差。", "stop", self.provider, self.model, self.mode)
+
+    workspace(client).turns._responder = RecordsTools()
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "net-off", "message": "介绍一下时间片轮转"})
+    assert "search_materials" in offered, f"连本地检索都没下发，测试本身有问题：{offered}"
+    assert "web_search" not in offered and "web_fetch" not in offered, f"联网工具仍在下发：{offered}"
+
+
+def test_ask_user_options_ride_along_the_message(client):
+    """反问的选项要跟着消息持久化：刷新页面后按钮还得在，否则用户只看到一个问题
+    却没得可点。选项不进 artifacts 表——那张表 course_id 是 NOT NULL，通用模式没课程。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    scripted = ScriptedChat([
+        [ChatToolCalls((ToolCallRequest("a1", "ask_user",
+                                        '{"question": "想从哪个角度看？", "options": ["先看吞吐", "先看公平", "先看吞吐"]}'),))],
+        [ChatDelta("想从哪个角度看？"), ChatFinal("想从哪个角度看？", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "ask-1", "message": "讲讲调度"}).text)
+    streamed = [data["options"] for name, data in events if name == "choices"]
+    # 流式期间就发一次，按钮不用等回合结束
+    assert streamed == [["先看吞吐", "先看公平"]], f"重复项要去掉：{streamed}"
+
+    persisted = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"][-1]
+    assert persisted["choices"] == ["先看吞吐", "先看公平"], "刷新后选项要还在"
+
+
+QUIZ = ("题目：自注意力为什么要除以 √d？\n"
+        "A. 稳定梯度\nB. 统一到 0~1\nC. 满足概率分布\nD. 降低复杂度\n")
+
+
+def test_a_choice_question_written_as_markdown_gets_one_reminder(client):
+    """出了选择题却没走 ask_user，选项就只是正文里的文字，用户没得可点。
+    题目常常出在某个工具轮之前，所以判据必须看整条回答——只看最后一段会漏掉。"""
+    session_id = _indexed_course_session(client, name="大模型", text="注意力得分要除以缩放因子。")
+    stash = ('{"kind": "practice", "visibility": "model_private", '
+             '"payload": {"questions": [{"answer": "A"}]}}')
+    scripted = ScriptedChat([
+        # 先把题目说了，再存 artifact（practice 规程要求的那步），题目因此落在前一段里
+        [ChatDelta(QUIZ), ChatToolCalls((ToolCallRequest("t1", "artifact_append", stash),))],
+        [ChatDelta("点选项作答就行。"), ChatFinal("点选项作答就行。", "stop", "example", "example-model", "provider")],
+        [ChatToolCalls((ToolCallRequest("a1", "ask_user",
+                                       '{"question": "自注意力为什么要除以 √d", "options": ["A", "B", "C", "D"]}'),))],
+        [ChatDelta(""), ChatFinal("", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "quiz-1", "message": "出一道选择题"}).text)
+    # 提示消息会留在 messages 里被后面每次调用重复看到，所以只数最后一次调用里出现几条
+    nudges = [m for m in scripted.calls[-1]["messages"] if m.role == "user" and "可点的按钮" in m.content]
+    assert len(nudges) == 1, f"该补一轮让它改用 ask_user，实际补了 {len(nudges)} 轮"
+    assert [data["options"] for name, data in events if name == "choices"] == [["A", "B", "C", "D"]], \
+        "补一轮之后选项该发出来了"
+
+
+def test_a_plain_answer_does_not_get_the_choice_reminder(client):
+    """判据要挑得动：普通回答里出现一个「A.」不该被当成选择题，白补一轮很贵。"""
+    session_id = _indexed_course_session(client, name="大模型", text="注意力得分要除以缩放因子。")
+    scripted = ScriptedChat([
+        [ChatDelta("A. 先说结论：要除以 √d 以稳定梯度。"),
+         ChatFinal("A. 先说结论：要除以 √d 以稳定梯度。", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+
+    client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "quiz-2", "message": "为什么除以根号d"})
+    assert not [m for call in scripted.calls for m in call["messages"]
+                if m.role == "user" and "可点的按钮" in m.content], "普通回答被误判成选择题"
+
+
+def test_ask_user_rejects_options_that_are_questions(client):
+    """实测里模型把三件要确认的事一起塞进了 options。那样点一下等于把问题原样问回给自己，
+    所以带问号的选项要打回去，让它重新组织成一问多答。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    scripted = ScriptedChat([
+        [ChatToolCalls((ToolCallRequest("a1", "ask_user",
+                                       '{"question": "先确认几件事", "options": ["考试哪天？", "范围是全部还是几章？"]}'),))],
+        [ChatDelta("好。"), ChatFinal("好。", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "ask-3", "message": "帮我准备考试"}).text)
+    results = [data for name, data in events if name == "tool_result" and data["name"] == "ask_user"]
+    assert results and results[0]["ok"] is False, "选项写成问题时该被拒"
+    assert not [name for name, _ in events if name == "choices"], "被拒的调用不该发选项事件"
+
+
+def test_ask_user_rejects_a_single_option(client):
+    """只给一个选项等于没让人选，直接回绝而不是渲染一个假的单选。"""
+    session_id = _indexed_course_session(client, name="操作系统", text="时间片越长，响应时间越差。")
+    scripted = ScriptedChat([
+        [ChatToolCalls((ToolCallRequest("a1", "ask_user", '{"question": "行吗？", "options": ["行"]}'),))],
+        [ChatDelta("好。"), ChatFinal("好。", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "ask-2", "message": "讲讲调度"}).text)
+    results = [data for name, data in events if name == "tool_result" and data["name"] == "ask_user"]
+    assert results and results[0]["ok"] is False
+    assert not [name for name, _ in events if name == "choices"], "被拒的调用不该发选项事件"
+    assert client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"][-1]["choices"] == []
