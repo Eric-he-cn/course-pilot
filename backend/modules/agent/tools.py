@@ -218,17 +218,15 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="wiki_index",
         description=(
             "读当前课程知识页的总索引：这门课有哪些概念页、各自的 concept_id。"
-            "知识页是系统事先按教材为每个概念写好的整理稿。"
-            "先读索引看清这门课由哪些部分组成，再用 wiki_read 定点读需要的那几页——"
-            "问「这门课分成哪几块」「该从哪学起」这类要看全貌的问题，或一个问题同时牵扯几章时，"
-            "比反复换关键词检索更快也更全。"
+            "系统提示里已经附了这份目录，通常直接照那里挑页就行；"
+            "只有那里注明还有页没列出时，才用本工具取完整目录。"
         ),
         parameters={"type": "object", "properties": {}},
     ),
     ToolSpec(
         name="wiki_read",
         description=(
-            "读一页知识页的正文，concept_id 取自 wiki_index。"
+            "读一页知识页的正文，concept_id 取自系统提示里的知识页目录（或 wiki_index）。"
             "知识页是对教材的转述，不是教材原文，也没有页码：据此作答可以，"
             "但不能给它标 [1] 这类引用编号。需要给出处时用 search_materials 回教材查到原文，"
             "用那一次返回的编号。"

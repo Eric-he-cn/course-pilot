@@ -545,9 +545,13 @@ class TurnService:
                     provider, model = (response.provider, response.model) if response else ("system", "none")
             else:
                 scope = ResolvedKnowledgeScope(turn_id=turn.id, course_id=context.course_id, resolver_version=context.resolver_version)
-                # 这门课没开知识页就整体不下发那两个工具，提示词里推荐它们的那半句也一起撤掉
-                # （见 context._WIKI_HINT）：下发不了还在推荐，模型会口头答应去读而实际读不到。
+                # 这门课没开知识页就整体不下发那两个工具，提示词里那一段也一起撤掉
+                # （见 context._WIKI_RULE）：下发不了还在推荐，模型会口头答应去读而实际读不到。
+                # 撤下发与撤提示词共用 wiki_entries 这一个来源，不会各撤各的。
                 wiki_off = frozenset() if self._knowledge.wiki_enabled(scope=scope) else WIKI_TOOLS
+                wiki_entries = [] if wiki_off else [
+                    (entry.concept_id, entry.concept_name) for entry in self._knowledge.wiki_index(scope=scope)
+                ]
                 # 种子检索：先查课程证据是系统行为，不依赖模型自觉；
                 # 结果以工具调用的形态注入，模型需要补查时自然复用同一工具。
                 seed_args = json.dumps({"query": message}, ensure_ascii=False)
@@ -565,7 +569,7 @@ class TurnService:
                     history=history,
                     question=message,
                     web_available=NETWORK not in self._offline,
-                    wiki_available=not wiki_off,
+                    wiki_entries=wiki_entries,
                     seed_query=message,
                     seed_result_text=seed.text,
                     history_token_budget=self._history_token_budget,
