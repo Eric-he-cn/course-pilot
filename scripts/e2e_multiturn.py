@@ -125,6 +125,10 @@ def scenario_options(course: str) -> None:
     """含糊的大任务 → 模型给选项 → 点选项 → 必须接着做，而不是从头再问。"""
     print("\n[A] 选项式反问：给选项 → 点一下 → 接着做原任务")
     session = call("/sessions", {"scope_mode": "course", "course_id": course})["id"]
+    # 数据目录复用，这门课的计划可能已经排到考试日了。记下起始版本，最后才判得出
+    # 「本轮真的写了」——只看「有没有计划」会靠上一次跑的数据空过。
+    existing = call(f"/courses/{course}/plan")["plan"]
+    version_at_start = existing["version"] if existing else 0
     first = ask(session, "下周我要考这门课，帮我准备一下", "mt-a1")
     # 缺关键信息时要先问清楚，不能自己编一个日期就开排。用不用按钮由模型自己判断：
     # 选择题那条路有服务端补救轮兜着，澄清式反问没有，实测约五次里有一次是纯文字问的。
@@ -139,19 +143,27 @@ def scenario_options(course: str) -> None:
 
     picked = first.choices[0] if first.choices else "8月3日考，考全部内容"
     second = ask(session, picked, "mt-a2")
-    # 把选中的那句复述一遍是好行为（确认收到），所以只查它没有再摆一次选项
-    check("回答之后不再重复问同一件事", "ask_user" not in second.tools, f"答了「{picked}」，工具={second.tools}")
+    # 把选中的那句复述一遍是好行为（确认收到），所以只查它没有再摆一次选项。
+    # 上一轮是正文提问时这条不查：那时回的是写死的一句，未必答得上它实际问的问题，
+    # 模型接着问反而是对的。
+    if first.choices:
+        check("回答之后不再重复问同一件事", "ask_user" not in second.tools, f"答了「{picked}」，工具={second.tools}")
+    else:
+        print("    （跳过「回答之后不再重复问同一件事」：上一轮是正文提问，回的这句未必对得上）")
     check("点选项后接着推进",
           bool(set(second.tools) & {"use_skill", "plan_update", "search_materials", "note_write", "get_archive"}),
           f"工具只有 {second.tools}")
 
     # 缺的信息补齐后必须真落库：多轮任务的终点是产物，不是又一轮对话。信息够了就动手，
     # 所以哪一轮写不固定——第二轮就写完的话，第三轮只读一下计划是对的。
-    third = ask(session, "8 月 20 号考，每天能看 1.5 小时，直接排进系统不用再确认", "mt-a3")
+    # 要求写成现有计划满足不了的样子（每天 2 小时、周末也排），否则模型读一眼发现
+    # 「已经排好了」就不写，那是对的行为，判据却会红。
+    third = ask(session, "8 月 20 号考，每天改成能看 2 小时、周末也照排，直接排进系统不用再确认", "mt-a3")
     check("授权明确后没被确认闸门挡住", "plan_update" in second.tools + third.tools,
           f"两轮的工具：{second.tools} / {third.tools}")
     plan = call(f"/courses/{course}/plan")["plan"]
-    check("三轮下来计划真的落库", bool(plan and plan["items"]), str(plan))
+    check("三轮下来本轮真的写进了计划", bool(plan and plan["items"]) and plan["version"] > version_at_start,
+          f"版本 {version_at_start} → {plan['version'] if plan else None}")
 
 
 # ---------------------------------------------------------------- 场景 B
