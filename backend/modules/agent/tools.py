@@ -22,6 +22,8 @@ from .skills import SkillRegistry
 logger = logging.getLogger(__name__)
 
 SEARCH_LIMIT = 6
+# concept_search 一次最多列几个概念：再多这份目录本身就成了要读的东西。
+CONCEPT_LIST_MAX = 40
 # 反问最多给几个选项：再多就不是「挑一个」而是又一道阅读题。
 _MAX_CHOICES = 4
 # 选项必须是答案。模型很容易把好几个待确认的问题一起塞进 options，用户点一下就等于
@@ -408,7 +410,9 @@ MAIN = ToolProfile(
     # 真正不同的检索上；难题往往需要换几个角度查。
     # history_read 例外：它不花钱，但翻历史翻上瘾会把省下来的上下文又填回去，
     # 3 次够「先看上一轮、再往前扩、再换个 kind」。
-    per_tool_budget={"web_search": 5, "web_fetch": 5, "plan_update": 1, "history_read": 3},
+    # wiki_read 给得宽：一页正文只有几百字，看全貌就是要连读好几页。10 次是防它把索引里
+    # 几十页一路读完，不是配给。
+    per_tool_budget={"web_search": 5, "web_fetch": 5, "plan_update": 1, "history_read": 3, "wiki_read": 10},
 )
 MAIN_PROFILE = MAIN.tools
 
@@ -744,9 +748,11 @@ class ToolExecutor:
         # 关键词没命中就退回全量：报"没有概念目录"会让调用方以为无从归因。
         prefix = "概念目录（归因只能用这些 id）：" if matched else f"没有名称含「{keyword}」的概念，以下是全部概念："
         listed = matched or concepts
-        lines = [f"- {item.id} | {item.name}" + (f"（第 {item.page} 页）" if item.page else "") for item in listed[:40]]
+        lines = [f"- {item.id} | {item.name}" + (f"（第 {item.page} 页）" if item.page else "") for item in listed[:CONCEPT_LIST_MAX]]
+        # 截断要说出来：静默切到 40 条，模型会以为这门课就这些概念，归因时直接编 topic_hint。
+        note = f"\n（只列出前 {CONCEPT_LIST_MAX} 个，还有 {len(listed) - CONCEPT_LIST_MAX} 个没有列出，用 keyword 缩小范围。）" if len(listed) > CONCEPT_LIST_MAX else ""
         return ToolOutcome(
-            text=f"{prefix}\n" + "\n".join(lines), ok=True,
+            text=f"{prefix}\n" + "\n".join(lines) + note, ok=True,
             summary=f"{len(listed)} 个概念", summary_key="summary.concepts_count", summary_args={"n": len(listed)},
         )
 

@@ -13,7 +13,7 @@ from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from contracts.knowledge import ResolvedKnowledgeScope, WikiDocument, WikiEntry
+from contracts.knowledge import ConceptRef, ResolvedKnowledgeScope, WikiDocument, WikiEntry
 from contracts.llm import ChatDelta, ChatFinal, ChatToolCalls, ToolCallRequest
 from core.settings import Settings
 from core.store import SQLiteStore
@@ -368,3 +368,31 @@ def test_the_model_can_walk_the_index_then_read_a_page(client, tmp_path):
     assert "cpt_convoy | 护航效应" in handed and "长作业把后面的短作业全拖住" in handed
     # 知识页不进引用列表。
     assert not [data for name, data in events if name == "citation" and data.get("kind") == "wiki"]
+
+
+# ---------------------------------------------------------------- 顺带收的两条
+
+def test_wiki_read_has_a_call_budget_wide_enough_to_read_several_pages():
+    """一页几百字，看全貌就是要连读好几页；额度是防它把索引里几十页一路读完。"""
+    from modules.agent.tools import WIKI_INDEX_MAX_ENTRIES as entries
+
+    budget = MAIN.per_tool_budget["wiki_read"]
+    assert 5 <= budget < entries
+
+
+def test_the_concept_list_says_how_many_it_left_out():
+    """静默切到 40 条，模型会以为这门课就这些概念，归因时直接编 topic_hint。"""
+    from modules.agent.tools import CONCEPT_LIST_MAX
+
+    class ManyConcepts:
+        def concepts(self, *, scope, limit=60):
+            return [ConceptRef(f"cpt_{i}", f"概念{i}", None) for i in range(CONCEPT_LIST_MAX + 7)]
+
+    executor = ToolExecutor(knowledge=ManyConcepts(), plans=None, plan_writer=None, archive=None,
+                            evidence=None, artifacts=None, skills=None, memory=None)
+    result = executor.execute(scope=SCOPE, session_id="s1", name="concept_search", arguments="{}",
+                              registry=CitationRegistry(), allowed=MAIN_PROFILE,
+                              capabilities=MAIN.capabilities, budget=dict(MAIN.per_tool_budget))
+    assert result.ok
+    assert f"概念{CONCEPT_LIST_MAX - 1}" in result.text and f"概念{CONCEPT_LIST_MAX}" not in result.text
+    assert "还有 7 个没有列出" in result.text
