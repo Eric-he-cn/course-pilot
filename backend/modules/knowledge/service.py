@@ -21,9 +21,6 @@ from .wiki import WikiStore
 from .models import ConceptNode, Job, Material
 from .repository import KnowledgeRepository
 
-# 一次 Wiki 构建最多写多少页。每页一次模型调用，页数直接等于花的钱。
-WIKI_MAX_PAGES = 12
-
 
 class KnowledgeService:
     """Local-only RAG fallback and optional Wiki job skeleton.
@@ -149,17 +146,23 @@ class KnowledgeService:
         return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=reason)
 
     def _run_wiki(self, job: Job, material: Material) -> Job:
-        """按这份教材抽出的概念逐个生成知识页。概念目录是索引时就建好的，这里只做写页。"""
+        """按教材目录自底向上把整份教材写成一棵知识页，全程不走检索。
+
+        叶子页读它那一节页码范围内的全部原文，中间页读子页，最后写课程首页。
+        """
         try:
             self._repository.update_job(job.id, status="running", stage="reading_index", progress=10)
             if self._wiki is None or self._responder is None:
                 raise ValueError("Wiki 需要配好模型槽位（见 .env 的 TEXT_*）")
-            concepts = [
-                ConceptRef(row["id"], row["name"], row["page"])
-                for row in self._repository.list_material_concepts(material_id=material.id, limit=WIKI_MAX_PAGES)
-            ]
-            if not concepts:
-                raise ValueError("这份教材还没有抽出概念，先重建索引")
+            chunks = self._repository.list_material_chunks(material_id=material.id)
+            if not chunks:
+                raise ValueError("这份教材还没有可读的正文，先重建索引")
+            sections, stats = wiki.plan_sections(
+                material_id=material.id, chunks=chunks,
+                concepts=self._repository.list_material_concept_tree(material_id=material.id),
+            )
+            if not sections:
+                raise ValueError("这份教材切不出可写的小节，先重建索引")
 
             def progress(done: int, total: int) -> None:
                 self._repository.update_job(job.id, status="running", stage=f"wiki {done}/{total}", progress=10 + int(85 * done / total))
@@ -168,15 +171,14 @@ class KnowledgeService:
             orphans = self._wiki.prune(
                 course_id=material.course_id,
                 valid_concept_ids=self._repository.concept_ids(course_id=material.course_id),
+                material_id=material.id, planned_ids={section.id for section in sections},
+                known_material_ids=self._repository.material_ids(course_id=material.course_id),
             )
             counts = wiki.build_pages(
-                course_id=material.course_id, concepts=concepts, store=self._wiki, now=utc_now(),
-                search=lambda query: self.search_course(course_id=material.course_id, query=query, limit=6),
-                ask=self._ask_once, on_progress=progress,
+                course_id=material.course_id, material_id=material.id, document=material.filename,
+                sections=sections, store=self._wiki, now=utc_now(), ask=self._ask_once, on_progress=progress,
             )
-            summary = (f"新增 {counts['written']} 页，跳过 {counts['skipped']} 页（证据未变），"
-                       f"{counts['ungrounded']} 个概念检索不到证据"
-                       + (f"，清掉 {len(orphans)} 个已失效的旧页" if orphans else ""))
+            summary = wiki.coverage_summary({**counts, **stats, "pruned": len(orphans)})
             return self._repository.update_job(job.id, status="completed", stage="wiki_completed", progress=100, error_message=summary)
         except Exception as error:
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error))

@@ -1100,8 +1100,24 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
       // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
       const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
-      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? tOr(`stage.${String(wikiJob.stage ?? wikiJob.status)}`, String(wikiJob.status)) : t('library.wiki_ready')}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <small className="danger-text">{wikiJob.error}</small>}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
+      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? tOr(`stage.${String(wikiJob.stage ?? wikiJob.status)}`, String(wikiJob.status)) : t('library.wiki_ready')}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <WikiBuildNote job={wikiJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
     }) : <div className="empty-inline">{t('library.wiki_needs_material')}</div>}</> : <div className="empty-inline"><b>{t('library.wiki_off_title')}</b><p>{t('library.wiki_off_body')}</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} />}</>}</div></section>
+}
+
+/** Wiki 构建的收尾提示。成功时后端给的是覆盖率字段串，按语言渲染；失败时原样显示报错。 */
+function WikiBuildNote({ job }: { job: Job }) {
+  const raw = job.error ?? ''
+  if (!raw.startsWith('wiki_coverage ')) return <small className="danger-text">{raw}</small>
+  const fields: Record<string, number> = {}
+  for (const item of raw.split(' ').slice(1)) {
+    const [key, value] = item.split('=')
+    fields[key] = Number(value) || 0
+  }
+  return <small className="wiki-coverage">
+    {t('library.wiki_coverage', { concepts: fields.concepts, pages: fields.pages, merged: fields.merged })}
+    {' '}{t('library.wiki_coverage_detail', { written: fields.written, skipped: fields.skipped })}
+    {fields.dropped > 0 && ` ${t('library.wiki_coverage_dropped', { dropped: fields.dropped })}`}
+  </small>
 }
 
 // 阶段名在字典里（`stage.<name>` 与 `pipeline.<name>`）：后端加新阶段时界面显示原始值。

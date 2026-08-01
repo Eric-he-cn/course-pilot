@@ -269,6 +269,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .switch.on { background:var(--accent) }
 .switch.on i { transform:translateX(18px) }
 .wiki-note { margin-top:18px!important; color:var(--text)!important }
+.wiki-coverage { color:var(--muted) }
 
 /* ---- 设置与健康 ---- */
 .settings-grid { grid-template-columns:repeat(2,minmax(0,1fr)) }

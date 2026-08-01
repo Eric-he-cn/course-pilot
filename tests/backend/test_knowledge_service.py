@@ -164,9 +164,11 @@ def test_wiki_requires_explicit_course_flag_and_keeps_rag_independent(env):
 
     pages = env.service.wiki_pages(course_id=env.math.id)
     assert pages, "启用后应该真的写出概念页"
-    content = env.service.wiki_page(course_id=env.math.id, concept_id=pages[0]["concept_id"])
+    # 首页排在最前，它读的是别的页；教材出处要到读原文的那一页上看
+    assert pages[0]["concept_id"] == "index"
+    content = env.service.wiki_page(course_id=env.math.id, concept_id=pages[1]["concept_id"])
     # frontmatter 要能追溯：概念 id、证据指纹、提示词版本
-    assert "concept_id:" in content and "source_hash:" in content and "prompt_version: wiki-v1" in content
+    assert "concept_id:" in content and "source_hash:" in content and "prompt_version: wiki-v2" in content
     assert "source_refs:" in content and "notes.md" in content
 
 
@@ -196,7 +198,7 @@ def test_rebuilding_skips_pages_whose_evidence_did_not_change(env):
 
     job = env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
     assert len(env.responder.prompts) == first_round, "第二次不该再调模型"
-    assert "跳过" in (job.error_message or "")
+    assert "written=0" in (job.error_message or "") and "skipped=2" in (job.error_message or "")
 
 
 def test_rebuilding_keeps_the_handwritten_block(env):

@@ -278,14 +278,27 @@ class KnowledgeRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_material_concepts(self, *, material_id: str, limit: int) -> list[dict]:
-        """按提及次数排序：Wiki 页数有上限，先写这份教材里讲得最多的概念。"""
+    def list_material_concept_tree(self, *, material_id: str) -> list[dict]:
+        """一份教材的概念目录，按教材里的先后返回。Wiki 自底向上遍历要的就是这个顺序。"""
         with self._store.read() as conn:
             rows = conn.execute(
-                "SELECT id, name, page FROM concepts WHERE material_id = ? ORDER BY mention_count DESC, page, name LIMIT ?",
-                (material_id, limit),
+                "SELECT id, name, page, level, parent_id FROM concepts WHERE material_id = ?"
+                " ORDER BY ordinal IS NULL, ordinal, rowid",
+                (material_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_material_chunks(self, *, material_id: str) -> list[dict]:
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT id, ordinal, page, content FROM chunks WHERE material_id = ? ORDER BY ordinal",
+                (material_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def material_ids(self, *, course_id: str) -> set[str]:
+        with self._store.read() as conn:
+            return {row["id"] for row in conn.execute("SELECT id FROM materials WHERE course_id = ?", (course_id,))}
 
     def concept_ids(self, *, course_id: str) -> set[str]:
         with self._store.read() as conn:
