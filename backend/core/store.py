@@ -195,6 +195,8 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # 父节点被删时置空而不是拦下删除，概念表本来就允许整份教材连带清掉。
     ("concepts", "parent_id", "TEXT REFERENCES concepts(id) ON DELETE SET NULL"),
     ("concepts", "level", "INTEGER"),
+    # 教材里的先后。不能靠 rowid：upsert 保留旧行，同一份教材改版重索引后顺序还是上一版的。
+    ("concepts", "ordinal", "INTEGER"),
 )
 RETIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sessions", "owner_id"),  # IM 渠道层去掉后恒为 'local-web'

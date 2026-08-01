@@ -387,3 +387,17 @@ def test_the_real_textbook_without_bookmarks_yields_flat_concepts(tmp_path):
     rows = repository.list_concept_tree(course_id=course.id)
     assert rows, "没有书签也要抽出概念"
     assert all(row["parent_id"] is None and row["level"] is None for row in rows)
+
+
+def test_reindexing_a_revised_material_reorders_the_tree(tmp_path):
+    """改版重索引后顺序要跟着走。upsert 保留旧行，只靠 rowid 的话顺序会停在上一版。"""
+    repository, _ = _repository(tmp_path)
+    first = from_outline([(0, "第 1 章 绪论", 1), (1, "1.1 背景", 2), (1, "1.2 目标", 3)])
+    repository.replace_material_concepts(course_id="course_x", material_id="m1", candidates=first)
+
+    # 改版：原来在后面的「目标」提到前面，中间插进一节新的。
+    revised = from_outline([(0, "第 1 章 绪论", 1), (1, "1.1 目标", 2), (1, "1.2 范围", 3), (1, "1.3 背景", 4)])
+    repository.replace_material_concepts(course_id="course_x", material_id="m1", candidates=revised)
+
+    names = [row["name"] for row in repository.list_concept_tree(course_id="course_x")]
+    assert names == ["绪论", "目标", "范围", "背景"], names
