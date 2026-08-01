@@ -154,6 +154,34 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
     # sessions.owner_id 恒为 'local-web'、kind 恒为 'user' 且没人读。留着只会让下一个
     # 人以为还有别的会话来源。
     (20, "DROP TABLE IF EXISTS channel_bindings;"),
+    # 错题库投影：和 concept_mastery 并列，同样只从 evidence_events 派生，可随时重建，
+    # 不参与掌握度数值。粒度是概念而不是题目——原题不会重复出，按题目永远等不到连续答对。
+    # 编号从 22 起：21 曾被 messages.choices_json 的编号迁移占用过（现已改走 ADDED_COLUMNS），
+    # 老开发库里留着 21 的记录，撞号会让这张表在那些库上静默不建。
+    (22, """
+        CREATE TABLE IF NOT EXISTS mistake_records (
+            id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL REFERENCES courses(id),
+            concept_id TEXT NOT NULL REFERENCES concepts(id),
+            status TEXT NOT NULL CHECK(status IN ('active', 'graduated')),
+            wrong_count INTEGER NOT NULL DEFAULT 0,
+            streak INTEGER NOT NULL DEFAULT 0,
+            first_wrong_at TEXT NOT NULL, last_wrong_at TEXT NOT NULL,
+            graduated_at TEXT, relapse_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mistake_course_concept ON mistake_records(course_id, concept_id);
+        CREATE INDEX IF NOT EXISTS idx_mistake_course_status ON mistake_records(course_id, status, last_wrong_at DESC);
+    """),
+    # 两张投影的补算记录：错题表是后加的，上线前的事件流得补一次；概念被删掉又重新抽出来时
+    # 也要按事件流重算。用完成记录当闸门，而不是看 mistake_records 空不空——用户先答错一题
+    # 就会把那种闸门顶死，历史再也补不回来。删概念的那几处会清掉这里的行来触发重算。
+    # 顺带给 evidence_events.concept_id 补索引：每次投影都按概念重放，原来只有 course_id 索引。
+    (23, """
+        CREATE TABLE IF NOT EXISTS mistake_backfills (
+            course_id TEXT PRIMARY KEY REFERENCES courses(id), completed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_concept ON evidence_events(concept_id, created_at);
+    """),
 )
 
 # 靠 ALTER 增删的列，以及依赖它们的残留索引。ALTER 没有 IF EXISTS，写成编号迁移的话，

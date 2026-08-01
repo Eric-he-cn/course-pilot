@@ -23,12 +23,13 @@ def _png(width: int = 64, height: int = 64) -> bytes:
     return buffer.getvalue()
 
 
-def _adapter(client: httpx.Client, *, max_retries: int = 0) -> VisionOcrTranscriber:
+def _adapter(client: httpx.Client, *, max_retries: int = 0, understand: bool = False) -> VisionOcrTranscriber:
     return VisionOcrTranscriber(
         api_key="test-secret",
         base_url="https://api.example.com/v1",
         model="example-ocr-model",
         max_retries=max_retries,
+        understand=understand,
         client=client,
     )
 
@@ -61,6 +62,28 @@ def test_vision_ocr_sends_data_url_and_parses_transcription():
     assert result.plain_text == "梯度下降\nw = w - lr * dL/dw"
     assert result.needs_confirmation is False
     assert result.usage["total_tokens"] == 241
+
+
+def test_vision_understand_prompt_follows_image_language():
+    """讲解语言跟随图中文字：提示词里不能把中文写死，否则英文材料会被转成中文。"""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Gradient descent"}}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        _adapter(client, understand=True).transcribe(content=b"x", mime_type="image/png")
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    prompt = body["messages"][0]["content"][1]["text"]
+    assert "图上文字用的是哪种语言" in prompt
+    assert "整篇回答就用那种语言写" in prompt
+    assert "用中文把它讲清楚" not in prompt
+    assert "公式用 LaTeX 写" in prompt  # 其余约束保持不变
+    # 位置也是承重的：实测这条规则放到后面时，英文材料的转录会退回中文。
+    assert prompt.index("图上文字用的是哪种语言") < prompt.index("图上的文字全部照录")
 
 
 def test_vision_ocr_empty_transcription_needs_confirmation():

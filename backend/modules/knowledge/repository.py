@@ -50,9 +50,12 @@ def _purge_materials(connection, material_ids: list[str]) -> None:
     marks = ",".join("?" * len(material_ids))
     owned_concepts = f"SELECT id FROM concepts WHERE material_id IN ({marks})"
     for statement in (
-        # 概念没了掌握度投影也留不住；原始 evidence_events 保留，日后可重算。
+        # 概念没了两张投影都留不住；原始 evidence_events 保留，日后可重算。
         f"DELETE FROM concept_mastery WHERE concept_id IN ({owned_concepts})",
+        f"DELETE FROM mistake_records WHERE concept_id IN ({owned_concepts})",
         f"DELETE FROM concept_aliases WHERE concept_id IN ({owned_concepts})",
+        # 重新上传同一份文件会算出同样的概念 id，标记不清掉的话投影就再也不重算了。
+        f"DELETE FROM mistake_backfills WHERE course_id IN (SELECT course_id FROM materials WHERE id IN ({marks}))",
         f"DELETE FROM concepts WHERE material_id IN ({marks})",
         f"DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE material_id IN ({marks}))",
         f"DELETE FROM chunks WHERE material_id IN ({marks})",
@@ -184,15 +187,42 @@ class KnowledgeRepository:
                 conn.execute("INSERT INTO chunks_fts(chunk_id, course_id, content) VALUES (?, ?, ?)", (chunk_id, course_id, content))
 
     def replace_material_concepts(self, *, course_id: str, material_id: str, candidates: list[dict]) -> int:
-        """重建本教材的概念，已存在的同名概念保持原 id 与原归属教材不动（§8.1）。"""
+        """重建本教材的概念，已存在的同名概念保持原 id 与原归属教材不动（§8.1）。
+
+        只删这次没再抽到的概念，连它的投影一起删。留下来的保住 id，掌握度与错题历史不断档；
+        整批删了再插会撞投影表的外键，也会把用户的错题记录一起抹掉。
+        """
         now = utc_now()
+        if not candidates:
+            # 抽取为空更像是抽取失败（没有标题结构的散文就抽不出东西），不是"这本教材的概念
+            # 都没了"。这时候什么都不动，免得把用户的错题与掌握度一起清掉。
+            with self._store.read() as conn:
+                return int(conn.execute("SELECT count(*) FROM concepts WHERE course_id = ?", (course_id,)).fetchone()[0])
+        keep = [concept_id_for(course_id, candidate["name"]) for candidate in candidates]
+        condition = f"course_id = ? AND material_id = ? AND id NOT IN ({','.join('?' * len(keep))})"
+        doomed, params = f"SELECT id FROM concepts WHERE {condition}", (course_id, material_id, *keep)
         with self._store.write() as conn:
-            conn.execute("DELETE FROM concepts WHERE course_id = ? AND material_id = ?", (course_id, material_id))
+            for statement in (
+                f"DELETE FROM concept_mastery WHERE concept_id IN ({doomed})",
+                f"DELETE FROM mistake_records WHERE concept_id IN ({doomed})",
+                f"DELETE FROM concept_aliases WHERE concept_id IN ({doomed})",
+                f"DELETE FROM concepts WHERE {condition}",
+            ):
+                conn.execute(statement, params)
+            # 每次索引作业跑完都清，不判概念集合有没有变化。要重算的时刻是概念"回来"而不是
+            # "离开"：id 由课程 + 名字派生，掉了一轮再被抽到还是同一个 id，而投影已经删了。
+            # 判变化要多查一次、还容易漏掉边界；相比索引本身的解析与嵌入，一次全量重放可忽略。
+            conn.execute("DELETE FROM mistake_backfills WHERE course_id = ?", (course_id,))
             for candidate in candidates:
                 conn.execute(
                     "INSERT INTO concepts(id, course_id, name, chapter, material_id, page, mention_count, created_at)"
                     " VALUES (?, ?, ?, NULL, ?, ?, ?, ?)"
-                    " ON CONFLICT(course_id, name) DO UPDATE SET mention_count = MAX(mention_count, excluded.mention_count)",
+                    # 本教材重新索引以这次抽取结果为准（次数会真的变少）；同名概念归属别的教材时
+                    # 不抢它的位置，次数取较大值。
+                    " ON CONFLICT(course_id, name) DO UPDATE SET"
+                    " mention_count = CASE WHEN material_id = excluded.material_id"
+                    " THEN excluded.mention_count ELSE MAX(mention_count, excluded.mention_count) END,"
+                    " page = CASE WHEN material_id = excluded.material_id THEN excluded.page ELSE page END",
                     (concept_id_for(course_id, candidate["name"]), course_id, candidate["name"], material_id,
                      candidate.get("page"), candidate.get("mention_count", 1), now),
                 )

@@ -2,7 +2,7 @@
 name: research
 description: 教材之外的内容联网查证，明确区分网络来源与教材结论
 when_to_use: 用户问教材里没有的内容、要最新进展或工业界现状，或明确要求联网查
-allowed_tools: [search_materials, list_materials, concept_search, web_search, web_fetch, note_read, note_write]
+allowed_tools: [search_materials, list_materials, concept_search, web_search, web_fetch, note_read, note_write, history_read]
 examples: 联网查一下最新进展 | 业界现在都怎么做 | 教材外的资料帮我查查
 ---
 

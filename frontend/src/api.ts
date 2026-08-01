@@ -1,3 +1,4 @@
+import { t } from './i18n'
 import type { ArchiveSummary, Attachment, Citation, Course, Job, Material, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
@@ -49,19 +50,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     response = await fetch(`${BASE}${path}`, { ...init, headers: { ...(init?.headers ?? {}), ...userHeaders() } })
   } catch {
     reportOffline?.()
-    throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')
+    throw new ApiError(t('api.offline'))
   }
   if (!response.ok) {
     let detail = ''
+    let code = ''
     try {
-      const body = await response.json() as { detail?: string | { message?: string; error?: { message?: string } } }
+      const body = await response.json() as {
+        detail?: string | { message?: string; error?: { message?: string; code?: string } }
+        error?: { message?: string; code?: string }
+      }
       detail = typeof body.detail === 'string' ? body.detail : body.detail?.message ?? body.detail?.error?.message ?? ''
+      // 错误处理器把 error 提到顶层、detail 留成消息串；少数端点直接抛嵌套形式，两种都认。
+      code = body.error?.code ?? (typeof body.detail === 'object' ? body.detail?.error?.code ?? '' : '')
     } catch { /* response is not JSON */ }
-    if (response.status === 422 && detail.includes('用户名')) {
-      // 本地存了个规则变严后不再合法的名字：清掉，让界面回到登录页。
+    // 本地存了个规则变严后不再合法的名字：清掉，让界面回到登录页。
+    // 认错误码而不是 message 里的文字，后端措辞变了或翻译了都不影响。
+    if (response.status === 422 && code === 'invalid_username') {
       clearCurrentUser()
     }
-    throw new ApiError(detail || `请求失败（${response.status}）`, response.status)
+    throw new ApiError(detail || t('api.request_failed', { status: response.status }), response.status)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
@@ -131,7 +139,7 @@ export const api = {
       response = await fetch(`${BASE}/sessions/${sessionId}/turns`, { ...init, headers: { ...init.headers, ...userHeaders(), ...modelHeaders() }, signal })
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error
-      throw new ApiError('无法连接 CoursePilot 服务。请确认后端已启动。')
+      throw new ApiError(t('api.offline'))
     }
     if (!response.ok || !response.body) {
       let detail = ''
@@ -139,7 +147,7 @@ export const api = {
         const body = await response.json() as { detail?: string | { message?: string; error?: { message?: string } } }
         detail = typeof body.detail === 'string' ? body.detail : body.detail?.message ?? body.detail?.error?.message ?? ''
       } catch { /* no JSON detail */ }
-      throw new ApiError(detail || `发送失败（${response.status}）`, response.status)
+      throw new ApiError(detail || t('api.send_failed', { status: response.status }), response.status)
     }
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
     // 用户点停止：中断读取即可，服务端的 finally 会把这一轮落成终态，
@@ -157,10 +165,10 @@ export const api = {
           const payload = JSON.parse(data) as TurnEvent
           if (payload.error) throw new ApiError(payload.error)
           if (eventName === 'turn_failed') {
-            const message = payload.error_code === 'session_busy' ? '该会话正在生成回答，请稍后重试。'
-              : payload.error_code === 'stream_interrupted' ? '回答在生成中被中断，已生成的内容已保留。'
-              : payload.error_code === 'attachment_not_found' ? '图片附件无效或不属于当前会话，请重新上传。'
-              : '本次回答未能完成，请重试。'
+            const message = payload.error_code === 'session_busy' ? t('api.session_busy')
+              : payload.error_code === 'stream_interrupted' ? t('api.stream_interrupted')
+              : payload.error_code === 'attachment_not_found' ? t('api.attachment_not_found')
+              : t('api.turn_failed')
             throw new ApiError(message)
           }
           onEvent({ ...payload, event: eventName, type: eventName })

@@ -25,6 +25,11 @@ class SessionUseCases(Protocol):
     def touch_turn(self, turn_id: str) -> bool: ...
 
 
+class MessageHistoryPort(Protocol):
+    """按会话回读消息记录。agent 回看历史只需要这一个动作，不该拿到整套会话用例。"""
+    def list_messages(self, session_id: str) -> list[Message]: ...
+
+
 class ArtifactStorePort(Protocol):
     """跨轮产物。agent 只需要这四个动作，不该知道它落在哪张表。"""
     def append(self, *, course_id: str, session_id: str, kind: str, visibility: str, payload: dict) -> Artifact: ...

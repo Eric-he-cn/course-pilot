@@ -50,20 +50,25 @@ _MATERIAL_TEXT = "\n\n".join((
 ))
 
 
+def _run_index(client: TestClient, material_id: str) -> None:
+    job_id = client.post(f"/api/v2/materials/{material_id}/index").json()["id"]
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/v2/jobs/{job_id}").json()
+        if job["status"] in {"completed", "failed"}:
+            assert job["status"] == "completed", job.get("error_message")
+            return
+        time.sleep(0.01)
+    raise AssertionError("索引任务未完成")
+
+
 def _indexed_material(client: TestClient, course_id: str, *, filename: str = "chain-rule.md") -> dict:
     material = client.post(
         f"/api/v2/courses/{course_id}/materials",
         files={"file": (filename, _MATERIAL_TEXT, "text/markdown")},
     ).json()
-    job_id = client.post(f"/api/v2/materials/{material['id']}/index").json()["id"]
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        job = client.get(f"/api/v2/jobs/{job_id}").json()
-        if job["status"] in {"completed", "failed"}:
-            assert job["status"] == "completed"
-            return material
-        time.sleep(0.01)
-    raise AssertionError("索引任务未完成")
+    _run_index(client, material["id"])
+    return material
 
 
 def _turn(client: TestClient, session_id: str, message: str, request_id: str) -> None:
@@ -178,6 +183,46 @@ def test_delete_course_removes_its_content_and_keeps_general_sessions(client):
     # 另一门课程的教材、分片与检索索引不受影响。
     assert [item["id"] for item in client.get(f"/api/v2/courses/{other['id']}/materials").json()] == [other_material["id"]]
     assert _count(client, "SELECT count(*) FROM chunks_fts WHERE course_id = ?", (other["id"],)) > 0
+
+
+def test_wrong_answers_survive_reindex_and_do_not_block_deletion(client):
+    """答错过的概念会在 mistake_records 留行，重新索引与两条删除路径都得处理它。
+    只用 attempt_correct 的用例覆盖不到——那条路径根本不建错题行。"""
+    course = client.post("/api/v2/courses", json={"name": "高等数学 II"}).json()
+    material = _indexed_material(client, course["id"])
+    application = workspace(client)
+    concept_id = application.knowledge.list_course_concepts(course_id=course["id"])[0].id
+    application.learning.record_evidence(course_id=course["id"], kind="attempt_incorrect", concept_id=concept_id)
+    assert _count(client, "SELECT count(*) FROM mistake_records WHERE concept_id = ?", (concept_id,)) == 1
+
+    # 重新索引：同名概念 id 不变，错题与掌握度历史都该留着。
+    _run_index(client, material["id"])
+    _assert_no_orphans(client)
+    assert _count(client, "SELECT count(*) FROM mistake_records WHERE concept_id = ?", (concept_id,)) == 1
+    assert _count(client, "SELECT count(*) FROM concept_mastery WHERE concept_id = ?", (concept_id,)) == 1
+
+    assert client.delete(f"/api/v2/materials/{material['id']}").status_code == 204
+    _assert_no_orphans(client)
+    assert _count(client, "SELECT count(*) FROM mistake_records") == 0
+
+    # 换一份教材再答错一次，这回删整门课程。
+    _indexed_material(client, course["id"], filename="again.md")
+    concept_again = application.knowledge.list_course_concepts(course_id=course["id"])[0].id
+    application.learning.record_evidence(course_id=course["id"], kind="attempt_incorrect", concept_id=concept_again)
+    # 再加一个不挂教材的概念：教材那一轮清不到它，只有课程级联能兜住。
+    with application.store.write() as connection:
+        connection.execute(
+            "INSERT INTO concepts(id, course_id, name, material_id, mention_count, created_at)"
+            " VALUES ('concept_loose', ?, '散装概念', NULL, 1, 'now')", (course["id"],))
+    application.learning.record_evidence(course_id=course["id"], kind="attempt_incorrect", concept_id="concept_loose")
+    application.learning.get_archive(course_id=course["id"])  # 顺带落下回填完成标记
+    assert _count(client, "SELECT count(*) FROM mistake_backfills WHERE course_id = ?", (course["id"],)) == 1
+    assert _count(client, "SELECT count(*) FROM mistake_records WHERE course_id = ?", (course["id"],)) == 2
+
+    assert client.delete(f"/api/v2/courses/{course['id']}").status_code == 204
+    _assert_no_orphans(client)
+    for table in ("mistake_records", "mistake_backfills"):
+        assert _count(client, f"SELECT count(*) FROM {table}") == 0, table
 
 
 def test_deleting_missing_ids_returns_404(client):

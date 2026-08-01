@@ -1,10 +1,14 @@
 from __future__ import annotations
 from typing import Protocol
-from .models import ArchiveSummary, ConceptMastery, EvidenceEvent
+from .mistakes import GRADUATE_STREAK  # 毕业阈值要写进给模型看的档案文本，跟着 Port 一起出口
+from .models import ArchiveSummary, ConceptMastery, EvidenceEvent, MistakeRecord
+
+__all__ = ["GRADUATE_STREAK", "ArchiveReaderPort", "ArchiveSummary", "ConceptMastery",
+           "EvidenceEvent", "EvidenceWriterPort", "MistakeRecord"]
 
 
 class ArchiveReaderPort(Protocol):
-    def get_archive(self, *, course_id: str, limit: int = 20) -> ArchiveSummary: ...
+    def get_archive(self, *, course_id: str, limit: int = 20, mistake_limit: int = 20) -> ArchiveSummary: ...
     def weak_concepts(self, *, course_id: str, limit: int = 5) -> list[ConceptMastery]: ...
     def due_concepts(self, *, course_id: str, limit: int = 5) -> list[ConceptMastery]: ...
 

@@ -20,9 +20,9 @@ from modules.sessions.api import (
 from contracts.web import WebSearchPort
 
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
-from .context import PROMPT_VERSION, SEED_CALL_ID, assemble_general_messages, assemble_messages, message_chars
+from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, assemble_general_messages, assemble_messages, message_chars
 from .skills import SkillRegistry
-from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, CitationRegistry, ToolExecutor, cited_only, is_repeatable, profile_for_skill, specs_for
+from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, profile_for_skill, specs_for
 from .trace import TraceWriter
 
 logger = logging.getLogger(__name__)
@@ -45,15 +45,28 @@ def _practice_reminder(missing: list[str], question_count: int | None, emitted: 
 # 明确要练题的说法：命中就直接注入 practice 规程。纯靠模型自觉调 use_skill 会漏，
 # 而漏加载意味着这次练习不落 artifact、后续作答也无从批改。误命中的代价很小——
 # 规程第一步就是判断本轮该做什么。
-_PRACTICE_INTENT = re.compile(r"出\s*(?:几|[一二三四五六1-9])?\s*道|出题|出几题|练练|练习题|做几道|来[一两]道|小测|测测我|考考我|练一练")
+_PRACTICE_INTENT = re.compile(
+    r"出\s*(?:几|[一二三四五六1-9])?\s*道|出题|出几题|练练|练习题|做几道|来[一两]道|小测|测测我|考考我|练一练"
+    r"|quiz\s+me|test\s+me|drill\s+me|ask\s+me\s+(?:\d+\s+|a\s+few\s+|some\s+)?questions?"
+    r"|(?:practice|sample|mock|extra|more)\s+(?:questions?|problems?|exercises?|quiz|test|exam)"
+    r"|problem\s+set|give\s+me\s+(?:\d+|a\s+few|some|another)\s+(?:questions?|problems?|exercises?)",
+    re.IGNORECASE)
 
 # 其余 skill 的预路由：模型不会主动 use_skill，漏加载就等于规程没生效
 # （画图不挑图型、卡片不落盘、联网不标来源）。误命中的代价很小——规程第一步都是判断本轮该做什么。
 _SKILL_INTENT = {
-    "diagram": re.compile(r"流程图|思维导图|结构图|时序图|画[一张个]*图|画一下|图解|捋[一下]*[遍流]"),
-    "flashcards": re.compile(r"学习卡片|抽认卡|记忆卡|卡片|知识点清单|整理成.{0,6}(卡|清单)"),
-    "mistake_review": re.compile(r"错题|复盘|哪里.{0,4}(薄弱|不会|没掌握)|薄弱|弱项|做错的|错在哪"),
-    "research": re.compile(r"联网|上网|查一下网|最新进展|业界|工业界|论文里|教材外|课外的?资料"),
+    "diagram": re.compile(r"流程图|思维导图|结构图|时序图|画[一张个]*图|画一下|图解|捋[一下]*[遍流]"
+                          r"|flow\s?chart|mind\s?map|sequence\s+diagram|diagram\s+(?:of|for)|draw\s+(?:me\s+)?a"
+                          r"|visuali[sz]e|sketch\s+(?:out|me)?", re.IGNORECASE),
+    "flashcards": re.compile(r"学习卡片|抽认卡|记忆卡|卡片|知识点清单|整理成.{0,6}(卡|清单)"
+                             r"|flash\s?cards?|cue\s+cards?|study\s+cards?|anki|cheat\s?sheet", re.IGNORECASE),
+    "mistake_review": re.compile(r"错题|复盘|哪里.{0,4}(薄弱|不会|没掌握)|薄弱|弱项|做错的|错在哪"
+                                 r"|my\s+mistakes|wrong\s+answers?|weak\s+(?:spots?|areas?|points?)"
+                                 r"|what\s+I\s+got\s+wrong|review\s+my\s+(?:mistakes|errors)", re.IGNORECASE),
+    "research": re.compile(r"联网|上网|查一下网|最新进展|业界|工业界|论文里|教材外|课外的?资料"
+                           r"|search\s+(?:online|the\s+web|the\s+internet)|look\s+.{0,12}\s?up\s+online"
+                           r"|latest\s+research|recent\s+papers?|state\s+of\s+the\s+art"
+                           r"|outside\s+the\s+(?:textbook|course\s+material)", re.IGNORECASE),
 }
 
 
@@ -61,11 +74,25 @@ _SKILL_INTENT = {
 # 教材照片不该获得写权限。排计划往往要先问考试日期，所以意图在本会话里粘住。
 # 关键词表必然有漏，宁可漏也不能误放：命中就等于拿到写权限，所以只收进指向明确的说法
 # （"进系统"覆盖排进/写进/存进），不收"排""冲刺"这类会撞上教材术语的词。
-_PLAN_INTENT = re.compile(r"计划|规划|复习安排|学习安排|安排一下|备考|日程|课表|进系统|考试.{0,4}(准备|安排)")
+# 英文侧同样只收指向明确的短语：光有 plan / schedule 会撞上 query plan、CPU scheduling
+# 这类教材术语，所以一律要求它跟 study / review / exam 之类的限定词连着出现。
+_PLAN_INTENT = re.compile(
+    r"计划|规划|复习安排|学习安排|安排一下|备考|日程|课表|进系统|考试.{0,4}(准备|安排)"
+    r"|(?:study|revision|review|exam|reading)\s+(?:plan|schedule|timetable)"
+    r"|(?:plan|schedule)\s+(?:out\s+)?my\s+(?:study|studies|revision|review|prep|week)"
+    r"|exam\s+prep|prepare\s+for\s+(?:the\s+|my\s+)?exam|into\s+the\s+system",
+    re.IGNORECASE)
 
 # 要求记住某件事的说法。模型不会主动调 memory_patch，却照样回答「已记住」——
 # 用户因此看到空的 user.md。命中这个又没真写成，就补一轮让它补上。
-_MEMORY_INTENT = re.compile(r"记住|记一下|记下来|别忘|以后都|下次也|默认就|我的习惯|我喜欢")
+# 英文侧要求 remember 后面跟 that / this / my 之类，否则「remember the chain rule」
+# 这种回忆式提问也会被当成要写记忆。
+_MEMORY_INTENT = re.compile(
+    r"记住|记一下|记下来|别忘|以后都|下次也|默认就|我的习惯|我喜欢"
+    r"|remember\s+(?:that|this|I|my|me)\b|from\s+now\s+on|going\s+forward|for\s+future\s+reference"
+    r"|don'?t\s+forget|do\s+not\s+forget|keep\s+in\s+mind|I\s+prefer\b|my\s+preference"
+    r"|(?:save|add|write)\s+(?:this|that)\s+to\s+(?:your\s+)?memory|memori[sz]e",
+    re.IGNORECASE)
 _TRANSCRIPTION_MARK = "[图片转录："
 
 
@@ -114,6 +141,18 @@ def join_answer(segments: list[str]) -> str:
     kept = [segment for segment in segments[:-1] if segment.strip() and not _is_filler(segment)]
     kept.append(segments[-1])
     return "\n\n".join(part.strip() for part in kept if part.strip())
+
+
+def _summary_fields(result: ToolOutcome, *, reused: bool = False) -> dict[str, object]:
+    """工具结果的展示文案。三条出口（SSE、activity、trace）用同一份，免得只有一条带上 key。
+    复用只挂一个标记，由前端拼后缀——把中文摘要塞进参数会让英文界面中英混排。
+    args 每条出口各拿一份拷贝：activity 要等本轮结束才落库，共享引用等于赌没人改它。"""
+    fields: dict[str, object] = {
+        "summary": result.summary, "summary_key": result.summary_key, "summary_args": dict(result.summary_args),
+    }
+    if reused:
+        fields["reused"] = True
+    return fields
 
 
 def _args_key(arguments: str) -> str:
@@ -242,7 +281,7 @@ class TurnService:
         self._executor = ToolExecutor(
             knowledge=knowledge, plans=plans, plan_writer=plan_writer, archive=archive,
             evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
-            web=web, notes=notes, search_limit=search_limit,
+            web=web, notes=notes, sessions=sessions, search_limit=search_limit,
         )
         # 没配联网就不下发 network 类工具。下发了模型也只会拿回 not_configured，
         # 白烧一轮工具（core/settings.py 的 web_search_api_key 注释写的就是这条约定）。
@@ -278,16 +317,17 @@ class TurnService:
         for key, value in extra.items():
             total[key] = total.get(key, 0) + value
 
-    def _context_usage(self, messages: list[ChatMessage], base: list[tuple[str, int]], assembled, summary) -> dict[str, object]:
+    def _context_usage(self, messages: list[ChatMessage], base: list[ContextSegment], assembled, summary) -> dict[str, object]:
         """本轮上下文构成。工具循环追加的内容算进"工具结果"，不然看不到真正的大头。
 
         字段名刻意避开 text / content / delta：前端对这三个键是无条件取值并拼进回答。
         """
         total = message_chars(messages)
-        segments = [*base, ("工具结果", max(0, total - sum(size for _, size in base)))]
+        tool_chars = max(0, total - sum(item.chars for item in base))
+        segments = [*base, ContextSegment("context.segment.tool_results", "工具结果", tool_chars)]
         return self._event(
             "context_usage",
-            segments=[{"label": label, "chars": size} for label, size in segments if size > 0],
+            segments=[{"label": item.label, "label_key": item.key, "chars": item.chars} for item in segments if item.chars > 0],
             total_chars=total, limit_chars=self._context_char_limit,
             history_budget_chars=self._history_token_budget,
             dropped_history=assembled.dropped_history, clipped_history=assembled.clipped_history,
@@ -462,9 +502,9 @@ class TurnService:
                 seed = self._executor.execute(scope=scope, session_id=session_id, name="search_materials", arguments=seed_args, registry=registry, allowed=MAIN_PROFILE)
                 for citation in seed.new_citations:
                     yield self._event("citation", **citation)
-                yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, summary=seed.summary)
-                activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, "summary": seed.summary})
-                trace_tools.append({"origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, "summary": seed.summary, "duration_ms": int((time.monotonic() - seed_started) * 1000)})
+                yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, **_summary_fields(seed))
+                activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, **_summary_fields(seed)})
+                trace_tools.append({"origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, **_summary_fields(seed), "duration_ms": int((time.monotonic() - seed_started) * 1000)})
                 assembled = assemble_messages(
                     course_name=context.course_name or "当前课程",
                     materials=self._knowledge.material_names(scope=scope),
@@ -500,11 +540,16 @@ class TurnService:
                 # 而漏批改意味着这次作答不进学习档案。加载后仍由规程自己判断本轮做什么。
                 practice.load(session_id=session_id)
                 practice_skill = self._skills.get("practice")
-                auto_skill, auto_reason = None, ""
+                # 加载原因三种情况各有一个完整 key，不做「原因」的二级插值：
+                # 嵌套要前端支持两层渲染，而扁平 key 直接就能翻。
+                auto_skill, auto_reason, auto_key = None, "", ""
                 if practice_skill is not None and practice.awaiting_grade:
-                    auto_skill, auto_reason = practice_skill, f"练习 {practice.pending.practice_id} 待批改"
+                    # 不带练习 id：那是内部标识，对用户没有信息量。
+                    auto_skill, auto_reason = practice_skill, "有练习待批改"
+                    auto_key = "summary.skill_auto_loaded_pending"
                 elif practice_skill is not None and practice.wants_practice:
                     auto_skill, auto_reason = practice_skill, "用户要练题"
+                    auto_key = "summary.skill_auto_loaded_requested"
                 else:
                     for name, pattern in _SKILL_INTENT.items():
                         # 没配联网时 research 的大半工具都会失败，加载它只是白费一轮。
@@ -512,17 +557,26 @@ class TurnService:
                             continue
                         if pattern.search(message) and (candidate := self._skills.get(name)) is not None:
                             auto_skill, auto_reason = candidate, "命中意图"
+                            auto_key = "summary.skill_auto_loaded_intent"
                             break
                 if auto_skill is not None:
                     call_id = f"call_auto_{auto_skill.name}"
                     arguments = {"name": auto_skill.name}
                     yield self._event("tool_call", call_id=call_id, name="use_skill", arguments=arguments, origin="auto")
-                    yield self._event("tool_result", call_id=call_id, name="use_skill", ok=True, summary=f"自动加载 {auto_skill.name}（{auto_reason}）")
-                    activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True, "summary": f"自动加载 {auto_skill.name}"})
-                    trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载", "decision": "allowed", "reason": None, "duration_ms": 0})
+                    yield self._event(
+                        "tool_result", call_id=call_id, name="use_skill", ok=True,
+                        summary=f"自动加载 {auto_skill.name}（{auto_reason}）", summary_key=auto_key,
+                        summary_args={"name": auto_skill.name},
+                    )
+                    activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True,
+                                     "summary": f"自动加载 {auto_skill.name}", "summary_key": "summary.skill_auto_loaded_short",
+                                     "summary_args": {"name": auto_skill.name}})
+                    trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载",
+                                        "summary_key": "summary.skill_auto_loaded_short", "summary_args": {"name": auto_skill.name},
+                                        "decision": "allowed", "reason": None, "duration_ms": 0})
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps(arguments)),)))
                     messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{auto_skill.body}", tool_call_id=call_id))
-                    base_segments = base_segments + [("skill 规程", len(auto_skill.body))]
+                    base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", len(auto_skill.body))]
                     skill_profile = profile_for_skill(auto_skill.allowed_tools)
                     active_skill, allowed_tools = auto_skill.name, skill_profile.tools
                     capabilities = skill_profile.capabilities - self._offline
@@ -620,7 +674,11 @@ class TurnService:
                                 repeat_key = (call.name, _args_key(call.arguments))
                                 cached = tool_results.get(repeat_key) if is_repeatable(call.name) else None
                                 if cached is not None:
-                                    result = replace(cached, new_citations=[], summary=f"{cached.summary}（与本轮上一次相同，已复用）")
+                                    # 沿用被复用那次的 key，只补中文兜底里的后缀；「已复用」靠标记传给前端。
+                                    result = replace(
+                                        cached, new_citations=[],
+                                        summary=f"{cached.summary}（与本轮上一次相同，已复用）",
+                                    )
                                 else:
                                     result = self._executor.execute(
                                         scope=scope, session_id=session_id, name=call.name, arguments=call.arguments,
@@ -650,9 +708,10 @@ class TurnService:
                                     trace_record["skill"] = {"name": active_skill, "content_hash": skill.content_hash if skill else None, "activation": "model"}
                                 for citation in result.new_citations:
                                     yield self._event("citation", **citation)
-                                yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, summary=result.summary)
-                                activity.append({"call_id": call.id, "name": call.name, "origin": "model", "ok": result.ok, "summary": result.summary})
-                                trace_tools.append({"origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, "summary": result.summary, "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
+                                shown = _summary_fields(result, reused=cached is not None)
+                                yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, **shown)
+                                activity.append({"call_id": call.id, "name": call.name, "origin": "model", "ok": result.ok, **_summary_fields(result, reused=cached is not None)})
+                                trace_tools.append({"origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, **_summary_fields(result, reused=cached is not None), "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
                                 messages.append(ChatMessage(role="tool", content=result.text, tool_call_id=call.id))
                         else:
                             raise LLMProviderError("invalid_response", "供应商流结束但没有终态响应", retryable=False)

@@ -240,6 +240,12 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .pipeline-step.done { border-color:#D4D4D8; color:var(--text) }
 .pipeline-step.current { border-color:var(--accent); background:var(--accent); color:#fff }
 .empty-inline { padding:16px 0; color:var(--muted); text-align:center; font-size:13px }
+/* 错题本：尾部标签包一层，让「复发 + 已清掉」同时出现时只占一个网格列。 */
+.mistake-tags { display:flex; gap:6px; justify-content:flex-end }
+.card > .mistake-more { margin:10px 0 0; font-size:12px }
+.mistake-cleared { margin-top:12px; padding-top:10px; border-top:1px solid var(--border) }
+.mistake-cleared > summary { color:var(--muted); font-size:12px; cursor:pointer }
+.mistake-cleared .material-row:first-of-type { margin-top:4px }
 .result { padding:12px 0; border-top:1px solid var(--border) }
 .result b { font-size:13px }
 .result p { white-space:pre-wrap; line-height:1.7; font-size:13.5px }
@@ -362,7 +368,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
   .hero h1 { font-size:21px }
   .messages { padding-top:18px }
   .material-row { grid-template-columns:36px minmax(0,1fr) }
-  .material-row .status-tag,.material-row .ghost-button { grid-column:2; justify-self:start }
+  .material-row .status-tag,.material-row .ghost-button,.material-row .mistake-tags { grid-column:2; justify-self:start }
   .search-card form { display:grid; grid-template-columns:1fr }
   .search-card .primary-button { width:max-content }
   .switch-row { align-items:flex-start }

@@ -28,7 +28,10 @@ def _detail(response: httpx.Response, secret: str) -> str:
     密钥就算被服务端回显也在这里抹掉。这条消息只进本地 trace，不随事件发给前端。"""
     try:
         response.read()
-        message = (response.json().get("error") or {}).get("message")
+        body = response.json()
+        # vLLM / FastAPI 系的错误说明在顶层 detail 或 message，不在 error.message 里。
+        message = (body.get("error") or {}).get("message") or body.get("message") \
+            or (body.get("detail") if isinstance(body.get("detail"), str) else None)
     except Exception:
         return ""
     if not isinstance(message, str):
@@ -100,8 +103,15 @@ class OpenAICompatibleChat:
             "messages": self._to_wire(messages),
             "max_tokens": self._max_output_tokens,
             "stream": True,
+            # 不带这个的话部分服务流式 usage 恒为 null，token 统计静默丢失。
+            "stream_options": {"include_usage": True},
             **self._extra_body,
         }
+        # 推理系模型要求 max_completion_tokens 且拒绝 max_tokens 同时出现，两者互斥。
+        if payload.get("max_completion_tokens") is not None:
+            payload.pop("max_tokens", None)
+        # extra_body 里置 null 表示移除该字段，留给不认识 stream_options 的服务一个出口。
+        payload = {key: value for key, value in payload.items() if value is not None}
         if tools:
             payload["tools"] = [
                 {"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}}
@@ -141,7 +151,8 @@ class OpenAICompatibleChat:
                             yield ChatDelta(piece)
                         # 思考内容单独走一路：它不进答案，但要回传给厂商。
                         # 刻意不设 emitted——答案还没开始，网络抖动时整轮重试仍然安全。
-                        thinking = delta.get("reasoning_content")
+                        # 字段名不统一：reasoning_content 之外也有服务用 reasoning。
+                        thinking = delta.get("reasoning_content") or delta.get("reasoning")
                         if isinstance(thinking, str) and thinking:
                             reasoning_parts.append(thinking)
                             yield ChatReasoning(thinking)
@@ -159,8 +170,14 @@ class OpenAICompatibleChat:
                         return
                     text = "".join(parts).strip()
                     if not text:
-                        self._record_failure("invalid_response")
-                        raise LLMProviderError("invalid_response", f"{self._provider} 返回了空回答", retryable=False)
+                        # 空回答按收尾原因归类：推理模型思考吃完输出预算是常见态，
+                        # 一律报「空回答」会让人查错方向。
+                        code, why = {
+                            "length": ("output_truncated", "输出在生成完正文前达到 token 上限"),
+                            "content_filter": ("content_filtered", "输出被服务端内容过滤拦下"),
+                        }.get(finish_reason, ("invalid_response", "返回了空回答"))
+                        self._record_failure(code)
+                        raise LLMProviderError(code, f"{self._provider} {why}", retryable=False)
                     self._record_success()
                     yield ChatFinal(text=text, finish_reason=finish_reason, provider=self.provider, model=self.model, mode=self.mode, usage=usage)
                     return
@@ -219,7 +236,11 @@ class OpenAICompatibleChat:
     @staticmethod
     def _accumulate_tool_call(acc: dict[int, dict[str, str]], raw_call: dict) -> None:
         # 流式 tool_calls 按 index 分片下发，逐片拼接 id/name/arguments。
-        index = raw_call.get("index", 0)
+        # 有的服务不发 index：带 id 的分片当作新调用开槽，不带的拼到最近一个——
+        # 否则两个并行调用会落进同一个槽，arguments 拼成非法 JSON。
+        index = raw_call.get("index")
+        if index is None:
+            index = len(acc) if raw_call.get("id") or not acc else max(acc)
         entry = acc.setdefault(index, {"id": "", "name": "", "arguments": ""})
         if raw_call.get("id"):
             entry["id"] = raw_call["id"]
@@ -267,6 +288,11 @@ class OpenAICompatibleChat:
             value = raw.get(key)
             if isinstance(value, int):
                 result[key] = value
+        # 缓存与思考的明细有的服务放嵌套对象里，拍平收进来，有就记没有跳过。
+        for parent, key in (("prompt_tokens_details", "cached_tokens"), ("completion_tokens_details", "reasoning_tokens")):
+            details = raw.get(parent)
+            if isinstance(details, dict) and isinstance(details.get(key), int):
+                result[key] = details[key]
         return result
 
     def _record_success(self) -> None:

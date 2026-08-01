@@ -164,7 +164,7 @@ class LLMClient(Protocol):
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]: ...
 ```
 
-`LLMEvent` 只允许 `text_delta / reasoning_delta / tool_call_delta / usage / completed / failed`。Agent 循环只消费这些内部类型，不访问 `choices[0]`、`reasoning_content` 等 provider 特有字段。主 Agent 首版关闭 DeepSeek thinking；若后续评测后为工具链开启，adapter 必须把 `reasoning_content` 作为 provider-private metadata 原样回传，但不得显示给用户、写入通用消息模型、记忆或 trace payload。
+`LLMEvent` 只允许 `text_delta / reasoning_delta / tool_call_delta / usage / completed / failed`。Agent 循环只消费这些内部类型，不访问 `choices[0]`、`reasoning_content` 等 provider 特有字段。思考/推理内容（各家字段名不同，如 `reasoning_content`）由 adapter 归一成 `reasoning_delta` 事件：可以展示为过程提示，但不进回答正文、通用消息模型、记忆或 trace payload。是否开启思考模式属于厂商私有配置，走 `TEXT_EXTRA_BODY`。
 
 ### 5.3 模型槽位与能力路由
 
@@ -186,6 +186,17 @@ class LLMClient(Protocol):
 
 厂商私有的请求字段统一走 `TEXT_EXTRA_BODY`（JSON 对象，原样并入请求体），
 适配器本身只发标准字段。覆盖 `messages` / `stream` 这类协议字段会在构造期报错。
+兼容性上有三个已经吸收掉的实际差异：
+
+- 输出上限字段名不统一：默认发 `max_tokens`；`TEXT_EXTRA_BODY` 里给了
+  `max_completion_tokens`（OpenAI 推理系模型的要求）就不再发 `max_tokens`，两者互斥。
+- 默认带 `stream_options: {"include_usage": true}`，否则部分服务流式 usage 恒为 null。
+  遇到不认识这个字段的服务，在 `TEXT_EXTRA_BODY` 里把它置 `null` 即整个移除。
+- 思考内容的字段名（`reasoning_content` / `reasoning`）都认，归一成同一个内部事件；
+  usage 里嵌套的缓存与思考明细（如 `prompt_tokens_details.cached_tokens`）有则拍平记录。
+
+已知边界：经代理接 Anthropic 思考模型并同时用工具调用时，思考内容的跨轮回传载体
+（带签名的 thinking block）超出 Chat Completions 协议的表达能力，这类链路不承诺兼容。
 
 - `TEXT_*` 四项配齐并把 `COURSEPILOT_ENABLE_REMOTE_LLM` 打到 1 才会调远端，否则走本地兜底 responder。
 - `VISION_*` 四项决定图片提问是否可用，未配置时附件上传返回 `feature_disabled`。
@@ -196,9 +207,9 @@ class LLMClient(Protocol):
 
 ### 5.5 调用策略与 512K 软窗口
 
-截至 2026-07-20，正式模型名是 `deepseek-v4-flash / deepseek-v4-pro`；`deepseek-chat / deepseek-reasoner` 仅是 Flash 非思考/思考模式的兼容别名，并将在 2026-07-24 23:59（北京时间）下线。首版固定 `deepseek-v4-flash`，不再保留两个旧模型名。官方模型支持 1M context，但 API 没有“把窗口改成固定档位”的独立参数；CoursePilot 通过上下文组装器限制发送的 token 数，取 512K 作软窗口，在 1M 上限内留出余量。[DeepSeek 模型与价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)、[Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)。
+上下文不靠模型侧的窗口参数控制——多数服务没有“把窗口改成固定档位”的独立参数。CoursePilot 在组装阶段限制发送量，软窗口由 `AGENT_CONTEXT_CHAR_LIMIT` 给（默认 512K 字符），在所配模型的上限内留出余量。换一个上下文更短的模型时改这一个配置项，代码不用动。思考模式的开关属于厂商私有字段，走 `TEXT_EXTRA_BODY`。
 
-当前实现状态（2026-07-21）：`contracts/llm.py` 定义供应商无关的 Tutor 增量流协议（deltas + 终态摘要），`adapters/llm/deepseek.py` 实现流式 Chat Completions（重试仅发生在首个增量之前），`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
+`contracts/llm.py` 定义供应商无关的增量流协议（deltas + 终态摘要），`adapters/llm/openai_compatible.py` 实现流式 Chat Completions（重试仅发生在首个增量之前），`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
 
 512K 软窗口分配如下，超过任一分区先裁剪该分区，不借用 output/reserve。输出分区受模型输出能力限制，不随窗口放大：
 
@@ -215,16 +226,16 @@ class LLMClient(Protocol):
 
 - 主 Agent、规划、practice 和 wiki 工具链显式传 `thinking.disabled`，保证延迟可控且无需保存隐式推理；离线 judge 可用 `thinking.enabled + reasoning_effort=high`。是否为具体 Skill 开启 thinking 必须先过 A/B eval。
 - 非思考模式按任务设置温度：Tutor/评分/Wiki 为 `0.2`，练习题创作为 `0.7`；thinking 模式不发送 `temperature / top_p / presence_penalty / frequency_penalty`，因为官方说明这些参数无效。
-- DeepSeek context cache 默认开启。上下文组装保持“稳定系统提示 → 稳定课程信息 → 动态历史/RAG”的顺序，并记录 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
+- 上下文组装保持“稳定系统提示 → 稳定课程信息 → 动态历史/RAG”的顺序，让支持 prompt cache 的服务能命中前缀缓存；usage 里的缓存命中字段（如 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`）有则记录。
 - 请求传入内部用户 ID 的 HMAC 作为 `user_id`，用于 provider 侧 KV cache 与调度隔离，不发送邮箱、IM 用户标识等隐私标识。
 
-### 5.6 首版选型的实测结论
+### 5.6 参考配置：一个双槽位的例子
 
-截至 2026-07-20，DeepSeek 官方列出的 V4 Flash / Pro API 支持 JSON Output 和 Tool Calls，适合主 Agent；但官方同时明确 V4 为 text-only，图片需要由其他视觉模型代理。因此，**单独一个 DeepSeek API 不足以完成 OCR**。另外，`deepseek-chat / deepseek-reasoner` 旧别名将于 2026-07-24 弃用，2.0 不再将该别名写死在代码中。
+接入层认 OpenAI Chat Completions 协议。text 与 vision 是两个独立槽位：主模型自带图片能力就把两个槽位配成同一个服务；主模型是纯文本的，vision 槽位另配一个视觉模型即可，业务代码感知不到差别。
 
-阿里云百炼的 Qwen-OCR 官方 API 同时支持 OpenAI-compatible 和 DashScope 协议，并提供普通文字、带坐标高精度识别、信息抽取、表格、文档结构与公式 LaTeX 识别。当前使用官方稳定模型 ID `qwen-vl-ocr`；需要锁定行为时可换成文档列出的日期快照（例如 `qwen-vl-ocr-2025-11-20`）。因此首版采用“DeepSeek 文本主模型 + Qwen-OCR 视觉模型”；同一把百炼 Key 可复用，但文本与视觉仍配置不同 model id。
+作者自用的配置可作参考：text 槽位接 DeepSeek（支持 Tool Calls 与 JSON Output，满足工具循环的要求，但 text-only），vision 槽位接同样暴露 OpenAI 兼容协议的 Qwen-OCR（`qwen-vl-ocr`，支持公式 LaTeX 与表格识别；需要锁定行为可换成日期快照版本）。接 OpenAI 或其他多模态服务的部署不需要这层拆分，两个槽位填同一份配置就行。
 
-官方能力依据：[DeepSeek 模型与功能](https://api-docs.deepseek.com/quick_start/pricing/)、[DeepSeek V4 发布说明](https://api-docs.deepseek.com/news/news260424/)、[Qwen-OCR API](https://help.aliyun.com/en/model-studio/qwen-vl-ocr-api-reference)。模型 ID 和能力可变，实现以配置与启动能力检查为准。
+模型 ID 和能力随时间变化，实现以配置与启动期能力检查为准：开启 OCR 却没配 vision 槽位时，管理页显示不可用，不会等到首次图片请求才报错。
 
 ### 5.7 OCR 调用链路
 
@@ -484,13 +495,15 @@ model tool call
 
 | Agent profile | 可见工具 | 说明 |
 | --- | --- | --- |
-| 主 Agent（无前台 skill） | `rag_search`、`wiki_read`、`concept_search`、`archive_query`、`plan_read`、`memory_patch`、`emit_evidence`、`plan_update`、`use_skill` | 覆盖讲解、规划、档案维护和能力加载；Wiki 关闭时自动移除 Wiki 工具 |
-| `practice` profile | `rag_search`、`wiki_read`、`concept_search`、`archive_query`、`skill_resource_read`、`emit_evidence`、`artifact_read`、`artifact_append` | 使用通用 artifact 保存必要事实与私有 answer key；看不到计划与 Wiki 写工具 |
+| 主 Agent（无前台 skill） | `rag_search`、`wiki_read`、`concept_search`、`archive_query`、`plan_read`、`history_read`、`memory_patch`、`emit_evidence`、`plan_update`、`use_skill` | 覆盖讲解、规划、档案维护和能力加载；Wiki 关闭时自动移除 Wiki 工具 |
+| `practice` profile | `rag_search`、`wiki_read`、`concept_search`、`archive_query`、`skill_resource_read`、`history_read`、`emit_evidence`、`artifact_read`、`artifact_append` | 使用通用 artifact 保存必要事实与私有 answer key；看不到计划与 Wiki 写工具 |
 | `wiki_curator` profile | `rag_search`、`wiki_read`、`concept_search`、`wiki_patch` | 对 Agent 管理区块做带 `expected_git_head` 的增量 patch；看不到学习档案、计划和练习写工具 |
 | 用户 Skill | 其 frontmatter 请求集合与 policy 的交集，另可使用受限 `skill_resource_read` | 默认关闭；不能获得 Shell、任意文件、数据库、调度、渠道发送或未注册工具 |
 | Research subagent | `web_search`、`web_fetch` | 与主会话隔离；结果视为不可信外部数据，必须带来源 |
 
 skill 激活时切换到其完整 profile，而不是在默认工具上做无限并集；退出该轮后恢复主 Agent profile。这与对话阶段无关，只是当轮最小权限。
+
+`history_read` 是只读工具：跨轮历史按 role 投影，工具正文从不进入下一轮，模型要看早先某轮检索到什么就得回捞。它一次最多回看 5 轮、6000 字符，每轮 3 次额度，只回放当前课程轮次的工具痕迹与引用原文，不碰模型私有 artifact（那里存着答案）。
 
 `memory_patch` 与 `ask_user` 是基座工具，每份 profile 都补上，不由各 skill 自己声明：整体替换意味着不兜住就会在 skill 激活后消失，而「记下值得长期记住的事」和「把选项摆给用户挑」在任何规程执行期间都可能需要，两者又都不碰课程数据。`ask_user` 只把选项挂到本轮消息上就收住，用户点击等于发一条新的用户消息，不占住当前 turn 等人。
 

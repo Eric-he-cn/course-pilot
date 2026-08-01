@@ -9,12 +9,13 @@
     .venv/bin/python scripts/e2e_multiturn.py --only A,C          # 只跑某几个场景
 
 数据目录得是新布局（<data>/users/<user_id>/），旧布局先跑 scripts/migrate_to_users.py。
-场景 D/E/F 依赖「大语言模型」「操作系统」两门已索引的课程。
+场景 D/E/F/G 依赖「大语言模型」「操作系统」两门已索引的课程。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -186,37 +187,60 @@ def scenario_practice(course: str) -> None:
 
 
 # ---------------------------------------------------------------- 场景 C
+def is_weekend_ahead(item: dict, today: str) -> bool:
+    return item["due_date"] >= today and time.strptime(item["due_date"], "%Y-%m-%d").tm_wday >= 5
+
+
 def scenario_plan(course: str) -> None:
     """排计划 → 提出约束改计划。第二轮必须先读旧计划再改，不能当新计划重排。"""
     print("\n[C] 计划两轮：排出来 → 按新约束改")
     session = call("/sessions", {"scope_mode": "course", "course_id": course})["id"]
+    # 数据目录复用，库里可能已经有上一次跑出来的计划。记下起始版本，首轮才能判「真的写进去了」。
+    existing = call(f"/courses/{course}/plan")["plan"]
+    version_at_start = existing["version"] if existing else 0
+    # 首轮点明周末也排：不然模型常自己避开周末，第二轮就没东西可匀，那条判据白过。
     made = ask(session, "我 8 月 20 号考这门，范围就是资料库里的内容，从明天开始每天 1.5 小时，"
-                        "直接排进系统排一份复习计划，不用再问我", "mt-c1")
+                        "周末也照排不休息，直接排进系统排一份复习计划，不用再问我", "mt-c1")
     check("排计划调了 plan_update", "plan_update" in made.tools, str(made.tools))
     plan = call(f"/courses/{course}/plan")["plan"]
-    if not check("计划已落库", bool(plan and plan["items"]), str(plan)):
+    # 光看「有没有条目」不够：首轮压根没写时库里留着上一次的计划，照样绿，
+    # 后面几条判据就顺着旧数据往下走，失败被藏起来。
+    if not check("首轮计划真的写进去了",
+                 bool(plan and plan["items"]) and plan["version"] > version_at_start,
+                 f"版本 {version_at_start} → {plan['version'] if plan else None}"):
         return
     version_before = plan["version"]
     revisions_before = scalar("SELECT count(*) FROM plan_revisions WHERE plan_id = ?", plan["id"])
-    weekend_before = sum(1 for item in plan["items"]
-                         if time.strptime(item["due_date"], "%Y-%m-%d").tm_wday >= 5)
+    # plan_update 的契约是重写今天及以后，过去日期它无权改动；复用的数据目录里会攒下
+    # 往日跑出来的周末条目，把它们算进来这条断言就永远红。
+    today = time.strftime("%Y-%m-%d")
+    weekend_before = sum(1 for item in plan["items"] if is_weekend_ahead(item, today))
     count_before = len(plan["items"])
 
-    changed = ask(session, "周六周日我要出差看不了书，把周末那几天的内容匀到前后的工作日去", "mt-c2")
+    # 说清是「以后每个周末」：只说「周末我要出差」可以读成只指这一个周末，那时判据去查
+    # 后面几个周末就等于把模型的一种合法理解判成错。
+    changed = ask(session, "从现在到考试，每个周六周日我都在出差看不了书，"
+                           "把所有周末的内容都匀到工作日去", "mt-c2")
     check("改计划先读了旧计划", "get_plan" in changed.tools, str(changed.tools))
     check("改计划走的是 plan_update", "plan_update" in changed.tools, str(changed.tools))
     after = call(f"/courses/{course}/plan")["plan"]
-    check("计划版本递增", after["version"] > version_before, f"{version_before} → {after['version']}")
+    written = check("计划版本递增", after["version"] > version_before, f"{version_before} → {after['version']}")
     check("改动留了 revision",
           scalar("SELECT count(*) FROM plan_revisions WHERE plan_id = ?", plan["id"]) > revisions_before)
     # 删掉周末条目、或者留一条「出差跳过」的占位标记，都算满足约束；不能满足的是
     # 周末还挂着真的学习任务。占位标记短且不挂概念，正经任务是几十字加 concept_id。
-    weekend = [item for item in after["items"]
-               if time.strptime(item["due_date"], "%Y-%m-%d").tm_wday >= 5]
+    weekend = [item for item in after["items"] if is_weekend_ahead(item, today)]
     still_working = [f"{item['due_date']} {item['title']}" for item in weekend
                      if len(item["title"]) >= 12 or item.get("concept_id")]
-    check("周末不再安排学习内容", not still_working, f"周末还挂着任务：{still_working}")
-    print(f"    （周末留了 {len(weekend)} 条占位：{[i['title'] for i in weekend][:2]}）")
+    if not written:
+        # 这轮压根没写进去，周末当然还挂着——报出来会把失败归因指错地方。
+        print("    （跳过「周末不再安排学习内容」：这轮没有写入，先看上面那条）")
+    elif weekend_before:
+        check("周末不再安排学习内容", not still_working, f"周末还挂着任务：{still_working}")
+        print(f"    （周末留了 {len(weekend)} 条占位：{[i['title'] for i in weekend][:2]}）")
+    else:
+        # 首版计划本来就没排到周末时，这条判据没有被考验到，报成通过会掩盖这一点。
+        print("    （跳过「周末不再安排学习内容」：首版计划就没排到周末，没什么可匀的）")
     # 条目数不作断言：合并天数并提高每日时长、或留一条占位标记，都是合法的匀法。
     print(f"    （条目 {count_before} → {len(after['items'])} 条，其中原周末 {weekend_before} 条）")
 
@@ -283,6 +307,50 @@ def scenario_switch(first_course: str, second_course: str) -> None:
           "指令微调" in back.answer or "预训练" in back.answer, back.answer[:80])
 
 
+# ---------------------------------------------------------------- 场景 G
+_CJK = re.compile(r"[一-鿿]")
+_LATIN = re.compile(r"[A-Za-z]")
+_QUOTE_LINE = re.compile(r"(?m)^\s*>.*$")
+# 公式和代码里的标识符（softmax、mathbb、W^Q）全是拉丁字母，但它们和回答语言无关：
+# 公式密集的中文回答照样能刷到 0.6 以上。剔掉之后剩下的才是散文部分。
+_NOISE = (
+    re.compile(r"```.*?```", re.S), re.compile(r"\$\$.*?\$\$", re.S),
+    re.compile(r"\$[^$\n]+\$"), re.compile(r"`[^`\n]+`"),
+)
+# 判英文答要用占比而不是「有没有汉字」：中文课程名、中文教材术语、照抄不翻译的原文片段
+# 都会合法地带进汉字。拉丁字母在「字母+汉字」里的占比对这些都不敏感。
+# 实测（剔公式后）：英文答 0.998~1.000，中文答 0.036~0.127，所以门槛取 0.60。
+_ENGLISH_MIN = 0.60
+
+
+def latin_share(text: str) -> float:
+    """拉丁字母占「拉丁字母 + 汉字」的比例。引用块、公式、代码先剔掉——照抄的中文原文和
+    公式里的标识符都不代表回答语言。"""
+    body = _QUOTE_LINE.sub("", text)
+    for pattern in _NOISE:
+        body = pattern.sub("", body)
+    latin, cjk = len(_LATIN.findall(body)), len(_CJK.findall(body))
+    return latin / (latin + cjk) if latin + cjk else 0.0
+
+
+def scenario_language(course: str) -> None:
+    """回答语言跟着这一轮提问的语言走，和界面语言无关。只看占比，不看措辞。"""
+    print("\n[G] 回答语言跟随提问语言")
+    general = call("/sessions", {"scope_mode": "general"})["id"]
+    hello = ask(general, "hello, what can you do?", "mt-g1")
+    share = latin_share(hello.answer)
+    check("通用会话英文提问用英文答", share > _ENGLISH_MIN,
+          f"拉丁字母占比 {share:.3f}，回答 {hello.answer[:80]!r}")
+    print(f"    （通用轮拉丁字母占比 {share:.3f}）")
+
+    session = call("/sessions", {"scope_mode": "course", "course_id": course})["id"]
+    asked = ask(session, "Please explain how multi-head attention differs from single-head attention.", "mt-g2")
+    share = latin_share(asked.answer)
+    check("课程会话英文提问用英文答", share > _ENGLISH_MIN,
+          f"拉丁字母占比 {share:.3f}，回答 {asked.answer[:80]!r}")
+    print(f"    （课程轮拉丁字母占比 {share:.3f}，引用 {len(asked.citations)} 条）")
+
+
 def main() -> int:
     global BASE, DATA
     parser = argparse.ArgumentParser()
@@ -301,6 +369,7 @@ def main() -> int:
         "D": lambda: scenario_reference(llm),
         "E": lambda: scenario_memory(llm),
         "F": lambda: scenario_switch(llm, operating),
+        "G": lambda: scenario_language(llm),
     }
     wanted = [k.strip().upper() for k in args.only.split(",") if k.strip()] or list(scenarios)
     for key in wanted:

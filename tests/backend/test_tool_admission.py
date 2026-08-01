@@ -264,16 +264,21 @@ def test_every_skill_example_actually_triggers_its_own_pre_routing():
 
 
 def test_frontend_tool_labels_and_capability_hints_cover_every_tool():
-    """前端的中文名与能力分组是硬编码的镜像：漏一个工具就会在界面上露出英文函数名，
-    或者在使用说明里被归错组。"""
+    """前端的工具显示名与能力分组是硬编码的镜像：漏一个工具就会在界面上露出英文函数名，
+    或者在使用说明里被归错组。显示名在 i18n 字典里，中英各一份。"""
     import re
 
-    app = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
-    labels = set(re.findall(r"(\w+): '", app.split("const TOOL_LABELS")[1].split("}")[0]))
+    src = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    app = (src / "App.tsx").read_text(encoding="utf-8")
+    i18n = (src / "i18n.ts").read_text(encoding="utf-8")
+    labels = [name for name in re.findall(r"'tool\.(\w+)':", i18n)
+              if name not in {"fallback_name", "stopped"}]
     hints = dict(re.findall(r"(\w+): '(\w+)'", app.split("TOOL_CAPABILITY_HINT")[1].split("}")[0]))
     backend = set(TOOL_CAPABILITY)
 
-    assert labels == backend, f"TOOL_LABELS 与后端工具不一致：{labels ^ backend}"
+    assert set(labels) == backend, f"tool.* 词条与后端工具不一致：{set(labels) ^ backend}"
+    for name in backend:
+        assert labels.count(name) == 2, f"tool.{name} 缺中文或英文译名"
     assert set(hints) == backend, f"TOOL_CAPABILITY_HINT 少了：{backend - set(hints)}"
     for name, capability in hints.items():
         assert TOOL_CAPABILITY[name] == capability, f"{name} 的能力分组前后端不一致"

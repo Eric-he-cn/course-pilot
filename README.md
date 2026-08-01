@@ -1,215 +1,265 @@
 # CoursePilot
 
-**上传你这门课的教材，得到一个记得你学到哪的学习 agent。** 每句结论都能落回教材页码，
-做过的题按概念沉淀成掌握度，计划按掌握度调整。
+**English** · [简体中文](README.zh-CN.md)
 
-它自己决定这一轮查什么、加载哪份规程、要不要写计划写笔记写记忆，信息不够时反问你；
-该做没做的步骤由服务端检出来补上。底下是一套完整的 agent harness，
-[清单在这里](#harness-里有什么)。
+**Upload your course's textbooks and get a learning agent that remembers how far along you are**,
+now at version 2.0. Every conclusion traces back to a textbook page, the problems you work through
+accumulate into per-concept mastery, and the plan adjusts to that mastery.
 
-个人开源项目，本地跑，数据不出机器。接任何兼容 OpenAI Chat Completions 的模型服务。
+It decides on its own what to look up this turn, which procedure to load, whether to write to the
+plan, the notes or its memory, and asks a clarifying question when it does not have enough to go
+on; steps that should have happened but did not are caught by the server and filled in afterwards.
+Underneath is a complete agent harness — [the list is here](#whats-in-the-harness).
 
-![对话取证](Docs/images/chat-citation.png)
+A personal open-source project. Runs locally. Works with any model service that speaks OpenAI Chat
+Completions.
 
-## 和「把教材喂给聊天工具」有什么不同
+![Cited answer](Docs/images/chat-citation.png)
 
-三件事决定了它是 agent 而不是问答框：
+## How this differs from "feeding a textbook to a chat tool"
 
-**一、回答有出处，而且出处可核对。** 每句结论标到教材文件名与页码，点开看原文片段。
-教材里没有的内容会明确标出「以下不是当前教材结论」，联网查来的资料带独立标记。
-教材与网页统一编号，底部 SOURCES 一起列出——你永远知道这句话是从哪来的。
+Three things make it an agent rather than a Q&A box:
 
-**二、掌握度是算出来的，不是模型说的。** 做过的题按概念沉淀成证据事件，数值走确定性
-算法（BKT 后验 × FSRS 遗忘曲线），模型只负责判断这道题考的是哪个概念。证据不够的概念
-显示「数据不足」而不是编一个百分比。答题记录只增不改，掌握度随时能从记录重算。
+**1. Answers have sources, and the sources can be checked.** Every conclusion is tagged with the
+textbook filename and page number; click it and you see the original excerpt. Content that is not
+in the textbook is explicitly marked "the following is not a conclusion from the current textbook",
+and material fetched from the web carries a separate marker. Textbook and web sources share one
+numbering scheme and are listed together under SOURCES at the bottom — you always know where a
+sentence came from.
 
-**三、规程由服务端兜底，不只靠提示词。** 提示词能表达要求，不能保证执行——实测只靠
-SKILL.md 约束时，练题闭环的通过率约 2/3：模型会跳过概念归因、漏写题目、批改完不闭合状态。
-所以出题、评分、归因这些必须发生的副作用由服务端校验，漏了就补救。
+**2. Mastery is computed, not stated by the model.** The problems you have done accumulate as
+evidence events attached to concepts, and the numbers come from a deterministic algorithm (BKT
+posterior × FSRS forgetting curve); the model only judges which concept a problem tests. A concept
+without enough evidence shows "not enough data" instead of an invented percentage. The answer log
+is append-only, so mastery can be recomputed from it at any time.
 
-## 安装
+**3. Procedures are backed by the server, not by the prompt alone.** A prompt can express a
+requirement; it cannot guarantee execution — in testing, with `SKILL.md` as the only constraint,
+the practice loop closed about 2/3 of the time: the model would skip concept attribution, fail to
+save the problem, or leave the state open after grading. So the side effects that have to happen —
+creating the problem, scoring it, attributing it — are verified by the server, and a missing one is
+repaired.
 
-最省事的办法是让编码 Agent 装。在 Claude Code 或 Codex 里打开这个目录，说：
+## Install
+
+Open this project link in Claude Code or Codex and say:
 
 ```
-帮我安装这个项目
+Install this project for me
 ```
 
-仓库里的 [AGENTS.md](AGENTS.md) 写清了步骤、依赖和配置要点，Agent 照着做即可。
+[AGENTS.md](AGENTS.md) in this repo spells out the steps, the dependencies and the key
+configuration points, and the agent can just follow it.
 
-手动装也不复杂，需要 Python 3.11+、Node 18+、pnpm：
+Requirements: Python 3.11+, Node 18+ and pnpm:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r backend/requirements.txt
 cd frontend && pnpm install && cd ..
-cp .env.example .env        # 填入你的模型服务信息
+cp .env.example .env        # fill in your model service details
 ./scripts/dev.sh
 ```
 
-打开 `http://127.0.0.1:5173`，输任意用户名进入。每个用户名一份独立的数据。
+Open `http://127.0.0.1:5173` and enter any username. Each username gets its own separate data.
 
-![登录](Docs/images/login.png)
+![Login](Docs/images/login.png)
 
-### 配置模型
+### Configuring a model
 
-`.env` 里这五项决定能不能真的调模型：
+These five entries in `.env` decide whether the model is really called:
 
 ```
-TEXT_PROVIDER=            # 显示用的名字，随便填
-TEXT_BASE_URL=            # 填到 /chat/completions 之前那一段
-TEXT_API_KEY=             # 你自己的 key
-TEXT_MODEL=               # 模型 id
+TEXT_PROVIDER=            # just a display name, put anything
+TEXT_BASE_URL=            # everything up to, but not including, /chat/completions
+TEXT_API_KEY=             # your own key
+TEXT_MODEL=               # model id
 COURSEPILOT_ENABLE_REMOTE_LLM=1
 ```
 
-任何兼容 OpenAI Chat Completions 的服务都能接，包括自建的。要求支持流式和
-function calling，否则工具循环跑不起来。厂商私有参数走 `TEXT_EXTRA_BODY`：
+Any service compatible with OpenAI Chat Completions works. It has to
+support streaming and function calling, otherwise the tool loop cannot run. Vendor-specific
+parameters go through `TEXT_EXTRA_BODY`:
 
 ```
 TEXT_EXTRA_BODY={"thinking":{"type":"disabled"}}
 ```
 
-没配齐或开关是 0 时服务照样启动，回答由本地兜底生成并明确标注——避免误耗你的额度。
+When the entries are incomplete or the switch is 0 the service still starts, and answers are
+produced by a local fallback and labeled as such — which avoids burning your quota by accident.
 
-`VISION_*` 四项配好才支持拍照提问；`RESEARCH_SERPAPI_API_KEY` 配好才会把联网工具
-下发给模型。两者都可选。
+`VISION_*` has to be set before you can ask questions with a photo or turn a scanned PDF into text;
+`RESEARCH_SERPAPI_API_KEY` has to be set before the web tools are handed to the model. Both are
+optional. `VISION_CHAT_MODEL` is only for photo questions and falls back to `VISION_MODEL` when
+left empty — a dedicated OCR model copies text page by page, while handwriting, figures and page
+layout need a general multimodal model.
 
-### 想先看看效果
+### If you want to see it working first
 
 ```bash
 .venv/bin/python scripts/example_setup.py
 ```
 
-下载一份公开教材（约 120 KB）、建课、建索引，落在 `example` 这个用户名下。
-用它登录就有东西可问。教材不在仓库里，脚本从各自官网下载。
+Downloads one public textbook (about 120 KB), creates a course and builds the index, all under the
+username `example`. Log in as that user and there is something to ask about. The textbooks are not
+in the repo; the script downloads them from their own official sites.
 
-## 能做什么
+## What it can do
 
-**取证问答。** 每轮先解析这个问题属于哪门课，再在那门课的资料里检索。
-解析不出唯一课程时会先问你，不跨课程猜。检索是语义向量 + 关键词混合，
-中文问题能命中英文教材。
+**Cited answers.** Each turn starts by working out which course the question belongs to, then
+searches within that course's material. When it cannot narrow it down to a single course it asks
+you first, and never guesses across courses. Retrieval is a hybrid of semantic vectors and
+keywords, so a Chinese question can hit an English textbook.
 
-**看得见它在做什么。** 用了哪个工具、查了什么、命中几段、耗时多久，都显示出来。
-失败的那一步也显示，不悄悄跳过。
+**You can see what it is doing.** Which tool it used, what it searched for, how many passages it
+hit, how long it took — all shown. A step that failed is shown too, not skipped quietly.
 
-![工具链](Docs/images/chat-tools.png)
+![Tool chain](Docs/images/chat-tools.png)
 
-**五个专项能力。** 说出对应的话会自动加载，不用手动选：
+**Five built-in skills.** They load automatically when you say the corresponding thing,
+with no need to pick one by hand:
 
-| 能力 | 什么时候用 |
+| Capability | When to use it |
 | --- | --- |
-| `practice` | 要练题、提交作答、要讲评或变式题 |
-| `flashcards` | 要学习卡片、抽认卡、知识点清单 |
-| `diagram` | 要流程图、思维导图、时序图 |
-| `mistake_review` | 要复盘错题、找薄弱环节 |
-| `research` | 要查教材外的资料 |
+| `practice` | Practicing problems, submitting answers, asking for a walkthrough or a variant |
+| `flashcards` | Study cards, flashcards, a checklist of key points |
+| `diagram` | Flowcharts, mind maps, sequence diagrams |
+| `mistake_review` | Reviewing wrong answers, finding weak spots |
+| `research` | Looking up material outside the textbook, in-depth research |
 
-也能导入自己写的 skill：单个 `SKILL.md`、含它的 zip，或直接选一个目录。
-带的参考文件会一起并进规程；导入的 skill 默认关着，权限按白名单收窄。
+You can also import skills you wrote yourself: a single `SKILL.md`, a zip containing one, or a
+directory picked directly. Reference files that come with it are merged into the procedure; an
+imported skill is off by default, and its permissions are narrowed by an allowlist.
 
-图示直接渲染成 SVG，可以下载：
+Diagrams are rendered straight to SVG and can be downloaded:
 
-![图示](Docs/images/chat-diagram.png)
+![Diagram](Docs/images/chat-diagram.png)
 
-**学习计划。** 在对话里说要排计划，助手写进来。每次改动升一版，过去的条目不动。
-顶部一张甘特图看整个周期的节奏，下面按天分段、今天高亮。
+**Study plans.** Ask for a plan in the conversation and the assistant writes it in. Every change
+bumps a version, and past entries are left alone. A Gantt chart at the top shows the rhythm of the
+whole cycle; below it the plan is split by day, with today highlighted.
 
-![学习计划](Docs/images/plan.png)
+![Study plan](Docs/images/plan.png)
 
-**学习档案。** 按概念看掌握度与它背后的每一条证据。
+**Learning record.** See mastery by concept, along with every piece of evidence behind it.
 
-![学习档案](Docs/images/archive.png)
+![Learning record](Docs/images/archive.png)
 
-**课程笔记。** 整理好的卡片和梳理稿存成 markdown，界面里能直接看。
+**Course notes.** Finished cards and write-ups are stored as markdown and can be read in the UI.
 
-![课程笔记](Docs/images/library-notes.png)
+![Course notes](Docs/images/library-notes.png)
 
-**上下文透明。** 输入框旁边显示这一轮上下文占了多少，展开能看到每一段的字符数。
-历史太长会自动压缩成摘要。
+**Visible context.** Next to the input box you see how much context this turn takes up; expand it
+for the character count of each section. History that gets too long is compressed into a summary
+automatically.
 
-![上下文](Docs/images/context.png)
+![Context](Docs/images/context.png)
 
-**使用说明页。** 清单和能力都读自当前实例的实际状态。
+**A help page.** Its lists and capabilities are read from the actual state of the running instance.
 
-![使用说明](Docs/images/help.png)
+![Help page](Docs/images/help.png)
 
-**随时换模型和思考档位。** 底部状态栏三个下拉：模型、思考（关 / 自动 / 开）、
-思考深度。想配几个模型就在 `.env` 里往下加编号，同一家的第二个模型只要写一行 model id。
+**Switch model and thinking level whenever you want.** Three dropdowns in the bottom status bar:
+model, thinking (off / auto / on), and thinking depth. Configure as many models as you like by
+continuing the numbering in `.env`; a second model from the same provider only needs one line with
+its model id.
 
-![模型切换](Docs/images/model-picker.png)
+![Model picker](Docs/images/model-picker.png)
 
-**数据可以删干净。** 会话在侧栏悬停就能改名或删除；教材在知识仓库里删；课程在管理页删。
-删除前会列出连带影响——删一门课会带走它的教材、概念、掌握度、计划、笔记与会话，
-所以这句话必须写在你点确认之前。
+**Data can be deleted completely.** Hover a conversation in the sidebar to rename or delete it;
+textbooks are deleted in the knowledge library, courses on the management page. Note that the
+knock-on effects are listed before the deletion — deleting a course takes its textbooks, concepts,
+mastery, plan, notes and conversations with it.
 
-![删除确认](Docs/images/delete-confirm.png)
+![Delete confirmation](Docs/images/delete-confirm.png)
 
-## Harness 里有什么
+## What's in the harness
 
-学习这件事只是场景。下面这些是让 agent 在真实任务上可靠的部分，换个领域照样要有。
+Learning is only the scenario. What follows is the part that makes an agent reliable on real tasks,
+and any other domain needs it just the same.
 
-**工具循环。** 注册了 17 个工具，按副作用分五档能力：读课程、写状态、写笔记、联网、无副作用。
-花钱的和会改用户数据的单独设次数上限。同一轮里参数相同的读工具复用结果、写工具不复用——
-连答三道同概念的题，写证据的参数就是逐字相同的。轮次用满时要明确告诉模型「别再调了，
-用手上的资料收尾」，不然它会把工具调用当正文吐出来。
+**Tool loop.** 17 tools registered, graded into five capability tiers by side effect: read course,
+write state, write notes, network, no side effect. The ones that cost money and the ones that
+change user data get their own call limits. Within one turn, read tools with identical arguments
+reuse the result and write tools do not — answer three problems on the same concept in a row and
+the arguments for writing evidence are word-for-word identical. When the turn budget runs out the
+model has to be told explicitly to "stop calling tools and wrap up with what you have", otherwise
+it emits tool calls as body text.
 
-**权限是整体替换，不是并集。** skill 激活后用它声明的完整工具集，声明即权限。
-两个基座工具（写记忆、反问用户）每份 profile 都补上——它们跨规程通用，又不碰任何数据。
-导入的第三方 skill 按白名单收窄，越权在注册期报错而不在运行期静默降权。
+**Permissions are replaced wholesale, not unioned.** Once a skill activates, the complete tool set
+it declares is what applies; declaring is granting. Two baseline tools (write memory, ask the user)
+are added back to every profile — they are useful across procedures and touch no data. Imported
+third-party skills are narrowed by an allowlist, and asking for more than allowed fails at
+registration time instead of being silently downgraded at run time.
 
-**服务端兜底规程。** 上面第三点讲的那件事在三处都用了同一个套路：练题规程有步骤没做完、
-用户说了「记住」却没调写记忆的工具、出了选择题却没把选项摆成按钮——都由服务端检出来补一轮。
-每处只补一次，避免和模型互相顶住。
+**Server-side procedure backstop.** What point 3 above describes uses the same pattern in three
+places: the practice procedure has steps left undone, the user said "remember this" but the
+memory-write tool was never called, a multiple-choice question was asked but the options were not
+laid out as buttons — the server detects each of these and adds one repair turn. Each one repairs
+only once, to avoid ending up in a standoff with the model.
 
-**跨轮状态。** artifacts 分公开与模型私有两档（标准答案存私有档，界面永不显示）；
-长期记忆是 markdown 的受管区块，模型只能改自己那部分。
+**State across turns.** Artifacts come in two tiers, public and model-private (reference answers go
+in the private tier and are never shown in the UI); long-term memory is a managed block of
+markdown, in which the model can only change its own part.
 
-**上下文预算。** 每一段（系统提示、能力摘要、练习状态、长期记忆、对话摘要、历史、
-当前问题、教材证据）分别计费并上报给界面。历史超阈值先压缩成摘要，不丢弃。
+**Context budget.** Every section (system prompt, capability summary, practice state, long-term
+memory, conversation summary, history, current question, textbook evidence) is accounted for
+separately and reported to the UI. History over the threshold is compressed into a summary first,
+not discarded.
 
-**反问走新回合。** 选项渲染成按钮，点一下等于发一条新的用户消息。做不到「暂停这一轮等人」——
-一个会话同时只允许一个活跃 turn，60 秒心跳过期就会被抢占。
+**Clarifying questions take a new turn.** Options are rendered as buttons, and clicking one is the
+same as sending a new user message. "Pause this turn and wait for the human" cannot be done — a
+conversation allows only one active turn at a time, and once the 60-second heartbeat expires it can
+be preempted.
 
-**可观测与评测。** 每轮一条 JSONL trace，带 `prompt_version` 与每个工具的决策，大 payload
-分离存放。评测分四层：冒烟 benchmark、judge 抽样、掌握度回放，以及两个端到端脚本——
-一个从空库走完整旅程，一个把同一件事拆到几轮里验多轮任务。断言只看结构化行为，
-不断言回答措辞，模型换个说法不该让测试假失败。
+**Observability and evaluation.** One JSONL trace per turn, carrying `prompt_version` and the
+decision behind every tool, with large payloads stored separately. Evaluation has four layers: a
+smoke benchmark, judge sampling, mastery replay, and two end-to-end scripts — one walks the full
+journey from an empty database, the other splits one task across several turns to check multi-turn
+behavior. Assertions look only at structured behavior, never at the wording of an answer; a model
+phrasing something differently should not make a test fail.
 
-**边界由测试守着。** 分层是 `app → modules/adapters → contracts/core`，模块之间只通过
-`modules.X.api` 里的 Port 互相看见，跨层引用会让 `test_module_boundaries.py` 挂掉。
-装配只在 `backend/app/bootstrap.py` 一处，换模型、换检索、换存储都是改这一个文件。
+**Boundaries are guarded by tests.** The layering is `app → modules/adapters → contracts/core`,
+modules see each other only through the Ports in `modules.X.api`, and a cross-layer reference makes
+`test_module_boundaries.py` fail. Assembly happens in exactly one place,
+`backend/app/bootstrap.py` — changing the model, the retrieval or the storage all mean editing that
+one file.
 
-## 边界
+## Boundaries
 
-- **没有 shell 执行。** 学习助手没有理由执行命令，导入的 skill 里的脚本一律不收。
-- 工具按副作用分级准入，导入的第三方 skill 拿不到计划、记忆、笔记与联网
-- 不做整卷模拟考试、社交对战、多租户商业化
-- 不含任何发布或部署链路
+- **No shell execution.** A study assistant has no reason to run commands, so scripts inside
+  imported skills are never accepted.
+- Tool access is graded by side effect. Imported third-party skills cannot get at the notes or the
+  network, and can read the plan but not change it; the memory tool is baseline infrastructure that
+  every skill gets, imported ones included
+- Looking back through the session history only replays turns from the current course, so switching
+  courses puts the previous one's textbook excerpts out of reach
+- No full mock exams, no social competition, no multi-tenant commercialization
+- No release or deployment path of any kind
 
-## 开发
+## Development
 
 ```bash
 ./scripts/check.sh
 ```
 
-跑后端全部测试、Python 编译检查、前端类型检查与生产构建。不需要 API key，
-不发网络请求。
+Runs the whole backend test suite, the Python compile check, frontend type checking and the
+production build. It needs no API key and makes no network requests.
 
-后端 FastAPI + SQLite（标准库，显式 migration），前端 React 19 + TypeScript + Vite。
-数据库改动一律新增 migration，不改已有条目。
+Backend is FastAPI + SQLite (standard library, explicit migrations), frontend is React 19 +
+TypeScript + Vite. Database changes always add a migration and never touch an existing entry.
 
-| 文档 | 内容 |
+| Document | Contents |
 | --- | --- |
-| [项目介绍](Docs/overview.md) | 各模块的设计思路与取舍 |
-| [产品设计](Docs/coursepilot-2.0.md) | 定位、功能模块、分期规划 |
-| [技术架构](Docs/coursepilot-2.0-architecture.md) | 模块边界、Skill 体系、存储、评测分层 |
-| [前端设计](Docs/coursepilot-2.0-frontend-design.md) | 视觉方案、信息架构、组件与状态 |
-| [开发中](Docs/development.md) | 当前进度、优先级、踩过的坑 |
-| [端到端测试](Docs/coursepilot-2.0-e2e-browser-test.md) | 浏览器回归清单 |
+| [Project overview](Docs/overview.md) | The design thinking and trade-offs behind each module |
+| [Product design](Docs/coursepilot-2.0.md) | Positioning, feature modules, phased plan |
+| [Architecture](Docs/coursepilot-2.0-architecture.md) | Module boundaries, the skill system, storage, evaluation layers |
+| [Frontend design](Docs/coursepilot-2.0-frontend-design.md) | Visual design, information architecture, components and state |
+| [In development](Docs/development.md) | Current status, priorities, pitfalls already hit |
+| [End-to-end tests](Docs/coursepilot-2.0-e2e-browser-test.md) | Browser regression checklist |
 
-截图由 `scripts/screenshots.py` 生成，UI 改了重跑即可。评测与端到端脚本见
-[开发中](Docs/development.md)。
+Screenshots are generated by `scripts/screenshots.py`; rerun it after a UI change. Evaluation and
+end-to-end scripts are covered in [In development](Docs/development.md).
 
 ## License
 

@@ -8,6 +8,7 @@ import pytest
 from conftest import workspace
 from fastapi.testclient import TestClient
 
+from modules.learning.api import GRADUATE_STREAK
 from app.main import create_app
 from core.settings import Settings
 from modules.sessions.api import SessionBusyError
@@ -207,7 +208,10 @@ def test_plan_and_archive_read_skeletons_return_persisted_empty_state(client):
 
     archive = client.get(f"/api/v2/courses/{course['id']}/archive")
     assert archive.status_code == 200
-    assert archive.json() == {"course_id": course["id"], "evidence_count": 0, "events": [], "mastery": [], "unattributed": []}
+    # graduate_streak 随响应下发，界面据它画「连对 M/N」——前端另存一份常量会在阈值改动后说假话。
+    assert archive.json() == {"course_id": course["id"], "evidence_count": 0, "events": [], "mastery": [],
+                              "unattributed": [], "mistakes": [], "active_count": 0, "graduated_count": 0,
+                              "graduate_streak": GRADUATE_STREAK}
 
 
 def test_errors_use_a_stable_envelope(client):

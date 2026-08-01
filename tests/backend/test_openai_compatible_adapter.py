@@ -194,7 +194,7 @@ def test_streams_chat_completion_and_encodes_tools():
     assert body["max_tokens"] == 2048
     assert body["stream"] is True
     # 默认只发标准字段，任何厂商私有参数都不该凭空出现在请求里。
-    assert set(body) == {"model", "messages", "max_tokens", "stream", "tools"}
+    assert set(body) == {"model", "messages", "max_tokens", "stream", "stream_options", "tools"}
     assert body["messages"][0]["role"] == "system"
     assert body["tools"][0]["function"]["name"] == "search_materials"
     assert body["tools"][0]["function"]["parameters"]["required"] == ["query"]
@@ -324,3 +324,118 @@ def test_provider_error_is_sanitized_and_recorded():
         assert "***" in str(raised.value)
         assert "sensitive-provider-body" not in str(raised.value)
         assert adapter.health()["last_error_code"] == "http_401"
+
+
+def test_max_completion_tokens_alias_suppresses_max_tokens():
+    """推理系模型要求 max_completion_tokens 且拒绝 max_tokens 同时出现。
+    extra_body 给了新名字就不发旧名字，两者互斥；直接覆盖 max_tokens 仍然构造期报错。"""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]}))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = OpenAICompatibleChat(
+            api_key="k", base_url="https://api.example.com/v1", model="m",
+            extra_body={"max_completion_tokens": 1024}, client=client,
+        )
+        list(adapter.chat(messages=_messages()))
+
+    body = captured["body"]
+    assert body["max_completion_tokens"] == 1024
+    assert "max_tokens" not in body
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        OpenAICompatibleChat(api_key="k", base_url="https://api.example.com/v1", model="m",
+                             extra_body={"max_tokens": 1024})
+
+
+def test_tool_call_fragments_without_index_split_by_id():
+    """有的服务流式 tool_calls 不带 index。带 id 的分片当作新调用开槽，
+    不带的拼到最近一个——否则两个并行调用会拼成一份非法 JSON。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"tool_calls": [{"id": "call_a", "function": {"name": "search_materials", "arguments": "{\"query\":"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": "\"链式法则\"}"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"id": "call_b", "function": {"name": "calculator", "arguments": "{\"expression\":\"1+1\"}"}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))[-1]
+
+    assert isinstance(result, ChatToolCalls)
+    assert [call.id for call in result.calls] == ["call_a", "call_b"]
+    assert json.loads(result.calls[0].arguments) == {"query": "链式法则"}
+    assert json.loads(result.calls[1].arguments) == {"expression": "1+1"}
+
+
+def test_reasoning_falls_back_to_the_shorter_field_name():
+    """思考内容的字段名不统一：reasoning_content 之外也有服务用 reasoning。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"reasoning": "先想一下"}}]},
+            {"choices": [{"delta": {"content": "答案"}, "finish_reason": "stop"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        events = list(_adapter(client).chat(messages=_messages()))
+
+    assert any(isinstance(event, ChatReasoning) and event.text == "先想一下" for event in events)
+
+
+def test_stream_usage_is_requested_and_nested_details_are_read():
+    """不带 stream_options 的话部分服务流式 usage 恒为 null，统计静默丢失；
+    嵌套的 cache/reasoning 明细拍平收进 usage。extra_body 置 null 可整个移除该字段。"""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                                       "prompt_tokens_details": {"cached_tokens": 8},
+                                       "completion_tokens_details": {"reasoning_tokens": 3}}},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        final = list(_adapter(client).chat(messages=_messages()))[-1]
+
+    assert captured["body"]["stream_options"] == {"include_usage": True}
+    assert isinstance(final, ChatFinal)
+    assert final.usage["cached_tokens"] == 8 and final.usage["reasoning_tokens"] == 3
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = OpenAICompatibleChat(api_key="k", base_url="https://api.example.com/v1", model="m",
+                                       extra_body={"stream_options": None}, client=client)
+        list(adapter.chat(messages=_messages()))
+    assert "stream_options" not in captured["body"]
+
+
+def test_empty_answer_from_length_is_reported_as_truncated():
+    """推理模型思考吃完输出预算时正文为空且 finish_reason=length，
+    报「空回答」会让人查错方向，按截断归类。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"reasoning_content": "想了很久"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LLMProviderError) as caught:
+            list(_adapter(client).chat(messages=_messages()))
+
+    assert caught.value.code == "output_truncated"
+
+
+def test_error_detail_recognizes_top_level_shapes():
+    """vLLM / FastAPI 系服务的错误不在 error.message 里，而是顶层 detail 或 message。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"detail": "unknown field: foo"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LLMProviderError) as caught:
+            list(_adapter(client).chat(messages=_messages()))
+
+    assert "unknown field: foo" in str(caught.value)

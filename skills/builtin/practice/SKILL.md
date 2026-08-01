@@ -2,7 +2,7 @@
 name: practice
 description: 组织完整练习过程，包括出题、评分、讲评和变式题
 when_to_use: 用户想练习或要做题、提交了对最近练习的作答、要求讲评错题或要同考点的变式题，以及每日小测触发时
-allowed_tools: [search_materials, list_materials, concept_search, get_archive, emit_evidence, artifact_read, artifact_append, web_search, web_fetch]
+allowed_tools: [search_materials, list_materials, concept_search, get_archive, emit_evidence, artifact_read, artifact_append, history_read, web_search, web_fetch]
 examples: 出三道题考考我 | 我觉得答案是 B | 讲讲我刚才那道题为什么错
 ---
 

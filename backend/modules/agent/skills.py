@@ -28,7 +28,8 @@ BUNDLE_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml", ".csv")
 _ENTRY_NAME = "skill.md"
 
 # 导入的 skill 只能拿到读工具与练习相关的写工具（架构 §6.1 的 policy 项）：
-# 长期记忆、学习计划与加载别的 skill 都不在可授予范围内。
+# 改计划、写笔记、联网与加载别的 skill 都不在可授予范围内。
+# 基座工具走另一条路（profile_for_skill 无条件补），不受这份白名单约束。
 IMPORTABLE_TOOLS = (
     "search_materials", "list_materials", "get_plan", "get_archive",
     "concept_search", "emit_evidence", "artifact_read", "artifact_append",

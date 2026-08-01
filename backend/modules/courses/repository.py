@@ -6,6 +6,8 @@ from core.store import SQLiteStore
 _COURSE_CASCADE = (
     # 概念可以不挂在任何教材上，教材清完再按课程兜一遍。
     "DELETE FROM concept_mastery WHERE course_id = ?",
+    "DELETE FROM mistake_records WHERE course_id = ?",
+    "DELETE FROM mistake_backfills WHERE course_id = ?",
     "DELETE FROM concept_aliases WHERE concept_id IN (SELECT id FROM concepts WHERE course_id = ?)",
     "DELETE FROM concepts WHERE course_id = ?",
     # 通用会话留下的解析记录：课程没了，这条痕迹也没有意义。

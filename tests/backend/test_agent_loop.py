@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import date, timedelta
 
 import pytest
 from conftest import workspace
@@ -272,7 +273,7 @@ def test_context_segments_cover_the_whole_prompt_and_report_truncation():
         seed_query="现在的问题", seed_result_text="教材证据", history_token_budget=3_000,
         skill_summaries="- practice：练习", practice_digest="练习 #1", memory="偏好：先给结论",
     )
-    assert sum(size for _, size in assembled.segments) == message_chars(assembled.messages)
+    assert sum(item.chars for item in assembled.segments) == message_chars(assembled.messages)
     assert assembled.dropped_history > 0  # 预算只放得下最近几条，更早的没进上下文
 
     full = assemble_messages(
@@ -488,12 +489,51 @@ def test_plan_write_permission_reads_the_users_own_words():
         assert not _has_plan_intent(text), f"该挡住却放行了：{text}"
 
 
+def test_english_intent_gates_stay_reachable_without_going_loose():
+    """闸门原来只认中文，英文用户碰不到计划、记忆、练题这些功能。权限型闸门
+    （计划、记忆）继续宁可漏也不误放，所以只收指向明确的短语。"""
+    from modules.agent.service import _MEMORY_INTENT, _PLAN_INTENT, _PRACTICE_INTENT, _SKILL_INTENT
+    from modules.agent.service import _has_plan_intent
+
+    for text in ("make me a study plan for the exam", "can you plan out my revision?",
+                 "I need a review schedule before Aug 20", "help me prepare for the exam",
+                 "write it into the system, don't ask again", "exam prep, 1.5h a day"):
+        assert _has_plan_intent(text), f"该放行却挡住了：{text}"
+    # 教材术语里 plan / schedule 到处都是，权限型闸门碰上它们必须不动
+    for text in ("explain the query plan for this join", "how does CPU scheduling work",
+                 "what is a round-robin scheduler", "I plan to read chapter 3 tonight",
+                 "walk me through the planning algorithm"):
+        assert not _PLAN_INTENT.search(text), f"该挡住却放行了：{text}"
+
+    for text in ("remember that I'm a math major", "from now on go straight to the formulas",
+                 "don't forget I prefer derivations", "keep in mind my exam is in August",
+                 "save this to memory: I skip analogies"):
+        assert _MEMORY_INTENT.search(text), f"该放行却挡住了：{text}"
+    for text in ("do you remember the chain rule?", "remember the formula for entropy",
+                 "what does memory hierarchy mean", "I forget how softmax works"):
+        assert not _MEMORY_INTENT.search(text), f"该挡住却放行了：{text}"
+
+    # 路由型闸门误命中的代价小（规程第一步就是判断本轮做什么），所以可以松
+    for text in ("quiz me on chapter 3", "give me 3 questions", "test me please",
+                 "some practice problems on attention", "ask me a few questions"):
+        assert _PRACTICE_INTENT.search(text), f"该放行却挡住了：{text}"
+    for text in ("draw me a flowchart of backprop", "can you make a mind map?"):
+        assert _SKILL_INTENT["diagram"].search(text), f"该放行却挡住了：{text}"
+    for text in ("make flashcards for these terms", "I want a cheat sheet"):
+        assert _SKILL_INTENT["flashcards"].search(text), f"该放行却挡住了：{text}"
+    for text in ("review my mistakes", "what are my weak spots?"):
+        assert _SKILL_INTENT["mistake_review"].search(text), f"该放行却挡住了：{text}"
+    for text in ("search online for the latest research", "look this up online"):
+        assert _SKILL_INTENT["research"].search(text), f"该放行却挡住了：{text}"
+
+
 def test_version_conflict_leaves_the_plan_budget_for_the_retry(client):
     """plan_update 每轮只有一次额度。冲突文案要求模型重读再重算，
     这次失败就不能记进预算，否则重试直接撞「已用满」，计划永远改不动。"""
     course = client.post("/api/v2/courses", json={"name": "概率论"}).json()
     session_id = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()["id"]
-    items = '[{"due_date": "2026-08-01", "title": "第一章"}]'
+    # 日期得算出来：plan_update 只写今天及以后，写死一个日期，跑到那天之后就什么都不落库。
+    items = f'[{{"due_date": "{date.today() + timedelta(days=1)}", "title": "第一章"}}]'
 
     class ConflictsThenRetries:
         mode, provider, model = "provider", "example", "example-model"

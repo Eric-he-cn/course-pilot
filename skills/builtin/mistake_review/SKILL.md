@@ -2,7 +2,7 @@
 name: mistake_review
 description: 复盘学习档案里的弱项与错题，定位错因并给针对性讲解
 when_to_use: 用户要看错题、问自己哪里薄弱、要复盘做错的题，或者要针对弱项补一补
-allowed_tools: [search_materials, concept_search, get_archive, note_read, note_write]
+allowed_tools: [search_materials, concept_search, get_archive, note_read, note_write, history_read]
 examples: 看看我的错题 | 我哪里比较薄弱 | 复盘一下做错的地方
 ---
 

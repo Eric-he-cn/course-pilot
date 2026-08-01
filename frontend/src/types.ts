@@ -41,6 +41,11 @@ export interface ToolActivity {
   name: string
   origin?: string
   summary?: string
+  // summary 是后端给的中文串，认识 key 就用本地译文。老数据没有 key，只能用 summary。
+  summary_key?: string
+  summary_args?: Record<string, string | number>
+  // 同一轮里重复调用被复用：后缀由前端拼，后端不把中文摘要当参数传
+  reused?: boolean
   ok?: boolean
   // 仅流式期间有值：用于显示"这一步已经跑了多久"
   started_at?: number
@@ -66,7 +71,7 @@ export interface NoteSummary {
 }
 
 export interface ContextUsage {
-  segments: { label: string; chars: number }[]
+  segments: { label: string; label_key?: string; chars: number }[]
   total_chars: number
   limit_chars: number
   history_budget_chars: number
@@ -92,6 +97,8 @@ export interface TurnEvent extends Partial<ContextUsage> {
   call_id?: string
   name?: string
   summary?: string
+  summary_key?: string
+  summary_args?: Record<string, string | number>
   ok?: boolean
   origin?: string
   finish_reason?: string
@@ -231,10 +238,29 @@ export interface UnattributedTopic {
   last_seen: string
 }
 
+export interface MistakeRecord {
+  concept_id: string
+  name: string
+  status: 'active' | 'graduated'
+  // 累计错次，毕业不清零；streak 是当前连对次数，答错归零
+  wrong_count: number
+  streak: number
+  first_wrong_at: string
+  last_wrong_at: string
+  graduated_at?: string | null
+  relapse_count: number
+}
+
 export interface ArchiveSummary {
   course_id: string
   evidence_count: number
   events: EvidenceEvent[]
   mastery: ConceptMastery[]
   unattributed: UnattributedTopic[]
+  // mistakes 只是一页（活跃优先），active_count/graduated_count 才是总数
+  mistakes: MistakeRecord[]
+  active_count: number
+  graduated_count: number
+  // 连对几次算清掉：跟着响应下发，前端不另存一份常量
+  graduate_streak: number
 }

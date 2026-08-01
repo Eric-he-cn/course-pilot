@@ -91,8 +91,11 @@ def test_invalid_usernames_are_rejected(bad, why):
 
 
 def test_invalid_username_header_is_422_not_a_wrong_workspace(client):
-    """静默降级会把人塞进别人的工作区，所以宁可报错。"""
-    assert client.get("/api/v2/courses", headers={"X-CoursePilot-User": "a/b"}).status_code == 422
+    """静默降级会把人塞进别人的工作区，所以宁可报错。错误码也是契约：前端靠它
+    认出「本地存的名字已经不合法」并清掉，改了码那边会静默失效。"""
+    response = client.get("/api/v2/courses", headers={"X-CoursePilot-User": "a/b"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_username"
 
 
 def test_cjk_username_survives_the_header(client):

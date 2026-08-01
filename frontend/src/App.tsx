@@ -5,46 +5,41 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
-import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity, WikiPageSummary } from './types'
+import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
+import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity, WikiPageSummary } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
 type TurnResolution = { sessionId: string; status: string; courseId: string | null; courseName: string | null }
 
-const viewNames: Record<View, string> = { chat: '对话', library: '知识仓库', plan: '学习计划', archive: '学习档案', settings: '管理与设置', help: '使用说明' }
+function viewName(view: View) { return t(`nav.${view}`) }
 const nav: { id: View; num: string }[] = [
   { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
 ]
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
 // 会用到本地嵌入/重排模型的工具：只有这几个会因为模型加载而变慢。
 const RETRIEVAL_TOOLS = ['search_materials', 'concept_search']
-const TOOL_LABELS: Record<string, string> = {
-  search_materials: '检索教材', list_materials: '资料清单', get_plan: '学习计划', plan_update: '写入计划',
-  get_archive: '学习档案', concept_search: '概念目录', emit_evidence: '记录学习证据', memory_patch: '更新记忆',
-  use_skill: '加载能力', artifact_read: '读取练习', artifact_append: '保存练习',
-  web_search: '联网检索', web_fetch: '读取网页', note_write: '写入笔记', note_read: '读取笔记',
-  calculator: '计算', ask_user: '请你选择',
-}
-
+// 停止时给未收尾的工具补的占位。带上 key 而不只是当时那句中文，展示层才判得出它不是真结果。
+const TOOL_STOPPED_KEY = 'tool.stopped'
+// 工具名在字典里（`tool.<name>`）。这张表是 17 个工具的全集，使用说明按它的顺序列举。
 const TOOL_CAPABILITY_HINT: Record<string, string> = {
   search_materials: 'read_course', list_materials: 'read_course', get_plan: 'read_course',
   get_archive: 'read_course', concept_search: 'read_course', note_read: 'read_course',
-  emit_evidence: 'write_state', plan_update: 'write_state', memory_patch: 'write_state',
+  history_read: 'read_course',
+  plan_update: 'write_state', emit_evidence: 'write_state', memory_patch: 'write_state',
   artifact_append: 'write_state', note_write: 'write_note',
   web_search: 'network', web_fetch: 'network',
-  calculator: 'free', use_skill: 'free', artifact_read: 'free', ask_user: 'free',
+  use_skill: 'free', artifact_read: 'free', calculator: 'free', ask_user: 'free',
 }
 
-function errorText(error: unknown) { return error instanceof Error ? error.message : '发生未知错误，请重试。' }
-function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : '刚刚' }
-
-const ADJECTIVES = ['勤奋的', '好奇的', '专注的', '沉稳的', '敏捷的', '踏实的', '爱问的', '安静的']
-const CREATURES = ['水獺', '猫头鹰', '小海豹', '刺猬', '树懒', '狐狸', '柯基', '企鹅']
+function errorText(error: unknown) { return error instanceof Error ? error.message : t('error.unknown') }
+function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat(locale(), { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : t('time.just_now') }
 
 function randomNames(count = 5): string[] {
+  const { adjectives, creatures } = nameParts()
   const picked = new Set<string>()
   while (picked.size < count) {
-    picked.add(ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)] + CREATURES[Math.floor(Math.random() * CREATURES.length)])
+    picked.add(adjectives[Math.floor(Math.random() * adjectives.length)] + creatures[Math.floor(Math.random() * creatures.length)])
   }
   return [...picked]
 }
@@ -58,32 +53,33 @@ function LoginView({ onLogin }: { onLogin: (name: string) => void }) {
   function submit(event: FormEvent) {
     event.preventDefault()
     const value = name.trim()
-    if (!value) { setError('请输入一个用户名'); return }
-    if (value.length > 32) { setError('用户名不能超过 32 个字符'); return }
-    if (!/^[\p{L}\p{N} _-]+$/u.test(value)) { setError('只能用中日韩文字、字母、数字、空格与 - _'); return }
+    if (!value) { setError(t('login.error.empty')); return }
+    if (value.length > 32) { setError(t('login.error.too_long')); return }
+    if (!/^[\p{L}\p{N} _-]+$/u.test(value)) { setError(t('login.error.charset')); return }
     onLogin(value)
   }
   return <div className="login-screen">
     <form className="login-card" onSubmit={submit}>
       <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
-      <h1>用哪个名字继续？</h1>
-      <p>每个用户名对应一份独立的课程、教材与学习记录。<strong>没有密码</strong>，
-        同一台机器上知道名字就能进。</p>
-      <input value={name} autoFocus aria-label="用户名" placeholder="输入用户名"
+      <h1>{t('login.title')}</h1>
+      <p>{t('login.intro.before')}<strong>{t('login.intro.strong')}</strong>{t('login.intro.after')}</p>
+      <input value={name} autoFocus aria-label={t('a11y.username')} placeholder={t('login.placeholder')}
         onChange={event => { setName(event.target.value); setError('') }} />
       {error && <span className="login-error">{error}</span>}
       <div className="login-suggestions">
-        <span>随便挑一个：</span>
+        <span>{t('login.suggest')}</span>
         {suggestions.map(item => <button type="button" key={item} onClick={() => { setName(item); setError('') }}>{item}</button>)}
       </div>
-      <button className="login-submit" type="submit">{remembered && remembered === name.trim() ? `以「${remembered}」继续` : '进入'}</button>
-      {remembered && <small>上次用的是「{remembered}」</small>}
+      <button className="login-submit" type="submit">{remembered && remembered === name.trim() ? t('login.continue_as', { name: remembered }) : t('login.enter')}</button>
+      {remembered && <small>{t('login.last_used', { name: remembered })}</small>}
     </form>
   </div>
 }
 
 export default function App() {
   const [username, setUsername] = useState(() => currentUser())
+  // 语言存在 i18n 的模块变量里（api.ts 也要读），这份 state 只负责换语言后重渲染整棵树。
+  const [lang, setLangState] = useState<Lang>(() => getLang())
   const [courses, setCourses] = useState<Course[]>([])
   const [workspace, setWorkspace] = useState<Workspace>({ scope: 'general' })
   const [sessions, setSessions] = useState<SessionSummary[]>([])
@@ -112,8 +108,9 @@ export default function App() {
   // reader.cancel() 会让读取正常结束而不抛错，所以"是否被停止"要显式记，不能靠捕获异常判断。
   const stoppedRef = useRef(false)
 
+  const i18n = useMemo(() => ({ lang, setLang: (next: Lang) => { setLang(next); setLangState(next) } }), [lang])
   const course = useMemo(() => courses.find(item => item.id === workspace.courseId) ?? null, [courses, workspace.courseId])
-  const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewNames[view]
+  const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewName(view)
 
   useEffect(() => { localStorage.setItem('cp-sidebar-collapsed', String(sidebarCollapsed)) }, [sidebarCollapsed])
   const heartbeat = useCallback(async () => {
@@ -188,7 +185,7 @@ export default function App() {
     } catch (error) { setNotice(errorText(error)) }
   }
   async function createCourse() {
-    const name = window.prompt('课程名称')?.trim(); if (!name) return
+    const name = window.prompt(t('course.prompt_name'))?.trim(); if (!name) return
     setCreating(true)
     try { const created = await api.createCourse(name); setCourses(current => [...current, created]); switchWorkspace({ scope: 'course', courseId: created.id }) }
     catch (error) { setNotice(errorText(error)) } finally { setCreating(false) }
@@ -196,7 +193,7 @@ export default function App() {
 
   if (!username) return <LoginView onLogin={name => { setCurrentUser(name); setUsername(name); window.location.reload() }} />
 
-  const workspaceName = workspace.scope === 'general' ? '通用模式' : course?.name ?? '课程工作区'
+  const workspaceName = workspace.scope === 'general' ? t('workspace.general') : course?.name ?? t('workspace.course_fallback')
   const healthLlm = (health?.llm ?? null) as Record<string, unknown> | null
   const healthRag = (health?.rag ?? null) as Record<string, unknown> | null
   // 冷启动时首次检索要等模型加载（实测嵌入 36s、重排 60s）。不说清楚，用户只看到
@@ -206,26 +203,26 @@ export default function App() {
       const slot = healthRag?.[key] as { model?: string; loaded?: boolean; error?: string | null } | undefined
       return !!slot?.model && slot.loaded === false && !slot.error
     })
-    .map(key => (key === 'embedding' ? '嵌入模型' : '重排模型'))
-    .join('、')
-  return <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
-    {sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} />}
-    <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label="课程与会话">
+    .map(key => (key === 'embedding' ? t('model.embedding') : t('model.reranker')))
+    .join(t('common.list_sep'))
+  return <LangContext.Provider value={i18n}><div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+    {sidebarOpen && <button className="sidebar-backdrop" aria-label={t('a11y.close_nav')} onClick={() => setSidebarOpen(false)} />}
+    <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label={t('a11y.sidebar')}>
       <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
       <div className="side-label">WORKSPACE</div>
       <button className={`workspace-card ${workspace.scope === 'general' ? 'selected' : ''}`} onClick={() => switchWorkspace({ scope: 'general' })}>
         <span className="general-icon" aria-hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M12 3v18M3 12h18" opacity=".35" /></svg></span>
-        <span className="workspace-copy"><b>通用模式</b><small>按问题自动判断课程</small></span>
+        <span className="workspace-copy"><b>{t('workspace.general')}</b><small>{t('workspace.general_hint')}</small></span>
       </button>
       <div className="course-switcher">
         {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id} onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
           <i style={{ backgroundColor: item.color }} /><span>{item.name}</span>{item.wiki_enabled && <em>Wiki</em>}
         </button>)}
-        <button className="text-button add-course" onClick={createCourse} disabled={creating}>＋ 新建课程</button>
+        <button className="text-button add-course" onClick={createCourse} disabled={creating}>{t('course.new')}</button>
       </div>
       <div className="side-label">NAV</div>
-      <nav className="main-nav" aria-label="学习导航">
-        {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false) }}><span aria-hidden>{item.num}</span><b>{viewNames[item.id]}</b></button>)}
+      <nav className="main-nav" aria-label={t('a11y.main_nav')}>
+        {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false) }}><span aria-hidden>{item.num}</span><b>{viewName(item.id)}</b></button>)}
       </nav>
       <div className="sessions-head"><span>SESSIONS</span></div>
       <div className="session-list">
@@ -233,19 +230,19 @@ export default function App() {
           active={session.id === activeSession?.id}
           onOpen={() => { setActiveSession(session); setView('chat'); setSidebarOpen(false) }}
           onRename={async title => { await renameSession(title, session.id) }}
-          onDelete={async () => { await deleteSession(session) }} />) : <p className="mini-empty">此工作区还没有会话。</p>}
+          onDelete={async () => { await deleteSession(session) }} />) : <p className="mini-empty">{t('session.empty')}</p>}
       </div>
-      <button className="new-session" onClick={newSession} disabled={creating}>＋ 新建{workspace.scope === 'general' ? '通用' : '课程'}会话</button>
+      <button className="new-session" onClick={newSession} disabled={creating}>{t('session.new', { scope: workspace.scope === 'general' ? t('session.scope_general') : t('session.scope_course') })}</button>
       <div className="sidebar-foot">
-        <button onClick={() => { setView('help'); setSidebarOpen(false) }}>? <span>使用说明</span></button>
-        <button onClick={() => { clearCurrentUser(); window.location.reload() }} title={`当前：${username}`}>⇄ <span>切换用户（{username}）</span></button>
-        <button onClick={() => { setView('settings'); setSidebarOpen(false) }}>⚙ <span>管理与设置</span></button>
+        <button onClick={() => { setView('help'); setSidebarOpen(false) }}>? <span>{t('nav.help')}</span></button>
+        <button onClick={() => { clearCurrentUser(); window.location.reload() }} title={t('a11y.current_user', { name: username })}>⇄ <span>{t('user.switch', { name: username })}</span></button>
+        <button onClick={() => { setView('settings'); setSidebarOpen(false) }}>⚙ <span>{t('nav.settings')}</span></button>
       </div>
     </aside>
     <main className="main">
       <header className="topbar">
-        <button className="icon-button mobile-only" aria-label="打开导航" onClick={() => setSidebarOpen(true)}>☰</button>
-        <button className="icon-button collapse-only" aria-label="折叠侧栏" onClick={() => setSidebarCollapsed(value => !value)}>☷</button>
+        <button className="icon-button mobile-only" aria-label={t('a11y.open_nav')} onClick={() => setSidebarOpen(true)}>☰</button>
+        <button className="icon-button collapse-only" aria-label={t('a11y.toggle_sidebar')} onClick={() => setSidebarCollapsed(value => !value)}>☷</button>
         <div className="title-area">
           {view === 'chat' && activeSession
             ? <SessionTitle session={activeSession} onRename={renameSession} />
@@ -253,7 +250,7 @@ export default function App() {
           <span className="crumb"><i style={{ backgroundColor: course?.color ?? '#D4D4D8' }} /> {workspaceName}</span>
         </div>
       </header>
-      {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label="关闭错误提示" onClick={() => setNotice('')}>×</button></div>}
+      {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label={t('a11y.dismiss_notice')} onClick={() => setNotice('')}>×</button></div>}
       {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} modelNote={modelNote} turnResolution={turnResolution} contextUsage={contextUsage} draftSeed={draftSeed} onSeedUsed={() => setDraftSeed('')} onCitation={setCitation} onUpload={async file => {
         try {
           let targetSession = activeSession
@@ -286,7 +283,7 @@ export default function App() {
         const sealActivity = () => {
           activity.forEach((item, index) => {
             if (item.summary) return
-            activity[index] = { ...item, summary: '已停止', elapsed_ms: item.started_at ? Date.now() - item.started_at : undefined }
+            activity[index] = { ...item, summary: t(TOOL_STOPPED_KEY), summary_key: TOOL_STOPPED_KEY, elapsed_ms: item.started_at ? Date.now() - item.started_at : undefined }
           })
           return [...activity]
         }
@@ -307,12 +304,12 @@ export default function App() {
             if (onThisSession()) setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
-            activity.push({ call_id: payload.call_id, name: payload.name ?? '工具', origin: payload.origin, started_at: Date.now() })
+            activity.push({ call_id: payload.call_id, name: payload.name ?? t('tool.fallback_name'), origin: payload.origin, started_at: Date.now() })
             patchMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           if (payload.type === 'tool_result' && payload.call_id) {
             const entry = activity.find(item => item.call_id === payload.call_id)
-            if (entry) { entry.summary = payload.summary; entry.ok = payload.ok; entry.elapsed_ms = entry.started_at ? Date.now() - entry.started_at : undefined }
+            if (entry) { entry.summary = payload.summary; entry.summary_key = payload.summary_key; entry.summary_args = payload.summary_args; entry.ok = payload.ok; entry.elapsed_ms = entry.started_at ? Date.now() - entry.started_at : undefined }
             patchMessages(current => current.map(item => item.id === pendingId ? { ...item, activity: [...activity] } : item))
           }
           if (payload.type === 'text_delta' && payload.text) {
@@ -322,19 +319,19 @@ export default function App() {
           if (payload.type === 'provider_fallback') {
             // 远端模型不可用时会静默切到本地兜底（无工具、无检索）。不上屏的话，
             // 用户会把质量完全不同的回答当成正常回答。
-            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: `远端模型 ${payload.provider ?? ''} 不可用，本次已切换到本地兜底模型` } : item))
+            patchMessages(current => current.map(item => item.id === pendingId ? { ...item, degraded: t('chat.degraded_switch', { provider: payload.provider ?? '' }) } : item))
           }
           if (payload.type === 'choices' && payload.options?.length) {
             const options = payload.options
             patchMessages(current => current.map(item => item.id === pendingId ? { ...item, choices: options } : item))
           }
-          if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice('回答达到长度上限，内容可能不完整。')
+          if (payload.type === 'turn_completed' && payload.finish_reason === 'length') setNotice(t('chat.length_limit'))
         }, attachmentIds, controller.signal)
           if (stoppedRef.current) {
             // 客户端断连时服务端生成器可能挂在 yield 上不进 finally，部分回答不一定落盘，
             // 所以保留本地已渲染的内容并标明它没有保存。
             patchMessages(current => current.map(item => item.id === pendingId
-              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）', activity: sealActivity() }
+              ? { ...item, status: 'stopped', content: item.content || t('chat.stopped_empty'), activity: sealActivity() }
               : item))
             await loadSessions()
           } else {
@@ -344,7 +341,7 @@ export default function App() {
         catch (error) {
           if (stoppedRef.current) {
             patchMessages(current => current.map(item => item.id === pendingId
-              ? { ...item, status: 'stopped', content: item.content || '（已停止，这一轮没有生成内容）', activity: sealActivity() }
+              ? { ...item, status: 'stopped', content: item.content || t('chat.stopped_empty'), activity: sealActivity() }
               : item))
             void loadSessions()
             return
@@ -352,7 +349,7 @@ export default function App() {
           setNotice(errorText(error))
           // 优先回读服务端真值（部分回答已带 interrupted 状态持久化）；服务不可达时保留本地标记。
           try { await loadMessages(targetSession.id); await loadSessions() }
-          catch { patchMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || '回答中断了，重发一次。', artifact: { kind: 'interrupted' }, activity: sealActivity() } : item)) }
+          catch { patchMessages(current => current.map(item => item.id === pendingId ? { ...item, content: item.content || t('chat.interrupted_retry'), artifact: { kind: 'interrupted' }, activity: sealActivity() } : item)) }
         }
         finally { setStreaming(false); abortRef.current = null }
       }} busy={streaming} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
@@ -366,13 +363,14 @@ export default function App() {
         <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
         {/* 掉线时这些都是缓存的旧值，留着会让人以为服务还在 */}
         {apiOnline !== false && healthLlm && <ModelPicker llm={healthLlm} />}
+        <LangPicker />
         {apiOnline !== false && healthRag && <span className="statusbar-detail">{retrievalLabel(healthRag.backend as string | undefined, true)}</span>}
-        {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">回答优先用当前课程的资料，没命中教材会标注出来</span>}
+        {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">{t('status.retrieval_note')}</span>}
         <span className="right">CoursePilot v2.0</span>
       </footer>
     </main>
     {citation && <CitationDrawer citation={citation} onClose={() => setCitation(null)} />}
-  </div>
+  </div></LangContext.Provider>
 }
 
 function ChatView({ session, messages, workspaceName, scope, modelNote, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, onStop, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; modelNote?: string; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onStop: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
@@ -415,19 +413,19 @@ function ChatView({ session, messages, workspaceName, scope, modelNote, turnReso
     if (box && following.current) box.scrollTop = box.scrollHeight
   }, [messages.length, lastContent])
 
-  const contextNote = !session ? '发送第一条消息会自动创建会话。'
+  const contextNote = !session ? t('chat.no_session')
     : session.scope_mode !== 'general' ? ''
     : turnResolution?.sessionId === session.id
       ? (turnResolution.status === 'resolved'
-          ? `本轮解析到：${turnResolution.courseName ?? turnResolution.courseId}`
-          : '本轮未解析到课程 · 在问题里说明课程名即可')
-      : session.resolved_course_id ? `最近解析到：${session.course_name ?? session.resolved_course_id}` : ''
+          ? t('chat.resolved_this_turn', { course: turnResolution.courseName ?? turnResolution.courseId ?? '' })
+          : t('chat.unresolved_hint'))
+      : session.resolved_course_id ? t('chat.resolved_recent', { course: session.course_name ?? session.resolved_course_id }) : ''
   return <section className="chat-view">
     {/* 课程会话的会话名与课程顶栏已经显示了，这里只留通用会话才有的逐轮解析结果。 */}
     {contextNote && <div className="session-context">{contextNote}</div>}
     <div className="messages" aria-live="polite" ref={scroller}
       onScroll={event => { const box = event.currentTarget; following.current = box.scrollHeight - box.scrollTop - box.clientHeight < 120 }}>
-      {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>今天想从哪里开始？</h1><p>{isCourseScope ? `这里的提问固定使用「${workspaceName}」的资料，回答会带教材页码引用。` : '通用模式每轮按问题解析课程。直接说出课程名最准。'}</p><div className="suggestion-row">{(isCourseScope ? ['讲讲这门课的核心概念', '给我出几道练习题', '帮我制定复习计划'] : ['「课程名」的某个概念怎么理解？', '给我出几道练习题', '帮我制定复习计划']).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
+      {!messages.length && <div className="welcome"><span aria-hidden>❯</span><h1>{t('chat.welcome_title')}</h1><p>{isCourseScope ? t('chat.welcome_course', { name: workspaceName }) : t('chat.welcome_general')}</p><div className="suggestion-row">{(isCourseScope ? [t('chat.suggest.concepts'), t('chat.suggest.practice'), t('chat.suggest.plan')] : [t('chat.suggest.concept_general'), t('chat.suggest.practice'), t('chat.suggest.plan')]).map(text => <button key={text} className="suggestion-chip" onClick={() => { setDraft(text); composer.current?.focus() }}>{text}</button>)}</div></div>}
       {messages.filter(item => item.role !== 'system').map((message, index, list) => <MessageCard message={message} key={message.id} onCitation={onCitation} modelNote={modelNote} onChoose={busy ? undefined : text => void onSend(text, [])} showResolution={!isCourseScope}
         onRetry={busy ? undefined : (() => {
           // 重发这条回答对应的那句提问——往前找最近的一条 user 消息
@@ -439,14 +437,14 @@ function ChatView({ session, messages, workspaceName, scope, modelNote, turnReso
       {(attachments.length > 0 || uploading) && <div className="attach-list">
         {attachments.map(item => <div className={item.needs_confirmation ? 'attach-chip warn' : 'attach-chip'} key={item.id}>
           <span className="attach-name">IMG · {item.filename}</span>
-          <span className="attach-preview">{item.needs_confirmation ? '没识别出文字，发送前在消息里补充说明' : item.transcription}</span>
-          <button type="button" aria-label={`移除图片 ${item.filename}`} onClick={() => setAttachments(current => current.filter(other => other.id !== item.id))}>×</button>
+          <span className="attach-preview">{item.needs_confirmation ? t('attach.no_text') : item.transcription}</span>
+          <button type="button" aria-label={t('a11y.remove_image', { name: item.filename })} onClick={() => setAttachments(current => current.filter(other => other.id !== item.id))}>×</button>
         </div>)}
-        {uploading && <div className="attach-chip pending"><span className="attach-name">IMG</span><span className="attach-preview">正在转录图片文字…</span></div>}
+        {uploading && <div className="attach-chip pending"><span className="attach-name">IMG</span><span className="attach-preview">{t('attach.transcribing')}</span></div>}
       </div>}
-      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? '写下你的思路，或继续提问…' : '先新建一个会话…'} aria-label="输入消息" rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label="上传图片提问"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>图片</button><span>Enter 发送 · Shift+Enter 换行</span>{contextUsage && <ContextMeter usage={contextUsage} />}{busy
-      ? <button className="send-button stop" type="button" onClick={onStop} aria-label="停止生成" title="停止生成">■</button>
-      : <button className="send-button" type="submit" disabled={!draft.trim() || uploading} aria-label="发送消息">↑</button>}</div></div>
+      <div className="composer"><span className="prompt" aria-hidden>❯</span><textarea ref={composer} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder={session ? t('chat.composer_placeholder') : t('chat.composer_placeholder_empty')} aria-label={t('a11y.composer')} rows={2} /><div className="composer-row"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} aria-label={t('a11y.upload_image')}><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><circle cx="5.5" cy="6.5" r="1.2" /><path d="M2.5 12.5 6.5 9l3 2.5 2-1.5 2 2" /></svg>{t('chat.image_button')}</button><span>{t('chat.enter_hint')}</span>{contextUsage && <ContextMeter usage={contextUsage} />}{busy
+      ? <button className="send-button stop" type="button" onClick={onStop} aria-label={t('a11y.stop')} title={t('a11y.stop')}>■</button>
+      : <button className="send-button" type="submit" disabled={!draft.trim() || uploading} aria-label={t('a11y.send')}>↑</button>}</div></div>
       <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={pickFile} />
     </form>
   </section>
@@ -482,20 +480,20 @@ function Mermaid({ code }: { code: string }) {
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = `coursepilot-图示-${new Date().toISOString().slice(0, 10)}.svg`
+    anchor.download = t('diagram.filename', { date: new Date().toISOString().slice(0, 10) })
     anchor.click()
     URL.revokeObjectURL(url)
   }
 
   if (!svg) return <pre className={failed ? 'mermaid-source failed' : 'mermaid-source'}>
-    <span className="mermaid-hint">{failed ? '这段图示代码有语法问题，下面是原文' : '正在生成图示…'}</span>
+    <span className="mermaid-hint">{failed ? t('diagram.bad_syntax') : t('diagram.rendering')}</span>
     <code>{code}</code>
   </pre>
   return <figure className="mermaid-figure">
-    <div role="img" aria-label="图示" dangerouslySetInnerHTML={{ __html: svg }} />
+    <div role="img" aria-label={t('a11y.diagram')} dangerouslySetInnerHTML={{ __html: svg }} />
     <figcaption>
-      <button type="button" onClick={download}>下载 SVG</button>
-      <span>可用浏览器或任意矢量图工具打开</span>
+      <button type="button" onClick={download}>{t('diagram.download')}</button>
+      <span>{t('diagram.open_hint')}</span>
     </figcaption>
   </figure>
 }
@@ -513,13 +511,8 @@ const markdownComponents = {
 }
 
 
-const CAPABILITY_GROUPS: { key: string; label: string; hint: string }[] = [
-  { key: 'read_course', label: '只读你的课程数据', hint: '检索教材、查概念目录、读计划与档案、读笔记' },
-  { key: 'write_state', label: '会改学习状态', hint: '写证据事件、改学习计划、更新长期记忆' },
-  { key: 'write_note', label: '会新建课程笔记', hint: '把整理好的内容写进你这个用户的 notes 目录' },
-  { key: 'network', label: '会访问外部网络', hint: '联网检索与抓取网页，每轮有次数上限' },
-  { key: 'free', label: '无副作用', hint: '算术求值、加载能力、读跨轮产物' },
-]
+// 分组名与说明在字典里（`capability.<key>` 与 `.hint`）：模块顶层调 t() 会锁住加载时的语言。
+const CAPABILITY_GROUPS = ['read_course', 'write_state', 'write_note', 'network', 'free'] as const
 
 /** 使用说明。可数的内容一律来自接口，避免变成需要人工同步的死文档。 */
 function HelpView({ courses, health, onError, onTry }: { courses: Course[]; health: Record<string, unknown> | null; onError: (message: string) => void; onTry: (text: string) => void }) {
@@ -545,69 +538,68 @@ function HelpView({ courses, health, onError, onTry }: { courses: Course[]; heal
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const web = (health?.web ?? null) as Record<string, unknown> | null
   const steps = [
-    { done: courses.length > 0, title: '新建一门课程', hint: '左栏「＋ 新建课程」' },
-    { done: indexedCourses.length > 0, title: '上传教材并等索引完成', hint: '知识仓库页上传 PDF、Word、PowerPoint、TXT 或 MD，单个 ≤ 100 MiB' },
-    { done: hasSession, title: '开始提问', hint: '回答会带教材文件名与页码，可点开看原文' },
+    { done: courses.length > 0, title: t('help.step1'), hint: t('help.step1_hint') },
+    { done: indexedCourses.length > 0, title: t('help.step2'), hint: t('help.step2_hint') },
+    { done: hasSession, title: t('help.step3'), hint: t('help.step3_hint') },
   ]
-  const grouped = CAPABILITY_GROUPS.map(group => ({
-    ...group,
-    tools: Object.entries(TOOL_LABELS).filter(([name]) => TOOL_CAPABILITY_HINT[name] === group.key).map(([, label]) => label),
+  const grouped = CAPABILITY_GROUPS.map(key => ({
+    key,
+    label: t(`capability.${key}`),
+    hint: t(`capability.${key}.hint`),
+    tools: Object.keys(TOOL_CAPABILITY_HINT).filter(name => TOOL_CAPABILITY_HINT[name] === key).map(name => tOr(`tool.${name}`, name)),
   })).filter(group => group.tools.length > 0)
 
   return <section className="page"><div className="page-inner">
-    <div className="hero"><div><p className="eyebrow">使用说明</p><h1>CoursePilot 能做什么</h1>
-      <p>本页的清单与能力来自当前实例的实时状态。</p></div></div>
+    <div className="hero"><div><p className="eyebrow">{t('nav.help')}</p><h1>{t('help.title')}</h1>
+      <p>{t('help.subtitle')}</p></div></div>
 
-    <article className="card"><h2>上手三步</h2>
-      <p>已完成的会自动打勾，依据是库里的真实数据。</p>
+    <article className="card"><h2>{t('help.steps_title')}</h2>
+      <p>{t('help.steps_hint')}</p>
       {steps.map((step, index) => <div className={`help-step ${step.done ? 'done' : ''}`} key={step.title}>
         <i aria-hidden>{step.done ? '✓' : index + 1}</i>
         <div><b>{step.title}</b><small>{step.hint}</small></div>
       </div>)}
     </article>
 
-    <article className="card"><h2>两种会话模式</h2>
+    <article className="card"><h2>{t('help.modes_title')}</h2>
       <div className="help-columns">
-        <div><b>通用会话</b><p>每轮按你的问题解析课程。指向不止一门课时会<strong>先问你</strong>，不跨课程取证。
-          课程名互相包含时（「深度学习」与「深度学习进阶」）取更具体的那个；问题里没有课程名时，用模型判一次学科。</p></div>
-        <div><b>课程会话</b><p>固定一门课，所有提问都只用这门课的资料。适合连续学一章内容。</p></div>
+        <div><b>{t('help.mode_general')}</b><p>{t('help.mode_general.before')}<strong>{t('help.mode_general.strong')}</strong>{t('help.mode_general.after')}</p></div>
+        <div><b>{t('help.mode_course')}</b><p>{t('help.mode_course_body')}</p></div>
       </div>
     </article>
 
-    <article className="card"><h2>专项能力{skills ? ` · ${skills.length} 个` : ''}</h2>
-      <p>说出对应的话就会自动加载相应规程，不需要手动选。点例句可以直接试。</p>
-      {skills === null ? <p className="mini-empty">正在读取…</p> : skills.filter(item => item.status === 'enabled').map(skill => <div className="help-skill" key={skill.name}>
-        <div className="help-skill-head"><b>{skill.name}</b><span>{skill.origin === 'builtin' ? '内建' : '导入'}</span></div>
+    <article className="card"><h2>{skills ? t('help.skills_title_n', { n: skills.length }) : t('help.skills_title')}</h2>
+      <p>{t('help.skills_hint')}</p>
+      {skills === null ? <p className="mini-empty">{t('common.loading')}</p> : skills.filter(item => item.status === 'enabled').map(skill => <div className="help-skill" key={skill.name}>
+        <div className="help-skill-head"><b>{skill.name}</b><span>{skill.origin === 'builtin' ? t('skill.origin_builtin') : t('skill.origin_user')}</span></div>
         <p>{skill.description}</p>
-        <small>什么时候用：{skill.when_to_use}</small>
+        <small>{t('help.when_to_use', { text: skill.when_to_use })}</small>
         {skill.examples && skill.examples.length > 0 && <div className="help-examples">
           {skill.examples.map(example => <button type="button" key={example} onClick={() => onTry(example)}>{example}</button>)}
         </div>}
       </div>)}
     </article>
 
-    <article className="card"><h2>当前实例状态</h2>
+    <article className="card"><h2>{t('help.instance_title')}</h2>
       <dl className="help-facts">
-        <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)}${llm.enabled ? '' : '（远端未启用，走本地兜底，回答不带教材检索）'}` : '未知'}</dd></div>
-        <div><dt>教材检索</dt><dd>{retrievalLabel(rag?.backend as string | undefined)}</dd></div>
-        <div><dt>联网</dt><dd>{web && (web as Record<string, unknown>).enabled ? '已启用。每轮最多检索 5 次、抓取 5 次；同一个查询重复调用不占额度' : '未启用（缺 RESEARCH_SERPAPI_API_KEY 或未开远端调用）'}</dd></div>
-        <div><dt>硬限制</dt><dd>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB，一轮最多 10 次工具调用（加载能力后 16 次）</dd></div>
+        <div><dt>{t('help.fact_model')}</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)}${llm.enabled ? '' : t('help.llm_local_note')}` : t('common.unknown')}</dd></div>
+        <div><dt>{t('help.fact_retrieval')}</dt><dd>{retrievalLabel(rag?.backend as string | undefined)}</dd></div>
+        <div><dt>{t('help.fact_web')}</dt><dd>{web && (web as Record<string, unknown>).enabled ? t('help.web_on') : t('help.web_off')}</dd></div>
+        <div><dt>{t('help.fact_limits')}</dt><dd>{t('help.limits_body')}</dd></div>
       </dl>
     </article>
 
-    <article className="card"><h2>它能碰到什么</h2>
-      <p>工具按副作用分组，后三组会改数据或出网。</p>
+    <article className="card"><h2>{t('help.reach_title')}</h2>
+      <p>{t('help.reach_hint')}</p>
       {grouped.map(group => <div className="help-group" key={group.key}>
         <div><b>{group.label}</b><small>{group.hint}</small></div>
-        <span>{group.tools.join('、')}</span>
+        <span>{group.tools.join(t('common.list_sep'))}</span>
       </div>)}
-      <p className="help-note">导入的第三方 skill 拿不到计划、记忆、笔记与联网。
-        权限取「声明 ∩ 白名单」，越权申请直接拒绝。</p>
+      <p className="help-note">{t('help.reach_note')}</p>
     </article>
 
-    <article className="card"><h2>不做什么</h2>
-      <p>播客音频、通用闪卡产品、泛化每日简报、整卷模拟考试、社交对战、多租户商业化。
-        通用会话不在同一轮里跨多门课读写；解析不出唯一课程时会先问你。</p>
+    <article className="card"><h2>{t('help.not_title')}</h2>
+      <p>{t('help.not_body')}</p>
     </article>
   </div></section>
 }
@@ -618,16 +610,16 @@ function CourseSettingRow({ course, onDelete, onError }: {
   const [confirming, setConfirming] = useState(false)
   return <div className="settings-course">
     <i style={{ backgroundColor: course.color }} /><b>{course.name}</b>
-    <span>{course.wiki_enabled ? 'Wiki 已开启' : 'Wiki 已关闭'}</span>
-    <button className="text-button danger-text" onClick={() => setConfirming(true)}>删除</button>
+    <span>{course.wiki_enabled ? t('settings.wiki_on') : t('settings.wiki_off')}</span>
+    <button className="text-button danger-text" onClick={() => setConfirming(true)}>{t('common.delete')}</button>
     {confirming && <DangerConfirm
-      what={`课程「${course.name}」`}
+      what={t('settings.delete_course_what', { name: course.name })}
       consequences={[
-        '这门课的全部教材、切块与索引',
-        '概念目录、掌握度与答题记录',
-        '学习计划及其改动历史',
-        '课程笔记、Wiki 页面与这门课的长期记忆',
-        '属于这门课的会话；不指定课程的会话会保留',
+        t('settings.delete_course.c1'),
+        t('settings.delete_course.c2'),
+        t('settings.delete_course.c3'),
+        t('settings.delete_course.c4'),
+        t('settings.delete_course.c5'),
       ]}
       onConfirm={async () => {
         setConfirming(false)
@@ -642,11 +634,11 @@ function DangerConfirm({ what, consequences, onConfirm, onCancel }: {
   what: string; consequences: string[]; onConfirm: () => void; onCancel: () => void
 }) {
   return <div className="danger-confirm">
-    <b>删除{what}？</b>
+    <b>{t('danger.title', { what })}</b>
     <ul>{consequences.map(line => <li key={line}>{line}</li>)}</ul>
     <div className="danger-actions">
-      <button className="danger" onClick={onConfirm}>确认删除</button>
-      <button onClick={onCancel}>取消</button>
+      <button className="danger" onClick={onConfirm}>{t('danger.confirm')}</button>
+      <button onClick={onCancel}>{t('common.cancel')}</button>
     </div>
   </div>
 }
@@ -660,7 +652,7 @@ function SessionRow({ session, active, onOpen, onRename, onDelete }: {
   useEffect(() => { setDraft(session.title); setMode('idle') }, [session.id, session.title])
 
   if (mode === 'rename') return <div className="session-row editing">
-    <input className="session-rename" value={draft} autoFocus aria-label="会话标题"
+    <input className="session-rename" value={draft} autoFocus aria-label={t('a11y.session_title')}
       onChange={event => setDraft(event.target.value)}
       onBlur={() => setMode('idle')}
       onKeyDown={event => {
@@ -674,18 +666,18 @@ function SessionRow({ session, active, onOpen, onRename, onDelete }: {
   </div>
 
   if (mode === 'confirm') return <div className="session-row confirming">
-    <span>删除这个会话？</span>
-    <button className="danger" onClick={() => { setMode('idle'); void onDelete() }}>删除</button>
-    <button onClick={() => setMode('idle')}>取消</button>
+    <span>{t('session.delete_confirm')}</span>
+    <button className="danger" onClick={() => { setMode('idle'); void onDelete() }}>{t('common.delete')}</button>
+    <button onClick={() => setMode('idle')}>{t('common.cancel')}</button>
   </div>
 
   return <div className={`session-row ${active ? 'active' : ''}`}>
     <button className="session" onClick={onOpen}>
-      <i title={session.scope_mode === 'general' ? '通用会话' : '课程会话'} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || '未命名会话'}</b><small>{timeLabel(session.updated_at)}</small></span>
+      <i title={session.scope_mode === 'general' ? t('session.general') : t('session.course')} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || t('session.untitled')}</b><small>{timeLabel(session.updated_at)}</small></span>
     </button>
     <span className="session-actions">
-      <button aria-label="重命名会话" title="重命名" onClick={() => setMode('rename')}>✎</button>
-      <button aria-label="删除会话" title="删除" onClick={() => setMode('confirm')}>×</button>
+      <button aria-label={t('a11y.rename_session')} title={t('common.rename')} onClick={() => setMode('rename')}>✎</button>
+      <button aria-label={t('a11y.delete_session')} title={t('common.delete')} onClick={() => setMode('confirm')}>×</button>
     </span>
   </div>
 }
@@ -710,40 +702,68 @@ function ModelPicker({ llm }: { llm: Record<string, unknown> }) {
   const apply = (next: string) => { setCurrentThinking(next); setTier(next) }
   return <>
     <label className="statusbar-picker">
-      <span className="sr-only">对话模型</span>
+      <span className="sr-only">{t('picker.model')}</span>
       <select value={active.key} onChange={event => { setCurrentModel(event.target.value); setModel(event.target.value) }}>
         {options.map(item => <option key={item.key} value={item.key}>{item.label} · {item.model}</option>)}
       </select>
     </label>
     <label className="statusbar-picker">
-      <span className="sr-only">思考模式</span>
+      <span className="sr-only">{t('picker.thinking')}</span>
       <select value={mode} onChange={event => apply(event.target.value === 'on' ? effort : event.target.value)}>
-        <option value="off">思考 关</option>
-        <option value="adaptive">思考 自动</option>
-        <option value="on">思考 开</option>
+        <option value="off">{t('picker.thinking_off')}</option>
+        <option value="adaptive">{t('picker.thinking_auto')}</option>
+        <option value="on">{t('picker.thinking_on')}</option>
       </select>
     </label>
     <label className="statusbar-picker">
-      <span className="sr-only">思考深度</span>
+      <span className="sr-only">{t('picker.effort')}</span>
       <select value={effort} disabled={mode !== 'on'} onChange={event => apply(event.target.value)}>
-        <option value="high">深度 high</option>
-        <option value="max">深度 max</option>
+        <option value="high">{t('picker.effort_high')}</option>
+        <option value="max">{t('picker.effort_max')}</option>
       </select>
     </label>
   </>
 }
 
+/** 界面语言。只换外壳文案，模型回答仍按提问语言。 */
+function LangPicker() {
+  const { lang, setLang: apply } = useI18n()
+  return <label className="statusbar-picker">
+    <span className="sr-only">{t('picker.language')}</span>
+    <select value={lang} onChange={event => apply(event.target.value as Lang)}>
+      {LANGS.map(item => <option key={item} value={item}>{t(`lang.${item}`)}</option>)}
+    </select>
+  </label>
+}
+
 function ThinkingHint({ activity, modelNote }: { activity?: ToolActivity[]; modelNote?: string }) {
   // 工具跑完到第一个字之间有一段空档，这里不说话用户就以为卡在上一个工具上。
   const running = activity?.find(entry => !entry.summary)
-  const label = running ? `正在${TOOL_LABELS[running.name] ?? running.name}` : activity?.length ? '正在思考' : '正在准备'
+  const label = running ? t('thinking.running', { tool: tOr(`tool.${running.name}`, running.name) }) : activity?.length ? t('thinking.thinking') : t('thinking.preparing')
   // 检索类工具在等模型加载时把原因说出来，别让用户以为是检索慢。
-  const reason = modelNote && running && RETRIEVAL_TOOLS.includes(running.name) ? `（${modelNote}载入中）` : ''
+  const reason = modelNote && running && RETRIEVAL_TOOLS.includes(running.name) ? t('thinking.model_loading', { models: modelNote }) : ''
   return <span className="typing">{label}{reason}<i aria-hidden /><i aria-hidden /><i aria-hidden /></span>
+}
+
+/** 种子检索是服务端每轮自动做的，只有命中才值得占一行——它解释了引用从哪来。
+ *  进行中由「正在检索教材」那句兜着，未命中和停止占位都不上屏。
+ *  模型自己发起的检索照常显示，失败的那一步也是它的决策过程。 */
+function seedChipHidden(entry: ToolActivity): boolean {
+  if (entry.origin !== 'seed') return false
+  return !entry.summary || entry.summary_key === 'summary.search_miss' || entry.summary_key === TOOL_STOPPED_KEY
+}
+
+function ToolActivityRow({ activity }: { activity: ToolActivity[] }) {
+  const visible = activity.filter(entry => !seedChipHidden(entry))
+  if (visible.length === 0) return null
+  return <div className="tool-activity">{visible.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>
 }
 
 function ToolChip({ entry }: { entry: ToolActivity }) {
   const pending = !entry.summary
+  // 后端给了 key 就用本地译文；历史 activity 只有中文 summary，退回它。
+  const translated = entry.summary_key ? tOr(entry.summary_key, entry.summary ?? '', entry.summary_args) : entry.summary
+  const summary = translated && entry.reused ? `${translated}${t('chip.reused_suffix')}` : translated
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (!pending || !entry.started_at) return
@@ -757,8 +777,8 @@ function ToolChip({ entry }: { entry: ToolActivity }) {
   const timing = pending ? (seconds >= 2 ? ` · ${seconds}s` : '') : (entry.elapsed_ms && entry.elapsed_ms >= 1000 ? ` · ${seconds}s` : '')
   return <span className={`tool-chip ${entry.ok === false ? 'warn' : ''} ${pending ? 'pending' : 'done'}`}>
     <i aria-hidden>{pending ? '⋯' : entry.ok === false ? '×' : '✓'}</i>
-    <span className="sr-only">{pending ? '进行中：' : entry.ok === false ? '失败：' : '完成：'}</span>
-    {TOOL_LABELS[entry.name] ?? entry.name}{entry.summary ? ` · ${entry.summary}` : ''}{timing}
+    <span className="sr-only">{pending ? t('chip.pending') : entry.ok === false ? t('chip.failed') : t('chip.done')}</span>
+    {tOr(`tool.${entry.name}`, entry.name)}{summary ? ` · ${summary}` : ''}{timing}
   </span>
 }
 
@@ -774,17 +794,17 @@ function NotesPanel({ course, onError }: { course: Course; onError: (message: st
     try { setOpen(await api.note(course.id, title)) } catch (error) { onError(errorText(error)) }
   }
   return <article className="card">
-    <div className="card-heading"><div><h2>课程笔记</h2>
-      <p>助手整理并存下的内容，按课程分目录存在你这个用户的工作区里。说「做成学习卡片」「存下来」，就会写到这里。</p></div></div>
-    {notes === null ? <p className="mini-empty">正在读取…</p> : notes.length === 0
-      ? <div className="empty-inline"><b>还没有笔记</b><p>让助手把内容整理成学习卡片或概念梳理，它会存到这里。</p></div>
+    <div className="card-heading"><div><h2>{t('library.notes_title')}</h2>
+      <p>{t('library.notes_hint')}</p></div></div>
+    {notes === null ? <p className="mini-empty">{t('common.loading')}</p> : notes.length === 0
+      ? <div className="empty-inline"><b>{t('library.notes_empty_title')}</b><p>{t('library.notes_empty_body')}</p></div>
       : notes.map(note => <div className="material-row" key={note.title}>
           <div className="file-mark">MD</div>
-          <div className="material-copy"><b>{note.title}</b><small>{note.chars} 字 · 更新于 {note.updated_at.slice(0, 16).replace('T', ' ')}</small></div>
-          <button className="ghost-button" onClick={() => void read(note.title)}>查看</button>
+          <div className="material-copy"><b>{note.title}</b><small>{t('library.note_meta', { chars: note.chars, time: note.updated_at.slice(0, 16).replace('T', ' ') })}</small></div>
+          <button className="ghost-button" onClick={() => void read(note.title)}>{t('common.view')}</button>
         </div>)}
     {open && <div className="note-viewer">
-      <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label="关闭笔记">×</button></div>
+      <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label={t('a11y.close_note')}>×</button></div>
       <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{open.content}</ReactMarkdown></div>
     </div>}
   </article>
@@ -812,15 +832,15 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
   }
   if (pages !== null && pages.length === 0) return null
   return <article className="card">
-    <div className="card-heading"><div><h2>知识页{pages ? ` · ${pages.length} 页` : ''}</h2>
-      <p>每页只用检索到的教材原文写成，结论后面标了页码。教材没覆盖的地方会写「教材未覆盖」。</p></div></div>
-    {pages === null ? <p className="mini-empty">正在读取…</p> : pages.map(page => <div className="material-row" key={page.concept_id}>
+    <div className="card-heading"><div><h2>{pages ? t('library.wiki_pages_title_n', { n: pages.length }) : t('library.wiki_pages_title')}</h2>
+      <p>{t('library.wiki_pages_hint')}</p></div></div>
+    {pages === null ? <p className="mini-empty">{t('common.loading')}</p> : pages.map(page => <div className="material-row" key={page.concept_id}>
       <div className="file-mark">WIKI</div>
-      <div className="material-copy"><b>{page.concept_name}</b><small>更新于 {page.updated_at.slice(0, 16).replace('T', ' ')}</small></div>
-      <button className="ghost-button" onClick={() => void read(page)}>查看</button>
+      <div className="material-copy"><b>{page.concept_name}</b><small>{t('library.updated_at', { time: page.updated_at.slice(0, 16).replace('T', ' ') })}</small></div>
+      <button className="ghost-button" onClick={() => void read(page)}>{t('common.view')}</button>
     </div>)}
     {open && <div className="note-viewer">
-      <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label="关闭知识页">×</button></div>
+      <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label={t('a11y.close_wiki')}>×</button></div>
       <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{open.content}</ReactMarkdown></div>
     </div>}
   </article>
@@ -830,14 +850,14 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
  *  后端没上报 backend 时返回空串，由调用方决定不显示。 */
 function retrievalLabel(backend: string | undefined, short = false): string {
   if (!backend) return ''
-  if (backend === 'hybrid_bge_rerank') return short ? '混合检索 + 重排' : '语义 + 词面混合，并做重排'
-  if (backend === 'hybrid_bge') return short ? '语义 + 词面混合检索' : '语义 + 词面混合（未启用重排）'
-  return short ? '仅词面检索' : '仅词面。中文问题命中英文教材效果差，可在知识仓库点一次「重建索引」'
+  if (backend === 'hybrid_bge_rerank') return short ? t('retrieval.hybrid_rerank_short') : t('retrieval.hybrid_rerank')
+  if (backend === 'hybrid_bge') return short ? t('retrieval.hybrid_short') : t('retrieval.hybrid')
+  return short ? t('retrieval.lexical_short') : t('retrieval.lexical')
 }
 
 function RetryCard({ title, message, onRetry }: { title: string; message: string; onRetry: () => void }) {
   return <article className="card"><h2>{title}</h2><p>{message}</p>
-    <button className="ghost-button" onClick={onRetry}>重新读取</button>
+    <button className="ghost-button" onClick={onRetry}>{t('common.reload')}</button>
   </article>
 }
 
@@ -852,15 +872,15 @@ function SessionTitle({ session, onRename }: { session: SessionSummary; onRename
     else setDraft(session.title)
   }
   if (editing) return <input
-    className="title-input" value={draft} autoFocus aria-label="会话标题"
+    className="title-input" value={draft} autoFocus aria-label={t('a11y.session_title')}
     onChange={event => setDraft(event.target.value)}
     onBlur={() => void commit()}
     onKeyDown={event => {
       if (event.key === 'Enter') { event.preventDefault(); void commit() }
       if (event.key === 'Escape') { setDraft(session.title); setEditing(false) }
     }} />
-  return <button type="button" className="title-edit" onClick={() => setEditing(true)} title="点击重命名会话">
-    <b>{session.title || '未命名会话'}</b>
+  return <button type="button" className="title-edit" onClick={() => setEditing(true)} title={t('a11y.click_rename')}>
+    <b>{session.title || t('session.untitled')}</b>
     <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden><path d="M11.5 2.5l2 2-7.5 7.5-2.5.5.5-2.5z" /></svg>
   </button>
 }
@@ -872,17 +892,17 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
   const filled = Math.max(1, Math.round(percent / 12.5))
   const notice = usage.dropped_history > 0 || usage.clipped_history > 0
   return <div className="context-chip">
-    <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} aria-label="查看本轮上下文构成" className={notice ? 'warn' : undefined}>
+    <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} aria-label={t('a11y.context')} className={notice ? 'warn' : undefined}>
       <span aria-hidden>{'▓'.repeat(filled)}{'░'.repeat(8 - filled)}</span>
       <b>{percent}%</b>
     </button>
     {open && <div className="context-popover">
-      <div className="popover-head"><b>本轮上下文</b><span>{k(usage.total_chars)} / {k(usage.limit_chars)}</span></div>
-      {usage.segments.map(segment => <div className="popover-row" key={segment.label}><span>{segment.label}</span><b>{k(segment.chars)}</b></div>)}
-      <p>按字符数估算，实际占用通常更小。</p>
-      {usage.compacted_messages > 0 && <p className="popover-note">更早的 {usage.compacted_messages} 条消息压成了摘要，仍在上下文里。</p>}
-      {usage.dropped_history > 0 && <p className="popover-warn">更早的 {usage.dropped_history} 条消息未进入本轮上下文。</p>}
-      {usage.clipped_history > 0 && <p className="popover-warn">有 {usage.clipped_history} 条超长消息被截断后才进入上下文。</p>}
+      <div className="popover-head"><b>{t('context.title')}</b><span>{k(usage.total_chars)} / {k(usage.limit_chars)}</span></div>
+      {usage.segments.map(segment => <div className="popover-row" key={segment.label}><span>{segment.label_key ? tOr(segment.label_key, segment.label) : segment.label}</span><b>{k(segment.chars)}</b></div>)}
+      <p>{t('context.note')}</p>
+      {usage.compacted_messages > 0 && <p className="popover-note">{t('context.compacted', { n: usage.compacted_messages })}</p>}
+      {usage.dropped_history > 0 && <p className="popover-warn">{t('context.dropped', { n: usage.dropped_history })}</p>}
+      {usage.clipped_history > 0 && <p className="popover-warn">{t('context.clipped', { n: usage.clipped_history })}</p>}
     </div>}
   </div>
 }
@@ -896,9 +916,9 @@ function PlanGantt({ items }: { items: Plan['items'] }) {
   for (const item of sorted) {
     // 三十多条一路铺下来读不动，按周切段
     const index = Math.floor((Date.parse(item.due_date) - start) / 604800000)
-    if (index !== week) { week = index; rows.push(`    section 第 ${index + 1} 周`) }
+    if (index !== week) { week = index; rows.push(`    section ${t('plan.gantt_section', { n: index + 1 })}`) }
     // mermaid 用冒号和逗号分隔字段，而计划标题里这两样都很常见——不换掉整张图都画不出来。
-    const label = item.title.replace(/[:：,，#;]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 16) || '待办'
+    const label = item.title.replace(/[:：,，#;]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 16) || t('plan.untitled_item')
     const state = item.status === 'done' ? 'done'
       : item.due_date === today ? 'active'
       : item.due_date < today ? 'crit' : ''
@@ -921,9 +941,9 @@ function PlanDays({ items }: { items: Plan['items'] }) {
   }
   return <div className="plan-days">
     {[...days].map(([date, dayItems]) => {
-      const when = date === today ? '今天' : date < today ? '已过' : ''
+      const when = date === today ? t('plan.today') : date < today ? t('plan.past') : ''
       return <section className={`plan-day ${date === today ? 'is-today' : ''} ${date < today ? 'is-past' : ''}`} key={date}>
-        <h3>{date.slice(5).replace('-', ' / ')}{when && <em>{when}</em>}<span>{dayItems.length} 项</span></h3>
+        <h3>{date.slice(5).replace('-', ' / ')}{when && <em>{when}</em>}<span>{t('plan.item_count', { n: dayItems.length })}</span></h3>
         {dayItems.map(item => <div className="material-row" key={item.id}>
           <div className="material-copy"><b>{item.title}</b><small>{item.status}{item.concept_name ? ` · ${item.concept_name}` : ''}</small></div>
         </div>)}
@@ -944,8 +964,8 @@ function safeHref(url?: string): string | null {
 
 function CitationChip({ item, fallbackNumber, onOpen }: { item: Citation; fallbackNumber: number; onOpen: (citation: Citation) => void }) {
   const label = <><i>[{item.number ?? fallbackNumber}]</i>{item.kind === 'web'
-    ? (item.title || item.url || '网页')
-    : `${item.material_name ?? '资料'}${item.page ? `:${item.page}` : ''}`}</>
+    ? (item.title || item.url || t('citation.web'))
+    : `${item.material_name ?? t('citation.material_fallback')}${item.page ? `:${item.page}` : ''}`}</>
   const href = item.kind === 'web' ? safeHref(item.url) : null
   if (href) return <a className="citation-web" href={href} target="_blank" rel="noopener noreferrer nofollow" title={item.url}>{label}</a>
   return <button onClick={() => onOpen(item)}>{label}</button>
@@ -955,10 +975,10 @@ function MessageCard({ message, onCitation, showResolution, onRetry, modelNote, 
   if (message.role === 'user') return <article className="message user-message"><div>{message.content}</div></article>
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
-  const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? `本轮解析：${message.resolved_course_name ?? message.resolved_course_id ?? '课程'}` : message.resolution_status ? '本轮未解析课程' : null
-  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <div className="tool-activity">{message.activity.map(entry => <ToolChip key={entry.call_id} entry={entry} />)}</div>}
-    {message.status === 'stopped' && <div className="degraded-notice"><span>已停止。上面的内容没有存进会话记录。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}
-    {message.degraded && <div className="degraded-notice">{message.degraded}。这次回答没有用教材检索与工具，仅供参考。</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>回答中断了，已生成的部分保留在上面。</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>重发这个问题</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>公开学习内容</b><span>{message.artifact.kind}</span></div>}{message.choices && message.choices.length > 0 && onChoose && <div className="choices">{message.choices.map(option => <button type="button" className="choice" key={option} onClick={() => onChoose(option)}>{option}</button>)}</div>}</article>
+  const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? t('message.resolved', { course: message.resolved_course_name ?? message.resolved_course_id ?? t('message.course_fallback') }) : message.resolution_status ? t('message.unresolved') : null
+  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <ToolActivityRow activity={message.activity} />}
+    {message.status === 'stopped' && <div className="degraded-notice"><span>{t('message.stopped_note')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}
+    {message.degraded && <div className="degraded-notice">{t('message.degraded_note', { note: message.degraded })}</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>{t('message.interrupted')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>{t('message.artifact_public')}</b><span>{message.artifact.kind}</span></div>}{message.choices && message.choices.length > 0 && onChoose && <div className="choices">{message.choices.map(option => <button type="button" className="choice" key={option} onClick={() => onChoose(option)}>{option}</button>)}</div>}</article>
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
@@ -997,7 +1017,7 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
     }, 1500)
     return () => window.clearInterval(interval)
   }, [jobs])
-  async function upload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; if (file.size > MAX_MATERIAL_BYTES) { onError('教材文件超过 100 MiB 上限。'); return } setLoading(true); try { const material = await api.uploadMaterial(course.id, file); setMaterials(current => [material, ...current]); const job = await api.indexMaterial(material.id); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } finally { setLoading(false); event.target.value = '' } }
+  async function upload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; if (file.size > MAX_MATERIAL_BYTES) { onError(t('library.too_large')); return } setLoading(true); try { const material = await api.uploadMaterial(course.id, file); setMaterials(current => [material, ...current]); const job = await api.indexMaterial(material.id); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } finally { setLoading(false); event.target.value = '' } }
   async function toggleWiki() { try { onCourseChange(await api.updateCourse(course.id, { wiki_enabled: !course.wiki_enabled })) } catch (error) { onError(errorText(error)) } }
   async function reindex(materialId: string) { try { const job = await api.indexMaterial(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
   function askOcr(materialId: string) {
@@ -1016,54 +1036,54 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   const wikiDone = Object.values(jobs).filter(job => job.type === 'wiki' && job.status === 'completed').length
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)); setSearched(searchQuery) } catch (error) { onError(errorText(error)); setResults([]); setSearched('') } finally { setLoading(false) } }
   const backendLabel = retrievalLabel(ragBackend, true)
-  return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">知识仓库</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>这门课的教材、索引与检索都在这里。换课程用左栏。{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>刷新状态</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>RAG 资料库</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>Wiki 知识页 {course.wiki_enabled ? '' : '（已关闭）'}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>课程笔记</button></div>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">{t('nav.library')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('library.hero')}{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>{t('library.refresh_status')}</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>{t('library.tab_rag')}</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>{t('library.tab_wiki')} {course.wiki_enabled ? '' : t('library.tab_wiki_off')}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>{t('library.notes_title')}</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
-    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>上传教材</h2><p>支持 PDF、Word、PowerPoint、TXT、MD。上传后自动执行：解析文本 → 切块 → 生成语义向量 → 建立索引。</p><p className="upload-hint">扫描版（图片版）PDF 也能传：识别出没有文字层时会先估算 OCR 要花多少额度，等你确认再开始转录。</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>上传到「{course.name}」</button><small>单个教材 ≤ 100 MiB，对话图片 ≤ 10 MiB。</small></article><article className="card search-card"><h2>检索验证</h2><p>在「{course.name}」范围内试查，看看索引质量与能引用的片段。</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder="试试概念名或一个真实问题" /><button className="primary-button" disabled={loading}>检索</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>资料与索引</h2><p>进度来自后端任务。</p></div><button className="text-button" onClick={() => void reload()}>刷新</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">还没有资料。上传并索引完成后可以在这里试查。</div>}</article>{searched && <article className="card results-card"><h2>检索结果</h2>{results.length === 0 && <div className="empty-inline"><b>没有匹配到内容</b><p>「{searched}」在这门课的资料里找不到足够相关的片段。重排分低于阈值的片段会被丢掉，所以这里宁可返回空，也不给你一堆不相关的原文。换个说法或换个更具体的术语再试。</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? '资料片段'} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? '服务端未返回可展示的文本片段。'}</p><small>{result.score !== undefined ? `检索排序分 ${result.score.toFixed(4)}` : '已返回引用'}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? '这份 PDF'} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : <><article className="card wiki-card"><div className="switch-row"><div><h2>启用 Course Wiki <span>实验功能</span></h2><p>关闭后不再生成新页面，已有的页面不会删除，提问与检索不受影响。</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label="切换 Course Wiki" onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">选一份已索引的资料生成知识页：按这份教材抽出的概念逐个写，每页只用检索到的原文。</p>{indexedMaterials.length ? indexedMaterials.map(material => {
+    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>{t('library.upload_title')}</h2><p>{t('library.upload_body')}</p><p className="upload-hint">{t('library.upload_ocr_hint')}</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>{t('library.upload_button', { name: course.name })}</button><small>{t('library.upload_limits')}</small></article><article className="card search-card"><h2>{t('library.search_title')}</h2><p>{t('library.search_body', { name: course.name })}</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder={t('library.search_placeholder')} /><button className="primary-button" disabled={loading}>{t('library.search_button')}</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>{t('library.materials_title')}</h2><p>{t('library.materials_hint')}</p></div><button className="text-button" onClick={() => void reload()}>{t('common.refresh')}</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">{t('library.materials_empty')}</div>}</article>{searched && <article className="card results-card"><h2>{t('library.results_title')}</h2>{results.length === 0 && <div className="empty-inline"><b>{t('library.results_empty_title')}</b><p>{t('library.results_empty_body', { query: searched })}</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? t('library.result_fallback_name')} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? t('library.result_no_text')}</p><small>{result.score !== undefined ? t('library.result_score', { score: result.score.toFixed(4) }) : t('library.result_cited')}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? t('library.ocr_fallback_name')} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : <><article className="card wiki-card"><div className="switch-row"><div><h2>{t('library.wiki_enable_title')} <span>{t('library.experimental')}</span></h2><p>{t('library.wiki_toggle_body')}</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label={t('a11y.toggle_wiki')} onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">{t('library.wiki_pick_hint')}</p>{indexedMaterials.length ? indexedMaterials.map(material => {
       // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
       const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
-      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? '未命名资料'}</b><small>{wikiJob ? (STAGE_LABELS[String(wikiJob.stage ?? wikiJob.status)] ?? String(wikiJob.status)) : '已索引，可独立解析到 Wiki'}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <small className="danger-text">{wikiJob.error}</small>}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? '重新解析到 Wiki' : '解析到 Wiki'}</button></div>
-    }) : <div className="empty-inline">请先上传并完成至少一份资料的索引。</div>}</> : <div className="empty-inline"><b>Wiki 尚未启用</b><p>Wiki 用来浏览教材生成的知识页。不开也不影响提问与检索。</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} />}</>}</div></section>
+      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? tOr(`stage.${String(wikiJob.stage ?? wikiJob.status)}`, String(wikiJob.status)) : t('library.wiki_ready')}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <small className="danger-text">{wikiJob.error}</small>}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
+    }) : <div className="empty-inline">{t('library.wiki_needs_material')}</div>}</> : <div className="empty-inline"><b>{t('library.wiki_off_title')}</b><p>{t('library.wiki_off_body')}</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} />}</>}</div></section>
 }
 
-const STAGE_LABELS: Record<string, string> = { uploaded: '待索引', queued: '排队中', starting: '准备中', extracting: '解析文本', chunking: '切块', embedding: '生成语义向量', indexing: '建立索引', completed: '已索引', indexed: '已索引', indexing_failed: '失败', failed: '失败', reading_index: '读取索引', wiki_completed: 'Wiki 已生成', needs_ocr: '需要 OCR' }
-const INDEX_PIPELINE: [string, string][] = [['extracting', '解析'], ['chunking', '切块'], ['embedding', '向量'], ['indexing', '索引']]
+// 阶段名在字典里（`stage.<name>` 与 `pipeline.<name>`）：后端加新阶段时界面显示原始值。
+const INDEX_PIPELINE = ['extracting', 'chunking', 'embedding', 'indexing'] as const
 
 function MaterialRow({ material, jobs, onReindex, onDelete, onOcr }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void; onDelete?: (materialId: string) => Promise<void>; onOcr?: (materialId: string) => void }) {
   const [confirming, setConfirming] = useState(false)
   // 只看索引任务，且取最后一个：jobs 只增不删，wiki 任务与上一次重建都在里面。
   const job = Object.values(jobs).filter(item => item.material_id === material.id && item.type !== 'wiki').at(-1)
   const rawStatus = job?.stage ?? job?.status ?? material.index_status ?? material.status ?? 'uploaded'
-  const statusLabel = STAGE_LABELS[String(rawStatus)] ?? String(rawStatus)
+  const statusLabel = tOr(`stage.${String(rawStatus)}`, String(rawStatus))
   const failed = String(job?.status ?? rawStatus).toLowerCase().includes('fail')
   const jobActive = job ? !['completed', 'failed'].includes(job.status) : false
   const indexed = (material.index_status ?? material.status) === 'indexed'
   const semantic = (material.embedded_count ?? 0) > 0
-  const stageIndex = INDEX_PIPELINE.findIndex(([stage]) => stage === job?.stage)
+  const stageIndex = INDEX_PIPELINE.findIndex(stage => stage === job?.stage)
   // 扫描版停在这里等确认：OCR 要花模型额度，先给账单再让用户点
   const needsOcr = job?.stage === 'needs_ocr' || (material.index_status ?? material.status) === 'needs_ocr'
   const productSummary = indexed && !jobActive
-    ? `${material.chunk_count ?? 0} 块 · ${semantic ? '语义 + 词面检索就绪' : '仅词面（点「重建索引」补语义向量）'}`
+    ? t(semantic ? 'library.product_semantic' : 'library.product_lexical', { n: material.chunk_count ?? 0 })
     : null
   return <div className="material-row">
     <div className="file-mark">{fileKind(material)}</div>
     <div className="material-copy">
-      <b>{material.filename ?? material.name ?? '未命名资料'}</b>
+      <b>{material.filename ?? material.name ?? t('library.material_untitled')}</b>
       <small>{[material.size_bytes ? `${Math.ceil(material.size_bytes / 1024 / 1024)} MiB` : null, productSummary].filter(Boolean).join(' · ') || statusLabel}</small>
-      {jobActive && <div className="pipeline">{INDEX_PIPELINE.map(([stage, label], position) => <span key={stage} className={`pipeline-step ${stageIndex > position ? 'done' : stageIndex === position ? 'current' : ''}`}>{label}</span>)}</div>}
+      {jobActive && <div className="pipeline">{INDEX_PIPELINE.map((stage, position) => <span key={stage} className={`pipeline-step ${stageIndex > position ? 'done' : stageIndex === position ? 'current' : ''}`}>{t(`pipeline.${stage}`)}</span>)}</div>}
       {job && !failed && <div className="job-progress"><i style={{ width: `${job.progress ?? 15}%` }} /></div>}
       {failed && job?.error && <small className="danger-text">{job.error}</small>}
     </div>
-    {needsOcr && onOcr && <button className="primary-button" onClick={() => onOcr(material.id)}>估算 OCR 用量</button>}
-    {!jobActive && !needsOcr && <button className="text-button" onClick={() => onReindex(material.id)}>{failed ? '重试索引' : '重建索引'}</button>}
-    {!jobActive && onDelete && <button className="text-button danger-text" onClick={() => setConfirming(true)}>删除</button>}
+    {needsOcr && onOcr && <button className="primary-button" onClick={() => onOcr(material.id)}>{t('library.ocr_estimate_button')}</button>}
+    {!jobActive && !needsOcr && <button className="text-button" onClick={() => onReindex(material.id)}>{failed ? t('library.reindex_retry') : t('library.reindex')}</button>}
+    {!jobActive && onDelete && <button className="text-button danger-text" onClick={() => setConfirming(true)}>{t('common.delete')}</button>}
     <span className={`status-tag ${failed ? 'failed' : ''}`}>{statusLabel}</span>
     {confirming && onDelete && <DangerConfirm
-      what={`教材「${material.filename ?? material.name ?? '未命名资料'}」`}
+      what={t('library.delete_material_what', { name: material.filename ?? material.name ?? t('library.material_untitled') })}
       consequences={[
-        '这份教材的原文件、切块与索引',
-        '由它提取的概念，以及基于这些概念的掌握度',
-        '答题记录本身会保留，掌握度日后可以从记录重算',
+        t('library.delete_material.c1'),
+        t('library.delete_material.c2'),
+        t('library.delete_material.c3'),
       ]}
       onConfirm={() => { setConfirming(false); void onDelete(material.id) }}
       onCancel={() => setConfirming(false)} />}
@@ -1074,7 +1094,7 @@ function fileKind(material: Material) { const name = material.filename ?? materi
 const thousands = (value: number) => value.toLocaleString('en-US')
 /** 几页教材的外推耗时不到一分钟，四舍五入会显示成「约 0 分钟」。 */
 const duration = (seconds: number | undefined, minutes: number) =>
-  seconds !== undefined && seconds < 60 ? `约 ${Math.max(1, seconds)} 秒` : `约 ${minutes} 分钟`
+  seconds !== undefined && seconds < 60 ? t('ocr.seconds', { n: Math.max(1, seconds) }) : t('ocr.minutes', { n: minutes })
 
 /** OCR 账单。取样那行是真跑出来的，全书那行是按页数外推的——两者要分开写，
  *  否则会让人以为外推值也是实测。 */
@@ -1083,20 +1103,20 @@ function OcrEstimatePanel({ filename, estimate, running, onConfirm, onCancel }: 
   onConfirm: () => void; onCancel: () => void
 }) {
   return <article className="card ocr-card">
-    <h2>「{filename}」是扫描版</h2>
-    <p>这份 PDF 没有文字层，要先逐页转成文字才能检索。转录会消耗你配置的 OCR 模型额度。</p>
-    {estimate === null ? <p className="mini-empty">正在取样估算…</p> : <table className="ocr-estimate"><tbody>
-      <tr><th>页数</th><td>{estimate.pages} 页</td></tr>
-      <tr><th>实测取样</th><td>{estimate.sampled_pages} 页 · {thousands(estimate.sample_prompt_tokens + estimate.sample_completion_tokens)} token · {estimate.sample_seconds}s</td></tr>
-      <tr><th>全书预计</th><td><b>{thousands(estimate.projected_total_tokens)} token</b>（输入 {thousands(estimate.projected_prompt_tokens)} ＋ 输出 {thousands(estimate.projected_completion_tokens)}）</td></tr>
-      <tr><th>预计耗时</th><td>{duration(estimate.projected_seconds, estimate.projected_minutes)}</td></tr>
+    <h2>{t('ocr.title', { name: filename })}</h2>
+    <p>{t('ocr.body')}</p>
+    {estimate === null ? <p className="mini-empty">{t('ocr.estimating')}</p> : <table className="ocr-estimate"><tbody>
+      <tr><th>{t('ocr.pages')}</th><td>{t('ocr.pages_value', { n: estimate.pages })}</td></tr>
+      <tr><th>{t('ocr.sampled')}</th><td>{t('ocr.sample_value', { pages: estimate.sampled_pages, tokens: thousands(estimate.sample_prompt_tokens + estimate.sample_completion_tokens), seconds: estimate.sample_seconds })}</td></tr>
+      <tr><th>{t('ocr.projected')}</th><td><b>{t('ocr.tokens', { n: thousands(estimate.projected_total_tokens) })}</b>{t('ocr.projected_split', { prompt: thousands(estimate.projected_prompt_tokens), completion: thousands(estimate.projected_completion_tokens) })}</td></tr>
+      <tr><th>{t('ocr.eta')}</th><td>{duration(estimate.projected_seconds, estimate.projected_minutes)}</td></tr>
     </tbody></table>}
-    <small className="help-note">全书数字按取样线性外推，实际随页面繁简浮动。折算成钱要按你自己那家的计价乘一下。</small>
+    <small className="help-note">{t('ocr.note')}</small>
     <div className="danger-actions">
       <button className="primary-button" disabled={estimate === null || running} onClick={onConfirm}>
-        {running ? '正在转录…' : '确认并开始 OCR'}
+        {running ? t('ocr.running') : t('ocr.confirm')}
       </button>
-      <button className="ghost-button" onClick={onCancel}>取消</button>
+      <button className="ghost-button" onClick={onCancel}>{t('common.cancel')}</button>
     </div>
   </article>
 }
@@ -1112,8 +1132,8 @@ function PlanView({ course, onError }: { course: Course; onError: (message: stri
     api.plan(course.id).then(payload => setPlan(payload.plan)).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
   }, [course.id, attempt])
   return <section className="page"><div className="page-inner">
-    <div className="hero"><div><p className="eyebrow">学习计划</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>在对话里说要排计划或改计划，助手就会写到这里。每次改动升一个版本，过去的条目不动。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取计划…</p> : error ? <RetryCard title="计划读取失败" message={error} onRetry={() => setAttempt(n => n + 1)} /> : plan ? <article className="card"><div className="card-heading"><div><h2>当前计划</h2><p>版本 v{plan.version} · {plan.items.length} 个条目 · 更新于 {plan.updated_at.slice(0, 16).replace('T', ' ')}</p></div></div><PlanGantt items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>还没有学习计划</h2><p>告诉助手考试日期和复习范围，让它排一份计划，这里就会显示。</p></article>}
+    <div className="hero"><div><p className="eyebrow">{t('nav.plan')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('plan.hero')}</p></div></div>
+    {!loaded ? <p className="mini-empty">{t('plan.loading')}</p> : error ? <RetryCard title={t('plan.error_title')} message={error} onRetry={() => setAttempt(n => n + 1)} /> : plan ? <article className="card"><div className="card-heading"><div><h2>{t('plan.current_title')}</h2><p>{t('plan.meta', { version: plan.version, n: plan.items.length, time: plan.updated_at.slice(0, 16).replace('T', ' ') })}</p></div></div><PlanGantt items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>{t('plan.empty_title')}</h2><p>{t('plan.empty_body')}</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {
@@ -1126,23 +1146,61 @@ function ArchiveView({ course, onError }: { course: Course; onError: (message: s
     api.archive(course.id).then(setArchive).catch(error => { setError(errorText(error)); onError(errorText(error)) }).finally(() => setLoaded(true))
   }, [course.id, attempt])
   return <section className="page"><div className="page-inner">
-    <div className="hero"><div><p className="eyebrow">学习档案</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>答题记录只增不改，掌握度由这些记录算出。</p></div></div>
-    {!loaded ? <p className="mini-empty">正在读取档案…</p> : error ? <RetryCard title="档案读取失败" message={error} onRetry={() => setAttempt(n => n + 1)} /> : !archive ? <p className="mini-empty">暂无档案数据。</p> : <>
-      <article className="card"><div className="card-heading"><div><h2>概念掌握度</h2><p>BKT 后验 × 遗忘曲线；证据不足的概念不给判断</p></div></div>
+    <div className="hero"><div><p className="eyebrow">{t('nav.archive')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('archive.hero')}</p></div></div>
+    {!loaded ? <p className="mini-empty">{t('archive.loading')}</p> : error ? <RetryCard title={t('archive.error_title')} message={error} onRetry={() => setAttempt(n => n + 1)} /> : !archive ? <p className="mini-empty">{t('archive.empty')}</p> : <>
+      <article className="card"><div className="card-heading"><div><h2>{t('archive.mastery_title')}</h2><p>{t('archive.mastery_hint')}</p></div></div>
         {archive.mastery.length ? archive.mastery.map(item => <div className="material-row" key={item.concept_id}>
           <div className="file-mark">{item.insufficient_evidence ? '—' : `${Math.round((item.score ?? 0) * 100)}`}</div>
           <div className="material-copy"><b>{item.name}</b>
-            <small>{item.insufficient_evidence ? `数据不足（${item.objective_events} 条客观证据）` : `${item.objective_events} 条客观证据`}{item.due_at ? ` · 复习到期 ${item.due_at.slice(0, 10)}` : ''}</small>
+            <small>{t(item.insufficient_evidence ? 'archive.insufficient' : 'archive.evidence_count', { n: item.objective_events })}{item.due_at ? ` · ${t('archive.due', { date: item.due_at.slice(0, 10) })}` : ''}</small>
             {!item.insufficient_evidence && <div className="job-progress"><i style={{ width: `${Math.round((item.score ?? 0) * 100)}%` }} /></div>}
           </div>
-        </div>) : <div className="empty-inline">还没有掌握度数据。做几道练习并提交作答，这里就会按概念显示。</div>}
+        </div>) : <div className="empty-inline">{t('archive.mastery_empty')}</div>}
       </article>
-      <article className="card"><div className="card-heading"><div><h2>证据事件</h2><p>共 {archive.evidence_count} 条</p></div></div>{archive.events.length ? archive.events.map(event => <div className="material-row" key={event.id}><div className="file-mark">{event.kind.toUpperCase().slice(0, 4)}</div><div className="material-copy"><b>{event.concept_name ?? event.topic_hint ?? (event.concept_id ? "已归因概念" : "未归因")}</b><small>{event.attribution_status} · {timeLabel(event.created_at)}</small></div></div>) : <div className="empty-inline">还没有证据事件。答题、小测与纠错之后，这里会出现可追溯的记录。</div>}</article>
-      {archive.unattributed.length > 0 && <article className="card"><div className="card-heading"><div><h2>未归因主题</h2><p>模型认不出概念时留下的线索，可以手动补进概念目录</p></div></div>
-        {archive.unattributed.map(item => <div className="material-row" key={item.topic_hint}><div className="file-mark">{item.hits}</div><div className="material-copy"><b>{item.topic_hint}</b><small>最近 {timeLabel(item.last_seen)}</small></div></div>)}
+      <MistakesCard archive={archive} />
+      <article className="card"><div className="card-heading"><div><h2>{t('archive.events_title')}</h2><p>{t('archive.events_count', { n: archive.evidence_count })}</p></div></div>{archive.events.length ? archive.events.map(event => <div className="material-row" key={event.id}><div className="file-mark">{event.kind.toUpperCase().slice(0, 4)}</div><div className="material-copy"><b>{event.concept_name ?? event.topic_hint ?? (event.concept_id ? t('archive.attributed') : t('archive.unattributed'))}</b><small>{event.attribution_status} · {timeLabel(event.created_at)}</small></div></div>) : <div className="empty-inline">{t('archive.events_empty')}</div>}</article>
+      {archive.unattributed.length > 0 && <article className="card"><div className="card-heading"><div><h2>{t('archive.topics_title')}</h2><p>{t('archive.topics_hint')}</p></div></div>
+        {archive.unattributed.map(item => <div className="material-row" key={item.topic_hint}><div className="file-mark">{item.hits}</div><div className="material-copy"><b>{item.topic_hint}</b><small>{t('archive.last_seen', { time: timeLabel(item.last_seen) })}</small></div></div>)}
       </article>}
     </>}
   </div></section>
+}
+
+function MistakeRow({ record, goal }: { record: MistakeRecord; goal: number }) {
+  const done = Math.min(record.streak, goal)
+  return <div className="material-row">
+    <div className="file-mark" title={t('archive.mistakes_wrong_total', { n: record.wrong_count })}>{record.wrong_count}</div>
+    <div className="material-copy"><b>{record.name}</b>
+      <small>{t('archive.mistakes_wrong', { n: record.wrong_count })} · {t('archive.mistakes_streak', { done, goal })} · {t('archive.mistakes_last_wrong', { time: timeLabel(record.last_wrong_at) })}</small>
+      <div className="job-progress"><i style={{ width: `${goal ? Math.round((done / goal) * 100) : 0}%` }} /></div>
+    </div>
+    <span className="mistake-tags">
+      {record.relapse_count > 0 && <span className="status-tag failed">{record.relapse_count > 1 ? t('archive.mistakes_relapse_n', { n: record.relapse_count }) : t('archive.mistakes_relapse')}</span>}
+      {record.status === 'graduated' && <span className="status-tag">{t('archive.mistakes_cleared_tag')}</span>}
+    </span>
+  </div>
+}
+
+/** 错题本。`mistakes` 只是一页，所以截断要显式说出来；毕业的折叠起来但计数始终可见——
+ *  清掉的东西看得见，用户才知道这套机制在起作用。 */
+function MistakesCard({ archive }: { archive: ArchiveSummary }) {
+  // 阈值跟着响应走：前端再存一份常量，后端改了界面就会理直气壮地说假话。
+  const goal = archive.graduate_streak
+  const active = archive.mistakes.filter(item => item.status === 'active')
+  const graduated = archive.mistakes.filter(item => item.status === 'graduated')
+  const hidden = Math.max(archive.active_count - active.length, 0)
+  return <article className="card"><div className="card-heading"><div><h2>{t('archive.mistakes_title')}</h2><p>{t('archive.mistakes_hint', { n: goal })}</p></div></div>
+    {archive.active_count + archive.graduated_count === 0
+      ? <div className="empty-inline">{t('archive.mistakes_empty', { n: goal })}</div>
+      : <>
+        {active.length ? active.map(item => <MistakeRow key={item.concept_id} record={item} goal={goal} />) : <div className="empty-inline">{t('archive.mistakes_all_clear')}</div>}
+        {hidden > 0 && <p className="mistake-more">{t('archive.mistakes_more', { n: hidden })}</p>}
+        {archive.graduated_count > 0 && <details className="mistake-cleared">
+          <summary>{t('archive.mistakes_cleared', { n: archive.graduated_count })}</summary>
+          {graduated.length ? graduated.map(item => <MistakeRow key={item.concept_id} record={item} goal={goal} />) : <div className="empty-inline">{t('archive.mistakes_cleared_hidden')}</div>}
+        </details>}
+      </>}
+  </article>
 }
 
 /** 长期记忆：user.md 与课程 memory.md 此前只有文件、没有入口，而文档宣称"可读可编辑"。 */
@@ -1168,27 +1226,23 @@ function MemoryCard({ courses, onError }: { courses: Course[]; onError: (message
     } catch (error) { onError(errorText(error)) } finally { setSaving(false) }
   }
   const dirty = draft !== content
-  return <article className="card"><h2>长期记忆</h2>
-    <p>助手跨课程记住的偏好与目标写在 <code>user.md</code>，每门课的学习进展写在各自的
-      <code>memory.md</code>。掌握度、错题与复习排期不在这里，那些由证据事件维护。</p>
+  return <article className="card"><h2>{t('memory.title')}</h2>
+    <p>{t('memory.body1')}<code>user.md</code>{t('memory.body2')}<code>memory.md</code>{t('memory.body3')}</p>
     <div className="memory-head">
-      <select value={scope} onChange={event => setScope(event.target.value)} aria-label="选择记忆范围">
-        <option value="user">跨课程画像（user.md）</option>
-        {courses.map(course => <option value={course.id} key={course.id}>{course.name} · 课程记忆</option>)}
+      <select value={scope} onChange={event => setScope(event.target.value)} aria-label={t('a11y.memory_scope')}>
+        <option value="user">{t('memory.scope_user')}</option>
+        {courses.map(course => <option value={course.id} key={course.id}>{t('memory.scope_course', { name: course.name })}</option>)}
       </select>
-      <span>{dirty ? '有未保存的修改' : loaded ? '已是最新' : '读取中…'}</span>
-      <button className="ghost-button" disabled={!dirty || saving} onClick={() => void save()}>{saving ? '保存中…' : '保存'}</button>
-      <button className="ghost-button" disabled={!dirty} onClick={() => setDraft(content)}>放弃修改</button>
+      <span>{dirty ? t('memory.dirty') : loaded ? t('memory.clean') : t('memory.loading')}</span>
+      <button className="ghost-button" disabled={!dirty || saving} onClick={() => void save()}>{saving ? t('memory.saving') : t('common.save')}</button>
+      <button className="ghost-button" disabled={!dirty} onClick={() => setDraft(content)}>{t('memory.discard')}</button>
     </div>
     <textarea className="memory-editor" value={draft} onChange={event => setDraft(event.target.value)}
-      placeholder={loaded ? '还没有内容。助手会在对话里自动补写，你也可以直接在这里写。' : '读取中…'}
-      spellCheck={false} aria-label="记忆内容" />
-    <p className="help-note">带 <code>agent:managed</code> 标记的区块由助手维护，删掉标记它会重新追加一份；
-      标记之外的段落助手不会覆盖。</p>
+      placeholder={loaded ? t('memory.placeholder') : t('memory.loading')}
+      spellCheck={false} aria-label={t('a11y.memory_content')} />
+    <p className="help-note">{t('memory.note1')}<code>agent:managed</code>{t('memory.note2')}</p>
   </article>
 }
-
-const SKILL_STATUS: Record<string, string> = { enabled: '已启用', draft: '未启用', permission_denied: '权限不足' }
 
 function SkillsCard({ onError }: { onError: (message: string) => void }) {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null)
@@ -1212,29 +1266,30 @@ function SkillsCard({ onError }: { onError: (message: string) => void }) {
     setSkipped([])
     await run(async () => { setSkipped((await api.importSkill(files)).skipped_files ?? []) })
   }
-  return <article className="card"><h2>能力（Skill）</h2>
-    <p>导入的 skill 默认关着，预览之后再打开。能授予的工具只有：{importable.join('、') || '—'}。</p>
-    {skills === null ? <p className="empty-inline">正在读取…</p> : skills.map(skill => <div className="skill-row" key={skill.name}>
+  const sep = t('common.list_sep')
+  return <article className="card"><h2>{t('settings.skills_title')}</h2>
+    <p>{t('settings.skills_hint', { tools: importable.join(sep) || '—' })}</p>
+    {skills === null ? <p className="empty-inline">{t('common.loading')}</p> : skills.map(skill => <div className="skill-row" key={skill.name}>
       <div className="skill-copy">
-        <b>{skill.name}<em>{skill.origin === 'builtin' ? '内建' : '导入'}</em></b>
+        <b>{skill.name}<em>{skill.origin === 'builtin' ? t('skill.origin_builtin') : t('skill.origin_user')}</em></b>
         <small>{skill.when_to_use}</small>
-        <small className="skill-tools">工具：{skill.allowed_tools.join('、') || '—'}</small>
-        {skill.denied_tools.length > 0 && <small className="skill-denied">被拒：{skill.denied_tools.join('、')} —— 改好 allowed_tools 再导入一次才能启用</small>}
+        <small className="skill-tools">{t('settings.skill_tools', { tools: skill.allowed_tools.join(sep) || '—' })}</small>
+        {skill.denied_tools.length > 0 && <small className="skill-denied">{t('settings.skill_denied', { tools: skill.denied_tools.join(sep) })}</small>}
       </div>
       <div className="skill-actions">
-        <span className={`skill-status ${skill.status}`}>{SKILL_STATUS[skill.status] ?? skill.status}</span>
+        <span className={`skill-status ${skill.status}`}>{tOr(`skill.status.${skill.status}`, skill.status)}</span>
         {skill.origin === 'user' && <>
-          <button className="ghost-button" disabled={busy || skill.status === 'permission_denied'} onClick={() => void run(() => api.setSkillEnabled(skill.name, skill.status !== 'enabled'))}>{skill.status === 'enabled' ? '停用' : '启用'}</button>
-          <button className="ghost-button danger" disabled={busy} onClick={() => void run(() => api.deleteSkill(skill.name))}>删除</button>
+          <button className="ghost-button" disabled={busy || skill.status === 'permission_denied'} onClick={() => void run(() => api.setSkillEnabled(skill.name, skill.status !== 'enabled'))}>{skill.status === 'enabled' ? t('settings.disable') : t('settings.enable')}</button>
+          <button className="ghost-button danger" disabled={busy} onClick={() => void run(() => api.deleteSkill(skill.name))}>{t('common.delete')}</button>
         </>}
       </div>
     </div>)}
     <div className="skill-import">
-      <button className="ghost-button" disabled={busy} onClick={() => fileInput.current?.click()}>导入文件（.md / .zip）</button>
-      <button className="ghost-button" disabled={busy} onClick={() => folderInput.current?.click()}>导入文件夹</button>
+      <button className="ghost-button" disabled={busy} onClick={() => fileInput.current?.click()}>{t('settings.import_file')}</button>
+      <button className="ghost-button" disabled={busy} onClick={() => folderInput.current?.click()}>{t('settings.import_folder')}</button>
     </div>
-    <small className="help-note">规程带的参考文件（.md / .txt / .json / .yaml / .csv）会一起并进规程；脚本与二进制文件跳过——这里不执行命令。</small>
-    {skipped.length > 0 && <small className="skill-denied">已跳过：{skipped.join('、')}</small>}
+    <small className="help-note">{t('settings.import_note')}</small>
+    {skipped.length > 0 && <small className="skill-denied">{t('settings.skipped', { files: skipped.join(sep) })}</small>}
     <input ref={fileInput} type="file" accept=".md,.zip,text/markdown,application/zip" hidden onChange={pick} />
     <input ref={folderInput} type="file" hidden multiple onChange={pick} {...{ webkitdirectory: '' }} />
   </article>
@@ -1247,16 +1302,16 @@ function SettingsView({ courses, onError, onCourseDeleted }: { courses: Course[]
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const rag = (health?.rag ?? null) as Record<string, unknown> | null
   const embedding = (rag?.embedding ?? null) as Record<string, unknown> | null
-  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>管理与设置</h1><p>课程、能力（Skill）与服务状态分开管理。</p></div><button className="ghost-button" onClick={check} disabled={loading}>检查服务</button></div><div className="settings-grid"><article className="card"><h2>课程与教材</h2><p>共 {courses.length} 门课程。课程颜色由服务端稳定返回。</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">暂无课程，请从左栏创建。</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><article className="card health-card"><h2>运行状态</h2>{health ? <><dl>
-    <div><dt>回答模型</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? '远端已启用' : '本地 Demo responder'}` : '未知'}</dd></div>
-    <div><dt>检索方式</dt><dd>{retrievalLabel(rag?.backend as string | undefined)}</dd></div>
-    {embedding && <div><dt>向量模型</dt><dd>{String(embedding.model)} · {embedding.error ? `加载失败：${String(embedding.error)}` : embedding.loaded ? '已加载' : '待首次使用时加载'}</dd></div>}
-    <div><dt>数据库</dt><dd>{(health.database as Record<string, unknown>)?.ok ? `正常 · migration v${String((health.database as Record<string, unknown>)?.migration_version)}` : '异常'}</dd></div>
-  </dl><details><summary>原始 JSON</summary><pre>{JSON.stringify(health, null, 2)}</pre></details></> : <p>点「检查服务」看模型与检索的当前状态。</p>}</article></div></div></section>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>{t('nav.settings')}</h1><p>{t('settings.hero')}</p></div><button className="ghost-button" onClick={check} disabled={loading}>{t('settings.check')}</button></div><div className="settings-grid"><article className="card"><h2>{t('settings.courses_title')}</h2><p>{t('settings.courses_count', { n: courses.length })}</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">{t('settings.courses_empty')}</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><article className="card health-card"><h2>{t('settings.health_title')}</h2>{health ? <><dl>
+    <div><dt>{t('help.fact_model')}</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? t('settings.remote_on') : t('settings.local_demo')}` : t('common.unknown')}</dd></div>
+    <div><dt>{t('settings.fact_retrieval')}</dt><dd>{retrievalLabel(rag?.backend as string | undefined)}</dd></div>
+    {embedding && <div><dt>{t('settings.fact_embedding')}</dt><dd>{String(embedding.model)} · {embedding.error ? t('settings.embed_failed', { error: String(embedding.error) }) : embedding.loaded ? t('settings.embed_loaded') : t('settings.embed_lazy')}</dd></div>}
+    <div><dt>{t('settings.fact_db')}</dt><dd>{(health.database as Record<string, unknown>)?.ok ? t('settings.db_ok', { version: String((health.database as Record<string, unknown>)?.migration_version) }) : t('settings.db_bad')}</dd></div>
+  </dl><details><summary>{t('settings.raw_json')}</summary><pre>{JSON.stringify(health, null, 2)}</pre></details></> : <p>{t('settings.health_hint')}</p>}</article></div></div></section>
 }
 function CoursePickerState({ view, courses, onPick, onCreate }: { view: View; courses: Course[]; onPick: (courseId: string) => void; onCreate: () => void }) {
-  return <section className="page"><div className="page-inner empty-course"><span aria-hidden>❯</span><h1>先选择一个课程</h1><p>{viewNames[view]}以课程为边界。选择后左栏会跟着切过去。</p>
-    <div className="picker-grid">{courses.map(item => <button className="picker-card" key={item.id} onClick={() => onPick(item.id)}><i style={{ backgroundColor: item.color }} /><b>{item.name}</b>{item.wiki_enabled && <em>Wiki</em>}</button>)}<button className="picker-card picker-create" onClick={onCreate}>＋ 新建课程</button></div>
+  return <section className="page"><div className="page-inner empty-course"><span aria-hidden>❯</span><h1>{t('picker.title')}</h1><p>{t('picker.body', { view: viewName(view) })}</p>
+    <div className="picker-grid">{courses.map(item => <button className="picker-card" key={item.id} onClick={() => onPick(item.id)}><i style={{ backgroundColor: item.color }} /><b>{item.name}</b>{item.wiki_enabled && <em>Wiki</em>}</button>)}<button className="picker-card picker-create" onClick={onCreate}>{t('course.new')}</button></div>
   </div></section>
 }
-function CitationDrawer({ citation, onClose }: { citation: Citation; onClose: () => void }) { return <aside className="citation-drawer" role="dialog" aria-label="教材引用详情"><header><div><p>教材引用</p><h2>{citation.material_name ?? '资料片段'}</h2></div><button aria-label="关闭引用详情" onClick={onClose}>×</button></header><p className="citation-location">{citation.page ? `第 ${citation.page} 页` : citation.chunk_id ? `片段 ${citation.chunk_id}` : '服务端返回的资料定位'}</p><blockquote>{citation.text ?? '该引用未提供可展示的原文片段。'}</blockquote>{citation.score !== undefined && <p>检索排序分：{citation.score.toFixed(4)}</p>}</aside> }
+function CitationDrawer({ citation, onClose }: { citation: Citation; onClose: () => void }) { return <aside className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{t('citation.title')}</p><h2>{citation.material_name ?? t('citation.fallback_name')}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{citation.page ? t('citation.page', { n: citation.page }) : citation.chunk_id ? t('citation.chunk', { id: citation.chunk_id }) : t('citation.location_unknown')}</p><blockquote>{citation.text ?? t('citation.no_text')}</blockquote>{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside> }
