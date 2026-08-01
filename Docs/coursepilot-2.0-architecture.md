@@ -207,7 +207,9 @@ class LLMClient(Protocol):
 
 ### 5.5 调用策略与 512K 软窗口
 
-上下文不靠模型侧的窗口参数控制——多数服务没有“把窗口改成固定档位”的独立参数。CoursePilot 在组装阶段限制发送量，软窗口由 `AGENT_CONTEXT_CHAR_LIMIT` 给（默认 512K 字符），在所配模型的上限内留出余量。换一个上下文更短的模型时改这一个配置项，代码不用动。思考模式的开关属于厂商私有字段，走 `TEXT_EXTRA_BODY`。
+上下文不靠模型侧的窗口参数控制——多数服务没有“把窗口改成固定档位”的独立参数。CoursePilot 在组装阶段限制发送量，软窗口由 `AGENT_CONTEXT_TOKEN_LIMIT` 给（默认 512K token），在所配模型的上限内留出余量。换一个上下文更短的模型时改这一个配置项，代码不用动。思考模式的开关属于厂商私有字段，走 `TEXT_EXTRA_BODY`。
+
+token 数是估算的：中日韩文字按 1 字 1 token，其余按 3.5 字符 1 token。不接 tokenizer 库——那类库只对某一家的 BPE 准，而这里接的是任意 OpenAI 兼容服务。系数两侧都取偏保守的一端，实测对 deepseek-v4-flash 高估 1.5~1.6 倍：宁可少留几条历史，也不要低估之后顶爆上游窗口。
 
 `contracts/llm.py` 定义供应商无关的增量流协议（deltas + 终态摘要），`adapters/llm/openai_compatible.py` 实现流式 Chat Completions（重试仅发生在首个增量之前），`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
 

@@ -282,7 +282,7 @@ def scenario_memory(course: str) -> None:
     fresh = call("/sessions", {"scope_mode": "course", "course_id": course})["id"]
     later = ask(fresh, "讲讲 softmax 温度系数是怎么起作用的", "mt-e2")
     # 段落列表恒有「长期记忆」一项，所以要看它的字数，不是看标签在不在
-    segments = {s["label"]: s["chars"] for item in later.named("context_usage") for s in item.get("segments", [])}
+    segments = {s["label"]: s["tokens"] for item in later.named("context_usage") for s in item.get("segments", [])}
     check("新会话把记忆带进了上下文", segments.get("长期记忆", 0) > 0, str(segments))
 
 
