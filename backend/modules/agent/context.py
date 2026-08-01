@@ -11,7 +11,7 @@ from contracts.llm import ChatMessage, ToolCallRequest
 
 SEED_CALL_ID = "call_seed_search"
 # 提示词版本：改动系统提示词就要 +1，trace 里据此区分不同版本的效果。
-PROMPT_VERSION = "tutor_v17"
+PROMPT_VERSION = "tutor_v18"
 
 # 没配联网时这半句要撤掉：工具表里已经没有 web_search，提示词还在推荐，
 # 模型就会口头答应去查而实际查不到。
@@ -28,8 +28,8 @@ _WIKI_RULE = """凡是问这门课的整体结构、学习顺序、某个主题�
 不许只拿检索到的片段拼。挑页要克制：目录本身已经说清了这门课的结构，整份读完既慢又答不准。
 问一个具体的定义、数字、公式或做法时不读知识页，检索片段够用就直接答。
 回答里只写概念名，绝不出现 concept_ / section_ 开头的 id——那是给工具用的。
-知识页是转述，没有页码，不能给它标 [1]；要给出处就用 search_materials 回教材查，
-用那一次返回的编号。"""
+知识页是转述、没有页码，但和教材片段一样要标引用：用到它的结论照工具返回的编号标 [n]，
+引用列表里会标成知识页。要给出教材页码就用 search_materials 回教材查原文。"""
 # 目录直接注进系统提示：它本来就该是常驻的导航，不该要专门取一次才看得见。
 # 上限跟 wiki_index 一致，超出的部分才需要回去调工具。
 WIKI_INJECT_MAX_ENTRIES = 60
@@ -168,6 +168,7 @@ def assemble_messages(
     question: str,
     seed_query: str,
     seed_result_text: str,
+    seed_wiki_text: str = "",
     history_token_budget: int,
     skill_summaries: str = "",
     practice_digest: str = "",
@@ -213,7 +214,10 @@ def assemble_messages(
         ContextSegment("context.segment.summary", "对话摘要", estimate_tokens(summary_block)),
         ContextSegment("context.segment.history", "会话历史", sum(estimate_tokens(item.content) for item in kept)),
         ContextSegment("context.segment.question", "当前问题", estimate_tokens(question) + estimate_tokens(seed_arguments)),
-        ContextSegment("context.segment.evidence", "教材证据", estimate_tokens(seed_result_text)),
+        # 教材原文与知识页转述分开报：这一段是用户判断「结论有没有原文依据」的地方。
+        ContextSegment("context.segment.evidence", "教材证据",
+                       estimate_tokens(seed_result_text) - estimate_tokens(seed_wiki_text)),
+        ContextSegment("context.segment.wiki_evidence", "知识页正文", estimate_tokens(seed_wiki_text)),
     ]
     return AssembledContext(messages, segments, dropped, clipped)
 

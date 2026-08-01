@@ -147,9 +147,19 @@ for _spec in SLICES:
 
 
 def cited_refs(turn: Turn) -> list[tuple[str, int]]:
-    """(文档, 页码)。一门课可能有多份切片，页码各自从 1 开始，只比页号会串。"""
+    """(文档, 页码)。一门课可能有多份切片，页码各自从 1 开始，只比页号会串。
+
+    只数教材引用：知识页是转述稿、没有页码，混进来会把按标注页码算的精确度拉低，
+    这一期前后的数字就不可比了。它单独计数，见 wiki_refs。
+    """
     return [(item.get("document") or "", item["page"]) for item in turn.named("citation")
-            if isinstance(item.get("page"), int)]
+            if item.get("kind", "material") == "material" and isinstance(item.get("page"), int)]
+
+
+def wiki_refs(turn: Turn) -> list[str]:
+    """这一轮引到了哪几页知识页。单独一列，不参与召回与精确。"""
+    return sorted({item.get("concept_name") or item.get("concept_id") or "?"
+                   for item in turn.named("citation") if item.get("kind") == "wiki"})
 
 
 def score_retrieval(sample: dict, refs: list[tuple[str, int]]) -> dict:
@@ -273,7 +283,7 @@ def run(base: str, samples: list[dict], chat, only: set[str]) -> list[dict]:
         retrieval = score_retrieval(sample, cited_refs(turn))
         workflow = score_workflow(sample, executed_tools(turn))
         entry = {"id": sample["id"], "category": sample["category"], "retrieval": retrieval,
-                 "workflow": workflow, "answer_chars": len(turn.answer)}
+                 "workflow": workflow, "wiki_cited": wiki_refs(turn), "answer_chars": len(turn.answer)}
         if chat is not None:
             points = sample["expected"]["answer_points"]
             case = (f"学生提问：\n{sample['question']}\n\n参考要点：\n"
@@ -306,8 +316,9 @@ def _print_one(index: int, total: int, sample: dict, entry: dict) -> None:
     covered = entry.get("answer", {}).get("covered")
     answer_note = f" 要点 {sum(bool(x) for x in covered)}/{len(covered)}" if isinstance(covered, list) else ""
     status = "FAIL " + " · ".join(flags) if flags else "ok"
+    wiki = entry.get("wiki_cited") or []
     print(f"[{index}/{total}] {sample['id']:<20} 召回 {retrieval['recall']:.2f} "
-          f"精确 {retrieval['precision']:.2f} 工具 {workflow['calls']}{answer_note}  {status}")
+          f"精确 {retrieval['precision']:.2f} 知识页 {len(wiki)} 工具 {workflow['calls']}{answer_note}  {status}")
 
 
 def summarize(results: list[dict]) -> None:
@@ -320,7 +331,11 @@ def summarize(results: list[dict]) -> None:
     print("\n" + "=" * 64)
     print(f"样本 {len(results)} 条，硬约束失败 {len(hard_fail)} 条")
     print(f"检索召回 {statistics.mean(r['retrieval']['recall'] for r in results):.3f}  "
-          f"精确 {statistics.mean(r['retrieval']['precision'] for r in results):.3f}")
+          f"精确 {statistics.mean(r['retrieval']['precision'] for r in results):.3f}"
+          "（只算教材引用，标注比的就是页码）")
+    # 知识页引用没有页码，参与不了页码判据，单独一列看它被用了多少。
+    wiki_counts = [len(r.get("wiki_cited") or []) for r in results]
+    print(f"知识页引用 {sum(wiki_counts)} 条，出现在 {sum(1 for n in wiki_counts if n)}/{len(results)} 条样本")
     covered = [(sum(bool(x) for x in r["answer"]["covered"]), len(r["answer"]["covered"]))
                for r in results if isinstance(r.get("answer", {}).get("covered"), list)]
     if covered:
@@ -339,7 +354,8 @@ def summarize(results: list[dict]) -> None:
     if hard_fail:
         print("\n失败明细：")
         for item in hard_fail:
-            print(f"  {item['id']}: 工具={item['workflow']['sequence']} 引用页={item['retrieval']['cited']}")
+            print(f"  {item['id']}: 工具={item['workflow']['sequence']} 引用页={item['retrieval']['cited']}"
+                  f" 知识页={item.get('wiki_cited') or []}")
 
 
 def main() -> int:

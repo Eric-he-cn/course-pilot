@@ -1017,11 +1017,17 @@ function safeHref(url?: string): string | null {
   } catch { return null }
 }
 
+// 三类来源的 chip 文案分开写：用户必须一眼看出这条是教材原文还是知识页转述。
+function citationLabel(item: Citation): string {
+  if (item.kind === 'web') return item.title || item.url || t('citation.web')
+  if (item.kind === 'wiki') return t('citation.wiki_chip', { name: item.concept_name || item.concept_id || t('citation.wiki_fallback') })
+  return `${item.material_name ?? t('citation.material_fallback')}${item.page ? `:${item.page}` : ''}`
+}
+
 function CitationChip({ item, fallbackNumber, onOpen }: { item: Citation; fallbackNumber: number; onOpen: (citation: Citation) => void }) {
-  const label = <><i>[{item.number ?? fallbackNumber}]</i>{item.kind === 'web'
-    ? (item.title || item.url || t('citation.web'))
-    : `${item.material_name ?? t('citation.material_fallback')}${item.page ? `:${item.page}` : ''}`}</>
+  const label = <><i>[{item.number ?? fallbackNumber}]</i>{citationLabel(item)}</>
   const href = item.kind === 'web' ? safeHref(item.url) : null
+  if (item.kind === 'wiki') return <button className="citation-wiki" onClick={() => onOpen(item)}>{label}</button>
   if (href) return <a className="citation-web" href={href} target="_blank" rel="noopener noreferrer nofollow" title={item.url}>{label}</a>
   return <button onClick={() => onOpen(item)}>{label}</button>
 }
@@ -1388,4 +1394,12 @@ function CoursePickerState({ view, courses, onPick, onCreate }: { view: View; co
     <div className="picker-grid">{courses.map(item => <button className="picker-card" key={item.id} onClick={() => onPick(item.id)}><i style={{ backgroundColor: item.color }} /><b>{item.name}</b>{item.wiki_enabled && <em>Wiki</em>}</button>)}<button className="picker-card picker-create" onClick={onCreate}>{t('course.new')}</button></div>
   </div></section>
 }
-function CitationDrawer({ citation, onClose }: { citation: Citation; onClose: () => void }) { return <aside className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{t('citation.title')}</p><h2>{citation.material_name ?? t('citation.fallback_name')}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{citation.page ? t('citation.page', { n: citation.page }) : citation.chunk_id ? t('citation.chunk', { id: citation.chunk_id }) : t('citation.location_unknown')}</p><blockquote>{citation.text ?? t('citation.no_text')}</blockquote>{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside> }
+function CitationDrawer({ citation, onClose }: { citation: Citation; onClose: () => void }) {
+  const isWiki = citation.kind === 'wiki'
+  // 抽屉头部就要说清这是转述稿：正文没有页码，用户不该以为自己在看教材原文。
+  const heading = isWiki ? (citation.concept_name || citation.concept_id || t('citation.wiki_fallback')) : (citation.material_name ?? t('citation.fallback_name'))
+  const location = isWiki ? t('citation.wiki_location')
+    : citation.page ? t('citation.page', { n: citation.page })
+    : citation.chunk_id ? t('citation.chunk', { id: citation.chunk_id }) : t('citation.location_unknown')
+  return <aside className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{isWiki ? t('citation.wiki_title') : t('citation.title')}</p><h2>{heading}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{location}</p><blockquote>{citation.text ?? t('citation.no_text')}</blockquote>{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside>
+}

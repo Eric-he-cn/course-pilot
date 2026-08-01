@@ -197,6 +197,12 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("concepts", "level", "INTEGER"),
     # 教材里的先后。不能靠 rowid：upsert 保留旧行，同一份教材改版重索引后顺序还是上一版的。
     ("concepts", "ordinal", "INTEGER"),
+    # 知识页也进 chunks 检索。'chunk' 是教材原文，'wiki' 是知识页正文；两路各按自己的
+    # 名额检索，混排会让概括语言写成的知识页把教材原文挤掉。挂在 chunks 上是为了让
+    # 删教材、删课程那两条既有的清理链路照样能收走它们。
+    ("chunks", "source_kind", "TEXT NOT NULL DEFAULT 'chunk'"),
+    ("chunks", "concept_id", "TEXT"),
+    ("chunks", "concept_name", "TEXT"),
 )
 RETIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sessions", "owner_id"),  # IM 渠道层去掉后恒为 'local-web'

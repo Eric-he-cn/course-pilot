@@ -38,8 +38,8 @@ _CONCEPT_UPSERT = (
 
 _MATERIAL_SELECT = """
     SELECT m.*,
-        (SELECT count(*) FROM chunks c WHERE c.material_id = m.id) AS chunk_count,
-        (SELECT count(*) FROM chunks c WHERE c.material_id = m.id AND c.embedding IS NOT NULL) AS embedded_count
+        (SELECT count(*) FROM chunks c WHERE c.material_id = m.id AND c.source_kind = 'chunk') AS chunk_count,
+        (SELECT count(*) FROM chunks c WHERE c.material_id = m.id AND c.source_kind = 'chunk' AND c.embedding IS NOT NULL) AS embedded_count
     FROM materials m
 """
 
@@ -52,6 +52,20 @@ def _material(row: object) -> Material:
         chunk_count=row["chunk_count"], embedded_count=row["embedded_count"],
         ocr_approved=bool(row["ocr_approved"]),
     )
+
+
+def _citation(row: object, score: float) -> Citation:
+    """chunks 一张表出两种来源。知识页没有文档名与页码，用概念名代替；
+    chunk_id 取 wiki:<concept_id> 而不是行 id——重建一次知识页行 id 就换了，
+    而去重、RRF 融合都按这个键，键跟着重建变就等于没去重。"""
+    if row["source_kind"] == "wiki":
+        # 正文以概念名开头（那一行是给检索用的），摘要里跳过它——抽屉标题已经写着同一个名字。
+        body = row["content"].split("\n\n", 1)[-1]
+        return Citation(material_id="", document="", page=None, chunk_id=f"wiki:{row['concept_id']}",
+                        snippet=body[:280], score=round(float(score), 6), kind="wiki",
+                        concept_id=row["concept_id"], concept_name=row["concept_name"] or row["concept_id"])
+    return Citation(material_id=row["material_id"], document=row["filename"], page=row["page"],
+                    chunk_id=row["id"], snippet=row["content"][:280], score=float(score))
 
 
 def _job(row: object) -> Job:
@@ -194,18 +208,43 @@ class KnowledgeRepository:
         return self.get_job(job_id)  # type: ignore[return-value]
 
     def replace_chunks(self, *, material_id: str, course_id: str, chunks: list[tuple[int | None, str]], embeddings: list[bytes] | None = None) -> None:
+        """只替换教材原文那一路。知识页的行由 Wiki 构建整课替换，重建索引不该顺手抹掉它们。"""
         with self._store.write() as conn:
-            old_ids = [row["id"] for row in conn.execute("SELECT id FROM chunks WHERE material_id = ?", (material_id,))]
+            old_ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM chunks WHERE material_id = ? AND source_kind = 'chunk'", (material_id,))]
             if old_ids:
                 conn.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?", ((chunk_id,) for chunk_id in old_ids))
-            conn.execute("DELETE FROM chunks WHERE material_id = ?", (material_id,))
+            conn.execute("DELETE FROM chunks WHERE material_id = ? AND source_kind = 'chunk'", (material_id,))
             for ordinal, (page, content) in enumerate(chunks):
                 chunk_id = new_id("chunk")
                 conn.execute(
-                    "INSERT INTO chunks(id, material_id, course_id, ordinal, page, content, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO chunks(id, material_id, course_id, ordinal, page, content, embedding, source_kind) VALUES (?, ?, ?, ?, ?, ?, ?, 'chunk')",
                     (chunk_id, material_id, course_id, ordinal, page, content, embeddings[ordinal] if embeddings else None),
                 )
                 conn.execute("INSERT INTO chunks_fts(chunk_id, course_id, content) VALUES (?, ?, ?)", (chunk_id, course_id, content))
+
+    def replace_wiki_chunks(self, *, course_id: str, pages: list[dict], embeddings: list[bytes] | None = None) -> None:
+        """整课替换知识页的检索行。按课程而不是按教材替换：一门课的几份教材共用一棵知识页，
+        构建任何一份都会重写课程首页。不进 chunks_fts——一门课的页数以十计，LIKE 扫得动。
+        """
+        with self._store.write() as conn:
+            conn.execute("DELETE FROM chunks WHERE course_id = ? AND source_kind = 'wiki'", (course_id,))
+            for ordinal, page in enumerate(pages):
+                conn.execute(
+                    "INSERT INTO chunks(id, material_id, course_id, ordinal, page, content, embedding,"
+                    " source_kind, concept_id, concept_name) VALUES (?, ?, ?, ?, NULL, ?, ?, 'wiki', ?, ?)",
+                    (new_id("wiki"), page["material_id"], course_id, ordinal, page["content"],
+                     embeddings[ordinal] if embeddings else None, page["concept_id"], page["concept_name"]),
+                )
+
+    def list_wiki_rows(self, *, course_id: str) -> list[dict]:
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT concept_id, concept_name, content FROM chunks"
+                " WHERE course_id = ? AND source_kind = 'wiki' ORDER BY ordinal",
+                (course_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def replace_material_concepts(self, *, course_id: str, material_id: str, candidates: list[dict]) -> int:
         """重建本教材的概念，已存在的同名概念保持原 id 与原归属教材不动（§8.1）。
@@ -291,7 +330,8 @@ class KnowledgeRepository:
     def list_material_chunks(self, *, material_id: str) -> list[dict]:
         with self._store.read() as conn:
             rows = conn.execute(
-                "SELECT id, ordinal, page, content FROM chunks WHERE material_id = ? ORDER BY ordinal",
+                "SELECT id, ordinal, page, content FROM chunks WHERE material_id = ?"
+                " AND source_kind = 'chunk' ORDER BY ordinal",
                 (material_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -308,9 +348,12 @@ class KnowledgeRepository:
         with self._store.read() as conn:
             return conn.execute("SELECT 1 FROM concepts WHERE id = ? AND course_id = ?", (concept_id, course_id)).fetchone() is not None
 
-    def load_course_embeddings(self, *, course_id: str) -> list[tuple[str, bytes]]:
+    def load_course_embeddings(self, *, course_id: str, source_kind: str = "chunk") -> list[tuple[str, bytes]]:
         with self._store.read() as conn:
-            rows = conn.execute("SELECT id, embedding FROM chunks WHERE course_id = ? AND embedding IS NOT NULL ORDER BY rowid", (course_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT id, embedding FROM chunks WHERE course_id = ? AND source_kind = ? AND embedding IS NOT NULL ORDER BY rowid",
+                (course_id, source_kind),
+            ).fetchall()
         return [(row["id"], row["embedding"]) for row in rows]
 
     def hits_by_chunk_ids(self, *, scored: list[tuple[str, float]]) -> list[KnowledgeHit]:
@@ -329,13 +372,35 @@ class KnowledgeRepository:
         for chunk_id, score in scored:
             row = rows.get(chunk_id)
             if row is not None:
-                hits.append(
-                    KnowledgeHit(
-                        citation=Citation(material_id=row["material_id"], document=row["filename"], page=row["page"], chunk_id=row["id"], snippet=row["content"][:280], score=score),
-                        content=row["content"],
-                    )
-                )
+                hits.append(KnowledgeHit(citation=_citation(row, score), content=row["content"]))
         return hits
+
+    def search_wiki(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:
+        """知识页的词面检索。页数以十计，直接 LIKE 扫全课再按词面重合度排，
+        不建 FTS：trigram 索引是为几千段教材原文准备的，这里用不上。"""
+        tokens = [token for token in re.findall(r"[^\W_一-鿿]+|[一-鿿]+", query, flags=re.UNICODE) if token]
+        if not tokens:
+            return []
+        terms = self._fallback_terms(tokens)
+        clauses = " OR ".join("lower(content) LIKE lower(?)" for _ in terms)
+        with self._store.read() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM chunks WHERE course_id = ? AND source_kind = 'wiki' AND ({clauses})",
+                (course_id, *(f"%{term}%" for term in terms)),
+            ).fetchall()
+        ranked = sorted(rows, key=lambda row: self._term_overlap_score(row["content"], terms), reverse=True)[:limit]
+        return [KnowledgeHit(citation=_citation(row, self._term_overlap_score(row["content"], terms)), content=row["content"])
+                for row in ranked]
+
+    def wiki_hits_by_ids(self, *, scored: list[tuple[str, float]]) -> list[KnowledgeHit]:
+        if not scored:
+            return []
+        placeholders = ",".join("?" * len(scored))
+        with self._store.read() as conn:
+            rows = {row["id"]: row for row in conn.execute(
+                f"SELECT * FROM chunks WHERE id IN ({placeholders})", [row_id for row_id, _ in scored])}
+        return [KnowledgeHit(citation=_citation(rows[row_id], score), content=rows[row_id]["content"])
+                for row_id, score in scored if row_id in rows]
 
     def search(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:
         # 中英混排必须在文种边界切开（"你有没有Deep"≠一个词），否则英文词
@@ -351,7 +416,7 @@ class KnowledgeRepository:
             try:
                 if fts_query:  # 全是短词时这一路没得查，直接落兜底
                     rows = conn.execute(
-                        "SELECT c.*, m.filename, bm25(chunks_fts) AS rank FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.chunk_id JOIN materials m ON m.id = c.material_id WHERE chunks_fts.course_id = ? AND chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+                        "SELECT c.*, m.filename, bm25(chunks_fts) AS rank FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.chunk_id JOIN materials m ON m.id = c.material_id WHERE chunks_fts.course_id = ? AND c.source_kind = 'chunk' AND chunks_fts MATCH ? ORDER BY rank LIMIT ?",
                         (course_id, fts_query, limit),
                     ).fetchall()
             except Exception:
@@ -364,7 +429,7 @@ class KnowledgeRepository:
                 terms = self._fallback_terms(tokens)
                 clauses = " OR ".join("lower(c.content) LIKE lower(?)" for _ in terms)
                 rows = conn.execute(
-                    f"SELECT c.*, m.filename FROM chunks c JOIN materials m ON m.id = c.material_id WHERE c.course_id = ? AND ({clauses}) ORDER BY c.ordinal LIMIT ?",
+                    f"SELECT c.*, m.filename FROM chunks c JOIN materials m ON m.id = c.material_id WHERE c.course_id = ? AND c.source_kind = 'chunk' AND ({clauses}) ORDER BY c.ordinal LIMIT ?",
                     (course_id, *(f"%{term}%" for term in terms), min(200, limit * 12)),
                 ).fetchall()
                 rows = sorted(
@@ -375,13 +440,7 @@ class KnowledgeRepository:
                 # Keep a single rank shape for the serializer below. SQLite
                 # rows are immutable, so convert only fallback result rows.
                 rows = [dict(row, rank=-self._term_overlap_score(row["content"], terms)) for row in rows]
-        return [
-            KnowledgeHit(
-                citation=Citation(material_id=row["material_id"], document=row["filename"], page=row["page"], chunk_id=row["id"], snippet=row["content"][:280], score=float(-row["rank"])),
-                content=row["content"],
-            )
-            for row in rows
-        ]
+        return [KnowledgeHit(citation=_citation(row, -row["rank"]), content=row["content"]) for row in rows]
 
     @staticmethod
     def _fts_terms(tokens: list[str]) -> list[str]:

@@ -23,13 +23,16 @@ export interface Citation {
   id?: string
   // 服务端给出的引用编号，与回答正文里的 [n] 对应
   number?: number
-  // 来源类别显式给出：网页点开是外链，教材点开是原文抽屉。
+  // 来源类别显式给出：网页点开是外链，教材与知识页点开是抽屉。
   // 不靠「有没有 url」这类隐式判断——那会在字段缺失时静默走错分支。
-  kind?: 'material' | 'web'
+  // wiki 是系统按教材整理的转述稿，没有页码，界面必须和教材原文标得不一样。
+  kind?: 'material' | 'web' | 'wiki'
   url?: string
   title?: string
   material_id?: string
   material_name?: string
+  concept_id?: string
+  concept_name?: string
   page?: number | null
   chunk_id?: string
   text?: string

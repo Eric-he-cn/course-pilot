@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from typing import Protocol
 @dataclass(frozen=True)
 class Citation:
+    """一条可点开的来源。kind 分教材原文与知识页转述：后者没有页码，
+    界面必须把两者标得不一样，用户才知道自己点开的是原文还是二手整理。"""
     material_id: str; document: str; page: int | None; chunk_id: str; snippet: str; score: float
+    kind: str = "material"; concept_id: str = ""; concept_name: str = ""
 @dataclass(frozen=True)
 class KnowledgeHit:
     citation: Citation; content: str
@@ -30,6 +33,7 @@ class WikiDocument:
     concept_id: str; concept_name: str; body: str; handwritten: str
 class KnowledgeSearchPort(Protocol):
     def search(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 6) -> list[KnowledgeHit]: ...
+    def search_wiki(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 2) -> list[KnowledgeHit]: ...
     def material_names(self, *, scope: ResolvedKnowledgeScope) -> list[str]: ...
     def concepts(self, *, scope: ResolvedKnowledgeScope, limit: int = 60) -> list[ConceptRef]: ...
     def wiki_enabled(self, *, scope: ResolvedKnowledgeScope) -> bool: ...

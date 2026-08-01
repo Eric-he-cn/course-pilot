@@ -22,6 +22,12 @@ from .skills import SkillRegistry
 logger = logging.getLogger(__name__)
 
 SEARCH_LIMIT = 6
+# 每次检索给知识页留的固定名额。和教材那 6 条各算各的，不合排：知识页用概括的语言写、
+# 提问也是概括的语言，同一个列表比相似度它会占便宜，把教材原文挤出去。
+WIKI_SEARCH_LIMIT = 2
+# 单条知识页进检索结果时的字符上限。生成的正文控制在 500-600 字，两条就是这个数的两倍，
+# 超出的部分留给 wiki_read 去读整页。
+WIKI_HIT_MAX_CHARS = 600
 # concept_search 一次最多列几个概念：再多这份目录本身就成了要读的东西。
 CONCEPT_LIST_MAX = 40
 # 反问最多给几个选项：再多就不是「挑一个」而是又一道阅读题。
@@ -75,12 +81,17 @@ _WIKI_INDEX_HEADER = (
     # 实测模型会把 id 抄进回答里（「进程抽象（concept_9dd5…）」），得明说一句。
     "id 只用于调工具，回答里不要出现，对用户只说概念名：\n"
 )
-# 知识页是转述，没有页码，也不进本轮的引用编号。这句要跟着正文一起给：
-# 只写在工具描述里的话，模型读完长正文就只记得内容，转头给它标了 [1]。
+# 知识页可以引用，但它是转述、没有页码。这句要跟着正文一起给：只写在工具描述里的话，
+# 模型读完长正文就只记得内容，转头把它当成有页码的教材证据。
 _WIKI_PAGE_HEADER = (
-    "（以下是知识页，系统按教材整理的转述稿，不是教材原文，也没有页码。"
-    "可以据此作答，但不能给它标 [1] 这类引用编号；要给出处就用 search_materials 回教材查，"
-    "用那一次返回的编号。）\n"
+    "（以下是知识页，系统按教材整理的转述稿，不是教材原文，也没有页码。用到它的结论"
+    "照下面的编号标 [n]，引用列表里会标成知识页。要给出教材页码就用 search_materials"
+    "回教材查原文，用那一次返回的编号。）\n"
+)
+# 检索结果里知识页那一段的段头，和教材原文分开摆。
+_WIKI_HITS_HEADER = (
+    "以下是同一次检索命中的知识页（系统按教材整理的转述稿，不是教材原文，也没有页码。"
+    "用到它的结论照编号标 [n]，引用列表里会标成知识页）：\n"
 )
 _WIKI_HANDWRITTEN_HEADER = "以下是用户自己在这一页写的补充（不是教材内容）："
 
@@ -227,9 +238,9 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="wiki_read",
         description=(
             "读一页知识页的正文，concept_id 取自系统提示里的知识页目录（或 wiki_index）。"
-            "知识页是对教材的转述，不是教材原文，也没有页码：据此作答可以，"
-            "但不能给它标 [1] 这类引用编号。需要给出处时用 search_materials 回教材查到原文，"
-            "用那一次返回的编号。"
+            "知识页是对教材的转述，不是教材原文，也没有页码：用到它的结论照返回的编号"
+            "标 [n]，引用列表里会标成知识页。需要给出教材页码时用 search_materials "
+            "回教材查到原文，用那一次返回的编号。"
         ),
         parameters={
             "type": "object",
@@ -472,8 +483,8 @@ def specs_for(allowed: tuple[str, ...], *, capabilities: frozenset[str] | None =
 
 
 class CitationRegistry:
-    """整轮统一的引用编号：教材与网页共用一套编号，kind 区分两类来源。
-    去重口径——教材按 chunk，网页按 URL。"""
+    """整轮统一的引用编号：教材、知识页与网页共用一套编号，kind 区分三类来源。
+    去重口径——教材按 chunk，知识页按概念，网页按 URL。"""
 
     def __init__(self) -> None:
         self._by_key: dict[str, int] = {}
@@ -492,6 +503,15 @@ class CitationRegistry:
                 "score": hit.citation.score,
             },
         )
+
+    def register_wiki(self, *, concept_id: str, concept_name: str, snippet: str,
+                      score: float = 0.0) -> tuple[int, bool]:
+        """一页知识页就是一条来源，检索到与 wiki_read 读到的是同一条，不编两个号。
+        不给 page：它是转述稿，页码无从核对，界面据此标成知识页而不是教材页。"""
+        return self._add(f"wiki:{concept_id}", {
+            "kind": "wiki", "concept_id": concept_id, "concept_name": concept_name,
+            "page": None, "snippet": snippet, "score": score,
+        })
 
     def register_web(self, *, url: str, title: str, snippet: str) -> tuple[int, bool]:
         """同一 URL 无论来自 web_search 还是 web_fetch 都是同一条来源：
@@ -621,6 +641,9 @@ class ToolOutcome:
     summary_key: str | None = None
     summary_args: dict[str, object] = field(default_factory=dict)
     new_citations: list[dict] = field(default_factory=list)
+    # text 里属于知识页的那一段。上下文构成要把转述与教材原文分开报，不然
+    # 「教材证据 N token」里混着二手内容。
+    wiki_text: str = ""
     activated_skill: str | None = None  # use_skill 成功时带回，用于当轮切换工具 profile
     # 只进 trace，不进面向用户的 activity——"预算耗尽"对用户没有意义。
     reason: str | None = None
@@ -709,7 +732,7 @@ class ToolExecutor:
             if name == "wiki_index":
                 return self._wiki_index(scope)
             if name == "wiki_read":
-                return self._wiki_read(scope, parsed)
+                return self._wiki_read(scope, parsed, registry)
             if name == "artifact_append":
                 return self._artifact_append(scope, session_id, parsed)
             if name == "memory_patch":
@@ -856,7 +879,7 @@ class ToolExecutor:
             summary=f"{len(shown)} 页知识页", summary_key="summary.wiki_index", summary_args={"n": len(shown)},
         )
 
-    def _wiki_read(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
+    def _wiki_read(self, scope: ResolvedKnowledgeScope, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
         concept_id = str(parsed.get("concept_id") or "").strip()
         if not concept_id:
             raise ValueError("wiki_read 需要 concept_id")
@@ -867,7 +890,11 @@ class ToolExecutor:
                 text=f"没有 {concept_id} 的知识页。先用 wiki_index 看有哪些页可读。", ok=False,
                 summary="没有这一页知识页", summary_key="summary.wiki_page_missing", reason="wiki_page_missing",
             )
-        parts = [f"{_WIKI_PAGE_HEADER}\n# {page.concept_name}\n\n{page.body}"]
+        # 读回来的正文也要能标引用，否则模型越用知识页，回答里越多结论没有出处可点。
+        number, is_new = registry.register_wiki(
+            concept_id=concept_id, concept_name=page.concept_name, snippet=page.body[:280],
+        )
+        parts = [f"{_WIKI_PAGE_HEADER}\n[{number}] 知识页\n\n# {page.concept_name}\n\n{page.body}"]
         if page.handwritten:
             parts.append(f"{_WIKI_HANDWRITTEN_HEADER}\n{page.handwritten}")
         text = "\n\n".join(parts)
@@ -877,6 +904,7 @@ class ToolExecutor:
         return ToolOutcome(
             text=text, ok=True, summary=f"读知识页「{_plain_line(page.concept_name, 20)}」",
             summary_key="summary.wiki_read", summary_args={"name": _plain_line(page.concept_name, 20)},
+            new_citations=[registry.citations[number - 1]] if is_new else [],
         )
 
     def _artifact_append(self, scope: ResolvedKnowledgeScope, session_id: str, parsed: dict) -> ToolOutcome:
@@ -914,12 +942,14 @@ class ToolExecutor:
         )
 
     def _search(self, scope: ResolvedKnowledgeScope, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
+        """一次覆盖教材与知识页两边，各按自己的固定名额取。"""
         query = str(parsed.get("query") or "").strip()
         if not query:
             return ToolOutcome(text="search_materials 需要非空的 query 参数。", ok=False, summary="缺少查询词", summary_key="summary.query_missing", reason="invalid_args")
         shown = _clip(query, 24)
         hits = self._knowledge.search(scope=scope, query=query, limit=self._search_limit)
-        if not hits:
+        wiki_hits = self._knowledge.search_wiki(scope=scope, query=query, limit=WIKI_SEARCH_LIMIT)
+        if not hits and not wiki_hits:
             return ToolOutcome(
                 text="（本课程资料里这次没有匹配到相关内容，教材已索引；可换关键词或换个说法再查一次。确实没有就按通用知识回答，并说明来源不是教材）",
                 ok=True, summary=f"检索「{shown}」未命中", summary_key="summary.search_miss", summary_args={"query": shown},
@@ -931,11 +961,38 @@ class ToolExecutor:
                 new_citations.append(registry.citations[number - 1])
             page = f"，第 {hit.citation.page} 页" if hit.citation.page is not None else ""
             blocks.append(f"[{number}] 文档：{hit.citation.document}{page}；片段：{hit.citation.chunk_id}\n{hit.content}")
+        wiki_text = self._wiki_blocks(wiki_hits, registry, new_citations)
+        text = "\n\n".join(blocks) + wiki_text
+        if wiki_hits:
+            return ToolOutcome(
+                text=text, ok=True, wiki_text=wiki_text,
+                summary=f"检索「{shown}」命中 {len(hits)} 段 + {len(wiki_hits)} 页知识页",
+                summary_key="summary.search_hit_wiki",
+                summary_args={"query": shown, "n": len(hits), "w": len(wiki_hits)},
+                new_citations=new_citations,
+            )
         return ToolOutcome(
-            text="\n\n".join(blocks), ok=True, summary=f"检索「{shown}」命中 {len(hits)} 段",
+            text=text, ok=True, summary=f"检索「{shown}」命中 {len(hits)} 段",
             summary_key="summary.search_hit", summary_args={"query": shown, "n": len(hits)},
             new_citations=new_citations,
         )
+
+    @staticmethod
+    def _wiki_blocks(wiki_hits: list, registry: CitationRegistry, new_citations: list[dict]) -> str:
+        """知识页那几条单起一段，和教材原文分开摆。声明放在这几条之前——
+        混在原文后面，模型会把它们一并当成有页码的教材证据。"""
+        if not wiki_hits:
+            return ""
+        lines = []
+        for hit in wiki_hits:
+            number, is_new = registry.register_wiki(
+                concept_id=hit.citation.concept_id, concept_name=hit.citation.concept_name,
+                snippet=hit.citation.snippet, score=hit.citation.score,
+            )
+            if is_new:
+                new_citations.append(registry.citations[number - 1])
+            lines.append(f"[{number}] 知识页：{hit.citation.concept_name}\n{_clip(hit.content, WIKI_HIT_MAX_CHARS)}")
+        return "\n\n" + _WIKI_HITS_HEADER + "\n\n".join(lines)
 
     def _web_search(self, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
         query = str(parsed.get("query") or "").strip()

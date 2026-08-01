@@ -491,6 +491,9 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 
 /* 网页来源与教材来源同一排，用下划线区分「点开会离开本页」 */
 .citations .citation-web { text-decoration:underline; text-decoration-style:dotted; text-underline-offset:2px }
+/* 知识页是转述稿，压低一档：文案已经写明，颜色再帮着把它和教材原文分开 */
+.citations .citation-wiki { color:var(--muted) }
+.citations .citation-wiki:hover { color:var(--accent) }
 
 /* 删除确认：连带影响必须列出来，用户才知道自己在删什么 */
 .danger-confirm { grid-column:1/-1; margin:8px 0 2px; padding:11px 13px; border:1px solid #FCA5A5; border-radius:6px; background:#FEF2F2; font-size:12.5px }

@@ -178,6 +178,7 @@ class KnowledgeService:
                 course_id=material.course_id, material_id=material.id, document=material.filename,
                 sections=sections, store=self._wiki, now=utc_now(), ask=self._ask_once, on_progress=progress,
             )
+            self.reindex_wiki_pages(course_id=material.course_id, material_id=material.id)
             summary = wiki.coverage_summary({**counts, **stats, "pruned": len(orphans)})
             return self._repository.update_job(job.id, status="completed", stage="wiki_completed", progress=100, error_message=summary)
         except Exception as error:
@@ -192,6 +193,33 @@ class KnowledgeService:
         if final is None:
             raise ValueError("模型没有返回完整结果")
         return final
+
+    def reindex_wiki_pages(self, *, course_id: str, material_id: str) -> int:
+        """把这门课落盘的每一页知识页正文写成一行可检索记录，整课替换。
+
+        知识页也要能被引用，前提是它得先在检索库里。归属教材照页里记的来，
+        记不到的（课程首页）挂在触发这次构建的那份上，删教材时才有人收走它。
+        """
+        if self._wiki is None:
+            return 0
+        known = self._repository.material_ids(course_id=course_id)
+        pages = []
+        for page in self._wiki.list_pages(course_id=course_id):
+            document = wiki.split_page(
+                concept_id=page.concept_id,
+                document=self._wiki.read(course_id=course_id, concept_id=page.concept_id),
+            )
+            body = document.body.strip()
+            if not body:
+                continue
+            owner = page.material_id if page.material_id in known else material_id
+            pages.append({"concept_id": page.concept_id, "concept_name": document.concept_name,
+                          "material_id": owner, "content": f"{document.concept_name}\n\n{body}"})
+        embeddings = None
+        if self._embedder is not None and pages:
+            embeddings = self._embedder.embed_documents([page["content"] for page in pages])
+        self._repository.replace_wiki_chunks(course_id=course_id, pages=pages, embeddings=embeddings)
+        return len(pages)
 
     def wiki_pages(self, *, course_id: str) -> list[dict[str, object]]:
         if self._wiki is None:
@@ -210,6 +238,36 @@ class KnowledgeService:
     def search(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 6) -> list[KnowledgeHit]:
         """Agent-only search: the course is a server-issued resolver result."""
         return self.search_course(course_id=scope.course_id, query=query, limit=limit)
+
+    def search_wiki(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 2) -> list[KnowledgeHit]:
+        """Agent-only：知识页那一路，名额与教材那一路各算各的。
+
+        不和教材合排：知识页用概括的语言写、提问也是概括的语言，同一个列表比相似度
+        它会占便宜，把教材原文挤出去，结果是照着转述回答。
+        """
+        if not query.strip() or not self._wiki_is_enabled(scope.course_id):
+            return []
+        limit = max(1, min(limit, 10))
+        lexical = self._repository.search_wiki(course_id=scope.course_id, query=query, limit=limit * 3)
+        dense = self._dense_wiki(course_id=scope.course_id, query=query, limit=limit * 3)
+        if not dense:
+            return lexical[:limit]
+        reranked = self._rerank(query=query, candidates=self._candidates(dense, lexical, limit=limit * 3))
+        if reranked is not None:
+            return reranked[:limit]
+        return self._fuse_rrf(dense, lexical, limit=limit)
+
+    def _dense_wiki(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:
+        if self._embedder is None:
+            return []
+        rows = self._repository.load_course_embeddings(course_id=course_id, source_kind="wiki")
+        if not rows:
+            return []
+        try:
+            ranked = self._embedder.rank(query=query, vectors=[vector for _, vector in rows], top_k=limit)
+        except Exception:
+            return []
+        return self._repository.wiki_hits_by_ids(scored=[(rows[index][0], score) for index, score in ranked])
 
     def material_names(self, *, scope: ResolvedKnowledgeScope) -> list[str]:
         return [material.filename for material in self.list_materials(course_id=scope.course_id)]

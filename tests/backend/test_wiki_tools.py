@@ -236,18 +236,21 @@ def test_read_clips_an_oversized_page_and_says_how_much_is_left():
 
 # ---------------------------------------------------------------- 引用边界
 
-def test_wiki_content_never_becomes_a_citation():
-    """知识页是转述，不接引用体系（那是后面的事）。这里守的是它没有被偷偷接进去：
-    一旦进了 CitationRegistry，前端 SOURCES 点开就会是一段没有页码的二手内容。"""
+def test_wiki_content_becomes_a_citation_of_its_own_kind():
+    """知识页可以引用，但必须标成知识页而不是教材页码：前端 SOURCES 点开时，
+    用户要一眼看出这条是转述还是原文。"""
     registry = CitationRegistry()
     result = _run(FakeKnowledge(pages={"cpt_1": _page()}), "wiki_read", '{"concept_id": "cpt_1"}', registry)
 
-    assert result.new_citations == [] and registry.citations == []
+    assert result.new_citations == registry.citations
+    entry = registry.citations[0]
+    assert entry["kind"] == "wiki" and entry["concept_name"] == "护航效应"
+    assert entry.get("page") is None and not entry.get("document")
 
 
-def test_the_page_itself_tells_the_model_not_to_cite_it_as_textbook_evidence():
+def test_the_page_itself_says_it_is_a_paraphrase_not_the_textbook():
     """这条只能靠提示词约束，所以至少要守住"话还在说"。约束同时出现在工具描述与正文头部：
-    只写在描述里的话，模型读完长正文就只记得内容，转头给它标了 [1]。"""
+    只写在描述里的话，模型读完长正文就只记得内容，转头把它当成教材页码引了。"""
     from modules.agent.tools import TOOL_SPECS
 
     description = next(spec.description for spec in TOOL_SPECS if spec.name == "wiki_read")
@@ -255,7 +258,7 @@ def test_the_page_itself_tells_the_model_not_to_cite_it_as_textbook_evidence():
 
     for text in (description, body):
         assert "不是教材原文" in text and "没有页码" in text
-        assert "[1]" in text and "search_materials" in text
+        assert "知识页" in text
 
 
 # ---------------------------------------------------------------- scope 边界
@@ -458,8 +461,9 @@ def test_the_model_can_walk_the_index_then_read_a_page(client, tmp_path):
     # 索引与正文都进了下一轮的上下文，模型才谈得上"按索引回答"。
     handed = "\n".join(item.content for item in scripted.calls[-1]["messages"] if item.role == "tool")
     assert "cpt_convoy | 护航效应" in handed and "长作业把后面的短作业全拖住" in handed
-    # 知识页不进引用列表。
-    assert not [data for name, data in events if name == "citation" and data.get("kind") == "wiki"]
+    # 读回来的页进引用列表，标成知识页。
+    cited = [data for name, data in events if name == "citation" and data.get("kind") == "wiki"]
+    assert [item["concept_id"] for item in cited] == ["cpt_convoy"]
 
 
 # ---------------------------------------------------------------- 顺带收的两条

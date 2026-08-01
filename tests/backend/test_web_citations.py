@@ -24,6 +24,9 @@ class FakeKnowledge:
             for page in (3, 4)
         ]
 
+    def search_wiki(self, *, scope, query, limit=2):
+        return []
+
     def material_names(self, *, scope):
         return ["操作系统.pdf"]
 

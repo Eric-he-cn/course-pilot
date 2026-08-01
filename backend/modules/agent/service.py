@@ -572,6 +572,7 @@ class TurnService:
                     wiki_entries=wiki_entries,
                     seed_query=message,
                     seed_result_text=seed.text,
+                    seed_wiki_text=seed.wiki_text,
                     history_token_budget=self._history_token_budget,
                     skill_summaries=self._skills.summaries(),
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
