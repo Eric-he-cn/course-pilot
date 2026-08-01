@@ -85,7 +85,7 @@ def test_compaction_replaces_early_messages_with_a_summary(client):
     responder.compact_calls.clear()
     events = client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "after", "message": "继续讲"}).text
     assert "compacted_messages" in events
-    assert '"chars"' in events
+    assert '"tokens"' in events
 
 
 def test_summary_is_injected_and_early_history_is_dropped(client):

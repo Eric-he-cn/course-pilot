@@ -301,7 +301,7 @@ export default function App() {
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
           }
           if (payload.type === 'context_usage' && payload.segments) {
-            if (onThisSession()) setContextUsage({ segments: payload.segments, total_chars: payload.total_chars ?? 0, limit_chars: payload.limit_chars ?? 1, history_budget_chars: payload.history_budget_chars ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
+            if (onThisSession()) setContextUsage({ segments: payload.segments, total_tokens: payload.total_tokens ?? 0, limit_tokens: payload.limit_tokens ?? 1, history_budget_tokens: payload.history_budget_tokens ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
             activity.push({ call_id: payload.call_id, name: payload.name ?? t('tool.fallback_name'), origin: payload.origin, started_at: Date.now() })
@@ -942,8 +942,8 @@ function SessionTitle({ session, onRename }: { session: SessionSummary; onRename
 
 function ContextMeter({ usage }: { usage: ContextUsage }) {
   const [open, setOpen] = useState(false)
-  const k = (chars: number) => chars >= 1000 ? `${(chars / 1000).toFixed(1)}K` : String(chars)
-  const percent = Math.min(100, Math.round((usage.total_chars / usage.limit_chars) * 100))
+  const k = (tokens: number) => tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}K` : String(tokens)
+  const percent = Math.min(100, Math.round((usage.total_tokens / usage.limit_tokens) * 100))
   const filled = Math.max(1, Math.round(percent / 12.5))
   const notice = usage.dropped_history > 0 || usage.clipped_history > 0
   return <div className="context-chip">
@@ -952,8 +952,8 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
       <b>{percent}%</b>
     </button>
     {open && <div className="context-popover">
-      <div className="popover-head"><b>{t('context.title')}</b><span>{k(usage.total_chars)} / {k(usage.limit_chars)}</span></div>
-      {usage.segments.map(segment => <div className="popover-row" key={segment.label}><span>{segment.label_key ? tOr(segment.label_key, segment.label) : segment.label}</span><b>{k(segment.chars)}</b></div>)}
+      <div className="popover-head"><b>{t('context.title')}</b><span>{k(usage.total_tokens)} / {k(usage.limit_tokens)}</span></div>
+      {usage.segments.map(segment => <div className="popover-row" key={segment.label}><span>{segment.label_key ? tOr(segment.label_key, segment.label) : segment.label}</span><b>{k(segment.tokens)}</b></div>)}
       <p>{t('context.note')}</p>
       {usage.compacted_messages > 0 && <p className="popover-note">{t('context.compacted', { n: usage.compacted_messages })}</p>}
       {usage.dropped_history > 0 && <p className="popover-warn">{t('context.dropped', { n: usage.dropped_history })}</p>}

@@ -20,7 +20,7 @@ from modules.sessions.api import (
 from contracts.web import WebSearchPort
 
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
-from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, assemble_general_messages, assemble_messages, message_chars
+from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, assemble_general_messages, assemble_messages, estimate_tokens, message_tokens
 from .skills import SkillRegistry
 from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, profile_for_skill, specs_for, without_tools
 from .trace import TraceWriter
@@ -317,7 +317,7 @@ class TurnService:
         max_tool_rounds: int = 10,
         search_limit: int = SEARCH_LIMIT,
         history_token_budget: int = 128_000,
-        context_char_limit: int = 512_000,
+        context_token_limit: int = 512_000,
         compact_threshold_ratio: float = 0.7,
     ) -> None:
         self._sessions, self._knowledge = sessions, knowledge
@@ -342,7 +342,7 @@ class TurnService:
         self._trace = trace
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
-        self._context_char_limit = context_char_limit
+        self._context_token_limit = context_token_limit
         self._compact_threshold_ratio = compact_threshold_ratio
 
     @staticmethod
@@ -373,14 +373,14 @@ class TurnService:
 
         字段名刻意避开 text / content / delta：前端对这三个键是无条件取值并拼进回答。
         """
-        total = message_chars(messages)
-        tool_chars = max(0, total - sum(item.chars for item in base))
-        segments = [*base, ContextSegment("context.segment.tool_results", "工具结果", tool_chars)]
+        total = message_tokens(messages)
+        tool_tokens = max(0, total - sum(item.tokens for item in base))
+        segments = [*base, ContextSegment("context.segment.tool_results", "工具结果", tool_tokens)]
         return self._event(
             "context_usage",
-            segments=[{"label": item.label, "label_key": item.key, "chars": item.chars} for item in segments if item.chars > 0],
-            total_chars=total, limit_chars=self._context_char_limit,
-            history_budget_chars=self._history_token_budget,
+            segments=[{"label": item.label, "label_key": item.key, "tokens": item.tokens} for item in segments if item.tokens > 0],
+            total_tokens=total, limit_tokens=self._context_token_limit,
+            history_budget_tokens=self._history_token_budget,
             dropped_history=assembled.dropped_history, clipped_history=assembled.clipped_history,
             compacted_messages=summary.covers_message_count if summary else 0,
         )
@@ -398,8 +398,8 @@ class TurnService:
                 item for item in self._sessions.list_messages(session_id)
                 if item.created_at > watermark and item.role in {"user", "assistant"} and item.content.strip()
             ]
-            live_chars = sum(len(item.content) for item in pending) + len(summary.summary_text if summary else "")
-            if live_chars <= threshold:
+            live_tokens = sum(estimate_tokens(item.content) for item in pending) + estimate_tokens(summary.summary_text if summary else "")
+            if live_tokens <= threshold:
                 return None
             boundary = self._compact_boundary(pending)
             if boundary <= 0:
@@ -434,7 +434,7 @@ class TurnService:
         used = 0
         while index > 0 and used < keep_budget:
             index -= 1
-            used += len(pending[index].content)
+            used += estimate_tokens(pending[index].content)
         while index > 0 and pending[index].role != "user":
             index -= 1
         return index
@@ -635,7 +635,7 @@ class TurnService:
                                         "decision": "allowed", "reason": None, "duration_ms": 0})
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps(arguments)),)))
                     messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{auto_skill.body}", tool_call_id=call_id))
-                    base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", len(auto_skill.body))]
+                    base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", estimate_tokens(auto_skill.body))]
                     skill_profile = profile_for_skill(auto_skill.allowed_tools)
                     active_skill, allowed_tools = auto_skill.name, without_tools(skill_profile.tools, wiki_off)
                     capabilities = skill_profile.capabilities - self._offline

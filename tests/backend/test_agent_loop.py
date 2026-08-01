@@ -264,8 +264,8 @@ def test_greeting_in_general_mode_is_not_a_course_prompt(client):
 
 
 def test_context_segments_cover_the_whole_prompt_and_report_truncation():
-    """分段之和必须等于实际发出去的字符数，否则上下文视图会误导用户。"""
-    from modules.agent.context import assemble_messages, message_chars
+    """分段之和必须等于实际发出去的估算 token 数，否则上下文视图会误导用户。"""
+    from modules.agent.context import assemble_messages, message_tokens
 
     history = [("user", "问题" * 500), ("assistant", "回答" * 500)] * 4
     assembled = assemble_messages(
@@ -273,7 +273,7 @@ def test_context_segments_cover_the_whole_prompt_and_report_truncation():
         seed_query="现在的问题", seed_result_text="教材证据", history_token_budget=3_000,
         skill_summaries="- practice：练习", practice_digest="练习 #1", memory="偏好：先给结论",
     )
-    assert sum(item.chars for item in assembled.segments) == message_chars(assembled.messages)
+    assert sum(item.tokens for item in assembled.segments) == message_tokens(assembled.messages)
     assert assembled.dropped_history > 0  # 预算只放得下最近几条，更早的没进上下文
 
     full = assemble_messages(

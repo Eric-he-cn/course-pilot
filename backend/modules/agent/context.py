@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -22,9 +23,22 @@ _WIKI_HINT = """
     这类要看全貌的问题，或一个问题牵扯到好几章时，先用 wiki_index 读索引看清有哪些概念，
     再用 wiki_read 读需要的那几页，不要只靠检索片段拼。知识页是转述，没有页码，
     不能给它标 [1]；要给出处就用 search_materials 回教材查，用那一次返回的编号。"""
-# ponytail: 字符数保守近似 token（1 字符 ≤ 1 token）；接入真实 tokenizer 前不做精确计数。
-# 单条消息上限，防止一条超长消息吃掉整个历史预算。
+# 单条消息的字符上限，防止一条超长消息吃掉整个历史预算。这里保持字符口径：
+# 它只是个截断点，按字符切才能直接切片，不必换成 token。
 MESSAGE_MAX_CHARS = 20_000
+
+# token 估算：CJK 按 1 字符 1 token，其余按 3.5 字符 1 token。主流 BPE 上中文约 1.5 字/token、
+# 英文约 3.5-4 字符/token，两端都取偏保守的一侧——高估只是少留几条历史，低估会顶爆上游窗口。
+_CJK_RE = re.compile(r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uff65]")
+_LATIN_CHARS_PER_TOKEN = 3.5
+
+
+def estimate_tokens(text: str) -> int:
+    """按 CJK / 非 CJK 分段折算 token。不接 tokenizer：它只对某一家的 BPE 准，
+    而这里对接的是任意 OpenAI 兼容服务。"""
+    cjk = len(_CJK_RE.findall(text))
+    return cjk + math.ceil((len(text) - cjk) / _LATIN_CHARS_PER_TOKEN)
+
 
 # 动态内容（记忆、练习状态）排在静态规则之后，让供应商的前缀缓存能覆盖住整段规则。
 _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课程「{course_name}」。今天是 {today}。
@@ -111,7 +125,7 @@ class ContextSegment:
     """上下文里的一段：key 供界面翻译，label 是中文兜底。"""
     key: str
     label: str
-    chars: int
+    tokens: int
 
 
 @dataclass(frozen=True)
@@ -165,22 +179,23 @@ def assemble_messages(
         ChatMessage(role="tool", content=seed_result_text, tool_call_id=SEED_CALL_ID),
     ]
     # 动态内容也算在系统提示里，这里逐段列出来，好看出记忆、练习状态和摘要各占多少。
+    # 系统提示那段用减法算，各段之和才恰好等于 message_tokens 报出来的总量。
     segments = [
-        ContextSegment("context.segment.system", "系统提示", len(system) - len(skills_block) - len(practice_block) - len(memory_block) - len(summary_block)),
-        ContextSegment("context.segment.skills", "能力摘要", len(skills_block)),
-        ContextSegment("context.segment.practice", "练习状态", len(practice_block)),
-        ContextSegment("context.segment.memory", "长期记忆", len(memory_block)),
-        ContextSegment("context.segment.summary", "对话摘要", len(summary_block)),
-        ContextSegment("context.segment.history", "会话历史", sum(len(item.content) for item in kept)),
-        ContextSegment("context.segment.question", "当前问题", len(question) + len(seed_arguments)),
-        ContextSegment("context.segment.evidence", "教材证据", len(seed_result_text)),
+        ContextSegment("context.segment.system", "系统提示", estimate_tokens(system) - estimate_tokens(skills_block) - estimate_tokens(practice_block) - estimate_tokens(memory_block) - estimate_tokens(summary_block)),
+        ContextSegment("context.segment.skills", "能力摘要", estimate_tokens(skills_block)),
+        ContextSegment("context.segment.practice", "练习状态", estimate_tokens(practice_block)),
+        ContextSegment("context.segment.memory", "长期记忆", estimate_tokens(memory_block)),
+        ContextSegment("context.segment.summary", "对话摘要", estimate_tokens(summary_block)),
+        ContextSegment("context.segment.history", "会话历史", sum(estimate_tokens(item.content) for item in kept)),
+        ContextSegment("context.segment.question", "当前问题", estimate_tokens(question) + estimate_tokens(seed_arguments)),
+        ContextSegment("context.segment.evidence", "教材证据", estimate_tokens(seed_result_text)),
     ]
     return AssembledContext(messages, segments, dropped, clipped)
 
 
-def message_chars(messages: Sequence[ChatMessage]) -> int:
-    """整份上下文的字符数，含工具循环里追加的内容。"""
-    return sum(len(item.content) + sum(len(call.arguments) for call in (item.tool_calls or ())) for item in messages)
+def message_tokens(messages: Sequence[ChatMessage]) -> int:
+    """整份上下文的估算 token 数，含工具循环里追加的内容。"""
+    return sum(estimate_tokens(item.content) + sum(estimate_tokens(call.arguments) for call in (item.tool_calls or ())) for item in messages)
 
 
 def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: int) -> tuple[list[ChatMessage], int, int]:
@@ -194,10 +209,11 @@ def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: 
         if len(content) > MESSAGE_MAX_CHARS:
             text = content[:MESSAGE_MAX_CHARS] + "…（已截断）"
             clipped += 1
-        if len(text) > remaining:
+        cost = estimate_tokens(text)
+        if cost > remaining:
             dropped = len(history) - index  # 更早的消息一律不再进上下文
             break
-        remaining -= len(text)
+        remaining -= cost
         kept.append(ChatMessage(role=role, content=text))
     kept.reverse()
     return kept, dropped, clipped
@@ -253,11 +269,11 @@ def assemble_general_messages(
     kept, dropped, clipped = _budgeted_history(history, history_token_budget)
     messages = [ChatMessage(role="system", content=system), *kept, ChatMessage(role="user", content=question)]
     segments = [
-        ContextSegment("context.segment.system", "系统提示", len(system) - len(courses_block) - len(memory_block) - len(summary_block)),
-        ContextSegment("context.segment.courses", "课程列表", len(courses_block)),
-        ContextSegment("context.segment.memory", "长期记忆", len(memory_block)),
-        ContextSegment("context.segment.summary", "对话摘要", len(summary_block)),
-        ContextSegment("context.segment.history", "会话历史", sum(len(item.content) for item in kept)),
-        ContextSegment("context.segment.question", "当前问题", len(question)),
+        ContextSegment("context.segment.system", "系统提示", estimate_tokens(system) - estimate_tokens(courses_block) - estimate_tokens(memory_block) - estimate_tokens(summary_block)),
+        ContextSegment("context.segment.courses", "课程列表", estimate_tokens(courses_block)),
+        ContextSegment("context.segment.memory", "长期记忆", estimate_tokens(memory_block)),
+        ContextSegment("context.segment.summary", "对话摘要", estimate_tokens(summary_block)),
+        ContextSegment("context.segment.history", "会话历史", sum(estimate_tokens(item.content) for item in kept)),
+        ContextSegment("context.segment.question", "当前问题", estimate_tokens(question)),
     ]
     return AssembledContext(messages, segments, dropped, clipped)

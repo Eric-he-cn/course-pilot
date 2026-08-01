@@ -177,7 +177,7 @@ const zh = {
 
   // —— 上下文占比 ——
   'context.title': '本轮上下文',
-  'context.note': '按字符数估算，实际占用通常更小。',
+  'context.note': 'token 为估算值：中日韩文字按 1 字 1 token、其余按 3.5 字符 1 token 折算。',
   'context.compacted': '更早的 {n} 条消息压成了摘要，仍在上下文里。',
   'context.dropped': '更早的 {n} 条消息未进入本轮上下文。',
   'context.clipped': '有 {n} 条超长消息被截断后才进入上下文。',
@@ -714,7 +714,7 @@ const en: Dictionary = {
   'citation.score': 'Retrieval score: {score}',
 
   'context.title': 'Context this turn',
-  'context.note': 'Estimated by character count; real usage is usually smaller.',
+  'context.note': 'Token counts are estimates: 1 token per CJK character, 3.5 characters per token otherwise.',
   'context.compacted': '{n} earlier messages were compressed into a summary and are still in context.',
   'context.compacted.one': '1 earlier message was compressed into a summary and is still in context.',
   'context.dropped': "{n} earlier messages did not make it into this turn's context.",

@@ -71,10 +71,10 @@ export interface NoteSummary {
 }
 
 export interface ContextUsage {
-  segments: { label: string; label_key?: string; chars: number }[]
-  total_chars: number
-  limit_chars: number
-  history_budget_chars: number
+  segments: { label: string; label_key?: string; tokens: number }[]
+  total_tokens: number
+  limit_tokens: number
+  history_budget_tokens: number
   dropped_history: number
   clipped_history: number
   compacted_messages: number
