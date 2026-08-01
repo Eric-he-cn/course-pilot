@@ -121,15 +121,15 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .typing i:nth-of-type(3) { animation-delay:.4s }
 .citations { display:flex; flex-wrap:wrap; gap:5px 14px; margin-top:14px; padding:9px 12px; border:1px solid var(--border); border-radius:8px; background:var(--panel) }
 .refs-label { flex:0 0 100%; color:var(--muted); font-family:var(--mono); font-size:10px; letter-spacing:.08em }
-.citations button { display:inline-flex; align-items:center; gap:5px; border:0; padding:0; background:none; color:var(--text); font-family:var(--mono); font-size:11.5px }
-.citations button:hover { color:var(--accent) }
+.citations button, .citations a { display:inline-flex; align-items:center; gap:5px; border:0; padding:0; background:none; color:var(--text); font-family:var(--mono); font-size:11.5px }
+.citations button:hover, .citations a:hover { color:var(--accent) }
 .tool-activity { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px }
 .tool-chip { display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:var(--muted); font-family:var(--mono); font-size:11px }
 .tool-chip i { font-style:normal; color:var(--muted) }
 .tool-chip.done { color:var(--text) }
 .tool-chip.done i { color:var(--accent) }
 .tool-chip.warn i { color:var(--warning) }
-.citations button i { font-style:normal; color:var(--accent) }
+.citations button i, .citations a i { font-style:normal; color:var(--accent) }
 .choices { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px }
 .choice { padding:7px 12px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-family:inherit; font-size:13px; cursor:pointer; text-align:left }
 .choice:hover { border-color:var(--primary); color:var(--primary) }
