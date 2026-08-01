@@ -36,6 +36,18 @@ class Job:
 
 
 @dataclass(frozen=True)
+class ConceptNode:
+    """概念目录的一条，带教材目录里的层级。没有书签的教材抽不到层级，
+    parent_id 与 level 都是空，调用方按平铺处理。"""
+    id: str
+    name: str
+    page: int | None
+    level: int | None
+    parent_id: str | None
+    material_id: str | None
+
+
+@dataclass(frozen=True)
 class Chunk:
     id: str
     material_id: str

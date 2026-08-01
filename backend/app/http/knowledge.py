@@ -134,6 +134,12 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
             for hit in application.knowledge.search_course(course_id=course_id, query=body.query, limit=body.limit)
         ]
 
+    @router.get("/courses/{course_id}/concepts")
+    def list_concepts(course_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """概念目录，按教材目录顺序。层级用 parent_id 表示，界面自己嵌套成树。"""
+        require_course(application, course_id)
+        return {"concepts": [asdict(node) for node in application.knowledge.concept_tree(course_id=course_id)]}
+
     @router.post("/materials/{material_id}/wiki")
     def build_wiki(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:

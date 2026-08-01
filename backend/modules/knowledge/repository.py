@@ -21,13 +21,16 @@ _CONCEPT_MERGE = (
     " DO UPDATE SET"
     " mention_count = CASE WHEN material_id = excluded.material_id"
     " THEN excluded.mention_count ELSE MAX(mention_count, excluded.mention_count) END,"
-    " page = CASE WHEN material_id = excluded.material_id THEN excluded.page ELSE page END"
+    " page = CASE WHEN material_id = excluded.material_id THEN excluded.page ELSE page END,"
+    " level = CASE WHEN material_id = excluded.material_id THEN excluded.level ELSE level END,"
+    " parent_id = CASE WHEN material_id = excluded.material_id THEN excluded.parent_id ELSE parent_id END"
 )
 # 只差大小写的名字撞的是主键而不是 (course_id, name)，得单开一条子句接住，
 # 否则整个索引作业抛 UNIQUE 冲突。合并进已有概念，显示名保持不变。
+# parent_id 先一律写空，等这一批行都建完再连边，免得候选顺序决定成败。
 _CONCEPT_UPSERT = (
-    "INSERT INTO concepts(id, course_id, name, chapter, material_id, page, mention_count, created_at)"
-    " VALUES (?, ?, ?, NULL, ?, ?, ?, ?)"
+    "INSERT INTO concepts(id, course_id, name, chapter, material_id, page, mention_count, level, parent_id, created_at)"
+    " VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?)"
     f" ON CONFLICT(course_id, name){_CONCEPT_MERGE}"
     f" ON CONFLICT(id){_CONCEPT_MERGE}"
 )
@@ -236,7 +239,20 @@ class KnowledgeRepository:
                 conn.execute(
                     _CONCEPT_UPSERT,
                     (concept_id_for(course_id, candidate["name"]), course_id, candidate["name"], material_id,
-                     candidate.get("page"), candidate.get("mention_count", 1), now),
+                     candidate.get("page"), candidate.get("mention_count", 1), candidate.get("level"), now),
+                )
+            # 连边单独一趟。父节点名派生的 id 与它自己的行是同一个，所以只差大小写的变体
+            # 被合并掉也指得回留下来的那条；不在这一批里的父节点不连，宁可平铺也不留悬空外键。
+            keep_ids = set(keep)
+            for candidate in candidates:
+                parent = candidate.get("parent")
+                parent_id = concept_id_for(course_id, parent) if parent else None
+                own_id = concept_id_for(course_id, candidate["name"])
+                if parent_id is None or parent_id == own_id or parent_id not in keep_ids:
+                    continue
+                conn.execute(
+                    "UPDATE concepts SET parent_id = ? WHERE id = ? AND material_id = ?",
+                    (parent_id, own_id, material_id),
                 )
             return int(conn.execute("SELECT count(*) FROM concepts WHERE course_id = ?", (course_id,)).fetchone()[0])
 
@@ -245,6 +261,17 @@ class KnowledgeRepository:
             rows = conn.execute(
                 "SELECT id, name, page, mention_count FROM concepts WHERE course_id = ? ORDER BY mention_count DESC, page, name LIMIT ?",
                 (course_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_concept_tree(self, *, course_id: str) -> list[dict]:
+        """整份概念目录，按插入顺序返回——候选是浅层在前、同层按目录顺序成批插入的，
+        所以同一个父节点下的兄弟节点保持教材里的先后。"""
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT id, name, page, level, parent_id, mention_count, material_id"
+                " FROM concepts WHERE course_id = ? ORDER BY rowid",
+                (course_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 

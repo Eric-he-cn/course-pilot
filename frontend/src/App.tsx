@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, FormEvent, ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -6,7 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ContextUsage, Course, Job, Material, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, ConceptNode, ContextUsage, Course, Job, Material, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity, WikiPageSummary } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -810,6 +810,61 @@ function NotesPanel({ course, onError }: { course: Course; onError: (message: st
   </article>
 }
 
+/** 概念目录：层级来自教材自带的目录书签，没有书签就平铺。 */
+function ConceptTreePanel({ course, refreshKey, onError }: { course: Course; refreshKey: number; onError: (message: string) => void }) {
+  const [nodes, setNodes] = useState<ConceptNode[] | null>(null)
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    setNodes(null); setCollapsed(new Set())
+    api.concepts(course.id).then(payload => setNodes(payload.concepts)).catch(error => { setNodes([]); onError(errorText(error)) })
+  }, [course.id, refreshKey])
+  // 后端按目录顺序返回，这里只按 parent_id 分组，兄弟节点的先后原样保留。
+  const children = useMemo(() => {
+    const grouped = new Map<string, ConceptNode[]>()
+    const known = new Set((nodes ?? []).map(node => node.id))
+    for (const node of nodes ?? []) {
+      const key = node.parent_id && known.has(node.parent_id) ? node.parent_id : ''
+      grouped.set(key, [...(grouped.get(key) ?? []), node])
+    }
+    return grouped
+  }, [nodes])
+  const branches = useMemo(() => (nodes ?? []).filter(node => (children.get(node.id) ?? []).length > 0), [nodes, children])
+  function toggle(id: string) {
+    setCollapsed(current => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function rows(parentId: string, depth: number): ReactElement[] {
+    return (children.get(parentId) ?? []).flatMap(node => {
+      const kids = children.get(node.id) ?? []
+      const shut = collapsed.has(node.id)
+      return [
+        <div className="concept-row" key={node.id} style={{ paddingLeft: `${depth * 18}px` }}>
+          {kids.length > 0
+            ? <button type="button" className={shut ? 'concept-toggle' : 'concept-toggle open'} aria-expanded={!shut} aria-label={node.name} onClick={() => toggle(node.id)}>›</button>
+            : <span className="concept-bullet" aria-hidden />}
+          <b>{node.name}</b>
+          <small>{node.page ? t('library.concepts_page', { page: node.page }) : t('library.concepts_no_page')}
+            {kids.length > 0 && ` · ${t('library.concepts_children', { n: kids.length })}`}</small>
+        </div>,
+        ...(shut ? [] : rows(node.id, depth + 1)),
+      ]
+    })
+  }
+  return <article className="card">
+    <div className="card-heading">
+      <div><h2>{nodes ? t('library.concepts_title_n', { n: nodes.length }) : t('library.concepts_title')}</h2>
+        <p>{t('library.concepts_hint')}</p></div>
+      {branches.length > 0 && <button className="text-button" onClick={() => setCollapsed(collapsed.size ? new Set() : new Set(branches.map(node => node.id)))}>
+        {collapsed.size ? t('library.concepts_expand_all') : t('library.concepts_collapse_all')}</button>}
+    </div>
+    {nodes === null ? <p className="mini-empty">{t('common.loading')}</p>
+      : nodes.length === 0 ? <div className="empty-inline">{t('library.concepts_empty')}</div>
+        : <div className="concept-tree">
+            {branches.length === 0 && <p className="wiki-note">{t('library.concepts_flat_note')}</p>}
+            {rows('', 0)}
+          </div>}
+  </article>
+}
+
 /** frontmatter 是给追溯用的元数据，不该当正文渲染给用户看。 */
 function stripFrontmatter(raw: string): string {
   const match = /^---\n[\s\S]*?\n---\n/.exec(raw)
@@ -982,7 +1037,7 @@ function MessageCard({ message, onCitation, showResolution, onRetry, modelNote, 
 }
 
 function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
-  const [tab, setTab] = useState<'rag' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [searched, setSearched] = useState(''); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
+  const [tab, setTab] = useState<'rag' | 'concepts' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [searched, setSearched] = useState(''); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
   const [ragBackend, setRagBackend] = useState<string>('')
   const polling = useRef(false)
   const [ocrTarget, setOcrTarget] = useState<string>(''); const [ocrEstimate, setOcrEstimate] = useState<OcrEstimate | null>(null); const [ocrRunning, setOcrRunning] = useState(false)
@@ -1034,11 +1089,14 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   async function buildWiki(materialId: string) { try { const job = await api.buildWiki(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
   // Wiki 页列表要在构建结束后重新拉一次，否则新写的页要刷新整页才看得到
   const wikiDone = Object.values(jobs).filter(job => job.type === 'wiki' && job.status === 'completed').length
+  // 概念目录同理，跟着索引任务的完成数刷新
+  const indexDone = Object.values(jobs).filter(job => job.type !== 'wiki' && job.status === 'completed').length
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)); setSearched(searchQuery) } catch (error) { onError(errorText(error)); setResults([]); setSearched('') } finally { setLoading(false) } }
   const backendLabel = retrievalLabel(ragBackend, true)
-  return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">{t('nav.library')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('library.hero')}{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>{t('library.refresh_status')}</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>{t('library.tab_rag')}</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>{t('library.tab_wiki')} {course.wiki_enabled ? '' : t('library.tab_wiki_off')}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>{t('library.notes_title')}</button></div>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">{t('nav.library')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('library.hero')}{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>{t('library.refresh_status')}</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>{t('library.tab_rag')}</button><button className={tab === 'concepts' ? 'active' : ''} onClick={() => setTab('concepts')}>{t('library.tab_concepts')}</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>{t('library.tab_wiki')} {course.wiki_enabled ? '' : t('library.tab_wiki_off')}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>{t('library.notes_title')}</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
-    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>{t('library.upload_title')}</h2><p>{t('library.upload_body')}</p><p className="upload-hint">{t('library.upload_ocr_hint')}</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>{t('library.upload_button', { name: course.name })}</button><small>{t('library.upload_limits')}</small></article><article className="card search-card"><h2>{t('library.search_title')}</h2><p>{t('library.search_body', { name: course.name })}</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder={t('library.search_placeholder')} /><button className="primary-button" disabled={loading}>{t('library.search_button')}</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>{t('library.materials_title')}</h2><p>{t('library.materials_hint')}</p></div><button className="text-button" onClick={() => void reload()}>{t('common.refresh')}</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">{t('library.materials_empty')}</div>}</article>{searched && <article className="card results-card"><h2>{t('library.results_title')}</h2>{results.length === 0 && <div className="empty-inline"><b>{t('library.results_empty_title')}</b><p>{t('library.results_empty_body', { query: searched })}</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? t('library.result_fallback_name')} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? t('library.result_no_text')}</p><small>{result.score !== undefined ? t('library.result_score', { score: result.score.toFixed(4) }) : t('library.result_cited')}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? t('library.ocr_fallback_name')} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : <><article className="card wiki-card"><div className="switch-row"><div><h2>{t('library.wiki_enable_title')} <span>{t('library.experimental')}</span></h2><p>{t('library.wiki_toggle_body')}</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label={t('a11y.toggle_wiki')} onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">{t('library.wiki_pick_hint')}</p>{indexedMaterials.length ? indexedMaterials.map(material => {
+    {tab === 'concepts' && <ConceptTreePanel course={course} refreshKey={indexDone} onError={onError} />}
+    {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>{t('library.upload_title')}</h2><p>{t('library.upload_body')}</p><p className="upload-hint">{t('library.upload_ocr_hint')}</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>{t('library.upload_button', { name: course.name })}</button><small>{t('library.upload_limits')}</small></article><article className="card search-card"><h2>{t('library.search_title')}</h2><p>{t('library.search_body', { name: course.name })}</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder={t('library.search_placeholder')} /><button className="primary-button" disabled={loading}>{t('library.search_button')}</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>{t('library.materials_title')}</h2><p>{t('library.materials_hint')}</p></div><button className="text-button" onClick={() => void reload()}>{t('common.refresh')}</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">{t('library.materials_empty')}</div>}</article>{searched && <article className="card results-card"><h2>{t('library.results_title')}</h2>{results.length === 0 && <div className="empty-inline"><b>{t('library.results_empty_title')}</b><p>{t('library.results_empty_body', { query: searched })}</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? t('library.result_fallback_name')} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? t('library.result_no_text')}</p><small>{result.score !== undefined ? t('library.result_score', { score: result.score.toFixed(4) }) : t('library.result_cited')}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? t('library.ocr_fallback_name')} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : tab !== 'wiki' ? null : <><article className="card wiki-card"><div className="switch-row"><div><h2>{t('library.wiki_enable_title')} <span>{t('library.experimental')}</span></h2><p>{t('library.wiki_toggle_body')}</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label={t('a11y.toggle_wiki')} onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">{t('library.wiki_pick_hint')}</p>{indexedMaterials.length ? indexedMaterials.map(material => {
       // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
       const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false

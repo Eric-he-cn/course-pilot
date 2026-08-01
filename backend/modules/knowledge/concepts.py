@@ -74,18 +74,44 @@ _OUTLINE_MAX_LEVEL_WEIGHT = 10
 
 
 def from_outline(rows: list[tuple[int, str, int | None]], *, limit: int = 200) -> list[dict]:
-    """把目录书签整理成概念候选。同名只留最浅、最靠前那一个。"""
-    seen: dict[str, dict] = {}
-    for level, title, page in sorted(rows, key=lambda row: (row[0], row[2] if row[2] is not None else 0)):
+    """把目录书签整理成概念候选，带上父节点名与层级。
+
+    同名只挂一处：concept_id 由课程 + casefold 名字派生，一个名字在两章下各出现一次时
+    树上给不了它两个父节点。留最浅的那处（并列时留最先出现的）——d2l 每章都有「模型」
+    小节，留章级那处才不会让整份列表被它占满。其余位置不建节点，它们的子节点改挂最近的
+    存活祖先，前言这类被过滤掉的标题同理，不会凭空多出一层。
+
+    level 是所得树里的深度，不是书签的原始层级：祖先被过滤掉时两者会差一层，
+    按树深度算，父子关系与缩进才对得上。返回顺序仍是浅层在前，页数上限截断不会切出孤儿。
+    """
+    kept: list[tuple[int, int, str, int | None]] = []  # (原始层级, 序号, 概念名, 页码)
+    winner: dict[str, tuple[int, int]] = {}
+    for ordinal, (level, title, page) in enumerate(rows):
         name = _normalize_outline(title)
         if not name or _FRONT_MATTER.match(name) or not _acceptable(name):
             continue
-        seen.setdefault(name, {
+        kept.append((level, ordinal, name, page))
+        key = name.casefold()
+        if key not in winner or (level, ordinal) < winner[key]:
+            winner[key] = (level, ordinal)
+
+    items: list[dict] = []
+    stack: list[tuple[int, str]] = []  # 各层最近一个成活节点：(原始层级, 概念名)
+    for level, ordinal, name, page in kept:
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        if winner[name.casefold()] != (level, ordinal):
+            continue
+        items.append({
             "name": name,
             "mention_count": max(1, _OUTLINE_MAX_LEVEL_WEIGHT - min(level, _OUTLINE_MAX_LEVEL_WEIGHT - 1)),
             "page": page,
+            "level": len(stack),
+            "parent": stack[-1][1] if stack else None,
+            "ordinal": ordinal,
         })
-    ordered = sorted(seen.values(), key=lambda item: (-item["mention_count"], item["page"] or 0, item["name"]))
+        stack.append((level, name))
+    ordered = sorted(items, key=lambda item: (-item["mention_count"], item["page"] or 0, item["ordinal"]))
     return ordered[:limit]
 
 

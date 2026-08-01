@@ -169,6 +169,16 @@ export interface OcrEstimate {
   projected_minutes: number
 }
 
+// 概念目录的一条。parent_id / level 来自教材自带的目录书签，没有书签就都是 null。
+export interface ConceptNode {
+  id: string
+  name: string
+  page: number | null
+  level: number | null
+  parent_id: string | null
+  material_id: string | null
+}
+
 // Wiki 知识页：一个概念一页
 export interface WikiPageSummary {
   concept_id: string

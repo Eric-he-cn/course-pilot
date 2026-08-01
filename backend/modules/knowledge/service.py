@@ -18,7 +18,7 @@ from .concepts import extract_candidates, from_outline
 from . import scanned, wiki
 from .extract import SUPPORTED_SUFFIXES, extract_pages, pdf_outline
 from .wiki import WikiStore
-from .models import Job, Material
+from .models import ConceptNode, Job, Material
 from .repository import KnowledgeRepository
 
 # 一次 Wiki 构建最多写多少页。每页一次模型调用，页数直接等于花的钱。
@@ -238,6 +238,14 @@ class KnowledgeService:
     def concept_exists(self, course_id: str, concept_id: str) -> bool:
         """按 id 精确判断，不受概念清单的展示上限影响。"""
         return self._repository.concept_exists(course_id=course_id, concept_id=concept_id)
+
+    def concept_tree(self, *, course_id: str) -> list[ConceptNode]:
+        """整份概念目录，按教材目录顺序返回。父子关系用 parent_id 表示，调用方自己嵌套。"""
+        return [
+            ConceptNode(id=row["id"], name=row["name"], page=row["page"], level=row["level"],
+                        parent_id=row["parent_id"], material_id=row["material_id"])
+            for row in self._repository.list_concept_tree(course_id=course_id)
+        ]
 
     def list_course_concepts(self, *, course_id: str, limit: int = 60) -> list[ConceptRef]:
         return [ConceptRef(row["id"], row["name"], row["page"]) for row in self._repository.list_concepts(course_id=course_id, limit=limit)]

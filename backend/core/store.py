@@ -191,6 +191,10 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # 反问时给的选项。跟消息走而不是进 artifacts：artifacts.course_id 是 NOT NULL，
     # 而最需要反问的通用模式恰恰没有课程。
     ("messages", "choices_json", "TEXT"),
+    # 教材目录的层级。两列都可空：没有书签的教材（讲义、扫描件）拿不到层级，界面平铺。
+    # 父节点被删时置空而不是拦下删除，概念表本来就允许整份教材连带清掉。
+    ("concepts", "parent_id", "TEXT REFERENCES concepts(id) ON DELETE SET NULL"),
+    ("concepts", "level", "INTEGER"),
 )
 RETIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sessions", "owner_id"),  # IM 渠道层去掉后恒为 'local-web'
