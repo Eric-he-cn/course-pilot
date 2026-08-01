@@ -556,6 +556,236 @@ def test_version_conflict_leaves_the_plan_budget_for_the_retry(client):
     assert client.get(f"/api/v2/courses/{course['id']}/plan").json()["plan"], "重算后计划仍未写入"
 
 
+PLAN_NUDGE = "还没有写进系统"
+PLAN_NUDGE_EN = "has not been written into the system"
+
+
+def _plan_course_session(client, name: str = "概率论") -> tuple[str, str]:
+    course = client.post("/api/v2/courses", json={"name": name}).json()["id"]
+    session_id = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course}).json()["id"]
+    return course, session_id
+
+
+def _plan_items() -> str:
+    # 日期得算出来：plan_update 只写今天及以后，写死一个日期跑到那天之后就什么都不落库。
+    return f'[{{"due_date": "{date.today() + timedelta(days=1)}", "title": "第一章"}}]'
+
+
+class _RecordsPrompts:
+    """记下每次收到的 user 消息，用来判断服务端有没有补那一轮。"""
+
+    mode, provider, model = "provider", "example", "example-model"
+
+    def __init__(self):
+        self.calls, self.prompts = 0, []
+
+    def chat(self, *, messages, tools=()):
+        self.prompts.extend(m.content for m in messages if m.role == "user")
+        self.calls += 1
+        yield from self.script()
+
+    def nudges(self, mark: str = PLAN_NUDGE) -> int:
+        # 补的那条会留在 messages 里被后面每次调用重复看到，所以按去重后的条数算。
+        return len({p for p in self.prompts if mark in p})
+
+    def health(self): return {}
+    def close(self): pass
+
+
+def test_writing_the_plan_only_in_prose_gets_one_reminder(client):
+    """真模型实测六次里三次：用户要求改计划，模型在正文里写了一份完整的新计划表，
+    却一次 plan_update 都没调，库里一个字没动。写权限早就开着，是模型自己选择不写。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class WritesPlanInProse(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:
+                # 用户遇到的情形：正文里排得有模有样，一个工具都不调
+                prose = "新计划如下：\n- 8/08（出差，空）\n- 8/11 第一章\n全部周末已清空。"
+                yield ChatDelta(prose)
+                yield ChatFinal(prose, "stop", self.provider, self.model, self.mode)
+            elif self.calls == 2:
+                yield ChatToolCalls((ToolCallRequest("g1", "get_plan", "{}"),))
+            elif self.calls == 3:
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                yield ChatFinal("已经写进系统了。", "stop", self.provider, self.model, self.mode)
+
+    responder = WritesPlanInProse()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-prose", "message": "帮我排一份复习计划，直接排进系统"})
+
+    assert responder.nudges() == 1, f"该补且只补一轮，实际 {responder.nudges()} 轮：{responder.prompts}"
+    plan = client.get(f"/api/v2/courses/{course}/plan").json()["plan"]
+    assert plan and plan["items"], "补的那一轮没把计划写进库"
+
+
+def test_a_keywordless_plan_change_still_gets_the_reminder(client):
+    """真实的第二轮改计划请求里往往没有「计划」两个字——「把所有周末的内容都匀到工作日去」
+    就一个关键词都不命中写权限闸门。事后检查要是复用那个闸门，这一条永远补不上。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class ForgetsOnTheSecondTurn(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:  # 首轮正常写入，顺便让 plan_intent 在会话里粘住
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            elif self.calls == 2:
+                yield ChatFinal("排好了。", "stop", self.provider, self.model, self.mode)
+            elif self.calls == 3:  # 第二轮：只查教材，改动只写在正文里
+                yield ChatToolCalls((ToolCallRequest("s1", "search_materials", '{"query": "第一章"}'),))
+            elif self.calls == 4:
+                yield ChatFinal("已经把周末的内容匀到工作日了。", "stop", self.provider, self.model, self.mode)
+            elif self.calls == 5:
+                yield ChatToolCalls((ToolCallRequest("p2", "plan_update", f'{{"expected_version": 1, "items": {items}}}'),))
+            else:
+                yield ChatFinal("这次真的写进去了。", "stop", self.provider, self.model, self.mode)
+
+    responder = ForgetsOnTheSecondTurn()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-k1", "message": "帮我排一份复习计划"})
+    before = client.get(f"/api/v2/courses/{course}/plan").json()["plan"]["version"]
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-k2",
+                      "message": "从现在到考试，每个周六周日我都在出差看不了书，把所有周末的内容都匀到工作日去"})
+
+    assert responder.nudges() == 1, f"没认出这是一次改计划请求：{responder.prompts}"
+    assert client.get(f"/api/v2/courses/{course}/plan").json()["plan"]["version"] > before, "补的那一轮没写进库"
+
+
+def test_asking_about_the_plan_does_not_trigger_a_rewrite(client):
+    """「我的复习计划到哪了」拿得到写权限（闸门是会话级的），但它只是一句查询。
+    在这里补一轮等于替用户重写一遍他没让改的计划——比漏补更糟。"""
+    _, session_id = _plan_course_session(client)
+
+    class JustReads(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:
+                yield ChatToolCalls((ToolCallRequest("g1", "get_plan", "{}"),))
+            else:
+                yield ChatFinal("你的计划还有三条没做。", "stop", self.provider, self.model, self.mode)
+
+    responder = JustReads()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-read", "message": "我的复习计划到哪了？"})
+    assert responder.nudges() == 0, f"纯查询被当成了改计划请求：{responder.prompts}"
+
+
+def test_no_reminder_when_the_plan_was_actually_written(client):
+    """已经写成功了就别再啰嗦一轮。"""
+    _, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class WritesProperly(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                yield ChatFinal("排好了。", "stop", self.provider, self.model, self.mode)
+
+    responder = WritesProperly()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-ok", "message": "帮我排一份复习计划，直接排进系统"})
+    assert responder.nudges() == 0, f"写成功了还补了一轮：{responder.prompts}"
+
+
+def test_no_reminder_when_the_turn_ends_on_ask_user(client):
+    """模型正等用户挑考试日期，这时候逼它写计划等于让它自己编一个日期。"""
+    _, session_id = _plan_course_session(client)
+
+    class AsksFirst(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:
+                yield ChatToolCalls((ToolCallRequest("a1", "ask_user",
+                    '{"question": "考试是哪天", "options": ["8 月 20 号", "8 月 27 号"]}'),))
+            else:
+                yield ChatFinal("考试哪天？", "stop", self.provider, self.model, self.mode)
+
+    responder = AsksFirst()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-ask", "message": "帮我排一份复习计划，直接排进系统"})
+    assert responder.nudges() == 0, f"模型在等用户选，不该逼它写：{responder.prompts}"
+
+
+def test_a_version_conflict_stays_on_its_own_retry_path(client):
+    """冲突已经有一条重试路径（失败不计预算、工具文案让它重读重算）。
+    再叠一条补救轮就成了两套机制抢同一次额度。"""
+    _, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class ConflictsThenGivesUp(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:  # 过期版本号，必然冲突
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 7, "items": {items}}}'),))
+            else:
+                yield ChatFinal("版本对不上，我再确认一下。", "stop", self.provider, self.model, self.mode)
+
+    responder = ConflictsThenGivesUp()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-conflict", "message": "帮我排一份复习计划，直接排进系统"})
+    assert responder.nudges() == 0, f"冲突该走原有重试路径：{responder.prompts}"
+
+
+def test_no_reminder_without_plan_write_permission(client):
+    """会话从没提过计划就没有写权限，这时候补也是白补——plan_update 会被闸门原样挡回来。"""
+    _, session_id = _plan_course_session(client)
+
+    class TalksAboutTheWeekend(_RecordsPrompts):
+        def script(self):
+            yield ChatFinal("那就工作日多看一点。", "stop", self.provider, self.model, self.mode)
+
+    responder = TalksAboutTheWeekend()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-noperm", "message": "周末我要出差，把周末的内容都匀到工作日去"})
+    assert responder.nudges() == 0, f"没有写权限却补了一轮：{responder.prompts}"
+
+
+def test_the_plan_reminder_follows_the_language_of_the_turn(client):
+    """补救轮之后模型还要报一句「计划已更新」并复述安排，用户看得到，
+    所以注入的这句要跟着本轮键入的语言走，别把英文轮拽回中文。"""
+    _, session_id = _plan_course_session(client)
+
+    class ProseOnly(_RecordsPrompts):
+        def script(self):
+            yield ChatFinal("Here is your plan: Aug 11 chapter 1.", "stop", self.provider, self.model, self.mode)
+
+    responder = ProseOnly()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-en", "message": "make me a study plan for the exam"})
+    assert responder.nudges(PLAN_NUDGE_EN) == 1, f"英文轮该注入英文：{responder.prompts}"
+    assert responder.nudges() == 0, "英文轮里混进了中文补救文案"
+
+
+def test_plan_change_intent_is_narrower_than_the_write_gate():
+    """写权限闸门管「能不能写」，事后检查管「这轮必须写」，判据不能共用一个。
+    第二轮的改计划请求常常一个计划关键词都没有，而纯查询句反而满是关键词。"""
+    from modules.agent.service import _has_plan_intent, _wants_plan_change
+
+    keywordless = "从现在到考试，每个周六周日我都在出差看不了书，把所有周末的内容都匀到工作日去"
+    assert not _has_plan_intent(keywordless) and _wants_plan_change(keywordless)
+    assert _has_plan_intent("我的复习计划到哪了？") and not _wants_plan_change("我的复习计划到哪了？")
+
+    for text in ("帮我排一份复习计划", "直接排进系统，不用再问我", "调整一下计划", "周末的任务往后挪两天",
+                 "把第三章提前到这周", "make me a study plan for the exam", "update my plan",
+                 "I'm away on weekends, move it all to weekdays"):
+        assert _wants_plan_change(text), f"该补却认不出：{text}"
+    # 教材术语和纯查询一律不收：误命中等于替用户重写一遍他没让改的计划
+    for text in ("计划怎么样了", "今天该学什么", "帮我看看计划", "排序算法怎么选", "把 x 挪到等号右边",
+                 "explain the query plan for this join", "how does CPU scheduling work",
+                 "the scheduler will move tasks between queues", "how is my plan going?",
+                 "[图片转录：本周复习计划：周一第三章 匀到工作日]"):
+        assert not _wants_plan_change(text), f"该挡却放行了：{text}"
+
+
 def test_top_k_results_limits_what_search_materials_returns(tmp_path):
     """RAG_TOP_K_RESULTS 是文档里写明会生效的旋钮，检索条数必须真的跟着它走。"""
     data_dir = tmp_path / "data"

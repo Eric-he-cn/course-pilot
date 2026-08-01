@@ -119,6 +119,57 @@ def _has_plan_intent(text: str) -> bool:
     return bool(_PLAN_INTENT.search(_typed_text(text)))
 
 
+# 「这一轮必须把计划写进系统」的说法，和写权限闸门 _PLAN_INTENT 不能共用一个判据：
+# 那个是会话级的、问一句「我的计划到哪了」也该放行；这里命中就等于「不写就算失败」，
+# 误命中会把一句纯查询变成一次未经要求的重写，所以必须见到改动动词。
+_PLAN_CHANGE_DIRECT = re.compile(
+    r"进系统|(?:排|重排|改|修改|调整|更新|写|存|做|生成)[一二三下份个张点\s]{0,4}(?:复习|学习|备考)?计划"
+    r"|计划[里的上]{0,2}(?:改|调整|更新|重排|重新排)"
+    r"|(?:update|change|adjust|revise|rewrite|redo|reschedule|rearrange|redistribute)\s+"
+    r"(?:the\s+|my\s+|our\s+)?(?:study\s+|review\s+|revision\s+|exam\s+)?(?:plan|schedule|timetable)"
+    r"|(?:make|create|build|write|draw|set)\s+(?:me\s+)?(?:up\s+)?(?:a\s+|an\s+|the\s+|my\s+)?"
+    r"(?:study|review|revision|exam|reading)\s*(?:plan|schedule|timetable)"
+    r"|into\s+the\s+system|weekends?\b.{0,40}\bweekdays?",
+    re.IGNORECASE)
+# 不点名「计划」的改动要求：「把所有周末的内容都匀到工作日去」。动词和对象都命中才算，
+# 光看动词会撞上教材里的搬移说法。英文侧一律走上面那条——move / shift / swap
+# 在调度、排序这些章节里满地都是，凑对象也压不住。
+_PLAN_CHANGE_VERB = re.compile(r"匀|挪|移到|挤|重新安排|重新分配|重新分摊|删掉|去掉|加到|补到|提前|推后|往后|往前|空出|腾出|错开")
+_PLAN_CHANGE_TARGET = re.compile(r"计划|日程|课表|安排|任务|周末|工作日|每天|这周|下周|周[一二三四五六日天]|考前|章节")
+
+
+def _wants_plan_change(text: str) -> bool:
+    typed = _typed_text(text)
+    if _PLAN_CHANGE_DIRECT.search(typed):
+        return True
+    return bool(_PLAN_CHANGE_VERB.search(typed) and _PLAN_CHANGE_TARGET.search(typed))
+
+
+# 补救轮注入的是 role=user 消息，模型会当成本轮最新的一句话，回话跟着它的语言走。
+# 另外三处补救都要求「只调工具、不要重复正文」，混不混排看不见；写计划这一处之后
+# 模型还要报一句「计划已更新」并复述安排，用户看得到，所以这里跟随本轮键入的语言。
+_LATIN = re.compile(r"[A-Za-z]")
+_CJK = re.compile(r"[一-鿿]")
+
+
+def _typed_in_latin(text: str) -> bool:
+    typed = _typed_text(text)
+    latin, cjk = len(_LATIN.findall(typed)), len(_CJK.findall(typed))
+    return latin > 0 and latin > cjk
+
+
+_PLAN_REMINDER_ZH = (
+    "用户这一轮要求的计划改动还没有写进系统，他看到的计划没有变。"
+    "现在先调用 get_plan 拿到 expected_version，再用一次 plan_update 把今天及以后的全部条目写完，"
+    "不要重复输出正文。"
+)
+_PLAN_REMINDER_EN = (
+    "The plan change the user asked for this turn has not been written into the system yet — "
+    "the plan they see is unchanged. Call get_plan now to read expected_version, then make a single "
+    "plan_update call that writes every item from today onward. Do not repeat the answer text."
+)
+
+
 # 供应商偶尔会在工具预算耗尽后把 tool_call 当普通文本吐出来，这类内部标记不能进回答。
 _PROVIDER_MARKUP = re.compile(r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}.*", re.DOTALL)
 
@@ -534,6 +585,10 @@ class TurnService:
                 # 只认用户键入的原话：一张写着「记住」的教材照片不该触发。
                 wants_memory = bool(_MEMORY_INTENT.search(_typed_text(message)))
                 memory_written = memory_reminded = False
+                # 有写权限（plan_intent 粘住的也算）且这一轮明确要求动计划，才做事后检查：
+                # 没权限时补也是白补，plan_update 会被闸门原样挡回来。
+                wants_plan_change = plan_intent and _wants_plan_change(message)
+                plan_written = plan_conflicted = plan_reminded = False
                 active_skill: str | None = None
                 max_rounds = self._max_tool_rounds
                 # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
@@ -620,6 +675,21 @@ class TurnService:
                             missing_steps = []
                             if active_skill == "practice" and not practice.reminded and tool_rounds < max_rounds:
                                 missing_steps = practice.missing_steps()
+                            # 四处补救轮的优先级：practice（整条练习链路）> 计划 > 记忆 > 选项
+                            # （按钮没出来用户还能打字，所以垫底）。计划排在记忆前是因为触发条件最窄，
+                            # 命中几乎不会是误判，先给它用轮次；一次只发一条，其余的等下次 ChatFinal。
+                            if (not missing_steps and wants_plan_change and not plan_written and not plan_reminded
+                                    and not plan_conflicted and not choices and tool_rounds < max_rounds):
+                                # 模型常把新计划写在正文里就收尾，库里一个字没动，用户以为已经改了。
+                                plan_reminded = True
+                                self._merge_usage(usage_total, outcome.usage)
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(
+                                    role="user",
+                                    content=_PLAN_REMINDER_EN if _typed_in_latin(message) else _PLAN_REMINDER_ZH,
+                                ))
+                                trace_record["plan_reminder"] = True
+                                continue
                             if not missing_steps and wants_memory and not memory_written and not memory_reminded and tool_rounds < max_rounds:
                                 # 用户明确要求记住，但这一轮没有一次成功的 memory_patch：
                                 # 模型会照样说「已记住」，用户下次打开长期记忆却是空的。
@@ -690,6 +760,11 @@ class TurnService:
                                         tool_results[repeat_key] = result
                                 if call.name == "memory_patch" and result.ok:
                                     memory_written = True
+                                if call.name == "plan_update":
+                                    plan_written = plan_written or result.ok
+                                    # 版本冲突有自己的重试路径（失败不计预算，工具文案让它重读重算），
+                                    # 补救轮再插一脚就成了两套机制抢同一次额度。
+                                    plan_conflicted = plan_conflicted or result.reason == "version_conflict"
                                 if result.ok:
                                     practice.note_tool(call.name)
                                 if result.choices:
