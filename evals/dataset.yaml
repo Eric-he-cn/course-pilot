@@ -1,0 +1,1136 @@
+# 评测数据集：30 个带标注的样本。怎么跑、怎么加样本见 evals/README.md。
+# materials 是切片教材的 sha256，内容一变标注的页码就失效，脚本会直接报错退出。
+samples:
+- id: qa-001
+  category: cited_qa
+  course: 大语言模型
+  scope: course
+  question: Self-Instruct 把新生成的指令加进指令池之前会做哪些过滤？
+  expected:
+    answer_points:
+    - 先与池中已有指令算 ROUGE-L 相似度，只有全部低于 0.7 才可能入池
+    - 另有启发式规则筛掉含特定关键词（如「图片」）的、重复的、过长或过短的数据
+    - 相似度过滤是为了多样性，启发式规则是为了质量
+    forbidden_claims: []
+    citations:
+      document: llm-指令数据集.pdf
+      must_include_pages:
+      - 5
+      acceptable_pages:
+      - 4
+      - 3
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 5
+      required_order: []
+  notes: llm-指令数据集.pdf p.5 开头「4. 过滤低质量数据」一段把两件事都写全了：ROUGE-L 相似度低于 0.7 才可能加入指令池、以及删除含「图片」等关键词/重复/过长过短的启发式规则。p.4
+    是上一步的 「输入优先/输出优先」提示模板，p.3 是前两步，都不含过滤规则，只作相邻页。单页即可答全。
+- id: qa-002
+  category: cited_qa
+  course: 操作系统
+  scope: course
+  question: 作业不是同时到达时，SJF 为什么还会出现护航问题？STCF 是怎么把它解决掉的？
+  expected:
+    answer_points:
+    - SJF 不可抢占，先跑起来的长作业会让后到的短作业一直等，平均周转时间被拉到 103.33 秒
+    - STCF 允许抢占：新作业到达时比较剩余时间，最短的先跑
+    - 同一组作业下 STCF 把平均周转时间降到 50 秒
+    forbidden_claims: []
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 5
+      - 6
+      acceptable_pages:
+      - 3
+      - 4
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 6
+      required_order: []
+  notes: os-cpu-scheduling.pdf p.5 图 7.4 那段给出 A 在 t=0 需 100 秒、B/C 在 t=10 各需 10 秒时纯 SJF 的平均周转 103.33 秒，并点明仍是
+    convoy 问题；p.6 首段讲 STCF 在新作业到达时抢占 A，平均周转 降到 50 秒。两页各答一半，缺任一页都答不全。p.3 是 FIFO 的护航效应、p.4 是 SJF 原则，属背景。
+- id: qa-003
+  category: cited_qa
+  course: 深度学习
+  scope: course
+  question: 批量规范化在训练模式和预测模式下有什么不一样，预测时的均值方差是怎么来的？
+  expected:
+    answer_points:
+    - 训练时用当前小批量的均值和标准差做规范化
+    - 预测时改用整个数据集的统计量，常用移动平均在训练中估算出来
+    - 训练时拿不到全数据集统计量，只能用小批量，这个噪声本身还带正则化作用
+    forbidden_claims: []
+    citations:
+      document: 深度学习-批量规范化.pdf
+      must_include_pages:
+      - 2
+      - 3
+      acceptable_pages:
+      - 4
+      - 8
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 6
+      required_order: []
+  notes: 深度学习-批量规范化.pdf p.2 末段明确区分「训练模式」（小批量统计）与「预测模式」（数据集统计）， 并在前一段讲噪声估计反而有益；p.3 的「预测过程中的批量规范化」小节给出具体做法：用移动平均估算
+    整个训练集的均值方差，预测时用它得到确定输出。p.4 的 batch_norm 代码里 if not autograd.is_training() 是同一件事的实现，p.8 小结复述一句，二者作相邻页。
+- id: qa-004
+  category: cited_qa
+  course: 大语言模型
+  scope: course
+  question: LoRA 是怎么用低秩矩阵模拟参数更新的？写出它的前向公式，并说明 A、B 为什么这样初始化。
+  expected:
+    answer_points:
+    - 冻结预训练权重 W0，在旁路加两个低秩矩阵的乘积 ΔW = BA 作为可训练参数，秩 r 远小于 d 和 k
+    - 前向是 h = W0x + BAx，即原权重输出加旁路输出
+    - A 用高斯初始化、B 用零初始化，使训练开始时旁路输出为 0，不影响原模型
+    forbidden_claims: []
+    citations:
+      document: llm-微调-LoRA.pdf
+      must_include_pages:
+      - 1
+      acceptable_pages:
+      - 2
+      - 4
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 5
+      required_order: []
+  notes: llm-微调-LoRA.pdf p.1 的 5.2.1 节把三点都写了：W0∈R^{d×k}、ΔW=BA、B∈R^{d×r}、A∈R^{r×k}； A 通过高斯函数初始化、B 零初始化，使训练开始前旁路对原模型不造成影响；式
+    (5.2) h=W0x+ΔWx= W0x+BAx。p.2 是图 5.3 与 peft 用法（含 lora_alpha/r 放缩系数），p.4 给 r=4 时的实验数据， 都是延伸不是答案本体。
+- id: qa-005
+  category: cited_qa
+  course: 机器学习数学
+  scope: course
+  question: 一元高斯和多元高斯的密度函数分别怎么写？标准正态是其中哪种特例？
+  expected:
+    answer_points:
+    - 一元密度是 p(x|μ,σ²) = (2πσ²)^(-1/2) exp(-(x-μ)²/(2σ²))
+    - 多元密度是 p(x|μ,Σ) = (2π)^(-D/2)|Σ|^(-1/2) exp(-½(x-μ)ᵀΣ⁻¹(x-μ))，由均值向量和协方差矩阵完全确定
+    - 均值为 0、协方差为单位矩阵的高斯就是标准正态分布
+    forbidden_claims: []
+    citations:
+      document: math-gaussian.pdf
+      must_include_pages:
+      - 5
+      acceptable_pages:
+      - 4
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 5
+      required_order: []
+  notes: math-gaussian.pdf p.5 上给出式 (6.62) 一元密度与式 (6.63) 多元密度，并在同页末尾写明 μ=0、Σ=I 的特例叫 standard normal distribution。p.4
+    是 6.5 节开头讲高斯为什么重要， 没有公式本体，只作相邻页。
+- id: qa-006
+  category: cited_qa
+  course: 机器学习数学
+  scope: course
+  question: 图 6.9 那个二元高斯的例子里，给定 x2 = -1 时 x1 的条件分布是什么？边缘分布 p(x1) 又是多少？
+  expected:
+    answer_points:
+    - 条件分布是 N(0.6, 0.1)
+    - 边缘分布 p(x1) 是 N(0, 0.3)，即直接取联合分布里 x1 的均值和方差
+    - 条件均值和条件方差是把联合分布的分块参数代入条件公式算出来的
+    forbidden_claims: []
+    citations:
+      document: math-gaussian.pdf
+      must_include_pages:
+      - 7
+      acceptable_pages:
+      - 6
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 5
+      required_order: []
+  notes: math-gaussian.pdf p.7 的 Example 6.6 紧挨着图 6.9 的图注：给定 p(x1,x2)=N([0,2], [[0.3,-1],[-1,5]])，代入 (6.66)(6.67)
+    得 μ=0.6、σ²=0.1，式 (6.72)(6.73) 写出 p(x1|x2=-1)=N(0.6,0.1) 与 p(x1)=N(0,0.3)。p.6 是被代入的两个公式本体，引了不罚。 这条也顺带考图注附近的文本能不能被检索到。
+- id: qa-007
+  category: cited_qa
+  course: 操作系统
+  scope: course
+  question: 多级反馈队列具体是按什么规则调整作业优先级的？
+  expected:
+    answer_points:
+    - 先说明当前课程资料里没有这部分内容，教材只提到它是下一章的主题
+    - 明确标注接下来的说法不是教材结论（用通用知识回答）
+    - 通用知识部分说清 MLFQ 用多个优先级队列，按作业的实际行为调整优先级：用满时间片就降级，交互性强或让出 CPU 的留在高优先级
+    forbidden_claims:
+    - 把 MLFQ 的具体调整规则说成本教材里讲过的内容
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 11
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 6
+      required_order: []
+  notes: os-cpu-scheduling.pdf 这 13 页只讲到 FIFO/SJF/STCF/RR 与 I/O 处理；p.11 小结的最后一句只说 multi-level feedback
+    queue 是下一章的主题，没有任何规则。全文 grep「MLFQ」0 命中， 「feedback queue」只有那一处前向引用。所以正确行为是先查、再说明教材没有、然后以 「以下不是当前教材结论：」给通用知识。must_include_pages
+    故意留空。换两三种说法确认教材里确实 没有是合理的，所以 max_tool_calls 比普通 cited_qa 多留一次；web_search 不禁， 系统提示词允许教材没有时联网补。
+- id: qa-008
+  category: cited_qa
+  course: 大语言模型
+  scope: course
+  question: DPO 和 RLHF 相比省掉了哪一步？为什么能省？
+  expected:
+    answer_points:
+    - 先说明教材里没有 DPO，教材讲到的是监督微调、奖励模型微调、PPO 版 RLHF 这条三步路线
+    - 明确标注接下来的说法不是教材结论
+    - 通用知识部分说清 DPO 直接用成对偏好数据优化策略，不需要单独训练奖励模型、也不需要在线采样做强化学习
+    forbidden_claims:
+    - 把 DPO 说成教材里介绍过的方法
+    citations:
+      document: llm-指令数据集.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 7
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 6
+      required_order: []
+  notes: 两份大语言模型切片 grep「DPO」「偏好优化」均为 0 命中。教材里最接近的是 llm-指令数据集.pdf p.7 的 DeepSpeed-Chat 三步骤（监督微调、奖励模型微调、PPO
+    版 RLHF）， 模型引它来说明「教材讲的是另一条路线」是合理的，故放 acceptable。must_include_pages 留空。
+- id: pgen-001
+  category: practice_gen
+  course: 操作系统
+  scope: course
+  question: 出 1 道选择题考我 FIFO 的护航效应。
+  expected:
+    answer_points:
+    - 正文里给出完整题干，以及 A/B/C/D 四个选项的完整内容
+    - 只出一道题，题目能用教材内容判定对错，并标了出处编号
+    - 没有透露正确答案或评分要点
+    forbidden_claims:
+    - 直接给出这道题的正确选项
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 3
+      acceptable_pages:
+      - 4
+      - 2
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - artifact_append
+      - ask_user
+      must_not_call:
+      - emit_evidence
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 考点钉在 FIFO 护航效应，教材依据在 os-cpu-scheduling.pdf p.3 末段：A 跑 100 秒、B/C 各 10 秒时 平均周转 110 秒，并给出 convoy
+    effect 的定义，句子续到 p.4 首行「behind a heavyweight resource consumer」。p.2 是 FIFO 小节的开头。按 practice 规程，只出一道选择题必须走
+    ask_user 给 A-D 四个 短标签；而界面不渲染 ask_user 的 question 参数，所以题干和四个选项的完整内容必须写在正文里—— 这是纯提示词约束，check.sh 测不出，本条就是为它设的。must_call
+    不含 use_skill：artifact_append 不在主工具集里，能调到它就说明 practice 规程已经生效，至于是模型自己加载还是服务端注入的， 不该由数据集规定。
+- id: pgen-002
+  category: practice_gen
+  course: 操作系统
+  scope: course
+  question: 给我出一道要动笔算的题，考平均周转时间的计算。
+  expected:
+    answer_points:
+    - 题目给出了具体的作业到达时间与运行时长，能算出唯一的数值答案
+    - 指明了用哪种调度策略算，题干标了教材出处编号
+    - 只给题目，没有给出答案或计算过程
+    forbidden_claims:
+    - 在题目里直接写出平均周转时间的数值答案
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 3
+      - 5
+      - 6
+      - 2
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - artifact_append
+      must_not_call:
+      - emit_evidence
+      - plan_update
+      max_tool_calls: 11
+      required_order: []
+  notes: 可判定的计算素材在 os-cpu-scheduling.pdf p.3（三作业各 10 秒平均 20 秒；A=100、B=C=10 时平均 110 秒）、p.5（SJF 迟到场景 103.33
+    秒）、p.6（STCF 50 秒）、p.2（周转时间定义式 7.1）。具体挑 哪组数字是模型的合法选择，所以页码全放 acceptable、must_include 留空。本轮用户还没作答， 出题就写证据事件是错的，故禁
+    emit_evidence。
+- id: pgen-003
+  category: practice_gen
+  course: 大语言模型
+  scope: course
+  question: 指令数据集这部分给我出 3 道题练练。
+  expected:
+    answer_points:
+    - 恰好给出 3 道题，不多不少
+    - 每道题都能用教材内容判定对错，题干后标了出处编号
+    - 只给题目，末尾说明作答后会逐题批改，没有给答案
+    forbidden_claims: []
+    citations:
+      document: llm-指令数据集.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - artifact_append
+      must_not_call:
+      - emit_evidence
+      - plan_update
+      max_tool_calls: 13
+      required_order: []
+  notes: llm-指令数据集.pdf p.1-p.6 有足量可判定素材：LIMA 用 1000 条指令（p.1-p.2）、Self-Instruct 四个 步骤与输入/输出优先的区别（p.2-p.4）、ROUGE-L
+    0.7 阈值（p.5）、表 5.1 里各开源数据集的规模、 语言与构建方式（p.6），p.7 是各数据集的逐条说明。页码不作约束：出哪 3 道由概念目录与学习档案 决定，钉死页码会把模型的合法选择判成错。这条只考数量约束是否被遵守
+    + 题目可判定性。 三道题各取一次教材证据是合理的，所以 max_tool_calls 留到 13。
+- id: pgen-004
+  category: practice_gen
+  course: 机器学习数学
+  scope: course
+  question: 刚才那道条件高斯的题我已经批改完了，再来一道同考点、换个数字的。
+  expected:
+    answer_points:
+    - 给出一道新题，考点仍是二元高斯的条件分布（或条件均值/方差的计算）
+    - 换了数值或情境，不是把原题原样重复
+    - 只给题目，没有给出答案
+    forbidden_claims: []
+    citations:
+      document: math-gaussian.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 6
+      - 7
+      - 5
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - artifact_append
+      must_not_call:
+      - emit_evidence
+      - plan_update
+      max_tool_calls: 10
+      required_order: []
+  notes: 变式题的依据是 math-gaussian.pdf p.6 的条件分布公式 (6.65)-(6.67) 与 p.7 的 Example 6.6 数值， 换一组 μ/Σ 仍然可判定；p.5
+    是密度函数本体。问法里写明「已经批改完了」是有意的：practice 规程 规定有未评分作答时必须先评分，不写清就会踩到补救轮的优先级，把这条测成 practice_grade。 页码不约束，换的是数字。
+- id: pgrade-001
+  category: practice_grade
+  course: 操作系统
+  scope: course
+  question: 第 1 题（三个作业同时到达、各需 10 秒，FIFO 下的平均周转时间）我算的是 (10+20+30)/3 = 20 秒。
+  expected:
+    answer_points:
+    - 判定这道题正确
+    - 判定依据与教材一致：三个作业依次在 10、20、30 秒完成，平均 20 秒
+    - 给出一句总结，说明这个概念的掌握情况
+    forbidden_claims: []
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 3
+      - 2
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - emit_evidence
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 10
+      required_order: []
+  notes: 正确答案在 os-cpu-scheduling.pdf p.3：A 在 10、B 在 20、C 在 30 完成，平均 (10+20+30)/3=20； p.2 是周转时间定义式 (7.1)。问法里复述了题面，样本因此不依赖上一轮到底出了哪道题——也因此
+    不要求 artifact_read：照着消息里的题面直接批改是一条合法路径。硬要求只有 emit_evidence， 漏了它这次作答就不进学习档案。
+- id: pgrade-002
+  category: practice_grade
+  course: 操作系统
+  scope: course
+  question: 那道 RR 平均响应时间的题（三个作业同时到达、各需 5 秒，时间片 1 秒）我算的是 5 秒。
+  expected:
+    answer_points:
+    - 判定这道题错误
+    - 指出正确答案是 1 秒，即 (0+1+2)/3
+    - 指出用户算的 5 秒是 SJF 的平均响应时间，把两种策略的结果搞混了
+    forbidden_claims:
+    - 认可 5 秒是 RR 在该场景下的平均响应时间
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 8
+      acceptable_pages:
+      - 7
+      - 6
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - emit_evidence
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 10
+      required_order: []
+  notes: os-cpu-scheduling.pdf p.8 正文明写：三作业各 5 秒、时间片 1 秒时 RR 的平均响应时间是 (0+1+2)/3=1，而 SJF 是 (0+5+10)/3=5。用户答
+    5 秒正是把 SJF 的值当成 RR，属于典型错法， 规程要求指出第一处出错的地方。p.7 是响应时间定义与图 7.6/7.7，p.6 是 7.6 节的定义式 (7.2)。
+- id: pgrade-003
+  category: practice_grade
+  course: 机器学习数学
+  scope: course
+  question: 那道条件高斯的题，我算出 p(x1|x2=-1) 的均值是 0.6、方差是 0.3。
+  expected:
+    answer_points:
+    - 判定为部分正确：均值 0.6 对，方差错
+    - 指出条件方差应为 0.1，按 Σxx - ΣxyΣyy⁻¹Σyx 算出
+    - 指出 0.3 是 x1 的边缘方差，把边缘方差当成了条件方差
+    forbidden_claims:
+    - 认可 0.3 是该条件分布的方差
+    citations:
+      document: math-gaussian.pdf
+      must_include_pages:
+      - 7
+      acceptable_pages:
+      - 6
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - emit_evidence
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 10
+      required_order: []
+  notes: math-gaussian.pdf p.7 Example 6.6 给出 μ=0.6（式 6.70）与 σ²=0.1（式 6.71），以及边缘 p(x1)=N(0,0.3)（式 6.73）——用户答的
+    0.3 正是那个边缘方差，是一个干净的「部分正确」。 p.6 是被代入的公式 (6.66)(6.67)。关键步骤错按 attempt_incorrect 归因。
+- id: pgrade-004
+  category: practice_grade
+  course: 深度学习
+  scope: course
+  question: 批量规范化那道题我不会，跳过吧。
+  expected:
+    answer_points:
+    - 明确把这道题判为未掌握，没有因为用户跳过就略过判定
+    - 给出这道题的正确解法与要点，落回教材引用
+    - 指出这个概念还需要巩固
+    forbidden_claims: []
+    citations:
+      document: 深度学习-批量规范化.pdf
+      must_include_pages:
+      - 2
+      acceptable_pages:
+      - 1
+      - 3
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - emit_evidence
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 10
+      required_order: []
+  notes: practice 规程明写：用户明确说不会/跳过也要写 attempt_incorrect，否则这次练习不进学习档案， 所以这条的硬要求就是 emit_evidence。讲解依据在 深度学习-批量规范化.pdf
+    p.2：式 (7.5.1) 的 BN 变换、式 (7.5.2) 的小批量均值方差与 ε 的作用、以及 γ/β 是要学习的参数；p.1 是「为什么需要 BN」的三条动机，p.3 是全连接层与卷积层的放置位置。
+- id: web-001
+  category: web_knowledge
+  course: 大语言模型
+  scope: course
+  question: 联网查一下 vLLM 的 PagedAttention 是怎么管理 KV cache 的。
+  expected:
+    answer_points:
+    - 说明教材里没有这部分内容
+    - 给出联网查到的机制要点：把 KV cache 切成固定大小的块按需分配、用块表做逻辑到物理的映射，从而减少显存碎片
+    - 明确标注这些结论来自网络而不是教材，并给出来源链接
+    forbidden_claims:
+    - 把联网查到的内容说成教材里的结论
+    citations:
+      document: null
+      must_include_pages: []
+      acceptable_pages: []
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - web_search
+      must_not_call:
+      - plan_update
+      - emit_evidence
+      max_tool_calls: 9
+      required_order: []
+  notes: 两份大语言模型切片 grep「vLLM」「PagedAttention」「KV」均为 0 命中，教材确实没有，而用户又明确 要求联网，所以这条判的是「联网做了没有 + 来源标清了没有」。教材侧不需要引任何页，
+    document 留空。max_tool_calls 按 search 与 fetch 各两次的合理路径留足。
+- id: web-002
+  category: web_knowledge
+  course: 深度学习
+  scope: course
+  question: 教材讲的是批量规范化，现在的模型更常用哪种规范化？这方面最近有什么进展？
+  expected:
+    answer_points:
+    - 教材侧说明它只讲了批量规范化，没有覆盖其他规范化方法
+    - 联网结论给出当前更常用的做法（如层规范化、RMSNorm，以及 Transformer 里把规范化放在残差分支之前）
+    - 明确区分哪句来自教材、哪句来自网络，并给出来源链接
+    forbidden_claims:
+    - 把层规范化或 RMSNorm 说成教材里介绍过的内容
+    citations:
+      document: 深度学习-批量规范化.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 1
+      - 2
+      - 8
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - web_search
+      must_not_call:
+      - plan_update
+      - emit_evidence
+      max_tool_calls: 9
+      required_order: []
+  notes: 深度学习-批量规范化.pdf 只讲 BN（p.1-p.8）与 ResNet 开头（p.9-p.10），grep「层规范化」 「LayerNorm」0 命中，属于典型的「教材外新进展」。教材侧可引
+    p.1（为什么需要 BN）、p.2（BN 公式）、 p.8（小结与争议）来说明教材讲到哪儿，故放 acceptable；判分重点是来源区分。
+- id: web-003
+  category: web_knowledge
+  course: 大语言模型
+  scope: course
+  question: 教材里 LoRA 讲得挺细，工业界现在做参数高效微调还是以 LoRA 为主吗？
+  expected:
+    answer_points:
+    - 教材侧概述 LoRA 的做法或它的变体（AdaLoRA/QLoRA），并标注教材引用编号
+    - 联网部分给出当前工业界的现状判断，并给出来源链接
+    - 逐段区分开哪部分是教材结论、哪部分是网络来源，没有把两者混在一起
+    forbidden_claims:
+    - 把联网得到的现状判断说成教材结论
+    citations:
+      document: llm-微调-LoRA.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 1
+      - 4
+      - 5
+      - 6
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - web_search
+      must_not_call:
+      - plan_update
+      - emit_evidence
+      max_tool_calls: 9
+      required_order: []
+  notes: 这条是三条里唯一教材有内容的：llm-微调-LoRA.pdf p.1（LoRA 原理与式 5.2）、p.4（r=4 的实验数据）、 p.5（AdaLoRA）、p.6（QLoRA）。所以它考的正是「哪句来自教材、哪句来自网络」的分界。教材页放
+    acceptable 不放 must：模型只引 p.1 或只引 p.5/p.6 都是合法的，判分重点在来源标注。
+- id: plan-001
+  category: plan
+  course: 操作系统
+  scope: course
+  question: 帮我排一个复习计划：8 月 12 日考操作系统这一章，从今天开始，每天能学一个小时。
+  expected:
+    answer_points:
+    - 计划已经写进系统，并把结果告诉用户（不是把条目列出来反问「可以吗」）
+    - 条目覆盖到 8 月 12 日之前，且覆盖了这一章的主要内容（FIFO/SJF/STCF/RR 等）
+    - 每天的任务量与「每天一小时」相称
+    forbidden_claims:
+    - 声称写入成功但实际没有调用过 plan_update
+    citations:
+      document: null
+      must_include_pages: []
+      acceptable_pages: []
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - get_plan
+      - plan_update
+      must_not_call:
+      - emit_evidence
+      max_tool_calls: 9
+      required_order:
+      - - get_plan
+        - plan_update
+  notes: 问法含「复习计划」，命中 service.py 的 _PLAN_INTENT（关键词「计划」），写计划的闸门放行—— 已逐词核对过。get_plan 早于 plan_update 是产品明写的前置：plan_update
+    的必填参数 expected_version 由 get_plan 报出，工具说明与系统提示词都要求先读再写（get_plan 同时给出弱项与 到期复习信号）。考试日期与每日时长都给全了，不需要先反问。判据落在用户能感知的性质上
+    （覆盖到考试日、覆盖这一章内容），不落在条目数或标题文本——plan_update 的契约是重写今天及以后 的全部条目，标题本来就会变。
+- id: plan-002
+  category: plan
+  course: 操作系统
+  scope: course
+  question: 我周三周四出差，把计划里这两天的内容挪到后面，别的保持不变。
+  expected:
+    answer_points:
+    - 改动已经写入，并说明了改了什么
+    - 出差那两天不再安排需要动笔学的任务
+    - 原来那两天的内容仍然出现在计划里的其他日期，没有被丢掉
+    forbidden_claims:
+    - 声称改好了但实际没有调用过 plan_update
+    citations:
+      document: null
+      must_include_pages: []
+      acceptable_pages: []
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - get_plan
+      - plan_update
+      must_not_call:
+      - emit_evidence
+      max_tool_calls: 9
+      required_order:
+      - - get_plan
+        - plan_update
+  notes: 问法含「计划」，同样命中 _PLAN_INTENT，闸门放行。前置需要课程里已有一份计划（由 plan-001 或 脚本预置）。改一份已存在的计划必须先 get_plan：既要拿 expected_version，也要知道原有条目是什么。
+    判据只落在「出差那两天没有学习任务」「原内容仍在计划里」：plan_update 的契约是重写今天及以后的 全部条目，所以标题会变、条目数也可能变（合并天数并提高每日时长同样合法），按这些写断言会假失败。
+    留一条「出差跳过」的占位条目也算合法，故第二条只要求不排需要动笔的任务。
+- id: plan-003
+  category: plan
+  course: 操作系统
+  scope: course
+  question: 我下周三要考操作系统这一章，现在只弄懂了 FIFO 和 SJF，剩下的内容里哪些最该先看？
+  expected:
+    answer_points:
+    - 直接回答该先看哪些内容，并给出教材依据
+    - 没有声称已经把计划写入或修改了系统
+    - 若建议排一份计划，是以建议的形式提出、等用户确认
+    forbidden_claims:
+    - 声称已经把复习计划写进系统或已更新计划
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 11
+      forbidden_pages: []
+    workflow:
+      must_call: []
+      must_not_call:
+      - plan_update
+      max_tool_calls: 6
+      required_order: []
+  notes: 逐词核对过 _PLAN_INTENT（计划|规划|复习安排|学习安排|安排一下|备考|日程|课表|进系统| 考试.{0,4}(准备|安排)）：这句一个都不命中——是「要考操作系统」而不是「考试」加「准备/安排」，
+    而且整句不含「安排」二字，也没有「计划」。所以 plan_update 会被服务端挡下，正确行为是直接答。 内容依据在 os-cpu-scheduling.pdf p.5-p.9（STCF、响应时间、RR、I/O）与
+    p.11（小结）， 引哪几页由模型判断，全放 acceptable。get_plan、get_archive 只读不写，不禁——先看一眼计划和 档案再回答该先看哪几节是合理路径。
+- id: bound-001
+  category: course_boundary
+  course: 操作系统
+  scope: course
+  question: 多元高斯分布的密度函数怎么写？
+  expected:
+    answer_points:
+    - 说明当前课程（操作系统）的资料里没有这部分内容
+    - 明确标注接下来的说法不是教材结论
+    - 通用知识部分给出正确的多元高斯密度函数，含均值向量与协方差矩阵
+    forbidden_claims:
+    - 给出操作系统教材里并不存在的引用编号来支撑高斯密度公式
+    citations:
+      document: math-gaussian.pdf
+      must_include_pages: []
+      acceptable_pages: []
+      forbidden_pages:
+      - 5
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 6
+      required_order: []
+  notes: 会话固定在操作系统，检索 scope 也固定在该课程，所以物理上取不到 math-gaussian.pdf 的页。 forbidden 一栏写的就是「math-gaussian.pdf
+    p.5」——多元高斯密度式 (6.63) 在那一页；有了 document 字段，这条约束不会再误伤 os-cpu-scheduling.pdf 自己的 p.5。真正的判据是：说明本课程没有、 以「以下不是当前教材结论：」作答、不伪造引用。
+- id: bound-002
+  category: course_boundary
+  course: 操作系统
+  scope: general
+  question: 护航效应到底是怎么产生的，为什么会拖累平均周转时间？
+  expected:
+    answer_points:
+    - 一批短作业排在一个重量级长作业后面，只能等它跑完
+    - 平均周转时间被显著拉长（例中从 20 秒变成 110 秒）
+    - 这是 FIFO 这类不可抢占、按到达顺序服务的策略带来的
+    forbidden_claims: []
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 3
+      acceptable_pages:
+      - 4
+      - 2
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      - note_write
+      max_tool_calls: 5
+      required_order: []
+  notes: 通用会话，句中不含任何课程名（四个课程名都不是这句的子串，核对过），所以走学科分类器， 正确结果是解析到操作系统。答案在 os-cpu-scheduling.pdf p.3 末段：A 跑
+    100 秒、B/C 各 10 秒时 平均周转 110 秒，紧接着给出 convoy effect 的定义，句子续到 p.4 首行「behind a heavyweight resource consumer」；p.2
+    是周转时间定义。
+- id: bound-003
+  category: course_boundary
+  course: 大语言模型
+  scope: general
+  question: 换个话题，QLoRA 是靠什么把显存占用压下来的？
+  expected:
+    answer_points:
+    - 把预训练模型量化到 4-bit（NF4 数据类型），LoRA 本身的逻辑没改
+    - 还用了双重量化（对分块的放缩系数再量化）与分页优化器
+    - 效果是 650 亿参数的模型能在单张 48GB GPU 上微调，并保持 16-bit 微调的性能
+    forbidden_claims: []
+    citations:
+      document: llm-微调-LoRA.pdf
+      must_include_pages:
+      - 6
+      acceptable_pages:
+      - 5
+      - 1
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - plan_update
+      - note_write
+      max_tool_calls: 5
+      required_order: []
+  notes: 前置：同会话上一轮聊的是另一门课（例如操作系统），本轮要能切到大语言模型。开场语「换个话题」 按分类提示词的明文规定不影响判课，这条就是盯这个已知脆弱点。答案在 llm-微调-LoRA.pdf
+    p.6 的 「2. QLoRA」整节：4-bit 量化、NF4 三项技术清单、单张 48GB GPU 微调 650 亿参数、双重量化把每参数 额外开销从 0.5 比特降到 0.127 比特。p.5
+    是 AdaLoRA，p.1 是 LoRA 本体，作相邻页。
+- id: bound-004
+  category: course_boundary
+  course: 操作系统
+  scope: general
+  question: 操作系统的调度策略和深度学习里的批量规范化，思路上有什么共同点？
+  expected:
+    answer_points:
+    - 指出这句话同时涉及两门课程
+    - 请用户说明用哪一门课的资料，没有替他选定一门就直接展开
+    forbidden_claims:
+    - 给出任一门课的教材引用编号
+    citations:
+      document: null
+      must_include_pages: []
+      acceptable_pages: []
+      forbidden_pages: []
+    workflow:
+      must_call: []
+      must_not_call:
+      - search_materials
+      - plan_update
+      - note_write
+      max_tool_calls: 2
+      required_order: []
+  notes: 这句同时含「操作系统」「深度学习」两个课程名（核对过都是子串），sessions/resolver.py 走 multiple_course_names 分支返回 ambiguous，service.py
+    随即用本地闸门直接回一句反问——种子检索在 另一个分支里，本轮不会有任何工具调用。所以 must_call 留空、禁掉 search_materials， max_tool_calls 留 2 只为兜住模型侧走
+    ask_user 的可能。
+- id: note-001
+  category: notes_diagram
+  course: 深度学习
+  scope: course
+  question: 把批量规范化这一节的要点整理成一张学习卡片，存成笔记。
+  expected:
+    answer_points:
+    - 卡片包含 BN 的变换式与 γ、β、ε 各自的作用
+    - 卡片写明训练模式与预测模式的差别
+    - 明确告知已经存成课程笔记
+    forbidden_claims:
+    - 声称已存成笔记但实际没有调用过 note_write
+    citations:
+      document: 深度学习-批量规范化.pdf
+      must_include_pages:
+      - 2
+      acceptable_pages:
+      - 1
+      - 3
+      - 8
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - note_write
+      must_not_call:
+      - plan_update
+      - emit_evidence
+      max_tool_calls: 7
+      required_order: []
+  notes: 卡片内容依据 深度学习-批量规范化.pdf p.2：式 (7.5.1) 的 BN 变换、式 (7.5.2) 的小批量均值方差、 ε 防除零、γ/β 是要学习的拉伸与偏移参数，以及该页末的训练/预测模式差别。p.3
+    讲全连接层与卷积层的 放置位置与预测时的移动平均，p.1 是三条动机，p.8 是小结，都作相邻页。用户明确说了「存成笔记」， 而 note_write 是唯一的落盘途径，所以它是硬要求；这条判的就是「说存了就真的存了」。
+- id: note-002
+  category: notes_diagram
+  course: 操作系统
+  scope: course
+  question: 画一张流程图，讲清 STCF 遇到新作业到达时是怎么决策的。
+  expected:
+    answer_points:
+    - 输出了一个 mermaid 代码块
+    - 图里体现「新作业到达 → 比较各作业的剩余时间 → 剩余时间更短就抢占，否则继续当前作业」
+    - 图外用文字说明并落回教材引用编号
+    forbidden_claims: []
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 6
+      acceptable_pages:
+      - 5
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - plan_update
+      - emit_evidence
+      max_tool_calls: 7
+      required_order: []
+  notes: STCF 的决策规则在 os-cpu-scheduling.pdf p.6 首段：任何新作业进入系统时，比较所有剩余作业 （含新作业）谁的剩余时间最少，就调度它；图 7.5 是抢占后的时间线。p.5
+    是 7.5 节开头，讲为什么需要 放开「运行到结束」这条假设。note_write 不禁：diagram 规程说用户要留档才存，但主提示词第 9 条 又鼓励把整理好的内容存成笔记，顺手存一份不该判失败。判据落在图本身——出了
+    mermaid、 分支画对、说明落回页码。
+- id: mistake-001
+  category: mistake_review
+  course: 操作系统
+  scope: course
+  question: 我哪个概念最薄弱？帮我复盘一下。
+  expected:
+    answer_points:
+    - 基于学习档案给出掌握度最低的概念，掌握度数值与档案一致（或如实说明数据不足）
+    - 对展开的概念给出教材关键点，带引用编号
+    - 指出错在概念理解上还是计算或读题上
+    forbidden_claims:
+    - 自己估算或换算掌握度分数
+    - 编造档案里不存在的错题
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages: []
+      acceptable_pages:
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - get_archive
+      must_not_call:
+      - emit_evidence
+      - plan_update
+      max_tool_calls: 10
+      required_order: []
+  notes: 前置：档案里已有若干 attempt_incorrect（由脚本预置，例如 Round Robin 与 FIFO 各错一次）。 页码不钉死：展开哪 2-3 个概念由档案决定，教材证据可能落在
+    os-cpu-scheduling.pdf p.2-p.8 的任一处， 全放 acceptable。get_archive 是读档案的唯一途径，所以是硬要求。禁 emit_evidence 出自
+    mistake_review 规程的明文边界：复盘是读档案，不是重新判定对错。第三条判据要的是「说清错因类型」 这件事，不要求照抄规程里的三分法小标题。
+- id: mistake-002
+  category: mistake_review
+  course: 大语言模型
+  scope: course
+  question: 看看我的错题，我这门课哪里最薄弱？
+  expected:
+    answer_points:
+    - 说明这门课还没有作答记录，档案是空的
+    - 建议先做几道题产生记录再复盘
+    - 没有给出任何掌握度数值，也没有列出任何具体错题
+    forbidden_claims:
+    - 编造具体的答题记录或掌握度数字
+    citations:
+      document: null
+      must_include_pages: []
+      acceptable_pages: []
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - get_archive
+      must_not_call:
+      - emit_evidence
+      - plan_update
+      max_tool_calls: 5
+      required_order: []
+  notes: 前置：这门课的学习档案为空（没跑过 practice）。mistake_review 规程第 1 步明写「档案为空就直接 说明还没有作答记录，建议先练几道，不要凭空编错题」，所以这条抓的是幻觉：只要出现具体错题或
+    掌握度数字就算失败。教材页不作约束，档案空的时候不需要引教材。
+- id: synth-001
+  category: global_synthesis
+  course: 操作系统
+  scope: course
+  question: 这一章是靠逐条放开最初的工作负载假设往下推进的。它一开始假设了哪几条？每放开一条各引出了什么策略？到这一章结束还有哪条没解决？
+  expected:
+    answer_points:
+    - 最初有五条假设：每个作业运行时间相同、所有作业同时到达、一旦开始就运行到结束、只用 CPU 不做 I/O、每个作业的运行时间已知
+    - 放开「运行时间相同」后 FIFO 出现护航效应，引出 SJF；放开「同时到达」后纯 SJF 仍被护航，再放开「运行到结束」才有可抢占的 STCF
+    - 放开「不做 I/O」的做法是把作业的每段 CPU 使用当成一个独立作业来调度，从而让 CPU 与 I/O 重叠
+    - 「运行时间已知」这条到本章结束仍未解决，教材说要靠用最近的过去预测未来，也就是下一章的多级反馈队列
+    forbidden_claims:
+    - 说这一章已经给出了在运行时间未知的情况下调度的完整方案
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 2
+      - 10
+      acceptable_pages:
+      - 3
+      - 4
+      - 5
+      - 6
+      - 9
+      - 11
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 全局在于这条线索本身就是整章的骨架，没有任何一页写全。五条假设的清单只在 os-cpu-scheduling.pdf p.2；放开第 1 条与 FIFO
+    失效在 p.3，SJF 在 p.4，放开第 2 条与纯 SJF 仍被护航在 p.5，放开第 3 条与 STCF 在 p.6；放开第 4 条（I/O）在 p.9-p.10，第
+    5 条「运行时间已知」未解决在 p.10 的 7.9 节与 p.11 小结（明说多级反馈队列是下一章的主题）。must 只钉 p.2 与 p.10 这两个相隔最远的位置：拿不到
+    p.2 就列不出假设清单，拿不到 p.10 就答不出哪条没解决。中间那几页引了都对，放 acceptable。预期当前版本在检索召回上失败：向量检索按「假设」这种概括词只会命中
+    p.2 附近，很难同时把 p.9-p.11 取回来，因此第 3、4 条要点会缺。
+- id: synth-002
+  category: global_synthesis
+  course: 操作系统
+  scope: course
+  question: 这一章为什么要在周转时间之外再引入一个指标？这两个指标在这一章里是怎么互相冲突的，教材各用了哪组数字说明？
+  expected:
+    answer_points:
+    - 周转时间是完成时刻减到达时刻，一开始是本章唯一的指标；时分共享的机器让用户坐在终端前要交互性能，才补上响应时间，定义为首次被调度的时刻减到达时刻
+    - 优化周转时间的 SJF/STCF 在响应时间上很差；优化响应时间的 RR 在周转时间上很差，两族策略在对方擅长的指标上都不行
+    - 教材的数字：三个各需 5 秒的作业同时到达、时间片 1 秒时，RR 的平均响应时间是 1 秒而 SJF 是 5 秒；同一组作业下 RR 的平均周转时间是 14
+      秒，比 FIFO 还差
+    - 这是公平与性能之间的固有取舍：把 CPU 在小时间尺度上均分给活跃进程的策略，在周转时间这类指标上必然表现差
+    forbidden_claims: []
+    citations:
+      document: os-cpu-scheduling.pdf
+      must_include_pages:
+      - 2
+      - 8
+      acceptable_pages:
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 9
+      - 11
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 全局在于「两个指标互相冲突」这个结论要把全章的例子并起来才成立，单看任一策略都看不出取舍。周转时间定义式 (7.1) 与性能／公平的对立在 os-cpu-scheduling.pdf
+    p.2；响应时间定义式 (7.2) 与引入它的理由在 p.6；SJF 对响应时间不利在 p.7；RR 的两组数字（平均响应 1 秒 vs SJF 的 5 秒、平均周转 14
+    秒且比 FIFO 更差）与「固有取舍」的表述都在 p.8；p.9 与 p.11 把两族策略各自的强弱总结成一句。must 钉 p.2 与 p.8：一头是指标的起点，一头是冲突被数字坐实的地方，相隔
+    6 页。预期当前版本在答案要点上失败：问句里没有 RR 也没有具体数字，检索会集中在两个指标的定义段，第 3 条要点（RR 那两个数）大概率缺。
+- id: synth-003
+  category: global_synthesis
+  course: 深度学习
+  scope: course
+  question: 这一节前后一共给批量规范化提了几种不同的解释和作用？教材最后对最初那套解释是什么态度？
+  expected:
+    answer_points:
+    - 开头列的三条动机：输入标准化能统一参数量级、有利于优化器；中间层变量的分布偏移可能阻碍收敛；更深的网络容易过拟合所以正则化更重要
+    - 小批量统计带来的噪声本身有益，起到类似正则化的作用，这也被用来解释为什么中等批量（50~100）效果最好
+    - 原论文的解释是减少内部协变量偏移，教材指出这个名字用词不当、只提供了一种不明确的直觉，还有工作给出与原论文相反的结论
+    - 教材的态度是分开看：批量规范化本身有效且已不可或缺，但「减少内部协变量偏移」这个原始动机似乎不是一个有效解释，要把指导性直觉和既定科学事实区分开
+    forbidden_claims:
+    - 把「减少内部协变量偏移」当成教材认可的解释
+    citations:
+      document: 深度学习-批量规范化.pdf
+      must_include_pages:
+      - 1
+      - 7
+      acceptable_pages:
+      - 2
+      - 3
+      - 8
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 全局在于这一节把「为什么有效」拆到了三个相隔很远的地方，而且前后态度不一致——只读一处会得出片面结论。三条动机在 深度学习-批量规范化.pdf
+    p.1 的 7.5.1 开头；噪声即正则化在 p.2 中段；7.5.6「争议」整节（内部协变量偏移用词不当、Santurkar 等给出相反结论）在 p.7；p.8 是
+    Ali Rahimi 的演讲与小结那句「原始动机似乎不是一个有效的解释」。must 钉 p.1 与 p.7：一头是教材自己给的动机，一头是它对原始解释的否定，相隔 6
+    页。p.2 与 p.8 引了都对。预期当前版本在答案要点上失败：问的是「几种解释」而不是某一种，检索容易只召回 7.5.1 那段动机，第 3、4 条要点缺失，答案会漏掉教材的保留态度。
+- id: synth-004
+  category: global_synthesis
+  course: 大语言模型
+  scope: course
+  question: 这一节讲了构建指令数据的哪几条路线？各自靠什么保证质量和多样性，代价差在哪？后面表里那些开源数据集分别属于哪条路线？
+  expected:
+    answer_points:
+    - 分两条路线：手动构建（网上收集问答再人为筛选，或标注人员直接编写提示与回答）和利用大模型的生成能力自动构建
+    - 手动构建以 LIMA 为例：从多个来源采样保证多样性，另定规则保证质量（社区数据取排名靠前的回答、统一成 AI 助手风格、删除过长过短或第一人称开头或含链接的回答）；代价是耗费人力，好处是过程可控
+    - 自动生成以 Self-Instruct 为例：从 175 条种子指令自举生成，入池前算 ROUGE-L 相似度、只有都低于 0.7 才可能入池以保证多样性，再用启发式规则筛掉低质量数据；代价低但必须靠过滤把质量补回来
+    - 表 5.1 的「构建方式」一列把两条路线分开了：Super-NaturalInstructions、Flan2021、pCLUE、OpenAssistant Conversations、Dolly、LIMA
+      是手动构建，Self-Instruct、Alpaca_data、BELLE 是自动生成
+    forbidden_claims:
+    - 把表里标为手动构建的数据集说成自动生成，或反之
+    citations:
+      document: llm-指令数据集.pdf
+      must_include_pages:
+      - 1
+      - 6
+      acceptable_pages:
+      - 2
+      - 3
+      - 4
+      - 5
+      - 7
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 全局在于要把「两条路线」这个分类和五页之后那张表的归属对上，两处内容形态完全不同（叙述 vs 表格）。5.4 节开头的两分法与 LIMA 的多样性／质量做法在
+    llm-指令数据集.pdf p.1；LIMA 只用 1000 条的结论在 p.2；Self-Instruct 四个步骤在 p.2-p.4；ROUGE-L 0.7 阈值与启发式规则在
+    p.5；表 5.1 及其「构建方式」一列在 p.6，各数据集的逐条说明在 p.7。must 钉 p.1 与 p.6，相隔 5 页：拿不到 p.1 说不出路线的划分依据，拿不到
+    p.6 就答不出归属。预期当前版本在检索召回上失败：表格页的文本是短列，向量检索按整句问法很难召回 p.6，第 4 条要点大概率靠模型自己的常识补，成为幻觉风险点。
+- id: synth-005
+  category: global_synthesis
+  course: 大语言模型
+  scope: course
+  question: 这一节里降低微调开销的方法不止一个，LoRA、AdaLoRA、QLoRA 各自省的是哪一部分开销？它们之间是替代还是可以叠加？
+  expected:
+    answer_points:
+    - LoRA 冻结预训练权重 W0，只训练旁路低秩矩阵的乘积 BA，省的是可训练参数量；而且推理时可以把 BA 合并回原权重，不像适配器那样带来额外的推理开销
+    - 教材给的量化收益：GPT-3 在 r=4、只给注意力的 Q 与 V 矩阵加旁路时，检查点从 350GB 降到 35MB，训练显存从 1.2TB 降到 350GB，训练速度提高
+      25%
+    - AdaLoRA 改的是 LoRA 内部的秩分配：按各权重矩阵对下游任务的重要性分数动态调整秩，而不是给所有低秩矩阵指定同一个秩，在更少可训练参数下保持或提高性能
+    - QLoRA 没有改 LoRA 的逻辑，而是把预训练模型量化到 4-bit（NF4），再对分块的放缩系数做双重量化、配分页优化器，省的是被冻结的主干那部分显存；它叠加在
+      LoRA 之上，效果是 650 亿参数的模型能在单张 48GB GPU 上微调
+    forbidden_claims:
+    - 说 QLoRA 修改了 LoRA 的低秩旁路逻辑
+    citations:
+      document: llm-微调-LoRA.pdf
+      must_include_pages:
+      - 1
+      - 6
+      acceptable_pages:
+      - 2
+      - 4
+      - 5
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 全局在于三种方法散在整节里，而「叠加还是替代」这个判断要同时读到 LoRA 的结构和 QLoRA 那句「并没有对 LoRA 的逻辑作出修改」才能下。LoRA
+    本体（W0 冻结、ΔW=BA、可合并因此无额外推理开销）在 llm-微调-LoRA.pdf p.1；lora_alpha/r 放缩在 p.2；r=4 时 GPT-3 的检查点
+    350GB→35MB、显存 1.2TB→350GB、速度 +25% 在 p.4；AdaLoRA 的动态秩分配与重要性分数在 p.5；QLoRA 的 4-bit NF4、双重量化把每参数额外开销从
+    0.5 比特降到 0.127 比特、单张 48GB GPU 微调 650 亿参数在 p.6。must 钉 p.1 与 p.6，相隔 5 页。预期当前版本在答案要点上失败：p.4
+    夹在大段 peft 代码里，问句又没提实验数据，第 2 条要点很可能召回不到；第 3 条要点也要靠单独一次检索才能拿到。
+- id: synth-006
+  category: global_synthesis
+  course: 机器学习数学
+  scope: course
+  question: 这份材料反复在强调高斯分布「算完还是高斯」，具体有哪几类运算满足这一条？教材为什么把这条性质看得这么重？
+  expected:
+    answer_points:
+    - 联合高斯的边缘分布和条件分布都还是高斯，而且有闭式表达：条件均值与条件协方差由分块参数算出，边缘分布直接取对应那一块的均值与协方差
+    - 两个高斯密度的乘积是一个被常数放缩的高斯；两个独立高斯随机变量之和也还是高斯，均值与协方差各自相加
+    - 任何线性／仿射变换后仍然是高斯（y=Ax 的均值是 Aµ、协方差是 AΣAᵀ），从标准正态采样出一般高斯正是靠这条，配合协方差矩阵的 Cholesky 分解
+    - 教材把这类性质概括成「闭合性」，并列为挑选分布时的第一条要求——运算做完还返回同类型的对象，推断才能闭式算出来，这也是它接着引出指数族的理由
+    forbidden_claims: []
+    citations:
+      document: math-gaussian.pdf
+      must_include_pages:
+      - 8
+      - 12
+      acceptable_pages:
+      - 5
+      - 6
+      - 7
+      - 10
+      - 11
+      forbidden_pages: []
+    workflow:
+      must_call:
+      - search_materials
+      must_not_call:
+      - web_search
+      - plan_update
+      max_tool_calls: 12
+      required_order: []
+  notes: 全局在于「闭合性」这个词只在最后一节出现，而支撑它的四五条性质散在前面七八页，教材从没在一处列全。math-gaussian.pdf p.5 末段说高斯之所以好用是因为边缘与条件有闭式表达；p.6
+    的 (6.65)-(6.68) 给出条件与边缘仍是高斯；p.7 是 Example 6.6 的数值；p.8 的 6.5.2 给出两个高斯密度之积是放缩后的高斯、6.5.3
+    给出独立高斯之和仍是高斯；p.10 给出线性变换后 p(y)=N(Aµ, AΣAᵀ)；p.11 是反向变换与 6.5.4 采样（Cholesky）；p.12 的 6.6
+    节开头把这件事明确写成「closure property」，列为三条 desiderata 的第一条，并由此引出指数族。must 钉 p.8 与 p.12：一头是性质最密集的地方，一头是教材给出这条性质名字与理由的地方，相隔
+    4 页且互不相邻。预期当前版本在检索召回与答案要点上一起失败：「算完还是高斯」在原文里没有对应字面（原文是英文的 closure property），检索大概率只落在
+    6.5.1 条件／边缘那一段，第 4 条要点缺失，第 2、3 条也可能只答一半。
+materials:
+  llm-微调-LoRA.pdf: e41fd1b18f13675425651548e3b65f036c390655f0b958c040bb5035746cdebd
+  llm-指令数据集.pdf: a6a14608cd04919579f9ced4d15644bdfda2600f4506f92e7a5444289a463fbb
+  math-gaussian.pdf: e7a7fe6bb9d3712c2195fb12a6f301f2e78efe194215cfc7f1f158558a7d918b
+  os-cpu-scheduling.pdf: 99f6989e446ef0307cf2eb604fa42ed2c7b1693a708f484b860bb84312c6e15e
+  深度学习-批量规范化.pdf: 03a142abf532373e7827e4ee4dc7224a7486644312b80cf1de42d7117c12bfad
