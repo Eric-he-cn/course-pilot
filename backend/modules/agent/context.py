@@ -10,12 +10,18 @@ from contracts.llm import ChatMessage, ToolCallRequest
 
 SEED_CALL_ID = "call_seed_search"
 # 提示词版本：改动系统提示词就要 +1，trace 里据此区分不同版本的效果。
-PROMPT_VERSION = "tutor_v14"
+PROMPT_VERSION = "tutor_v15"
 
 # 没配联网时这半句要撤掉：工具表里已经没有 web_search，提示词还在推荐，
 # 模型就会口头答应去查而实际查不到。
 _WEB_HINT = ("教材里没有而用户想要最新资料时，可以用 web_search 联网查，再按同样方式标注"
              "——网络内容永远不算教材结论，并要给出来源链接。")
+# 课程没开知识页时同样要撤（工具也不下发，见 service 里的 wiki_off）。
+_WIKI_HINT = """
+5.2 这门课有知识页：系统事先按教材为每个概念写好的整理稿。问"这门课分成哪几块""该从哪学起"
+    这类要看全貌的问题，或一个问题牵扯到好几章时，先用 wiki_index 读索引看清有哪些概念，
+    再用 wiki_read 读需要的那几页，不要只靠检索片段拼。知识页是转述，没有页码，
+    不能给它标 [1]；要给出处就用 search_materials 回教材查，用那一次返回的编号。"""
 # ponytail: 字符数保守近似 token（1 字符 ≤ 1 token）；接入真实 tokenizer 前不做精确计数。
 # 单条消息上限，防止一条超长消息吃掉整个历史预算。
 MESSAGE_MAX_CHARS = 20_000
@@ -52,7 +58,7 @@ _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课�
    范围就先问清再排，不要自己假设。
 5.1 上面的会话历史只保留了双方说过的话，早先轮次检索到的教材原文与工具结果不在里面。
     用户提到"刚才那段""你之前查到的"而历史里只剩你当时的结论时，用 history_read 把那几轮的
-    引用原文和工具痕迹取回来，不要凭印象复述，也不要当作没有过。
+    引用原文和工具痕迹取回来，不要凭印象复述，也不要当作没有过。{wiki_hint}
 6. 不要写"让我再搜索一下""我来查一下"这类过渡语。需要补查就直接调用工具，
    界面会展示检索过程；你的回答只写结论本身。
 7. 只承诺系统当前具备的能力，不要声称自己能做工具清单以外的事。
@@ -132,6 +138,7 @@ def assemble_messages(
     conversation_summary: str = "",
     today: str = "",
     web_available: bool = True,
+    wiki_available: bool = False,
 ) -> AssembledContext:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
     与模型自己调 search_materials 得到的形态一致）。"""
@@ -143,6 +150,7 @@ def assemble_messages(
         course_name=course_name, materials=_material_lines(materials),
         skills=skills_block, practice_digest=practice_block, memory=memory_block,
         web_hint=_WEB_HINT if web_available else "",
+        wiki_hint=_WIKI_HINT if wiki_available else "",
         conversation_summary=summary_block,
         today=today or date.today().isoformat(),
     )

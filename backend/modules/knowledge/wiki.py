@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from contracts.knowledge import ConceptRef, KnowledgeHit
+from contracts.knowledge import ConceptRef, KnowledgeHit, WikiDocument
 from contracts.llm import ChatFinal, ChatMessage
 
 PROMPT_VERSION = "wiki-v1"
@@ -145,6 +145,21 @@ class WikiStore:
     def delete_course(self, *, course_id: str) -> None:
         """删课程时由组装根调用。目录布局是本模块自己的事，别处不该知道。"""
         shutil.rmtree(self._course_dir(course_id), ignore_errors=True)
+
+
+def split_page(*, concept_id: str, document: str) -> WikiDocument:
+    """把落盘的一页拆成正文与手写区，丢掉 frontmatter。
+
+    frontmatter 记的是证据指纹、提示词版本这类内部账，读页的人不需要；标题行也去掉，
+    概念名单独给出。手写区要留着——那是用户自己整理的内容，但归属得说清楚。
+    """
+    text = re.sub(r"\A---\n.*?\n---\n", "", document, count=1, flags=re.S).strip()
+    body, _, handwritten = text.partition(HANDWRITTEN_MARKER)
+    concept_name = ""
+    if match := re.match(r"#\s+(.+)", body.strip()):
+        concept_name = match.group(1).strip()
+        body = body.strip()[match.end():]
+    return WikiDocument(concept_id, concept_name or concept_id, body.strip(), handwritten.strip())
 
 
 def _evidence(hits: Iterable[KnowledgeHit]) -> tuple[str, list[str], str]:

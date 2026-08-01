@@ -22,7 +22,7 @@ from contracts.web import WebSearchPort
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
 from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, assemble_general_messages, assemble_messages, message_chars
 from .skills import SkillRegistry
-from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, profile_for_skill, specs_for
+from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, profile_for_skill, specs_for, without_tools
 from .trace import TraceWriter
 
 logger = logging.getLogger(__name__)
@@ -545,6 +545,9 @@ class TurnService:
                     provider, model = (response.provider, response.model) if response else ("system", "none")
             else:
                 scope = ResolvedKnowledgeScope(turn_id=turn.id, course_id=context.course_id, resolver_version=context.resolver_version)
+                # 这门课没开知识页就整体不下发那两个工具，提示词里推荐它们的那半句也一起撤掉
+                # （见 context._WIKI_HINT）：下发不了还在推荐，模型会口头答应去读而实际读不到。
+                wiki_off = frozenset() if self._knowledge.wiki_enabled(scope=scope) else WIKI_TOOLS
                 # 种子检索：先查课程证据是系统行为，不依赖模型自觉；
                 # 结果以工具调用的形态注入，模型需要补查时自然复用同一工具。
                 seed_args = json.dumps({"query": message}, ensure_ascii=False)
@@ -562,6 +565,7 @@ class TurnService:
                     history=history,
                     question=message,
                     web_available=NETWORK not in self._offline,
+                    wiki_available=not wiki_off,
                     seed_query=message,
                     seed_result_text=seed.text,
                     history_token_budget=self._history_token_budget,
@@ -576,7 +580,7 @@ class TurnService:
                 responder = self._responder
                 if self._select_responder and (model_key is not None or thinking is not None):
                     responder = self._select_responder(model_key, thinking)
-                allowed_tools = MAIN_PROFILE
+                allowed_tools = without_tools(MAIN_PROFILE, wiki_off)
                 budget_notified = False
                 capabilities = MAIN.capabilities - self._offline
                 tool_budget = MAIN.per_tool_budget
@@ -633,7 +637,7 @@ class TurnService:
                     messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{auto_skill.body}", tool_call_id=call_id))
                     base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", len(auto_skill.body))]
                     skill_profile = profile_for_skill(auto_skill.allowed_tools)
-                    active_skill, allowed_tools = auto_skill.name, skill_profile.tools
+                    active_skill, allowed_tools = auto_skill.name, without_tools(skill_profile.tools, wiki_off)
                     capabilities = skill_profile.capabilities - self._offline
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                     trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
@@ -777,7 +781,7 @@ class TurnService:
                                     skill = self._skills.get(active_skill)
                                     if skill:
                                         skill_profile = profile_for_skill(skill.allowed_tools)
-                                        allowed_tools = skill_profile.tools
+                                        allowed_tools = without_tools(skill_profile.tools, wiki_off)
                                         capabilities = skill_profile.capabilities - self._offline
                                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                                     trace_record["skill"] = {"name": active_skill, "content_hash": skill.content_hash if skill else None, "activation": "model"}

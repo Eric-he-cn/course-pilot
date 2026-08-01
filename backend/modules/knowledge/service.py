@@ -9,7 +9,7 @@ from typing import Callable
 from core.common import new_id, utc_now
 from core.settings import Settings
 from contracts.embedding import EmbedderPort
-from contracts.knowledge import ConceptRef, KnowledgeHit, ResolvedKnowledgeScope
+from contracts.knowledge import ConceptRef, KnowledgeHit, ResolvedKnowledgeScope, WikiDocument, WikiEntry
 from contracts.llm import ChatFinal
 from contracts.reranker import RerankerPort
 
@@ -214,6 +214,26 @@ class KnowledgeService:
 
     def concepts(self, *, scope: ResolvedKnowledgeScope, limit: int = 60) -> list[ConceptRef]:
         return self.list_course_concepts(course_id=scope.course_id, limit=limit)
+
+    def wiki_enabled(self, *, scope: ResolvedKnowledgeScope) -> bool:
+        return self._wiki_is_enabled(scope.course_id)
+
+    def wiki_index(self, *, scope: ResolvedKnowledgeScope) -> list[WikiEntry]:
+        """Agent-only：课程没开知识页就当作没有页，不靠调用方记得先问一句。"""
+        if not self._wiki_is_enabled(scope.course_id):
+            return []
+        return [
+            WikiEntry(str(page["concept_id"]), str(page["concept_name"]), int(page["chars"] or 0))
+            for page in self.wiki_pages(course_id=scope.course_id)
+        ]
+
+    def wiki_read(self, *, scope: ResolvedKnowledgeScope, concept_id: str) -> WikiDocument:
+        """Agent-only：按落盘格式拆成正文与手写区。frontmatter 是内部记账（证据指纹、
+        提示词版本），对调用方没有意义，就地丢掉。"""
+        if not self._wiki_is_enabled(scope.course_id):
+            raise LookupError(concept_id)
+        raw = self.wiki_page(course_id=scope.course_id, concept_id=concept_id)
+        return wiki.split_page(concept_id=concept_id, document=raw)
 
     def concept_exists(self, course_id: str, concept_id: str) -> bool:
         """按 id 精确判断，不受概念清单的展示上限影响。"""

@@ -60,6 +60,34 @@ def _history_limit_note(dropped: int, clipped: bool) -> str:
     advice = "用 kind 只取一类可以给得更全" if clipped else "用 kind 只取一类，或减小 turns，可以把剩下的读回来"
     return f"\n\n（已到单次返回上限：{'；'.join(facts)}。{advice}。）"
 
+# wiki_index 一次最多列几页。目录本身要能一眼看完，列到上百条就又变成一篇要读的东西；
+# 超出部分明说有多少，别让模型以为这门课就这些概念。
+WIKI_INDEX_MAX_ENTRIES = 60
+# wiki_read 单页字符上限。生成的正文控制在 500 字以内，手写区没有上限（落盘只挡 128 KiB），
+# 6000 够放下正文加一段长手写，又不至于一页吃掉整个上下文。
+WIKI_PAGE_MAX_CHARS = 6_000
+_WIKI_NOTE_RESERVE = 60
+_WIKI_INDEX_HEADER = (
+    "本课程知识页索引（每页是系统按教材为一个概念整理的转述稿，"
+    "用 wiki_read 加下面的 id 读正文）。"
+    # 实测模型会把 id 抄进回答里（「进程抽象（concept_9dd5…）」），得明说一句。
+    "id 只用于调工具，回答里不要出现，对用户只说概念名：\n"
+)
+# 知识页是转述，没有页码，也不进本轮的引用编号。这句要跟着正文一起给：
+# 只写在工具描述里的话，模型读完长正文就只记得内容，转头给它标了 [1]。
+_WIKI_PAGE_HEADER = (
+    "（以下是知识页，系统按教材整理的转述稿，不是教材原文，也没有页码。"
+    "可以据此作答，但不能给它标 [1] 这类引用编号；要给出处就用 search_materials 回教材查，"
+    "用那一次返回的编号。）\n"
+)
+_WIKI_HANDWRITTEN_HEADER = "以下是用户自己在这一页写的补充（不是教材内容）："
+
+
+def _wiki_limit_note(dropped: int) -> str:
+    """截断说清楚剩多少，不然模型会把"给到这里"当成"这一页就这么长"。"""
+    return f"\n\n（本页超过单次返回上限，末尾还有约 {dropped} 字没有给出。）" if dropped else ""
+
+
 # 网页与检索结果是用户可控的外部内容，和教材证据、OCR 转录同一档：只作资料。
 # 声明放在正文之前——后置声明会被长正文推走。
 _UNTRUSTED_PREFIX = (
@@ -182,6 +210,31 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "description": "citations 只要引用原文，tools 只要工具痕迹，默认 all",
                 },
             },
+        },
+    ),
+    ToolSpec(
+        name="wiki_index",
+        description=(
+            "读当前课程知识页的总索引：这门课有哪些概念页、各自的 concept_id。"
+            "知识页是系统事先按教材为每个概念写好的整理稿。"
+            "先读索引看清这门课由哪些部分组成，再用 wiki_read 定点读需要的那几页——"
+            "问「这门课分成哪几块」「该从哪学起」这类要看全貌的问题，或一个问题同时牵扯几章时，"
+            "比反复换关键词检索更快也更全。"
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="wiki_read",
+        description=(
+            "读一页知识页的正文，concept_id 取自 wiki_index。"
+            "知识页是对教材的转述，不是教材原文，也没有页码：据此作答可以，"
+            "但不能给它标 [1] 这类引用编号。需要给出处时用 search_materials 回教材查到原文，"
+            "用那一次返回的编号。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"concept_id": {"type": "string", "description": "wiki_index 列出的概念 id"}},
+            "required": ["concept_id"],
         },
     ),
     ToolSpec(
@@ -314,7 +367,7 @@ READ_COURSE, WRITE_STATE, WRITE_NOTE, NETWORK, FREE = "read_course", "write_stat
 TOOL_CAPABILITY: dict[str, str] = {
     "search_materials": READ_COURSE, "list_materials": READ_COURSE, "get_plan": READ_COURSE,
     "get_archive": READ_COURSE, "concept_search": READ_COURSE, "note_read": READ_COURSE,
-    "history_read": READ_COURSE,
+    "history_read": READ_COURSE, "wiki_index": READ_COURSE, "wiki_read": READ_COURSE,
     "emit_evidence": WRITE_STATE, "plan_update": WRITE_STATE, "memory_patch": WRITE_STATE,
     "artifact_append": WRITE_STATE,
     "note_write": WRITE_NOTE,
@@ -347,6 +400,7 @@ MAIN = ToolProfile(
         "search_materials", "list_materials", "get_plan", "plan_update", "get_archive",
         "concept_search", "emit_evidence", "memory_patch", "note_write", "note_read",
         "web_search", "web_fetch", "calculator", "use_skill", "ask_user", "history_read",
+        "wiki_index", "wiki_read",
     ),
     capabilities=frozenset({READ_COURSE, WRITE_STATE, WRITE_NOTE, NETWORK, FREE}),
     # 只给花钱的工具设上限：其余都是本地读，轮次上限已经在管。
@@ -357,6 +411,16 @@ MAIN = ToolProfile(
     per_tool_budget={"web_search": 5, "web_fetch": 5, "plan_update": 1, "history_read": 3},
 )
 MAIN_PROFILE = MAIN.tools
+
+# 课程没开知识页时这两个整体不下发（照没配联网时 web_* 的先例）。判据在课程上而不在配置上，
+# 所以不能像 NETWORK 那样按能力摘——它们和 search_materials 同属 read_course。
+WIKI_TOOLS: frozenset[str] = frozenset({"wiki_index", "wiki_read"})
+
+
+def without_tools(names: tuple[str, ...], excluded: frozenset[str]) -> tuple[str, ...]:
+    """摘掉本轮用不了的工具。摘在工具集这一层，schema 下发与运行期准入就用的是同一份名单。"""
+    return tuple(name for name in names if name not in excluded) if excluded else names
+
 
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 
@@ -640,6 +704,10 @@ class ToolExecutor:
                 return self._artifact_read(session_id, parsed)
             if name == "history_read":
                 return self._history_read(scope, session_id, parsed)
+            if name == "wiki_index":
+                return self._wiki_index(scope)
+            if name == "wiki_read":
+                return self._wiki_read(scope, parsed)
             if name == "artifact_append":
                 return self._artifact_append(scope, session_id, parsed)
             if name == "memory_patch":
@@ -765,6 +833,46 @@ class ToolExecutor:
         return ToolOutcome(
             text=text, ok=True, summary=f"回看 {len(kept)} 轮记录",
             summary_key="summary.history_read", summary_args={"n": len(kept)},
+        )
+
+    def _wiki_index(self, scope: ResolvedKnowledgeScope) -> ToolOutcome:
+        """总索引：概念名 + id，让模型据此挑要读哪几页。页面目前是平的，有层级后在这里分层。"""
+        entries = self._knowledge.wiki_index(scope=scope)
+        if not entries:
+            return ToolOutcome(
+                text="当前课程还没有知识页。用 search_materials 直接检索教材。", ok=True,
+                summary="无知识页", summary_key="summary.wiki_index_empty",
+            )
+        shown = entries[:WIKI_INDEX_MAX_ENTRIES]
+        lines = [f"- {entry.concept_id} | {entry.concept_name}" for entry in shown]
+        dropped = len(entries) - len(shown)
+        note = f"\n\n（还有 {dropped} 页没有列出，用 concept_search 按名称找它们的 id。）" if dropped else ""
+        return ToolOutcome(
+            text=_WIKI_INDEX_HEADER + "\n".join(lines) + note, ok=True,
+            summary=f"{len(shown)} 页知识页", summary_key="summary.wiki_index", summary_args={"n": len(shown)},
+        )
+
+    def _wiki_read(self, scope: ResolvedKnowledgeScope, parsed: dict) -> ToolOutcome:
+        concept_id = str(parsed.get("concept_id") or "").strip()
+        if not concept_id:
+            raise ValueError("wiki_read 需要 concept_id")
+        try:
+            page = self._knowledge.wiki_read(scope=scope, concept_id=concept_id)
+        except LookupError:
+            return ToolOutcome(
+                text=f"没有 {concept_id} 的知识页。先用 wiki_index 看有哪些页可读。", ok=False,
+                summary="没有这一页知识页", summary_key="summary.wiki_page_missing", reason="wiki_page_missing",
+            )
+        parts = [f"{_WIKI_PAGE_HEADER}\n# {page.concept_name}\n\n{page.body}"]
+        if page.handwritten:
+            parts.append(f"{_WIKI_HANDWRITTEN_HEADER}\n{page.handwritten}")
+        text = "\n\n".join(parts)
+        dropped = len(text) - (WIKI_PAGE_MAX_CHARS - _WIKI_NOTE_RESERVE)
+        if dropped > 0:
+            text = _clip(text, WIKI_PAGE_MAX_CHARS - _WIKI_NOTE_RESERVE) + _wiki_limit_note(dropped)
+        return ToolOutcome(
+            text=text, ok=True, summary=f"读知识页「{_plain_line(page.concept_name, 20)}」",
+            summary_key="summary.wiki_read", summary_args={"name": _plain_line(page.concept_name, 20)},
         )
 
     def _artifact_append(self, scope: ResolvedKnowledgeScope, session_id: str, parsed: dict) -> ToolOutcome:

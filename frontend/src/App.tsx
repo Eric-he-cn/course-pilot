@@ -25,7 +25,7 @@ const TOOL_STOPPED_KEY = 'tool.stopped'
 const TOOL_CAPABILITY_HINT: Record<string, string> = {
   search_materials: 'read_course', list_materials: 'read_course', get_plan: 'read_course',
   get_archive: 'read_course', concept_search: 'read_course', note_read: 'read_course',
-  history_read: 'read_course',
+  history_read: 'read_course', wiki_index: 'read_course', wiki_read: 'read_course',
   plan_update: 'write_state', emit_evidence: 'write_state', memory_patch: 'write_state',
   artifact_append: 'write_state', note_write: 'write_note',
   web_search: 'network', web_fetch: 'network',
