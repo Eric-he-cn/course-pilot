@@ -1129,8 +1129,8 @@ samples:
     4 页且互不相邻。预期当前版本在检索召回与答案要点上一起失败：「算完还是高斯」在原文里没有对应字面（原文是英文的 closure property），检索大概率只落在
     6.5.1 条件／边缘那一段，第 4 条要点缺失，第 2、3 条也可能只答一半。
 materials:
-  llm-微调-LoRA.pdf: e41fd1b18f13675425651548e3b65f036c390655f0b958c040bb5035746cdebd
-  llm-指令数据集.pdf: a6a14608cd04919579f9ced4d15644bdfda2600f4506f92e7a5444289a463fbb
-  math-gaussian.pdf: e7a7fe6bb9d3712c2195fb12a6f301f2e78efe194215cfc7f1f158558a7d918b
+  llm-微调-LoRA.pdf: b08af8193f0a36610439a4921a66e1ba512d72953376cc960e22b95af3602942
+  llm-指令数据集.pdf: f7a2dfe8138420148c9d595892d248041d93343985442e44e7d8006000b2e8c9
+  math-gaussian.pdf: eda7ff4a6ce8a152490d13c84b2ca9a1e0bf09500dca04dc15115111f5628039
   os-cpu-scheduling.pdf: 99f6989e446ef0307cf2eb604fa42ed2c7b1693a708f484b860bb84312c6e15e
-  深度学习-批量规范化.pdf: 03a142abf532373e7827e4ee4dc7224a7486644312b80cf1de42d7117c12bfad
+  深度学习-批量规范化.pdf: 2b2d34c3b242c241016ee296f423dc118c280d03fd84fc907092ed9a1dd0dee2

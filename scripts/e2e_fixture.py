@@ -75,14 +75,45 @@ def fetch(source: Source, directory: Path) -> Path:
     return path
 
 
+def carry_outline(reader: PdfReader, writer: PdfWriter, first: int, last: int) -> int:
+    """把原书目录里落在 [first, last] 的书签按原层级搬进切片，页码换算成切片内的序号。
+
+    pypdf 的 outline 是嵌套列表：紧跟某一条之后的子列表就是它的下级。只 add_page 不会
+    带走书签，而概念的层级要靠它还原。
+    """
+    carried = 0
+
+    def walk(node, parent) -> None:
+        nonlocal carried
+        latest = parent
+        for item in node:
+            if isinstance(item, list):
+                walk(item, latest)
+                continue
+            try:
+                page = reader.get_destination_page_number(item) + 1
+            except Exception:  # noqa: BLE001 - 指不到页的书签跳过就行
+                continue
+            if not first <= page <= last:
+                latest = parent  # 范围外的条目不入切片，它的下级挂回上一层
+                continue
+            latest = writer.add_outline_item(item.title, page - first, parent=parent)
+            carried += 1
+
+    walk(reader.outline, None)
+    return carried
+
+
 def cut(source_pdf: Path, spec: Slice, out_dir: Path) -> tuple[Path, list[str]]:
     reader = PdfReader(source_pdf)
     writer = PdfWriter()
     for number in range(spec.first_page, spec.last_page + 1):
         writer.add_page(reader.pages[number - 1])
+    carried = carry_outline(reader, writer, spec.first_page, spec.last_page)
     target = out_dir / spec.out
     with target.open("wb") as stream:
         writer.write(stream)
+    print(f"  {spec.out}：{spec.last_page - spec.first_page + 1} 页，书签 {carried} 条")
     pages = [(page.extract_text() or "").replace("\n", " ") for page in PdfReader(target).pages]
     return target, pages
 
