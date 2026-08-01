@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from modules.knowledge.concepts import extract_candidates, from_outline
+from modules.knowledge.concepts import extract_candidates, from_outline, merge_case_variants
 
 
 def _names(segments: list[tuple[int | None, str]]) -> list[str]:
@@ -91,3 +91,25 @@ def test_outline_dedupes_repeated_titles_keeping_the_shallowest():
 def test_outline_reuses_the_same_sanity_filters_as_scraping():
     rows = [(1, "x = y + 1", 5), (1, "https://example.com", 6), (1, "3.2", 7), (1, "批量规范化", 8)]
     assert [item["name"] for item in from_outline(rows)] == ["批量规范化"]
+
+
+# ---- 大小写变体 ----
+
+def test_case_variants_merge_and_the_most_mentioned_one_names_the_concept():
+    """id 由 casefold 派生，LoRA 与 lora 本来就是同一个概念。"""
+    merged = merge_case_variants([
+        {"name": "lora", "mention_count": 1, "page": 9},
+        {"name": "微调", "mention_count": 4, "page": 2},
+        {"name": "LoRA", "mention_count": 6, "page": 3},
+    ])
+    assert [(item["name"], item["mention_count"], item["page"]) for item in merged] == [
+        ("LoRA", 6, 3), ("微调", 4, 2),
+    ]
+
+
+def test_case_variant_merge_is_idempotent_and_breaks_ties_by_order():
+    """次数并列时留先出现的；结果再合一次不变，重复索引才拿得到同样的概念。"""
+    once = merge_case_variants([{"name": "Attention", "mention_count": 3, "page": 1},
+                                {"name": "ATTENTION", "mention_count": 3, "page": 8}])
+    assert [item["name"] for item in once] == ["Attention"]
+    assert merge_case_variants(once) == once

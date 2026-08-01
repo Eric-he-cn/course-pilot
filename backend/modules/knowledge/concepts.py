@@ -101,6 +101,21 @@ def concept_id_for(course_id: str, name: str) -> str:
     return f"concept_{digest}"
 
 
+def merge_case_variants(candidates: list[dict]) -> list[dict]:
+    """把只差大小写的候选合成一个：id 由 casefold 派生，它们本来就是同一个概念。
+
+    显示名与页码取提及次数最多的那个变体，并列时取先出现的；次数本身取较大值，
+    与同名概念跨教材 upsert 的口径一致。候选顺序确定，所以重复索引结果不变。
+    """
+    merged: dict[str, dict] = {}
+    for candidate in candidates:
+        key = candidate["name"].casefold()
+        winner = merged.get(key)
+        if winner is None or candidate.get("mention_count", 1) > winner.get("mention_count", 1):
+            merged[key] = candidate
+    return list(merged.values())
+
+
 def extract_candidates(segments: list[tuple[int | None, str]], *, limit: int = 200) -> list[dict]:
     """从教材文本抽概念候选，按提及次数排序。
 

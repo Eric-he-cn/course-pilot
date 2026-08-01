@@ -7,13 +7,30 @@ from core.common import new_id, utc_now
 from core.store import SQLiteStore
 from contracts.knowledge import Citation, KnowledgeHit
 
-from .concepts import concept_id_for
+from .concepts import concept_id_for, merge_case_variants
 from .models import Chunk, Job, Material
 
 
 _CJK = re.compile(r"[一-鿿]")
 # 与 chunks_fts 的 trigram 分词器保持一致（core/store.py 迁移 19）。
 _FTS_GRAM = 3
+
+# 本教材重新索引以这次抽取结果为准（次数会真的变少）；同名概念归属别的教材时
+# 不抢它的位置，次数取较大值。
+_CONCEPT_MERGE = (
+    " DO UPDATE SET"
+    " mention_count = CASE WHEN material_id = excluded.material_id"
+    " THEN excluded.mention_count ELSE MAX(mention_count, excluded.mention_count) END,"
+    " page = CASE WHEN material_id = excluded.material_id THEN excluded.page ELSE page END"
+)
+# 只差大小写的名字撞的是主键而不是 (course_id, name)，得单开一条子句接住，
+# 否则整个索引作业抛 UNIQUE 冲突。合并进已有概念，显示名保持不变。
+_CONCEPT_UPSERT = (
+    "INSERT INTO concepts(id, course_id, name, chapter, material_id, page, mention_count, created_at)"
+    " VALUES (?, ?, ?, NULL, ?, ?, ?, ?)"
+    f" ON CONFLICT(course_id, name){_CONCEPT_MERGE}"
+    f" ON CONFLICT(id){_CONCEPT_MERGE}"
+)
 
 _MATERIAL_SELECT = """
     SELECT m.*,
@@ -191,6 +208,7 @@ class KnowledgeRepository:
 
         只删这次没再抽到的概念，连它的投影一起删。留下来的保住 id，掌握度与错题历史不断档；
         整批删了再插会撞投影表的外键，也会把用户的错题记录一起抹掉。
+        只差大小写的名字（Attention / attention）派生同一个 id，按同一个概念合并。
         """
         now = utc_now()
         if not candidates:
@@ -198,6 +216,7 @@ class KnowledgeRepository:
             # 都没了"。这时候什么都不动，免得把用户的错题与掌握度一起清掉。
             with self._store.read() as conn:
                 return int(conn.execute("SELECT count(*) FROM concepts WHERE course_id = ?", (course_id,)).fetchone()[0])
+        candidates = merge_case_variants(candidates)
         keep = [concept_id_for(course_id, candidate["name"]) for candidate in candidates]
         condition = f"course_id = ? AND material_id = ? AND id NOT IN ({','.join('?' * len(keep))})"
         doomed, params = f"SELECT id FROM concepts WHERE {condition}", (course_id, material_id, *keep)
@@ -215,14 +234,7 @@ class KnowledgeRepository:
             conn.execute("DELETE FROM mistake_backfills WHERE course_id = ?", (course_id,))
             for candidate in candidates:
                 conn.execute(
-                    "INSERT INTO concepts(id, course_id, name, chapter, material_id, page, mention_count, created_at)"
-                    " VALUES (?, ?, ?, NULL, ?, ?, ?, ?)"
-                    # 本教材重新索引以这次抽取结果为准（次数会真的变少）；同名概念归属别的教材时
-                    # 不抢它的位置，次数取较大值。
-                    " ON CONFLICT(course_id, name) DO UPDATE SET"
-                    " mention_count = CASE WHEN material_id = excluded.material_id"
-                    " THEN excluded.mention_count ELSE MAX(mention_count, excluded.mention_count) END,"
-                    " page = CASE WHEN material_id = excluded.material_id THEN excluded.page ELSE page END",
+                    _CONCEPT_UPSERT,
                     (concept_id_for(course_id, candidate["name"]), course_id, candidate["name"], material_id,
                      candidate.get("page"), candidate.get("mention_count", 1), now),
                 )
