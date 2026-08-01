@@ -376,3 +376,22 @@ def test_segments_beyond_the_cap_are_reported_as_dropped():
     _sections, stats = _plan([], _chunks(list(range(1, 21)), size=5000), max_nodes=4)
 
     assert stats["candidates"] > 4 and stats["dropped"] == stats["candidates"] - 4
+
+
+def test_a_backwards_bookmark_does_not_leave_a_section_reading_nothing():
+    """目录里页码倒退时（扫描件重排、附录插在中间），区间会变成起点大于终点，
+    那一节一个分片都取不到。夹到起始页，它至少还读得到自己那一页。"""
+    concepts = [
+        {"id": "a", "name": "第一章", "page": 1, "level": 0, "parent_id": None, "ordinal": 0},
+        {"id": "b", "name": "第二章", "page": 5, "level": 0, "parent_id": None, "ordinal": 1},
+        {"id": "c", "name": "附录", "page": 2, "level": 0, "parent_id": None, "ordinal": 2},
+    ]
+    chunks = [{"id": f"ch{page}", "page": page, "ordinal": page, "content": f"p{page}"} for page in range(1, 9)]
+    from modules.knowledge.wiki import plan_sections
+
+    sections, _ = plan_sections(material_id="m1", concepts=concepts, chunks=chunks)
+
+    assert all(section.last_page >= section.first_page for section in sections), \
+        [(s.name, s.first_page, s.last_page) for s in sections]
+    assert all(section.chunks for section in sections if not section.children), \
+        [s.name for s in sections if not s.children and not s.chunks]

@@ -339,7 +339,8 @@ def plan_sections(
         # 书签页码指的是标题所在页，跨页标题会指到上一页。结尾多带一页，宁可相邻
         # 小节重叠，也不让边界那页的正文谁都没读到。
         end = (following.get("page") or starts[following["id"]]) if following else total_pages
-        # 同一页上排着几个小节时区间会退化成负数，夹到起始页，段落照样成立。
+        # 目录里页码倒退时（扫描件重排、附录插在中间）区间会起点大于终点，那一节
+        # 一个分片都取不到。夹到起始页，它至少读得到自己那一页。
         ends[row["id"]] = max(end, starts[row["id"]])
 
     sections: list[Section] = []
