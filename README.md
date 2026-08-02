@@ -178,8 +178,8 @@ mastery, plan, notes and conversations with it.
 Learning is only the scenario. What follows is the part that makes an agent reliable on real tasks,
 and any other domain needs it just the same.
 
-**Tool loop.** 17 tools registered, graded into five capability tiers by side effect: read course,
-write state, write notes, network, no side effect. The ones that cost money and the ones that
+**Tool loop.** 21 tools registered, graded into six capability tiers by side effect: read course,
+write state, write notes, network, delegate, no side effect. The ones that cost money and the ones that
 change user data get their own call limits. Within one turn, read tools with identical arguments
 reuse the result and write tools do not — answer three problems on the same concept in a row and
 the arguments for writing evidence are word-for-word identical. When the turn budget runs out the
