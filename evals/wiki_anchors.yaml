@@ -1,0 +1,155 @@
+# 事实锚点：知识页收益的第三个判据。
+#
+# 为什么要这一维——召回量的是「引用了哪几页教材」，而知识页是转述稿、天然引不出教材页码。
+# 知识页真正的作用是让模型知道「这门课还有这么一件事」，这件事显形在回答正文里，不在引用列表里。
+# 所以每条 global_synthesis 各钉一个只在远处那一页出现的事实，判它有没有被答出来。
+#
+# 选锚点的规矩：
+#   1. 锚点文本只在远端那一页出现（下面每条都标了 page，已用 pypdf 逐页核过）。
+#   2. 用正则匹配，不用 judge——judge 在这一维上对同一次调用给过 1 分和 4 分。
+#   3. 正则要容得下改写，但必须要求那条事实本身，不能只匹配问句里已经出现的词。
+#
+# primary 是这条样本的判据；secondary 只作参考，不进主表。
+# only_on_page 是核对结果，不参与匹配。
+
+anchors:
+- id: synth-001
+  document: os-cpu-scheduling.pdf
+  primary:
+    name: oracle_unsolved
+    only_on_page: 10
+    fact: 到本章结束仍未放开的是「调度器已知每个作业的运行时间」这条假设；教材第 7.9 节 No More
+      Oracle 明说通用操作系统对作业长度几乎一无所知。
+    patterns:
+    - '(运行时间|作业长度|执行时间|作业时长|运行时长|任务长度|job length)[^。；\n]{0,24}(已知|未知|不可知|无法预知|无法得知|不知道)'
+    - '(无法|不能|不可能|难以|很难)[^。；\n]{0,12}(预知|预先知道|提前知道|事先知道|得知|知晓|知道)[^。；\n]{0,24}(运行时间|作业长度|执行时间|运行时长|时长)'
+    - 'no more oracle'
+    - '(先知|oracle)[^。；\n]{0,20}(假设|假定)'
+  secondary:
+    name: io_subjob
+    only_on_page: 10
+    fact: 放开「只用 CPU 不做 I/O」这条的做法是把作业的每一段 CPU 使用（10ms 子作业）当成一个独立作业来调度。
+    patterns:
+    - '独立[的]?(作业|任务|job)'
+    - '子作业'
+    - 'sub-?job'
+    - '(每|各)[一]?(段|次|个)[^。；\n]{0,8}CPU[^。；\n]{0,12}(当成|当作|视为|看作|视作|作为|按)'
+
+- id: synth-002
+  document: os-cpu-scheduling.pdf
+  primary:
+    name: rr_turnaround_14
+    only_on_page: 8
+    fact: 三个各 5 秒的作业、时间片 1 秒时，RR 的平均周转时间是 14 秒（A/B/C 分别在 13、14、15 完成），比 FIFO 还差。
+    patterns:
+    - '(周转|turnaround)[^。；\n]{0,60}\b14\b'
+    - '\b14\b[^。；\n]{0,60}(周转|turnaround)'
+    - '13[^0-9\n]{0,6}14[^0-9\n]{0,6}15'
+  secondary:
+    name: rr_response_1_vs_5
+    only_on_page: 8
+    fact: 同一组作业下 RR 的平均响应时间是 1 秒，SJF 是 5 秒。
+    patterns:
+    - '(响应|response)[^。；\n]{0,60}\b1\b[^。；\n]{0,40}\b5\b'
+    - '(响应时间)[^。；\n]{0,30}(是|为|＝|=)\s*1\s*(秒|s\b)'
+
+- id: synth-003
+  document: 深度学习-批量规范化.pdf
+  primary:
+    name: icv_misnomer
+    only_on_page: 7
+    fact: 教材指出「内部协变量偏移」这个名字用词不当，而且这种解释只提供了一种不明确的直觉。
+    patterns:
+    - '用词不当'
+    - 'misnomer'
+    - '(名字|名称|命名|术语|叫法)[^。；\n]{0,16}(不当|不准确|不恰当|不合适|有误导|误导性)'
+    - '不明确的直觉'
+    - '(模糊|含糊|不清晰)[^。；\n]{0,6}直觉'
+  secondary:
+    name: icv_refuted
+    only_on_page: 8
+    fact: 有工作给出与原论文相反的结论，教材小结说「原始动机似乎不是一个有效的解释」。
+    patterns:
+    - 'santurkar'
+    - '(相反|截然不同|截然相反)[^。；\n]{0,10}(结论|结果|发现)'
+    - '(不是|并非|未必是|算不上)[^。；\n]{0,8}(一个)?有效的?解释'
+    - 'rahimi'
+
+- id: synth-004
+  document: llm-指令数据集.pdf
+  primary:
+    name: table_only_datasets
+    only_on_page: 6
+    fact: 表 5.1 的「构建方式」一列。Flan2021 / pCLUE / OpenAssistant Conversations / Dolly / BELLE
+      这五个数据集只出现在这张表（及紧随其后的逐条说明）里，正文前五页一次都没提过。答出其中三个以上，
+      说明表格页的内容真的到场了。
+    match: count>=3
+    patterns:
+    - 'flan\s*-?\s*2021'
+    - 'pclue'
+    - 'openassistant'
+    - '\bdolly\b'
+    - '\bbelle\b'
+  secondary:
+    name: belle_auto_generated
+    only_on_page: 6
+    fact: BELLE 在表里被标为「自动生成」。
+    patterns:
+    - 'belle[^。；\n]{0,40}自动生成'
+    - '自动生成[^。；\n]{0,60}belle'
+
+- id: synth-005
+  document: llm-微调-LoRA.pdf
+  primary:
+    name: qlora_quantization
+    only_on_page: 6
+    fact: QLoRA 把预训练模型量化到 4-bit NormalFloat（NF4），并对分块的放缩系数做双重量化，
+      使每参数额外开销从 0.5 比特降到 0.127 比特。
+    patterns:
+    - 'nf4'
+    - 'normalfloat'
+    - '双重量化'
+    - 'double\s*quantization'
+    - '0\.127'
+  secondary:
+    name: qlora_65b_48gb
+    only_on_page: 6
+    fact: QLoRA 能把 650 亿参数的模型在单张 48GB GPU 上微调。
+    patterns:
+    - '650\s*亿'
+    - '\b65\s*B\b'
+    - '48\s*GB'
+
+- id: synth-006
+  document: math-gaussian.pdf
+  primary:
+    name: exponential_family
+    only_on_page: 12
+    fact: 教材把闭合性列为挑选分布的第一条 desiderata，并由此引出指数族——「为什么把这条性质看得这么重」
+      的答案只在 6.6 节开头。
+    patterns:
+    - '指数族'
+    - 'exponential\s+family'
+    - 'desiderata'
+  secondary:
+    name: closure_property
+    only_on_page: 12
+    fact: 教材给这条性质起的名字是 closure property（闭合性 / 封闭性）。
+    patterns:
+    - 'closure'
+    - '闭合性'
+    - '封闭性'
+    - '闭包性'
+  # 主锚点匹配「指数族」，而 B 侧的知识页目录里正好有一页叫「高斯变换与指数族分布概述」，
+  # 目录又是注入系统提示的——只凭这个词判命中，可能把「抄了个页面标题」读成「答出了事实」。
+  # 这条换成标题里没有的判据：p.12 三条 desiderata 的后两条。两者结论一致才敢下判断。
+  strict:
+    name: desiderata_beyond_title
+    only_on_page: 12
+    fact: 挑选分布的另外两条 desiderata——数据变多时不需要更多参数、参数估计行为良好。
+    patterns:
+    - '(参数(的)?(个数|数量|数目)|参数量)[^。；\n]{0,20}(不(随|会随|需要)|无需)[^。；\n]{0,20}(数据|样本|增长|增多)'
+    - '(收集|拿到)[^。；\n]{0,12}(更多)?数据[^。；\n]{0,24}不(需要|用)[^。；\n]{0,10}更多[^。；\n]{0,6}参数'
+    - '参数估计[^。；\n]{0,16}(行为|性质)[^。；\n]{0,8}(良好|好)'
+    - 'desiderata'
+    - '三(条|点|个)[^。；\n]{0,8}(期望|要求|诉求|愿望|理想)'
