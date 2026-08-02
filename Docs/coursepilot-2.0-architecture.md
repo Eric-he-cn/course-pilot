@@ -118,10 +118,12 @@ Tutor 不是独立角色或 skill，而是系统提示词中常驻的课程问�
 1. **系统提示**：Tutor 证据合约 + 工具总则 + 可用 skill 摘要列表（只有 name + when_to_use 一句话，不含正文）。语言规则前置在最开头——它管全局，编号排到底下会被后面的中文教材证据压住。
 2. **本轮课程上下文**：课程会话使用固定绑定；通用会话注入本轮不可变 `turn_course_context`、解析理由、课程名称、教材列表和知识页目录。这一段是服务端事实，不允许模型修改；未解析时不注入任何课程资料或课程工具。
 3. **学习档案注入**：user.md + 当前课程 memory.md + 掌握度概要（由 mastery 表渲染）+ 进行中计划状态 + 对话摘要——按 token 预算截断。
-4. **会话历史与结构化产物**：原始消息 append-only 存 SQLite；近期练习题、作答和评分作为 artifact 一并注入。是否正在出题或评分由模型根据用户消息与这些事实判断，不引入硬编码阶段枚举。旧工具输出在读时投影中被裁剪或摘要，原文始终保留。
+4. **会话历史与结构化产物**：原始消息 append-only 存 SQLite；近期练习题、作答和评分作为 artifact 一并注入。是否正在出题或评分由模型根据用户消息与这些事实判断，不引入硬编码阶段枚举。跨轮投影只送 `user / assistant` 两种角色，工具正文不进下一轮上下文。
 5. **本轮用户消息**，以及用它做的一次种子检索取回的教材片段与知识页正文。
 
 分层压缩的设计直接采纳源码调研结论：零成本裁剪先行（工具输出占上下文大头）、LLM 摘要兜底、失败降级，原文永远保留在存储层可回查。
+
+检索类工具的正文与对话原文同表，以 `role='tool'` 落在 `messages` 里（名单与判据见 §9.2）。它们不参与读时投影，因此不占每轮的历史预算、不进会话压缩、界面也不画；模型要看早先某轮取回了什么，走 `history_read` 按需读回。工具正文先于预算计算被摘出去——留在里面会让「更早的消息丢了几条」把它们也数进去，报给用户的数字就不是对话轮数了。
 
 ## 5. LLM 接入层
 
@@ -211,13 +213,15 @@ class LLMClient(Protocol):
 
 token 数是估算的：中日韩文字按 1 字 1 token，其余按 3.5 字符 1 token。不接 tokenizer 库——那类库只对某一家的 BPE 准，而这里接的是任意 OpenAI 兼容服务。系数两侧都取偏保守的一端，实测对 deepseek-v4-flash 高估 1.5~1.6 倍：宁可少留几条历史，也不要低估之后顶爆上游窗口。
 
+算进去的不只是 `messages`。**工具定义**走 `tools=` 参数，每轮照发、一样吃上游窗口，所以它计进系统提示分区的配额，总闸也把它算进总量——它裁不掉，漏算就会以为还有余量。主 Agent 全套 19 个工具估 3561 token，比系统提示本身还大（撤掉 `delegate` 回到 3114，实测口径同样偏高约 1.2 倍），skill 激活或撤掉 `wiki_*` / `web_*` 都会改变它，因此只按这一轮实际下发的那份算。**思考内容**（`reasoning`）在思考模式下要随消息回传，也一起计；厂商收不收它的钱各家不同，宁可高估。界面把工具定义单开一段展示：它比系统提示还大，混进那一行用户就看不出有多少是自己改不动的固定开销。
+
 `contracts/llm.py` 定义供应商无关的增量流协议（deltas + 终态摘要），`adapters/llm/openai_compatible.py` 实现流式 Chat Completions（重试仅发生在首个增量之前），`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
 
 软窗口按固定比例切给各分区（`core/settings.py` 的 `CONTEXT_PARTITION_RATIOS`），组装时逐段核对：超出的只裁本段，不借用别的分区，也不动 output/reserve。下表的 token 数是默认软窗口 512,000 下的取值，换窗口时按同样比例缩放。每一次裁剪都随 `context_usage` 事件报到界面上，正文里也留一句说明——静默截断读起来像“资料就这些”。
 
 | 分区 | 占软窗口 | 默认上限 | 超限策略 |
 | --- | ---: | ---: | --- |
-| 系统提示（静态规则 + 教材清单 + 能力摘要 + 练习状态） | 12.5% | 64,000 | 依次收教材清单、练习状态、能力摘要；静态规则不动 |
+| 系统提示（静态规则 + 工具定义 + 教材清单 + 能力摘要 + 练习状态） | 12.5% | 64,000 | 依次收教材清单、练习状态、能力摘要；静态规则与工具定义不动 |
 | 当前用户消息（含 OCR 转录）与它派生的检索参数 | 9.375% | 48,000 | 从尾部截断，检索参数只用本分区剩下的额度 |
 | 最近会话历史 | 25% | 128,000 | 保留最近轮次，较早内容用会话摘要替代 |
 | 长期记忆 + 对话摘要 + 知识页目录 | 15.625% | 80,000 | 先减知识页目录（可用 `wiki_index` 补回），再裁摘要，最后才动用户手写的记忆 |
@@ -333,12 +337,18 @@ RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿�
 - skill 声明 `allowed_tools`，激活期间工具集收窄到声明范围——这是权限门控的主要形式。
 - `use_skill` 只加载当轮所需的操作规程，不创建独立 Agent，也不引入持久化阶段状态。一轮只有一个前台 skill，但该 skill 可在同一循环内调用多个受控工具。
 
-**Subagent = 独立上下文的一次性任务执行器。** 仅两个场景使用：
+**Subagent = 独立上下文的一次性任务执行器。** 两个场景使用：
 
-- Deep Research 补料（联网检索大量噪音内容，不应污染主对话）；
+- 成规模的调研（横跨好几个来源、来回换关键词才查得清），模型通过 `delegate` 工具派出；
 - LLM-as-judge 离线评测（独立于用户会话运行）。
 
-实现：spawn 一个新的循环实例，全新消息历史、受限工具集、禁止递归派发，结果取最后一条 assistant 文本返回。不做 worktree 隔离、后台常驻、fork 继承这类重型机制。
+实现是一个新的循环实例：全新消息历史、只读工具集、禁止递归派发，结果取最后一条 assistant 文本返回。不做 worktree 隔离、后台常驻、fork 继承这类重型机制。子任务沿用父轮选中的模型与思考档位，工具轮次上限 4 轮——每一轮都是一次模型调用，这个数字直接乘进一次 `delegate` 的成本。
+
+三条实现约束：
+
+- **摘要不额外调模型。** 子 agent 自己的最后一轮回复就是交回父轮的成果，为「总结一下」再花一次调用不值。父轮上下文只放这份摘要（3000 token 封顶），完整检索记录落 `kind=delegate_findings` 的 artifact，条数与单条长度都有界（`payload` 有 64 KiB 硬上限，而 task 与正文都由模型写、长度没有上界）。回执里不摆 artifact id：主 Agent profile 没有读产物的工具，摆出来只会换来一次白花的调用。
+- **最后一轮要明说工具没了。** 只是不下发 `tools` 的话子 agent 并不知道，它会接着写「让我再查一下」然后停住，那段过场话就成了成果。轮次用尽时追加一句话让它用手上的资料收尾。
+- **每一步都要续约心跳。** 一个会话同时只能有一个 running turn，60 秒心跳过期后可被抢占；而子任务跑的时候父轮一个 SSE 事件都不发，心跳只在流式增量分支续约就不够了。
 
 练习不做成 subagent 的理由：出题依据、用户作答、评分标准和讲评都需要留在主对话里被用户看到和追问。`practice` skill 根据当前用户消息、最近的练习 artifact 与是否已存在评分 artifact，自主判断本轮是出题、评分、讲评还是生成变式题；服务端不维护 `AWAITING_ANSWER / GRADING` 等硬状态枚举。
 
@@ -396,7 +406,7 @@ examples: 出三道题考考我 | 我觉得答案是 B | 讲讲我刚才那道�
 | 内建 | 图片点评 | 附件处理层先生成 `VisionTranscriptionV1`；主 Agent 先展示完整转录并标注不确定处，待用户确认后再点评；图片是练习作答时激活 `practice`，未确认内容不得触发 `emit_evidence` |
 | 内建 | 知识页导航 | 知识页目录常驻系统提示；问整体结构、学习顺序或要并起好几节才答得全时读两到四页，问具体定义、数字、公式时不读（见 §8.4） |
 | Skill | `practice` 练习 | 根据用户消息、会话历史和最近 artifact 自主判断出题/评分/讲评/变式题；不使用阶段状态机；出题前取教材证据和弱项；答案与 rubric 可写入模型私有 artifact，用户提交前不得展示；评分后再产生概念证据事件 |
-| Skill | `research` 联网查证 | 教材外的内容才联网；网络结论与教材结论分开写，必须给来源链接 |
+| Skill | `research` 联网查证 | 教材外的内容才联网；网络结论与教材结论分开写，必须给来源链接；成规模的调研用 `delegate` 派给子任务，一件事派一次 |
 | Skill | `mistake_review` 错题复盘 | 读学习档案定位弱项与错题，区分概念错与计算错，给针对性讲解 |
 | Skill | `flashcards` 学习卡片 | 把教材内容做成可反复看的卡片，用 `note_write` 落成课程笔记 |
 | Skill | `diagram` 图解 | 用 mermaid 画流程图、思维导图、时序图讲清结构与流程 |
@@ -554,17 +564,17 @@ model tool call
 
 `ToolProjection` 只依赖服务端能力、Agent profile、当前激活的 skill 和渠道策略，不根据“正在出题/正在评分”等硬阶段枚举裁剪工具。被 policy 永久拒绝或依赖未配置的工具不应继续展示给模型，既减少误调用，也节省 tool schema token。
 
-首版注册工具少于 20 个，不实现额外 `tool_search`；若以后接入大量 MCP/插件，再将长尾工具延迟到一次工具检索后加载，避免所有 schema 常驻上下文。
+注册工具二十出头，不实现额外 `tool_search`；若以后接入大量 MCP/插件，再将长尾工具延迟到一次工具检索后加载，避免所有 schema 常驻上下文。这个数字要盯着：主 Agent 那份工具定义已经比系统提示本身还大（见 §5.5）。
 
 ### 9.2 默认工具与扩展工具
 
 | Agent profile | 可见工具 | 说明 |
 | --- | --- | --- |
-| 主 Agent（无前台 skill） | `search_materials`、`list_materials`、`concept_search`、`wiki_index`、`wiki_read`、`get_plan`、`plan_update`、`get_archive`、`history_read`、`note_read`、`note_write`、`memory_patch`、`emit_evidence`、`calculator`、`web_search`、`web_fetch`、`use_skill`、`ask_user` | 覆盖讲解、规划、档案维护和能力加载 |
+| 主 Agent（无前台 skill） | `search_materials`、`list_materials`、`concept_search`、`wiki_index`、`wiki_read`、`get_plan`、`plan_update`、`get_archive`、`history_read`、`note_read`、`note_write`、`memory_patch`、`emit_evidence`、`calculator`、`web_search`、`web_fetch`、`use_skill`、`ask_user`、`delegate` | 覆盖讲解、规划、档案维护、能力加载和派子任务 |
 | `practice` profile | `search_materials`、`list_materials`、`concept_search`、`get_archive`、`history_read`、`web_search`、`web_fetch`、`emit_evidence`、`artifact_read`、`artifact_append`（+ 基座工具） | 使用通用 artifact 保存必要事实与私有 answer key；看不到计划与笔记写工具 |
-| 其余内置 skill | 各自 frontmatter 声明的集合（+ 基座工具） | `research` 加联网、`mistake_review` 加档案读、`flashcards` / `diagram` 加笔记读写 |
-| 用户 Skill | 其 frontmatter 请求集合与白名单的交集 | 默认关闭；`memory_patch` / `plan_update` / `use_skill` 一律不授予，也不能获得 Shell、任意文件、数据库、调度或未注册工具 |
-| Research subagent | `web_search`、`web_fetch` | 与主会话隔离；结果视为不可信外部数据，必须带来源。尚未实现 |
+| 其余内置 skill | 各自 frontmatter 声明的集合（+ 基座工具） | `research` 加联网与 `delegate`、`mistake_review` 加档案读、`flashcards` / `diagram` 加笔记读写 |
+| 用户 Skill | 其 frontmatter 请求集合与白名单的交集 | 默认关闭；`memory_patch` / `plan_update` / `use_skill` / `delegate` 一律不授予，也不能获得 Shell、任意文件、数据库、调度或未注册工具 |
+| 子任务（`delegate` 派出） | `search_materials`、`list_materials`、`concept_search`、`wiki_index`、`wiki_read`、`web_search`、`web_fetch`、`calculator`、`note_read` | 全是只读取证工具，一件写操作都没有；它没有界面、反问不了用户，所以 `ask_user` 也不给。网络结果视为不可信外部数据，必须带来源 |
 
 工具名里 `search_materials / get_plan / get_archive` 分别对应本文其他章节使用的历史名 `rag_search / plan_read / archive_query`。
 
@@ -572,9 +582,17 @@ skill 激活时切换到其完整 profile，而不是在默认工具上做无限
 
 课程没开知识页时 `wiki_index / wiki_read` 整体不下发，且系统提示里的知识页目录同时撤下。这一摘发生在工具集这一层而不是能力这一层——它们和 `search_materials` 同属 `read_course`，按能力摘会把整档一起摘掉；摘在工具集上，schema 下发与运行期准入读的才是同一份名单。`wiki_read` 的每轮额度给到 10 次：一页正文只有几百字，看全貌就是要连读好几页，这个数是防它把几十页索引一路读完，不是配给。
 
-`history_read` 是只读工具：跨轮历史按 role 投影，工具正文从不进入下一轮，模型要看早先某轮检索到什么就得回捞。它一次最多回看 5 轮、6000 字符，每轮 3 次额度，只回放当前课程轮次的工具痕迹与引用原文，不碰模型私有 artifact（那里存着答案）。
+`delegate` 把一件成规模的调研派给子任务（形态见 §6），参数只有 `task / expect / sources / avoid`——**不给模型 `tools` 参数**，子任务能用哪些工具由服务端定。它单开一档能力 `delegate`：归到 `free` 会让「不花钱的工具」这句话不再成立，而预算判断正靠它；每轮额度 2 次，够「派一件、看完成果再补派一件」。三条约束：
 
-`memory_patch` 与 `ask_user` 是基座工具，每份 profile 都补上，不由各 skill 自己声明：整体替换意味着不兜住就会在 skill 激活后消失，而「记下值得长期记住的事」和「把选项摆给用户挑」在任何规程执行期间都可能需要，两者又都不碰课程数据。`ask_user` 只把选项挂到本轮消息上就收住，用户点击等于发一条新的用户消息，不占住当前 turn 等人。
+- **子任务与父轮共享同一份额度计数。** 子任务花掉的 `web_search` 等次数算在父轮头上，它不是绕开预算的口子。
+- **递归入口在注册期就断死。** 子任务的工具集与 `{delegate, use_skill}` 的交集非空、或它的能力集含 `delegate` 时，`validate_profiles` 报错、进程启动失败——前者让子任务能继续往下派，后者让规程在子循环里再展开一层。
+- **没有派子任务的意图时整体不下发**（照 `wiki_*` 的先例摘在工具集这一层），系统提示里推荐它的那一段同时撤下。这道意图闸门比计划写入那道更紧，只认「明说要做一件成规模的调研」：漏放只是这一轮模型自己去查，误放要花用户的钱。判据同样只看用户键入的原话，图片转录不参与。skill 激活后不再摘——声明它的 `research` 本来就是被意图路由进来的，那一步已经是一道闸门。
+
+`history_read` 是只读工具：跨轮历史按 role 投影，工具正文不进下一轮，模型要看早先某轮检索到什么就得回捞。它一次最多回看 5 轮、6000 字符，每轮 3 次额度，只回放当前课程轮次的工具痕迹、落库的工具正文与引用原文，不碰模型私有 artifact（那里存着答案）。摘要来自消息的 `activity` 字段、正文来自同一张表里 `role='tool'` 的行——同一条读回路径的两半。有正文的那一轮不再重贴引用片段：那几段原文正文里已经是全文。
+
+**哪些工具的正文落库**，按四条判据取，缺一条就不落：正文是取回的资料而不是「已保存」这类回执；同样的内容用户在引用面板或资料库里本来就看得到；不读消息表自己（否则历史会自我复制）；内容不随时间变。在册六个：`search_materials`、`concept_search`、`wiki_index`、`wiki_read`、`web_search`、`web_fetch`。`artifact_read` 出局——它会带出 `model_private` 的标准答案；`get_plan` / `get_archive` / `note_read` 出局——每轮重读才是最新的，存下来只会让模型抄到过期版本，`plan_update` 还会因为旧 `expected_version` 撞版本冲突；`list_materials` 出局——文件清单每轮都在系统提示里。单条正文上限 8000 字符，超了截断并在正文里说明。落库失败只记日志不打断对话：最坏是这一段以后回看不到。子任务查到的资料走同一条落库路径，`call_id` 加 `sub:` 前缀错开——父子两边的 id 都由模型生成，撞上会让 `history_read` 把子任务的正文接到父轮某次调用的摘要底下。
+
+`memory_patch` 与 `ask_user` 是基座工具，每份 profile 都补上，不由各 skill 自己声明：整体替换意味着不兜住就会在 skill 激活后消失，而「记下值得长期记住的事」和「把选项摆给用户挑」在任何规程执行期间都可能需要，两者又都不碰课程数据。`ask_user` 只把选项挂到本轮消息上就收住，用户点击等于发一条新的用户消息，不占住当前 turn 等人。这一轮真能写计划（写权限开着、`plan_update` 在册）而反问又是在问排计划的参数时，服务端保证选项里有一条「就按默认排计划」的出口：计划的事后兜底在本轮以 `ask_user` 收住时主动放过（那时逼模型写就是让它自己编日期），没有出口用户就只能把需求重说一遍。出口的措辞必须能被计划写入的意图判据认出来——用户点它等于发一条新消息，模型第二次只说不写还得有人拦；模型自己写的出口常常少了关键词，那种就地换成标准措辞。选择题与和计划无关的澄清不给出口。
 
 不向模型暴露通用 Shell、任意文件路径、SQLite、`schedule_job` 或 `send_to_channel`。知识页构建、调度 tick 和渠道发送由确定性服务执行。图片点评也不注册模型工具：附件处理器把 `VisionTranscriptionV1` 作为结构化上下文交给主 Agent。
 
@@ -666,7 +684,7 @@ SQLite 单文件（`data/users/<user_id>/coursepilot.db`，WAL），核心表：
 | `sessions` | 可变 | `scope_mode=general/course`；course 必须有不可变 `course_id`，general 必须为空；`last_resolved_course_id` 仅作列表投影；另含 `kind=user/system` |
 | `turn_course_context` | append-only | 每个 turn 唯一的 `resolved/ambiguous/unresolved` 结果、课程、resolver version 与理由；是本轮工具 scope 真源 |
 | `turn_requests` | append-oriented | `request_id`、`session_id`、`client_request_id`、`running / completed / failed` 与执行结果；`(session_id, client_request_id)` 唯一 |
-| `messages` | append-only | 全量对话原文，含 `complete / interrupted` 状态和 artifact 引用；上下文投影不改此表 |
+| `messages` | append-only | 全量对话原文，含 `complete / interrupted` 状态和 artifact 引用；上下文投影不改此表。`role` 认 `user / assistant / system / tool`，`tool` 行是落库的检索工具正文（§9.2），不投影进上下文、不进压缩、也不返回给前端 |
 | `attachments` | append-oriented | 会话附件元数据、内部路径、MIME 与校验结果；必须同时关联 session/course |
 | `artifacts` | append-only | 通用 artifact envelope；`kind / visibility / payload` 由 Skill 定义，服务端不维护练习阶段枚举 |
 | `evidence_events` | append-only | `concept_id` 可空；空值必须带 `attribution_status=unattributed` 与 `topic_hint`，不进入 mastery 投影 |
@@ -680,6 +698,7 @@ SQLite 单文件（`data/users/<user_id>/coursepilot.db`，WAL），核心表：
 - **SQLite 事务**：证据事件写入与当前 mastery / review_queue 投影更新在同一事务内完成；投影失败则整体回滚。所有表由显式 schema migration 管理，不在运行时隐式改表。
 - **连接与并发**：启动时固定设置 `journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout`。Store 层串行化短写事务，读请求可并发。每个 session 同时只执行一个 turn；用户 session 与课程隐藏 system session 使用独立锁。
 - **迁移**：编号迁移之外，增删列走按 `PRAGMA` 对账的 `ADDED_COLUMNS`。`ALTER` 没有 `IF EXISTS`，写成编号迁移的话同一批里后面一句失败会让版本号没落库，下次重跑必撞 duplicate column，工作区就再也起不来；按现存结构对账则重复执行天然安全。
+- **放宽 CHECK**：SQLite 改不了 CHECK，只能整表重建，走 `WIDENED_CHECKS`——按 `sqlite_master` 里的现存 DDL 对账，已含新 CHECK 就跳过，不含就把旧 CHECK 子句替换掉重建，整个包在一个事务里，同样重复执行天然安全。DDL 与预期对不上时中止而不是猜着改。重建按官方顺序：建暂存表 → 搬数据 → 删旧表 → **把暂存表改成正名** → 重建索引 → `PRAGMA foreign_key_check` 复核。改名必须落在新表上，反过来先给旧表改名会毁掉别的表指过来的外键（见 `Docs/development.md` 的「踩过的坑」）。
 - **Markdown 层**（user.md、memory.md、notes、wiki）：落盘文件，写入前校验落点仍在本课程目录内且不是符号链接。Agent 只改受管区块或整页替换，用户手写部分不动。掌握度在读页时动态渲染，不回写 markdown。
 - **回滚与纠错**：定量状态不物理截断正式事件流；写入 `correction / supersede` 事件后重放。调试可按任意 seq 做只读投影。
 - **Trace**：`data/users/<user_id>/traces/<date>.jsonl`，每 span 一行。
@@ -751,7 +770,7 @@ class Channel(Protocol):
 | `GET` | `/jobs/{job_id}` | 查询索引或知识页构建任务的状态、阶段与错误摘要 |
 | `POST` | `/sessions` | 创建 `{scope_mode: general}` 或 `{scope_mode: course, course_id}` 会话；默认 general |
 | `GET` | `/sessions` | 按 `workspace=general|course:<id>` 可选过滤，返回课程色点与最近解析投影 |
-| `GET` | `/sessions/{session_id}/messages` | 读取原始消息与 artifact 引用 |
+| `GET` | `/sessions/{session_id}/messages` | 读取原始消息与 artifact 引用；`role='tool'` 的工具正文不返回 |
 | `POST` | `/sessions/{session_id}/attachments` | 上传当前会话的图片附件；vision 未配置时返回 `feature_disabled` |
 | `POST` | `/sessions/{session_id}/turns` | 发起一轮 Agent 执行，通过 SSE 返回 |
 | `POST` | `/courses/{course_id}/knowledge/search` | 知识仓库中对用户明确选定课程做检索验证；通用对话不能绕过 Resolver 调用 |
