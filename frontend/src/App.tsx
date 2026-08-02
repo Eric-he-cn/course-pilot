@@ -21,7 +21,7 @@ const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
 const RETRIEVAL_TOOLS = ['search_materials', 'concept_search']
 // 停止时给未收尾的工具补的占位。带上 key 而不只是当时那句中文，展示层才判得出它不是真结果。
 const TOOL_STOPPED_KEY = 'tool.stopped'
-// 工具名在字典里（`tool.<name>`）。这张表是 17 个工具的全集，使用说明按它的顺序列举。
+// 工具名在字典里（`tool.<name>`）。这张表是全部工具，使用说明按它的顺序列举。
 const TOOL_CAPABILITY_HINT: Record<string, string> = {
   search_materials: 'read_course', list_materials: 'read_course', get_plan: 'read_course',
   get_archive: 'read_course', concept_search: 'read_course', note_read: 'read_course',
@@ -30,6 +30,7 @@ const TOOL_CAPABILITY_HINT: Record<string, string> = {
   artifact_append: 'write_state', note_write: 'write_note',
   web_search: 'network', web_fetch: 'network',
   use_skill: 'free', artifact_read: 'free', calculator: 'free', ask_user: 'free',
+  delegate: 'delegate',
 }
 
 function errorText(error: unknown) { return error instanceof Error ? error.message : t('error.unknown') }
@@ -512,7 +513,7 @@ const markdownComponents = {
 
 
 // 分组名与说明在字典里（`capability.<key>` 与 `.hint`）：模块顶层调 t() 会锁住加载时的语言。
-const CAPABILITY_GROUPS = ['read_course', 'write_state', 'write_note', 'network', 'free'] as const
+const CAPABILITY_GROUPS = ['read_course', 'write_state', 'write_note', 'network', 'delegate', 'free'] as const
 
 /** 使用说明。可数的内容一律来自接口，避免变成需要人工同步的死文档。 */
 function HelpView({ courses, health, onError, onTry }: { courses: Course[]; health: Record<string, unknown> | null; onError: (message: string) => void; onTry: (text: string) => void }) {

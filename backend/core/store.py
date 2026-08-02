@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -209,6 +210,18 @@ RETIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sessions", "kind"),      # 恒为 'user'，全仓无读取
 )
 
+# 要放宽的 CHECK。SQLite 改不了 CHECK，只能整表重建。写成编号迁移的话中途失败会让版本号
+# 没落库，下次重跑必撞「表已存在」；这里按 sqlite_master 现存 DDL 对账，重建整个包在一个
+# 事务里，要么全成要么原样回滚，重复执行天然安全。
+WIDENED_CHECKS: tuple[tuple[str, str, str], ...] = (
+    # 工具正文以 role='tool' 落进消息表：后面几轮要能看见早先轮次取回了什么资料，
+    # 而 trace 是可观测设施、可随时清理，业务功能不该依赖它。
+    ("messages",
+     "CHECK(role IN ('user','assistant','system'))",
+     "CHECK(role IN ('user','assistant','system','tool'))"),
+)
+_CREATE_TABLE_HEAD = re.compile(r'^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"[^"]+"|\w+)', re.IGNORECASE)
+
 class SQLiteStore:
     def __init__(self, path: Path) -> None: self.path, self._write_lock = path, threading.RLock()
     def _connect(self) -> sqlite3.Connection:
@@ -229,6 +242,55 @@ class SQLiteStore:
                     self._drop_dependent_indexes(connection, table, column)
                     connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
             connection.commit()
+        self._widen_checks()
+    def _widen_checks(self) -> None:
+        """按现存 DDL 对账要放宽的 CHECK，需要动的表逐张重建。"""
+        pending = []
+        with self.read() as connection:
+            for table, old, new in WIDENED_CHECKS:
+                row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?", (table,)).fetchone()
+                if row is None or not row[0] or new in row[0]:
+                    continue
+                if row[0].count(old) != 1:
+                    raise RuntimeError(f"{table} 的 CHECK 与预期不符，不做重建：{row[0]}")
+                indexes = [item[0] for item in connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name = ? AND sql IS NOT NULL", (table,))]
+                pending.append((table, row[0].replace(old, new), indexes))
+        for table, create_sql, indexes in pending:
+            self._rebuild_table(table, create_sql, indexes)
+    def _rebuild_table(self, table: str, create_sql: str, indexes: list[str]) -> None:
+        """SQLite 官方的整表重建流程：建暂存表 → 搬数据 → 删旧表 → 把暂存表改成正名 → 重建索引。
+
+        改名必须落在新表上。反过来先给旧表改名的话，即使关掉外键，别的表里那句
+        REFERENCES 也会被一起改指到旧名上（实测如此，与文档说法不同），旧表一删就成了悬空外键。
+        """
+        staging = f"{table}__rebuild"
+        head = _CREATE_TABLE_HEAD.match(create_sql)
+        if head is None:
+            raise RuntimeError(f"{table} 的建表语句无法解析，不做重建：{create_sql}")
+        with self._write_lock:
+            connection = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
+            connection.isolation_level = None  # 事务边界自己写，不让驱动插手
+            try:
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("PRAGMA foreign_keys=OFF")  # 只能在事务外改
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(f"CREATE TABLE {staging}" + create_sql[head.end():])
+                    connection.execute(f"INSERT INTO {staging} SELECT * FROM {table}")
+                    connection.execute(f"DROP TABLE {table}")
+                    connection.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+                    for statement in indexes:
+                        connection.execute(statement)
+                    connection.execute("COMMIT")
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    raise
+                connection.execute("PRAGMA foreign_keys=ON")
+                if broken := connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise RuntimeError(f"{table} 重建后外键校验未通过：{broken[:3]}")
+            finally:
+                connection.close()
     @staticmethod
     def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
         return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}

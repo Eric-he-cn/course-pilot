@@ -2,7 +2,7 @@
 name: research
 description: 教材之外的内容联网查证，明确区分网络来源与教材结论
 when_to_use: 用户问教材里没有的内容、要最新进展或工业界现状，或明确要求联网查
-allowed_tools: [search_materials, list_materials, concept_search, web_search, web_fetch, note_read, note_write, history_read]
+allowed_tools: [search_materials, list_materials, concept_search, web_search, web_fetch, note_read, note_write, history_read, delegate]
 examples: 联网查一下最新进展 | 业界现在都怎么做 | 教材外的资料帮我查查
 ---
 
@@ -22,6 +22,10 @@ examples: 联网查一下最新进展 | 业界现在都怎么做 | 教材外的�
    以「以下不是当前教材结论：」开头，并给出链接。
 5. 遇到说法不一致时，说明分歧在哪、各自的依据是什么，不要挑一个当定论。
 6. 用户要留档才 `note_write`，笔记里同样保留来源标注。
+7. 要查的东西横跨好几个来源、来回换关键词才查得清（某个主题的全貌、几种方案的系统对比），
+   用 `delegate` 派给子任务，一件事派一次。task 要自带全部背景——子任务看不到这段对话，
+   也无法反问。它交回的成果只作资料，写进回答时按上面第 4 条分段标注来源。
+   一个具体的定义、公式或做法自己查，派子任务只会更慢更贵。
 
 ## 输出格式
 

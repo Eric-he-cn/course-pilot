@@ -98,7 +98,9 @@ export const api = {
   deleteMaterial: (materialId: string) => request<void>(`/materials/${materialId}`, { method: 'DELETE' }),
   messages: async (sessionId: string) => {
     const payload = await request<{ messages: Array<Omit<Message, 'citations'> & { citations?: BackendCitation[] }> }>(`/sessions/${sessionId}/messages`)
-    return payload.messages.map(message => ({ ...message, citations: message.citations?.map(citation => ({ ...citation, id: citation.id ?? citation.citation_id, material_name: citation.material_name ?? citation.document, text: citation.text ?? citation.snippet })) }))
+    // 工具正文（role='tool'）是给模型跨轮读回的资料，不是对话的一句话。服务端已经滤过，
+    // 这里再滤一次：多一道拦截比事后发现检索原文被画成气泡便宜。
+    return payload.messages.filter(message => message.role !== 'tool').map(message => ({ ...message, citations: message.citations?.map(citation => ({ ...citation, id: citation.id ?? citation.citation_id, material_name: citation.material_name ?? citation.document, text: citation.text ?? citation.snippet })) }))
   },
   materials: (courseId: string) => request<Material[]>(`/courses/${courseId}/materials`),
   uploadMaterial: (courseId: string, file: File) => {

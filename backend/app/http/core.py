@@ -117,7 +117,10 @@ def create_core_router() -> APIRouter:
             messages = application.sessions.list_messages(session_id)
         except LookupError as exc:
             raise _not_found(exc) from exc
-        return {"session": asdict(session) if session else None, "messages": [asdict(message) for message in messages]}
+        # role='tool' 是落库的工具正文，界面不画它：那是给模型跨轮读回的资料，
+        # 当成对话气泡贴出来只会把检索原文摊满整个会话。
+        return {"session": asdict(session) if session else None,
+                "messages": [asdict(message) for message in messages if message.role != "tool"]}
 
     @router.post("/sessions/{session_id}/attachments", status_code=201)
     async def upload_attachment(session_id: str, file: UploadFile = File(...), application: Application = Depends(current_workspace)):

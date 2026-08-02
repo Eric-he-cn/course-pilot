@@ -131,7 +131,8 @@ export interface TurnEvent extends Partial<ContextUsage> {
 
 export interface Message {
   id: string
-  role: 'user' | 'assistant' | 'system'
+  // 'tool' 是落库的工具正文，只给模型跨轮读回；它在 api.messages 里就被滤掉，画不到界面上
+  role: 'user' | 'assistant' | 'system' | 'tool'
   content: string
   status?: string
   created_at?: string

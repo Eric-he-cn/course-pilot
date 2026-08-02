@@ -96,7 +96,9 @@ def test_delete_session_removes_messages_turns_and_artifacts(client):
     _compact(client, session["id"])
     application = workspace(client)
     ArtifactStore(application.store).append(course_id=course["id"], session_id=session["id"], kind="practice", visibility="user_visible", payload={"practice_id": "p1"})
-    assert _count(client, "SELECT count(*) FROM messages WHERE session_id = ?", (session["id"],)) == 2
+    # 提问 + 回答 + 种子检索落库的那条工具正文；三种角色都要跟着会话一起删掉。
+    assert _count(client, "SELECT count(*) FROM messages WHERE session_id = ?", (session["id"],)) == 3
+    assert _count(client, "SELECT count(*) FROM messages WHERE session_id = ? AND role = 'tool'", (session["id"],)) == 1
 
     assert client.delete(f"/api/v2/sessions/{session['id']}").status_code == 204
 

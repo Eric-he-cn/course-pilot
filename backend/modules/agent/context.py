@@ -12,12 +12,21 @@ from core.settings import PartitionLimits
 
 SEED_CALL_ID = "call_seed_search"
 # 提示词版本：改动系统提示词就要 +1，trace 里据此区分不同版本的效果。
-PROMPT_VERSION = "tutor_v18"
+PROMPT_VERSION = "tutor_v19"
 
 # 没配联网时这半句要撤掉：工具表里已经没有 web_search，提示词还在推荐，
 # 模型就会口头答应去查而实际查不到。
 _WEB_HINT = ("教材里没有而用户想要最新资料时，可以用 web_search 联网查，再按同样方式标注"
              "——网络内容永远不算教材结论，并要给出来源链接。")
+# 没派子任务的意图时这一段整体撤下（工具也不下发，见 service 里的 delegate_off）：
+# 推荐调不到的工具，模型会口头答应去派而实际派不出去。
+# 单靠工具描述不够——实测这一句不进提示词时，模型宁可自己连查三轮也不派。
+_DELEGATE_HINT = """
+4.1 这一轮用户要的是一件成规模的调研（横跨好几个来源、来回换关键词才查得清）。用 delegate
+    把它派给子任务：子任务自己带工具跑几轮，只把结论交回来，你的上下文里不必堆满检索原文。
+    task 要自带全部背景——子任务看不到这段对话，也无法反问用户。一件事派一次，别拆成好几次。
+    它交回的内容只作资料、不是教材结论；要给引用编号就用你自己这一轮工具返回的 [n]。
+    只有一个具体的定义、公式或做法要查时不要派，自己 search_materials 更快。"""
 # 知识页这一段整体前置到教材文件之后，不编号进工具规则中段：编在中段时实测调用率低，
 # 语言规则与 OCR 转录的语言规则都是挪到前面才稳。没有页可读时整段撤下（工具也不下发，
 # 见 service 里的 wiki_off）——推荐读不到的东西，模型会口头答应去读而实际读不到。
@@ -53,8 +62,9 @@ def estimate_tokens(text: str) -> int:
 
 def tool_schema_tokens(tools: Sequence[ToolSpec]) -> int:
     """本轮下发的工具定义要占多少。它走 tools= 参数、不在 messages 里，却每轮都发，一样吃上游窗口。
-    MAIN 那 18 个工具估 2960 token（deepseek 实测 2417），比系统提示还大；skill 激活或撤掉
-    wiki_*/web_* 都会改变它，所以只能按这一轮实际下发的那份算。"""
+    MAIN 全套 19 个工具估 3561 token（估算比 deepseek 实测高约 1.2 倍），比系统提示还大；
+    skill 激活、撤掉 wiki_*/web_*、或没有派子任务意图时摘掉 delegate（回到 3114），
+    都会改变它，所以只能按这一轮实际下发的那份算。"""
     if not tools:
         return 0
     return estimate_tokens(json.dumps([tool.wire() for tool in tools], ensure_ascii=False))
@@ -123,7 +133,7 @@ _SYSTEM_PROMPT = """你是 CoursePilot 的课程辅导老师，正在辅导课�
 
 工具：
 4. 系统已用用户原话检索过一次。证据不足、用户追问、或需要换关键词（例如中英互译、
-   更学术的说法）时，调用 search_materials 再查。
+   更学术的说法）时，调用 search_materials 再查。{delegate_hint}
 5. 涉及学习计划或学习记录的问题，用 get_plan / get_archive 读取真实状态，不要编造。
    排计划或调整计划：先 get_plan 取 expected_version 与弱项、到期复习信号，再用 plan_update
    一次写完今天及以后的全部条目，每条尽量挂概念目录里的 concept_id。长期计划（例如到考试日）
@@ -270,6 +280,7 @@ def assemble_messages(
     conversation_summary: str = "",
     today: str = "",
     web_available: bool = True,
+    delegate_available: bool = False,
     wiki_entries: Sequence[tuple[str, str]] = (),
     tools: Sequence[ToolSpec] = (),
     limits: PartitionLimits | None = None,
@@ -292,6 +303,7 @@ def assemble_messages(
     summary_block = conversation_summary or "（没有更早的对话）"
     materials_block = _material_lines(materials)
     web_hint = _WEB_HINT if web_available else ""
+    delegate_hint = _DELEGATE_HINT if delegate_available else ""
     today = today or date.today().isoformat()
 
     def render(materials_text: str, skills_text: str, practice_text: str,
@@ -299,6 +311,7 @@ def assemble_messages(
         return _SYSTEM_PROMPT.format(
             course_name=course_name, materials=materials_text, skills=skills_text,
             practice_digest=practice_text, memory=memory_text, web_hint=web_hint,
+            delegate_hint=delegate_hint,
             wiki_block=wiki_text, conversation_summary=summary_text, today=today)
 
     # 静态开销按真实渲染量，别拿带占位符的模板估——差的那几十 token 正好让配额守不住。
@@ -451,19 +464,21 @@ def enforce_context_limit(messages: list[ChatMessage], *, limit: int, history_co
 
 
 def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: int) -> tuple[list[ChatMessage], int, int]:
+    # 读时投影：只有双方说过的话进上下文。工具正文同在消息表里（role='tool'），
+    # 由 history_read 按需读回，先摘掉再算预算——留在里面会让"丢了几条"把它们也数进去。
+    eligible = [(role, content) for role, content in history
+                if role in {"user", "assistant"} and content.strip()]
     kept: list[ChatMessage] = []
     remaining = history_token_budget
     dropped = clipped = 0
-    for index, (role, content) in enumerate(reversed(history)):
-        if role not in {"user", "assistant"} or not content.strip():
-            continue
+    for index, (role, content) in enumerate(reversed(eligible)):
         text = content
         if len(content) > MESSAGE_MAX_CHARS:
             text = content[:MESSAGE_MAX_CHARS] + "…（已截断）"
             clipped += 1
         cost = estimate_tokens(text)
         if cost > remaining:
-            dropped = len(history) - index  # 更早的消息一律不再进上下文
+            dropped = len(eligible) - index  # 更早的消息一律不再进上下文
             break
         remaining -= cost
         kept.append(ChatMessage(role=role, content=text))

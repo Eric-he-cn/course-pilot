@@ -255,6 +255,80 @@ def test_model_private_artifacts_never_come_through_history():
     assert "正确答案是 B" not in result.text and "model_private" not in result.text
 
 
+TOOL_BODY = "[1] 文档：操作系统原理.pdf，第 42 页；片段：chunk-42\nFIFO 让长作业挡在前面，后面的短作业全被拖住。"
+
+
+def _tool_row(index: int, *, call_id: str = "c1", name: str = "search_materials",
+              body: str = TOOL_BODY, course_id: str = "c1") -> Message:
+    return Message(
+        f"message_turn_{index}_tool_{call_id}", f"turn_{index}", "tool", body, [], "complete",
+        f"2026-07-30T0{index}:00:00Z", resolution_status="resolved", resolved_course_id=course_id,
+        activity=[{"call_id": call_id, "name": name}],
+    )
+
+
+def test_the_persisted_tool_body_comes_back_under_its_summary_line():
+    """摘要说明当时调了什么，正文接在它下面。摘要来自 activity、正文来自 role='tool' 的行，
+    是同一张表的两半，不是两条读回路径。"""
+    messages = _turn(1, activity=ACTIVITY) + [_tool_row(1)]
+    result = _read(messages)
+
+    assert result.ok
+    head = "- 工具 search_materials：检索「护航效应」命中 3 段"
+    assert head in result.text
+    assert result.text.index(head) < result.text.index("片段：chunk-42"), "正文没有接在它自己那行摘要下面"
+    assert "全被拖住" in result.text
+
+
+def test_a_turn_with_tool_bodies_does_not_also_replay_the_citation_snippets():
+    """正文里已经是那几段原文的全文，引用摘要是它的子集。两份都贴等于把额度花在重复内容上。"""
+    result = _read(_turn(1, citations=[MATERIAL], activity=ACTIVITY) + [_tool_row(1)])
+
+    assert "片段：chunk-42" in result.text
+    assert "- 引用｜" not in result.text, "工具正文和引用摘要贴了两遍"
+
+
+def test_turns_without_a_persisted_body_still_replay_their_citations():
+    """落库这套上线之前的老轮次只有引用摘要。它们不能因为新机制而读不到。"""
+    result = _read(_turn(1, citations=[MATERIAL], activity=ACTIVITY))
+    assert "操作系统原理.pdf" in result.text and "护航效应" in result.text
+
+
+def test_kind_citations_never_returns_a_tool_body():
+    """kind 是给模型收窄用的。要引用原文时不该被大段工具正文顶掉额度。"""
+    result = _read(_turn(1, citations=[MATERIAL], activity=ACTIVITY) + [_tool_row(1)], '{"kind": "citations"}')
+    assert "操作系统原理.pdf" in result.text and "片段：chunk-42" not in result.text
+
+
+def test_an_orphan_tool_body_is_still_readable():
+    """那一轮中途失败、助手消息没落库时，工具正文仍在库里——读不到就等于白存。"""
+    messages = [
+        _message(turn_id="turn_1", role="user", content="第 1 轮的问题", created_at="2026-07-30T01:00:00Z"),
+        _tool_row(1),
+    ]
+    result = _read(messages)
+    assert "片段：chunk-42" in result.text and "没有留下工具痕迹或引用" not in result.text
+
+
+def test_another_courses_tool_body_is_not_readable():
+    """按课程过滤要盖住工具正文这条新路径，不然隔壁课的教材原文照样端得上来。"""
+    other = _tool_row(1, body="[1] 文档：编译原理.pdf；片段：chunk-9\nLR(1) 项集族从增广文法开始。", course_id="c2")
+    messages = _turn(1, activity=ACTIVITY, course_id="c2") + [other] + _turn(2, citations=[MATERIAL])
+
+    result = _read(messages, '{"turns": 5}')
+    assert "编译原理.pdf" not in result.text and "LR(1)" not in result.text
+
+
+def test_a_fat_tool_body_still_respects_the_single_call_limit():
+    """正文比引用摘要大得多。上限守不住，这个工具就把压缩机制废掉了。"""
+    fat = [_tool_row(index, body="料" * 3000) for index in range(1, 4)]
+    messages = [item for index in range(1, 4) for item in _turn(index, activity=ACTIVITY)] + fat
+    result = _read(messages, '{"turns": 3}')
+
+    assert len(result.text) <= HISTORY_MAX_CHARS
+    assert "已到单次返回上限" in result.text
+
+
 def test_history_read_is_a_read_only_course_capability_with_a_call_budget():
     """只读、不碰用户数据，与 get_archive / note_read 同档；次数有上限，
     免得模型把省下来的上下文又用翻历史填回去。"""
