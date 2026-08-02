@@ -81,6 +81,12 @@ export interface ContextUsage {
   dropped_history: number
   clipped_history: number
   compacted_messages: number
+  /** 超出分区配额被裁的段 */
+  clipped_segments: { label: string; label_key?: string; before: number; after: number }[]
+  /** 总闸：整轮超出软窗口后裁掉的东西 */
+  gate_tools_cleared: number
+  gate_history_dropped: number
+  gate_evidence_clipped: boolean
 }
 
 /** SSE 事件负载：字段随事件类型而异，所以都是可选的。 */

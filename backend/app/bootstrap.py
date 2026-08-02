@@ -318,6 +318,7 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         search_limit=settings.top_k_results,
         history_token_budget=settings.agent_history_token_budget,
         context_token_limit=settings.agent_context_token_limit,
+        partitions=settings.context_partitions,
         compact_threshold_ratio=settings.agent_compact_threshold_ratio,
     )
     return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, notes, memory, vision, web)

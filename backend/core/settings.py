@@ -37,6 +37,34 @@ def _parse_extra_body(raw: str, name: str = "TEXT_EXTRA_BODY") -> dict[str, obje
 
 _CN_DIGITS = "一二三四五六七八九"
 
+# 软窗口各分区占的比例，对应架构 §5.5 那张表。合计 92.2%，余下留给模型输出与估算误差。
+# 换一个窗口更小的模型只改 AGENT_MODEL_CONTEXT_WINDOW，各分区按同样比例一起缩。
+CONTEXT_PARTITION_RATIOS: dict[str, float] = {
+    "system": 0.125,       # 静态规则 + 教材清单 + 能力摘要 + 练习状态
+    "question": 0.09375,   # 本轮用户消息（含图片转录）与它派生的检索参数
+    "history": 0.25,       # 最近会话历史
+    "knowledge": 0.15625,  # 长期记忆 + 对话摘要 + 知识页目录
+    "evidence": 0.234375,  # 种子检索取回的教材与知识页正文
+    "skill": 0.0625,       # 当前 skill 正文
+}
+
+
+@dataclass(frozen=True)
+class PartitionLimits:
+    """软窗口切给各分区的 token 配额。某段超了先裁它自己，不借用别的分区。"""
+
+    system: int
+    question: int
+    history: int
+    knowledge: int
+    evidence: int
+    skill: int
+
+    @classmethod
+    def from_window(cls, soft_window: int) -> "PartitionLimits":
+        return cls(**{name: max(256, int(soft_window * ratio))
+                      for name, ratio in CONTEXT_PARTITION_RATIOS.items()})
+
 
 @dataclass(frozen=True)
 class ModelChoice:
@@ -164,10 +192,12 @@ class Settings:
     vision_chat_model: str = ""
     attachment_max_bytes: int = 10 * 1024 * 1024
     attachment_max_pixels: int = 12_000_000
-    # Agent 历史预算，按 context.estimate_tokens 折算的 token 计（中英分段估算，偏高估）。
-    # 默认对应 512K 软窗口里 128K 的历史份额。
+    # 所配模型的上下文窗口，按 context.estimate_tokens 折算的 token 计（中英分段估算，偏高估）。
+    # 换模型时改这一个数，软窗口与各分区配额都跟着它推导。
+    agent_model_context_window: int = 1_024_000
+    # Agent 历史预算，默认是软窗口的 history 份额。
     agent_history_token_budget: int = 128_000
-    # 整轮上下文的软窗口，同样是估算 token（架构 §5.5 的 512K 软窗口）。
+    # 整轮上下文的软窗口，默认取模型窗口的一半，留出输出与估算误差的余量。
     agent_context_token_limit: int = 512_000
     # 历史占到预算这个比例就压缩；调小可以在短对话上验证压缩链路。
     agent_compact_threshold_ratio: float = 0.7
@@ -196,6 +226,12 @@ class Settings:
             database_path=workspace_dir / "coursepilot.db",
             uploads_dir=workspace_dir / "materials",
         )
+
+    @property
+    def context_partitions(self) -> PartitionLimits:
+        """按软窗口切出的分区配额；历史那一份用配置里的实际值，别和已生效的预算说两套。"""
+        return replace(PartitionLimits.from_window(self.agent_context_token_limit),
+                       history=self.agent_history_token_budget)
 
     @property
     def remote_llm_configured(self) -> bool:
@@ -236,6 +272,13 @@ class Settings:
         machine = hardware.probe()
         embedding_model = hardware.resolve("embedding", value("RAG_EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5"), machine)
         reranker_model = hardware.resolve("reranker", value("RAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"), machine)
+        # 软窗口与历史预算默认都从模型窗口推导，显式配了才用配的值；两者都不许超过上一层。
+        window = max(4096, int(value("AGENT_MODEL_CONTEXT_WINDOW", "1024000")))
+        raw_limit = value("AGENT_CONTEXT_TOKEN_LIMIT").strip()
+        context_limit = min(window, max(2048, int(raw_limit))) if raw_limit else window // 2
+        raw_history = value("AGENT_HISTORY_TOKEN_BUDGET").strip()
+        history_budget = (min(context_limit, max(1024, int(raw_history))) if raw_history
+                          else PartitionLimits.from_window(context_limit).history)
         return cls(
             data_dir=data_dir,
             database_path=data_dir / "coursepilot.db",
@@ -269,8 +312,9 @@ class Settings:
             vision_chat_model=value("VISION_CHAT_MODEL"),
             attachment_max_bytes=max(1, int(value("ATTACHMENT_MAX_BYTES", str(10 * 1024 * 1024)))),
             attachment_max_pixels=max(1, int(value("ATTACHMENT_MAX_PIXELS", "12000000"))),
-            agent_history_token_budget=max(1024, int(value("AGENT_HISTORY_TOKEN_BUDGET", "128000"))),
-            agent_context_token_limit=max(2048, int(value("AGENT_CONTEXT_TOKEN_LIMIT", "512000"))),
+            agent_model_context_window=window,
+            agent_history_token_budget=history_budget,
+            agent_context_token_limit=context_limit,
             agent_compact_threshold_ratio=min(0.95, max(0.05, float(value("AGENT_COMPACT_THRESHOLD_RATIO", "0.7")))),
             default_user=value("COURSEPILOT_DEFAULT_USER", "local"),
             web_search_api_key=value("RESEARCH_SERPAPI_API_KEY"),

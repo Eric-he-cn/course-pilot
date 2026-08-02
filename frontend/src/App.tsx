@@ -301,7 +301,7 @@ export default function App() {
             setSessions(current => current.map(item => item.id === targetSession.id ? { ...item, resolved_course_id: resolvedId, course_name: isResolved ? payload.course_name ?? item.course_name : null, course_color: isResolved ? payload.course_color ?? item.course_color : null } : item))
           }
           if (payload.type === 'context_usage' && payload.segments) {
-            if (onThisSession()) setContextUsage({ segments: payload.segments, total_tokens: payload.total_tokens ?? 0, limit_tokens: payload.limit_tokens ?? 1, history_budget_tokens: payload.history_budget_tokens ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0 })
+            if (onThisSession()) setContextUsage({ segments: payload.segments, total_tokens: payload.total_tokens ?? 0, limit_tokens: payload.limit_tokens ?? 1, history_budget_tokens: payload.history_budget_tokens ?? 0, dropped_history: payload.dropped_history ?? 0, clipped_history: payload.clipped_history ?? 0, compacted_messages: payload.compacted_messages ?? 0, clipped_segments: payload.clipped_segments ?? [], gate_tools_cleared: payload.gate_tools_cleared ?? 0, gate_history_dropped: payload.gate_history_dropped ?? 0, gate_evidence_clipped: payload.gate_evidence_clipped ?? false })
           }
           if (payload.type === 'tool_call' && payload.call_id) {
             activity.push({ call_id: payload.call_id, name: payload.name ?? t('tool.fallback_name'), origin: payload.origin, started_at: Date.now() })
@@ -945,7 +945,8 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
   const k = (tokens: number) => tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}K` : String(tokens)
   const percent = Math.min(100, Math.round((usage.total_tokens / usage.limit_tokens) * 100))
   const filled = Math.max(1, Math.round(percent / 12.5))
-  const notice = usage.dropped_history > 0 || usage.clipped_history > 0
+  const gated = usage.gate_tools_cleared > 0 || usage.gate_history_dropped > 0 || usage.gate_evidence_clipped
+  const notice = usage.dropped_history > 0 || usage.clipped_history > 0 || usage.clipped_segments.length > 0 || gated
   return <div className="context-chip">
     <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} aria-label={t('a11y.context')} className={notice ? 'warn' : undefined}>
       <span aria-hidden>{'▓'.repeat(filled)}{'░'.repeat(8 - filled)}</span>
@@ -958,6 +959,12 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
       {usage.compacted_messages > 0 && <p className="popover-note">{t('context.compacted', { n: usage.compacted_messages })}</p>}
       {usage.dropped_history > 0 && <p className="popover-warn">{t('context.dropped', { n: usage.dropped_history })}</p>}
       {usage.clipped_history > 0 && <p className="popover-warn">{t('context.clipped', { n: usage.clipped_history })}</p>}
+      {usage.clipped_segments.map(item => <p className="popover-warn" key={item.label_key ?? item.label}>
+        {t('context.over_quota', { name: item.label_key ? tOr(item.label_key, item.label) : item.label, before: k(item.before), after: k(item.after) })}
+      </p>)}
+      {usage.gate_tools_cleared > 0 && <p className="popover-warn">{t('context.gate_tools', { n: usage.gate_tools_cleared })}</p>}
+      {usage.gate_history_dropped > 0 && <p className="popover-warn">{t('context.gate_history', { n: usage.gate_history_dropped })}</p>}
+      {usage.gate_evidence_clipped && <p className="popover-warn">{t('context.gate_evidence')}</p>}
     </div>}
   </div>
 }

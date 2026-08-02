@@ -4,10 +4,11 @@ import json
 import math
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 from contracts.llm import ChatMessage, ToolCallRequest
+from core.settings import PartitionLimits
 
 SEED_CALL_ID = "call_seed_search"
 # 提示词版本：改动系统提示词就要 +1，trace 里据此区分不同版本的效果。
@@ -48,6 +49,46 @@ def estimate_tokens(text: str) -> int:
     而这里对接的是任意 OpenAI 兼容服务。"""
     cjk = len(_CJK_RE.findall(text))
     return cjk + math.ceil((len(text) - cjk) / _LATIN_CHARS_PER_TOKEN)
+
+
+# 没显式给配额时按这个软窗口推导，与 settings 的默认一致。
+DEFAULT_SOFT_WINDOW = 512_000
+
+# 截断都要在正文里说出来：静默截断读起来像「资料就这些」，模型和用户都会据此下错结论。
+_QUESTION_CLIP = "…（本轮提问超出分区配额，后半已截断）"
+_SEED_QUERY_CLIP = "…（检索词已截断）"
+_EVIDENCE_CLIP = "\n…（检索证据超出分区配额，末尾片段已截断；需要更多原文请换关键词再查）"
+_MEMORY_CLIP = "\n…（长期记忆超出分区配额，末尾内容未进入本轮上下文）"
+_SUMMARY_CLIP = "\n…（对话摘要超出分区配额，末尾内容未进入本轮上下文）"
+_MATERIALS_CLIP = "- …（教材清单超出分区配额，其余文件未列出，仍可被检索到）"
+_SKILLS_CLIP = "\n…（能力摘要超出分区配额，末尾内容已截断）"
+_PRACTICE_CLIP = "\n…（练习状态超出分区配额，末尾内容已截断）"
+# 种子检索参数裁到底也要占的位置：JSON 外壳 + 那句截断说明。
+_SEED_ARGS_FLOOR = estimate_tokens(json.dumps({"query": _SEED_QUERY_CLIP}, ensure_ascii=False))
+
+
+def clip_to_tokens(text: str, limit: int, notice: str) -> str:
+    """按估算 token 截到限额内，尾部接上说明。二分找切点：字符与 token 中英不成定比。"""
+    if estimate_tokens(text) <= limit:
+        return text
+    room = max(0, limit - estimate_tokens(notice))
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_tokens(text[:mid]) <= room:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low] + notice
+
+
+@dataclass(frozen=True)
+class ClipNote:
+    """某个分区超了配额被裁：key 供界面翻译，label 是中文兜底。"""
+    key: str
+    label: str
+    before: int
+    after: int
 
 
 # 动态内容（记忆、练习状态）排在静态规则之后，让供应商的前缀缓存能覆盖住整段规则。
@@ -130,17 +171,59 @@ def _material_lines(materials: Sequence[str]) -> str:
     return "\n".join("- 「" + re.sub(r"\s+", " ", name).strip()[:80] + "」" for name in materials)
 
 
-def _wiki_block(entries: Sequence[tuple[str, str]]) -> str:
+def _wiki_block(shown: Sequence[tuple[str, str]], total: int) -> str:
     """知识页目录 + 怎么用它。没有页就返回空串，规则跟着目录一起消失。"""
-    if not entries:
+    if not shown:
         return ""
-    shown = list(entries)[:WIKI_INJECT_MAX_ENTRIES]
     # 概念名是按教材生成的，和文件名同一档：压成单行、截断，只能被读成数据。
     lines = "\n".join(f"- {cid} | " + re.sub(r"\s+", " ", name).strip()[:60] for cid, name in shown)
-    dropped = len(entries) - len(shown)
+    dropped = total - len(shown)
     tail = (f"目录只列了前 {len(shown)} 页，还有 {dropped} 页没列出，需要时用 wiki_index 取完整目录。"
-            if dropped else "整份目录已经在上面，不必再调 wiki_index。")
+            if dropped > 0 else "整份目录已经在上面，不必再调 wiki_index。")
     return f"\n{_WIKI_DIRECTORY_HEADER}\n{lines}\n\n{_WIKI_RULE}{tail}\n"
+
+
+def _fit_system(materials: str, practice: str, skills: str, limit: int, fixed: int) -> tuple[str, str, str, int, int]:
+    """系统分区：静态规则动不了（fixed），按「教材清单 → 练习状态 → 能力摘要」的顺序往回收。
+    教材清单排最前是因为它随上传数量无上界，而少列几个文件仍然检索得到。"""
+    def size() -> int:
+        return fixed + estimate_tokens(materials) + estimate_tokens(practice) + estimate_tokens(skills)
+    before = size()
+    if before <= limit:
+        return materials, practice, skills, before, before
+    materials = clip_to_tokens(materials, max(0, limit - before + estimate_tokens(materials)), _MATERIALS_CLIP)
+    if size() > limit:
+        practice = clip_to_tokens(practice, max(0, limit - size() + estimate_tokens(practice)), _PRACTICE_CLIP)
+    if size() > limit:
+        skills = clip_to_tokens(skills, max(0, limit - size() + estimate_tokens(skills)), _SKILLS_CLIP)
+    return materials, practice, skills, before, size()
+
+
+def _fit_knowledge(
+    entries: Sequence[tuple[str, str]], memory: str, summary: str, limit: int,
+) -> tuple[list[tuple[str, str]], str, str, int, int]:
+    """知识分区：先减知识页目录（少列的用 wiki_index 补得回来），再裁对话摘要，
+    最后才动用户手写的长期记忆。"""
+    total = len(entries)
+    shown = list(entries)[:WIKI_INJECT_MAX_ENTRIES]
+    def size() -> int:
+        return estimate_tokens(_wiki_block(shown, total)) + estimate_tokens(memory) + estimate_tokens(summary)
+    before = size()
+    if before <= limit:
+        return shown, memory, summary, before, before
+    low, high = 0, len(shown)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_tokens(_wiki_block(shown[:mid], total)) + estimate_tokens(memory) + estimate_tokens(summary) <= limit:
+            low = mid
+        else:
+            high = mid - 1
+    shown = shown[:low]
+    if size() > limit:
+        summary = clip_to_tokens(summary, max(0, limit - size() + estimate_tokens(summary)), _SUMMARY_CLIP)
+    if size() > limit:
+        memory = clip_to_tokens(memory, max(0, limit - size() + estimate_tokens(memory)), _MEMORY_CLIP)
+    return shown, memory, summary, before, size()
 
 
 @dataclass(frozen=True)
@@ -158,6 +241,8 @@ class AssembledContext:
     segments: list[ContextSegment]
     dropped_history: int  # 因预算没进上下文的历史消息条数
     clipped_history: int  # 进了上下文但被单条上限截断的消息条数
+    clips: tuple[ClipNote, ...] = ()  # 超出分区配额被裁的段
+    history_count: int = 0  # 历史消息在 messages 里占的条数，从下标 1 起
 
 
 def assemble_messages(
@@ -177,24 +262,63 @@ def assemble_messages(
     today: str = "",
     web_available: bool = True,
     wiki_entries: Sequence[tuple[str, str]] = (),
+    limits: PartitionLimits | None = None,
 ) -> AssembledContext:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
-    与模型自己调 search_materials 得到的形态一致）。"""
+    与模型自己调 search_materials 得到的形态一致）。
+
+    每个分区逐段核对配额，超了只裁本段，不借用别的分区；裁了就记进 clips 报出去。
+    """
+    limits = limits or PartitionLimits.from_window(DEFAULT_SOFT_WINDOW)
+    clips: list[ClipNote] = []
+
+    def note(key: str, label: str, before: int, after: int) -> None:
+        if after < before:
+            clips.append(ClipNote(key, label, before, after))
+
     skills_block = skill_summaries or "（当前没有可加载的能力）"
     practice_block = practice_digest or "（本会话还没有练习记录）"
     memory_block = memory or "（还没有长期记忆）"
     summary_block = conversation_summary or "（没有更早的对话）"
-    wiki_block = _wiki_block(wiki_entries)
-    system = _SYSTEM_PROMPT.format(
-        course_name=course_name, materials=_material_lines(materials),
-        skills=skills_block, practice_digest=practice_block, memory=memory_block,
-        web_hint=_WEB_HINT if web_available else "",
-        wiki_block=wiki_block,
-        conversation_summary=summary_block,
-        today=today or date.today().isoformat(),
-    )
-    kept, dropped, clipped = _budgeted_history(history, history_token_budget)
+    materials_block = _material_lines(materials)
+    web_hint = _WEB_HINT if web_available else ""
+    today = today or date.today().isoformat()
+
+    def render(materials_text: str, skills_text: str, practice_text: str,
+               memory_text: str, summary_text: str, wiki_text: str) -> str:
+        return _SYSTEM_PROMPT.format(
+            course_name=course_name, materials=materials_text, skills=skills_text,
+            practice_digest=practice_text, memory=memory_text, web_hint=web_hint,
+            wiki_block=wiki_text, conversation_summary=summary_text, today=today)
+
+    # 静态开销按真实渲染量，别拿带占位符的模板估——差的那几十 token 正好让配额守不住。
+    overhead = estimate_tokens(render("", "", "", "", "", ""))
+    materials_block, practice_block, skills_block, sys_before, sys_after = _fit_system(
+        materials_block, practice_block, skills_block, limits.system, overhead)
+    note("context.segment.system", "系统提示", sys_before, sys_after)
+    shown_wiki, memory_block, summary_block, know_before, know_after = _fit_knowledge(
+        wiki_entries, memory_block, summary_block, limits.knowledge)
+    note("context.segment.knowledge", "记忆与知识页", know_before, know_after)
+    question_before = estimate_tokens(question) + estimate_tokens(seed_query)
+    # 给检索参数留出它最小也要占的那点位置，否则提问吃满配额后这一段仍会溢出。
+    question = clip_to_tokens(question, max(0, limits.question - _SEED_ARGS_FLOOR), _QUESTION_CLIP)
+    # 检索参数是提问的副本，只能用本分区剩下的额度：不然一条超长提问要占两遍。
+    # JSON 外壳与转义也算进来，配额是按实际发出去的字符串核的。
     seed_arguments = json.dumps({"query": seed_query}, ensure_ascii=False)
+    if estimate_tokens(question) + estimate_tokens(seed_arguments) > limits.question:
+        wrapper = estimate_tokens(seed_arguments) - estimate_tokens(seed_query)
+        seed_query = clip_to_tokens(seed_query, max(0, limits.question - estimate_tokens(question) - wrapper), _SEED_QUERY_CLIP)
+        seed_arguments = json.dumps({"query": seed_query}, ensure_ascii=False)
+    note("context.segment.question", "当前问题", question_before, estimate_tokens(question) + estimate_tokens(seed_arguments))
+    evidence_before = estimate_tokens(seed_result_text)
+    seed_result_text = clip_to_tokens(seed_result_text, limits.evidence, _EVIDENCE_CLIP)
+    evidence_after = estimate_tokens(seed_result_text)
+    note("context.segment.evidence", "教材证据", evidence_before, evidence_after)
+    # 知识页正文排在检索结果末尾，先被切掉；两段之和仍要等于整段证据。
+    wiki_evidence = max(0, estimate_tokens(seed_wiki_text) - (evidence_before - evidence_after))
+    wiki_block = _wiki_block(shown_wiki, len(wiki_entries))
+    system = render(materials_block, skills_block, practice_block, memory_block, summary_block, wiki_block)
+    kept, dropped, clipped = _budgeted_history(history, history_token_budget)
     seed_call = ToolCallRequest(id=SEED_CALL_ID, name="search_materials", arguments=seed_arguments)
     messages = [
         ChatMessage(role="system", content=system),
@@ -215,16 +339,91 @@ def assemble_messages(
         ContextSegment("context.segment.history", "会话历史", sum(estimate_tokens(item.content) for item in kept)),
         ContextSegment("context.segment.question", "当前问题", estimate_tokens(question) + estimate_tokens(seed_arguments)),
         # 教材原文与知识页转述分开报：这一段是用户判断「结论有没有原文依据」的地方。
-        ContextSegment("context.segment.evidence", "教材证据",
-                       estimate_tokens(seed_result_text) - estimate_tokens(seed_wiki_text)),
-        ContextSegment("context.segment.wiki_evidence", "知识页正文", estimate_tokens(seed_wiki_text)),
+        ContextSegment("context.segment.evidence", "教材证据", evidence_after - wiki_evidence),
+        ContextSegment("context.segment.wiki_evidence", "知识页正文", wiki_evidence),
     ]
-    return AssembledContext(messages, segments, dropped, clipped)
+    return AssembledContext(messages, segments, dropped, clipped, tuple(clips), len(kept))
 
 
 def message_tokens(messages: Sequence[ChatMessage]) -> int:
     """整份上下文的估算 token 数，含工具循环里追加的内容。"""
     return sum(estimate_tokens(item.content) + sum(estimate_tokens(call.arguments) for call in (item.tool_calls or ())) for item in messages)
+
+
+# 总闸的说明文字。工具消息不能整条删掉——厂商要求每个 tool_call 都有配对的 tool 消息，
+# 所以换成一句话，模型也就知道那份资料需要重新取。
+GATE_TOOL_NOTE = "（更早的工具结果已因整轮上下文超出软窗口而移出；需要时重新调用工具取回。）"
+_GATE_EVIDENCE_CLIP = "\n…（整轮上下文超出软窗口，种子检索证据的末尾已截断）"
+_GATE_RECENT_CLIP = "\n…（整轮上下文超出软窗口，这条工具结果的末尾已截断）"
+# 最近这几条工具结果留着：模型正要用它们作答，砍掉等于让这一轮白跑。
+GATE_KEEP_RECENT_TOOLS = 2
+
+
+@dataclass(frozen=True)
+class TrimReport:
+    """总闸这一轮裁掉了什么。"""
+    tools_cleared: int = 0
+    history_dropped: int = 0
+    evidence_clipped: bool = False
+    before: int = 0
+    after: int = 0
+
+    @property
+    def triggered(self) -> bool:
+        return bool(self.tools_cleared or self.history_dropped or self.evidence_clipped)
+
+
+def enforce_context_limit(messages: list[ChatMessage], *, limit: int, history_count: int) -> TrimReport:
+    """整轮上下文的总闸，就地裁剪 messages。
+
+    工具循环每轮都往上下文追加内容，只在组装时算一次挡不住。优先级：较早的工具结果 →
+    较早的历史 → 种子证据 → 最近那几条工具结果。系统提示与本轮提问永不裁——
+    它们是这一轮要办的事本身；只剩它们还超限时如实报出去，不去动。
+    """
+    total = message_tokens(messages)
+    if total <= limit:
+        return TrimReport(before=total, after=total)
+    before = total
+    cleared = dropped = 0
+    evidence_clipped = False
+    seed = next((i for i, item in enumerate(messages) if item.tool_call_id == SEED_CALL_ID), None)
+    slots = [i for i, item in enumerate(messages)
+             if item.role == "tool" and i != seed and item.content != GATE_TOOL_NOTE]
+    for index in slots[:max(0, len(slots) - GATE_KEEP_RECENT_TOOLS)]:
+        if total <= limit:
+            break
+        total -= estimate_tokens(messages[index].content) - estimate_tokens(GATE_TOOL_NOTE)
+        messages[index] = replace(messages[index], content=GATE_TOOL_NOTE)
+        cleared += 1
+    cut = 1  # 下标 0 是系统提示，历史紧随其后
+    while total > limit and dropped < history_count:
+        total -= estimate_tokens(messages[cut].content)
+        cut += 1
+        dropped += 1
+    if dropped:
+        del messages[1:cut]
+        if seed is not None:
+            seed -= dropped
+    if total > limit and seed is not None:
+        room = max(0, limit - total + estimate_tokens(messages[seed].content))
+        text = clip_to_tokens(messages[seed].content, room, _GATE_EVIDENCE_CLIP)
+        if text != messages[seed].content:
+            evidence_clipped = True
+            total += estimate_tokens(text) - estimate_tokens(messages[seed].content)
+            messages[seed] = replace(messages[seed], content=text)
+    # 留出来的那几条也超了，就只能连它们一起截：被上游整轮打回比少读几段更糟。
+    for index, item in enumerate(messages):
+        if total <= limit:
+            break
+        if item.role != "tool" or index == seed or item.content == GATE_TOOL_NOTE:
+            continue
+        room = max(0, limit - total + estimate_tokens(item.content))
+        text = clip_to_tokens(item.content, room, _GATE_RECENT_CLIP)
+        if text != item.content:
+            cleared += 1
+            total += estimate_tokens(text) - estimate_tokens(item.content)
+            messages[index] = replace(item, content=text)
+    return TrimReport(cleared, dropped, evidence_clipped, before, total)
 
 
 def _budgeted_history(history: Sequence[tuple[str, str]], history_token_budget: int) -> tuple[list[ChatMessage], int, int]:
@@ -286,15 +485,33 @@ def assemble_general_messages(
     memory: str = "",
     conversation_summary: str = "",
     today: str = "",
+    limits: PartitionLimits | None = None,
 ) -> AssembledContext:
-    """没有课程 scope 的一轮：没有教材段，也不注入种子检索。"""
+    """没有课程 scope 的一轮：没有教材段，也不注入种子检索。分区配额同样在执行。"""
+    limits = limits or PartitionLimits.from_window(DEFAULT_SOFT_WINDOW)
+    clips: list[ClipNote] = []
     memory_block = memory or "（还没有长期记忆）"
     summary_block = conversation_summary or "（没有更早的对话）"
     courses_block = "、".join(f"「{name}」" for name in courses) or "（还没有课程）"
-    system = _GENERAL_SYSTEM_PROMPT.format(
-        courses=courses_block, memory=memory_block, conversation_summary=summary_block,
-        today=today or date.today().isoformat(),
-    )
+    today = today or date.today().isoformat()
+
+    def render(courses_text: str, memory_text: str, summary_text: str) -> str:
+        return _GENERAL_SYSTEM_PROMPT.format(courses=courses_text, memory=memory_text,
+                                             conversation_summary=summary_text, today=today)
+
+    overhead = estimate_tokens(render("", "", ""))
+    courses_block, _, _, sys_before, sys_after = _fit_system(courses_block, "", "", limits.system, overhead)
+    if sys_after < sys_before:
+        clips.append(ClipNote("context.segment.courses", "课程列表", sys_before, sys_after))
+    _, memory_block, summary_block, know_before, know_after = _fit_knowledge(
+        (), memory_block, summary_block, limits.knowledge)
+    if know_after < know_before:
+        clips.append(ClipNote("context.segment.knowledge", "记忆与知识页", know_before, know_after))
+    question_before = estimate_tokens(question)
+    question = clip_to_tokens(question, limits.question, _QUESTION_CLIP)
+    if estimate_tokens(question) < question_before:
+        clips.append(ClipNote("context.segment.question", "当前问题", question_before, estimate_tokens(question)))
+    system = render(courses_block, memory_block, summary_block)
     kept, dropped, clipped = _budgeted_history(history, history_token_budget)
     messages = [ChatMessage(role="system", content=system), *kept, ChatMessage(role="user", content=question)]
     segments = [
@@ -305,4 +522,4 @@ def assemble_general_messages(
         ContextSegment("context.segment.history", "会话历史", sum(estimate_tokens(item.content) for item in kept)),
         ContextSegment("context.segment.question", "当前问题", estimate_tokens(question)),
     ]
-    return AssembledContext(messages, segments, dropped, clipped)
+    return AssembledContext(messages, segments, dropped, clipped, tuple(clips), len(kept))

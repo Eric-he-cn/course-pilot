@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterator
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
 from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest
 from core.common import utc_now
+from core.settings import PartitionLimits
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
 from modules.memory.api import MemoryStorePort
 from modules.planning.api import PlanReaderPort, PlanWriterPort
@@ -20,7 +21,7 @@ from modules.sessions.api import (
 from contracts.web import WebSearchPort
 
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
-from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, assemble_general_messages, assemble_messages, estimate_tokens, message_tokens
+from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, TrimReport, assemble_general_messages, assemble_messages, clip_to_tokens, enforce_context_limit, estimate_tokens, message_tokens
 from .skills import SkillRegistry
 from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, profile_for_skill, specs_for, without_tools
 from .trace import TraceWriter
@@ -94,6 +95,8 @@ _MEMORY_INTENT = re.compile(
     r"|(?:save|add|write)\s+(?:this|that)\s+to\s+(?:your\s+)?memory|memori[sz]e",
     re.IGNORECASE)
 _TRANSCRIPTION_MARK = "[图片转录："
+# skill 正文超出分区配额时的说明，和别处的截断一样要在正文里讲出来。
+_SKILL_BODY_CLIP = "\n…（skill 规程超出分区配额，末尾步骤未进入上下文）"
 
 
 def _typed_text(message: str) -> str:
@@ -318,6 +321,7 @@ class TurnService:
         search_limit: int = SEARCH_LIMIT,
         history_token_budget: int = 128_000,
         context_token_limit: int = 512_000,
+        partitions: PartitionLimits | None = None,
         compact_threshold_ratio: float = 0.7,
     ) -> None:
         self._sessions, self._knowledge = sessions, knowledge
@@ -343,6 +347,9 @@ class TurnService:
         self._max_tool_rounds = max_tool_rounds
         self._history_token_budget = history_token_budget
         self._context_token_limit = context_token_limit
+        # 分区配额按软窗口切，历史那一份用已生效的预算，免得同一件事有两个数。
+        self._limits = replace(partitions or PartitionLimits.from_window(context_token_limit),
+                               history=history_token_budget)
         self._compact_threshold_ratio = compact_threshold_ratio
 
     @staticmethod
@@ -368,12 +375,17 @@ class TurnService:
         for key, value in extra.items():
             total[key] = total.get(key, 0) + value
 
-    def _context_usage(self, messages: list[ChatMessage], base: list[ContextSegment], assembled, summary) -> dict[str, object]:
+    def _context_usage(self, messages: list[ChatMessage], base: list[ContextSegment], assembled, summary,
+                       trim: TrimReport | None = None, history_count: int | None = None) -> dict[str, object]:
         """本轮上下文构成。工具循环追加的内容算进"工具结果"，不然看不到真正的大头。
 
-        字段名刻意避开 text / content / delta：前端对这三个键是无条件取值并拼进回答。
+        历史与种子证据按实际发出去的消息重算：总闸裁过之后，组装时的数字就不再是
+        上下文里真有的东西，照着报等于让用户以为那几条还在。分区裁剪与总闸裁剪
+        也随这个事件报出去。字段名刻意避开 text / content / delta：
+        前端对这三个键是无条件取值并拼进回答。
         """
         total = message_tokens(messages)
+        base = self._live_segments(messages, base, history_count)
         tool_tokens = max(0, total - sum(item.tokens for item in base))
         segments = [*base, ContextSegment("context.segment.tool_results", "工具结果", tool_tokens)]
         return self._event(
@@ -383,7 +395,27 @@ class TurnService:
             history_budget_tokens=self._history_token_budget,
             dropped_history=assembled.dropped_history, clipped_history=assembled.clipped_history,
             compacted_messages=summary.covers_message_count if summary else 0,
+            clipped_segments=[{"label": item.label, "label_key": item.key, "before": item.before, "after": item.after}
+                              for item in assembled.clips],
+            gate_tools_cleared=trim.tools_cleared if trim else 0,
+            gate_history_dropped=trim.history_dropped if trim else 0,
+            gate_evidence_clipped=bool(trim and trim.evidence_clipped),
         )
+
+    @staticmethod
+    def _live_segments(messages: list[ChatMessage], base: list[ContextSegment],
+                       history_count: int | None) -> list[ContextSegment]:
+        """把总闸能裁到的两段按当前 messages 重算，其余沿用组装时的数字。
+        没裁过时结果与组装时逐字相同。"""
+        if history_count is None:
+            return base
+        live = {"context.segment.history": sum(estimate_tokens(item.content)
+                                               for item in messages[1:1 + history_count])}
+        seed = next((item for item in messages if item.tool_call_id == SEED_CALL_ID), None)
+        if seed is not None:
+            wiki = next((item.tokens for item in base if item.key == "context.segment.wiki_evidence"), 0)
+            live["context.segment.evidence"] = max(0, estimate_tokens(seed.content) - wiki)
+        return [replace(item, tokens=live[item.key]) if item.key in live else item for item in base]
 
     def _compact_if_needed(self, *, session_id: str, turn_id: str, summary) -> dict[str, object] | None:
         """把水位之后过长的那段对话压成摘要，为下一轮腾出上下文。
@@ -524,9 +556,13 @@ class TurnService:
                         history_token_budget=self._history_token_budget,
                         memory=self._memory.read_user(),
                         conversation_summary=summary.summary_text if summary else "",
+                        limits=self._limits,
                     )
                     messages = assembled.messages
-                    yield self._context_usage(messages, assembled.segments, assembled, summary)
+                    trim = enforce_context_limit(messages, limit=self._context_token_limit,
+                                                 history_count=assembled.history_count)
+                    yield self._context_usage(messages, assembled.segments, assembled, summary, trim,
+                                              assembled.history_count - trim.history_dropped)
                     responder = self._responder
                     if self._select_responder and (model_key is not None or thinking is not None):
                         responder = self._select_responder(model_key, thinking)
@@ -578,9 +614,13 @@ class TurnService:
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
                     memory=self._memory_context(context.course_id),
                     conversation_summary=summary.summary_text if summary else "",
+                    limits=self._limits,
                 )
                 messages = assembled.messages
                 base_segments = assembled.segments
+                # 总闸每轮都要重算，所以历史条数与累计裁剪量得跟着走。
+                history_count = assembled.history_count
+                trim = TrimReport()
                 # 没带选择就用构造时注入的那个（生产里即配置中第一个模型与它的默认思考状态）。
                 responder = self._responder
                 if self._select_responder and (model_key is not None or thinking is not None):
@@ -638,9 +678,10 @@ class TurnService:
                     trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载",
                                         "summary_key": "summary.skill_auto_loaded_short", "summary_args": {"name": auto_skill.name},
                                         "decision": "allowed", "reason": None, "duration_ms": 0})
+                    skill_body = clip_to_tokens(auto_skill.body, self._limits.skill, _SKILL_BODY_CLIP)
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps(arguments)),)))
-                    messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{auto_skill.body}", tool_call_id=call_id))
-                    base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", estimate_tokens(auto_skill.body))]
+                    messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{skill_body}", tool_call_id=call_id))
+                    base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", estimate_tokens(skill_body))]
                     skill_profile = profile_for_skill(auto_skill.allowed_tools)
                     active_skill, allowed_tools = auto_skill.name, without_tools(skill_profile.tools, wiki_off)
                     capabilities = skill_profile.capabilities - self._offline
@@ -648,7 +689,16 @@ class TurnService:
                     trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
                 try:
                     while response is None:
-                        yield self._context_usage(messages, base_segments, assembled, summary)
+                        # 工具循环每轮都在追加内容，总闸必须每轮都过一次，不能只在组装时算。
+                        round_trim = enforce_context_limit(
+                            messages, limit=self._context_token_limit, history_count=history_count)
+                        history_count -= round_trim.history_dropped
+                        trim = replace(
+                            trim, tools_cleared=trim.tools_cleared + round_trim.tools_cleared,
+                            history_dropped=trim.history_dropped + round_trim.history_dropped,
+                            evidence_clipped=trim.evidence_clipped or round_trim.evidence_clipped,
+                        )
+                        yield self._context_usage(messages, base_segments, assembled, summary, trim, history_count)
                         allow_tools = tool_rounds < max_rounds
                         if not allow_tools and not budget_notified:
                             # 只是不下发 tools 的话模型并不知道，它会继续尝试调用、把调用写成正文
