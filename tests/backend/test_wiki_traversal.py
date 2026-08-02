@@ -371,11 +371,35 @@ def test_a_section_too_long_to_read_in_one_go_is_split_further():
     assert _leaf_pages(sections) == set(range(1, 11))
 
 
-def test_segments_beyond_the_cap_are_reported_as_dropped():
-    """没有目录时上限之外的段没有上级页兜住，是真的没读到，必须单独报出来。"""
-    _sections, stats = _plan([], _chunks(list(range(1, 21)), size=5000), max_nodes=4)
+def test_the_node_cap_makes_pages_bigger_it_never_drops_content():
+    """没有目录时上限之外的段没有上级页兜住，所以段要放大到装得下，不能砍掉尾巴。
 
-    assert stats["candidates"] > 4 and stats["dropped"] == stats["candidates"] - 4
+    真实故障：一本 813 页的书切出 169 段、上限 50，119 段的原文一个字都没进知识页。
+    """
+    sections, stats = _plan([], _chunks(list(range(1, 21)), size=5000), max_nodes=4)
+
+    assert len(sections) <= 4
+    assert stats["candidates"] > 4, "这个用例本来就该顶到上限，不然测不到东西"
+    assert stats["dropped"] == 0
+    assert stats["capped"] == stats["candidates"] - len(sections), "合并了多少要报出来"
+    assert _leaf_pages(sections) == set(range(1, 21))
+
+
+@pytest.mark.parametrize("max_nodes", [2, 4, 7, 50])
+@pytest.mark.parametrize("with_outline", [True, False])
+def test_every_chunk_is_read_by_some_section(max_nodes, with_outline):
+    """不漏是这次改造的全部意义：任何配置下，每个分片都必须被某个 section 读到。
+
+    判据落在分片上而不是页码上——页码粒度太粗，几段各查几页就能凑满整本书，
+    旧实现在页码判据下是绿的，实际每份教材只读到了一半分片。
+    """
+    chunks = _chunks(list(range(1, 21)), size=3000)
+    rows = [("章", 1, 0, None)] + [(f"节{index}", index + 1, 1, "章") for index in range(1, 15)]
+    sections, stats = _plan(_concepts(rows) if with_outline else [], chunks, max_nodes=max_nodes)
+
+    read = {chunk["id"] for section in sections for chunk in section.chunks}
+    assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len({c['id'] for c in chunks}) - len(read)} 个分片"
+    assert stats["dropped"] == 0
 
 
 def test_a_backwards_bookmark_does_not_leave_a_section_reading_nothing():

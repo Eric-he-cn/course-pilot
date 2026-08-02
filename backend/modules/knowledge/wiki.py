@@ -240,20 +240,35 @@ def _section_id(material_id: str, ordinal: int) -> str:
     return "section_" + hashlib.sha1(f"{material_id}\n{ordinal}".encode()).hexdigest()[:16]
 
 
-def _groups_by_size(chunks: list[dict]) -> list[list[dict]]:
-    """按分片顺序攒段，攒到读不动为止。单个超长分片自己成一段，绝不丢。"""
+def _groups_by_size(chunks: list[dict], *, target: int) -> list[list[dict]]:
+    """按分片顺序攒段，攒到 target 为止。单个超长分片自己成一段，绝不丢。"""
     groups: list[list[dict]] = []
     current: list[dict] = []
     size = 0
     for chunk in chunks:
         length = len(chunk["content"])
-        if current and size + length > MAX_EVIDENCE_CHARS:
+        if current and size + length > target:
             groups.append(current)
             current, size = [], 0
         current.append(chunk)
         size += length
     if current:
         groups.append(current)
+    return groups
+
+
+def _merge_to_fit(groups: list[list[dict]], max_nodes: int) -> list[list[dict]]:
+    """段数还是超上限时并掉多出来的那几段，每次挑最短的一对相邻段。
+
+    只并到刚好装下，不是两两减半——减半会把段撑到远超必要的长度。
+    合并只让段变长，不会漏掉分片。
+    """
+    def size(group: list[dict]) -> int:
+        return sum(len(chunk["content"]) for chunk in group)
+
+    while len(groups) > max_nodes >= 1:
+        pick = min(range(len(groups) - 1), key=lambda index: size(groups[index]) + size(groups[index + 1]))
+        groups[pick : pick + 2] = [groups[pick] + groups[pick + 1]]
     return groups
 
 
@@ -269,12 +284,17 @@ def _by_chunk_order(*, material_id: str, chunks: list[dict], max_nodes: int,
     """没有可用目录时的切法：按分片顺序切成等大的段，段名让模型读完自己起。
 
     讲义、扫描件、没做书签的 PDF 都走这条路，它不是兜底——多数真实教材没有书签。
-    这里没有上级页兜底，上限之外的段就是真的没读到，要单独报出来。
+    这条路没有上级页接住被砍掉的段，所以段数超过节点上限时**把段放大到装得下**，
+    而不是丢掉尾巴：原文一页都不能漏是这次改造的全部意义。代价是每页要读的原文变多，
+    合并了多少如实报出来，让调用方知道该提高上限。
     """
-    groups = _groups_by_size(chunks)
-    sections = [_group_section(material_id, group, level=0, parent_id=None)
-                for group in groups[:max_nodes]]
-    return sections, {"candidates": len(groups), "capped": 0, "dropped": len(groups) - len(sections)}
+    natural = _groups_by_size(chunks, target=MAX_EVIDENCE_CHARS)
+    groups = natural
+    if max_nodes >= 1 and len(natural) > max_nodes:
+        total = sum(len(chunk["content"]) for chunk in chunks)
+        groups = _merge_to_fit(_groups_by_size(chunks, target=max(1, -(-total // max_nodes))), max_nodes)
+    sections = [_group_section(material_id, group, level=0, parent_id=None) for group in groups]
+    return sections, {"candidates": len(natural), "capped": len(natural) - len(groups), "dropped": 0}
 
 
 def plan_sections(
@@ -370,7 +390,7 @@ def _split_oversized(sections: list[Section], *, material_id: str, max_nodes: in
             continue
         if sum(len(chunk["content"]) for chunk in section.chunks) <= MAX_EVIDENCE_CHARS:
             continue
-        groups = _groups_by_size(section.chunks)
+        groups = _groups_by_size(section.chunks, target=MAX_EVIDENCE_CHARS)
         if len(groups) < 2 or len(sections) + len(groups) > max_nodes:
             continue
         position = sections.index(section) + 1
