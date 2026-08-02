@@ -133,6 +133,8 @@ export interface Message {
   id: string
   // 'tool' 是落库的工具正文，只给模型跨轮读回；它在 api.messages 里就被滤掉，画不到界面上
   role: 'user' | 'assistant' | 'system' | 'tool'
+  // 这条消息属于哪一轮。开发者模式按它去取那一轮的 trace；流式中的临时消息还没有。
+  turn_id?: string | null
   content: string
   status?: string
   created_at?: string
@@ -148,6 +150,69 @@ export interface Message {
   choices?: string[]
   // 本轮切到本地兜底模型的说明；有值就必须显示，否则降级回答会被当成正常回答
   degraded?: string
+}
+
+// —— 开发者模式的 trace 侧栏。观测用，读不到就是读不到，别拿它当业务数据 ——
+
+/** 工具取回的正文。text 为 null 表示超出本次响应的字符预算，chars 仍是它原本的长度。 */
+export interface TraceBody {
+  call_id: string
+  name: string
+  chars: number
+  text: string | null
+}
+
+export interface TraceTool {
+  index: number
+  origin?: string | null
+  name?: string | null
+  ok?: boolean | null
+  summary?: string | null
+  summary_key?: string | null
+  summary_args?: Record<string, string | number> | null
+  duration_ms?: number | null
+  decision?: string | null
+  reason?: string | null
+  reused?: boolean | null
+  arguments?: Record<string, unknown> | null
+  // 长参数搬进了 payload 文件而这次没取到：参数不是空的，只是没读到
+  arguments_ref?: { chars?: number | null } | null
+  body: TraceBody | null
+}
+
+export interface TraceTurn {
+  turn_id: string
+  // false 表示这一轮的 trace 记录已经不在了（目录被清理），正文还在库里
+  trace_record: boolean
+  started_at?: string | null
+  status?: string | null
+  error_code?: string | null
+  duration_ms?: number | null
+  scope_mode?: string | null
+  prompt_version?: string | null
+  answer_chars?: number | null
+  citations?: number | null
+  citations_retrieved?: number | null
+  tool_rounds?: number | null
+  resolution?: Record<string, unknown> | null
+  responder?: Record<string, unknown> | null
+  usage?: Record<string, unknown> | null
+  payload_state: 'inline' | 'resolved' | 'missing' | 'skipped' | 'oversized' | 'invalid'
+  tools: TraceTool[]
+  // 子任务查到的正文：父轮的 trace 里没有对应的调用，所以单列
+  subagent_bodies: TraceBody[]
+  unmatched_bodies: TraceBody[]
+  bodies_omitted: number
+  extras: Record<string, unknown>
+}
+
+export interface SessionTrace {
+  session_id: string
+  focus_turn_id: string | null
+  focus_found: boolean
+  turns: TraceTurn[]
+  limits: { max_turns: number; max_scan_lines: number; max_day_files: number; max_body_chars: number; max_payload_bytes: number; max_payload_total_bytes: number }
+  scan: { files: string[]; scanned_lines: number; scan_capped: boolean; turns_capped: boolean; files_capped: boolean; truncated: boolean }
 }
 
 export interface Attachment {

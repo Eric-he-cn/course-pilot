@@ -1,12 +1,18 @@
-import { ChangeEvent, FormEvent, ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, createContext, FormEvent, ReactElement, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import { api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
+import { api, clearCurrentUser, currentDevMode, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentDevMode, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, StructurePreview, ToolActivity, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceTurn, WikiEstimate, WikiPageSummary } from './types'
+
+/** 开发者模式。关掉时 openTrace 为 null——入口靠这一个判断决定要不要渲染成可点的元素，
+ *  免得出现「按钮还在、只是点了没反应」这种状态。 */
+type DevMode = { enabled: boolean; setEnabled: (on: boolean) => void; openTrace: ((turnId: string) => void) | null }
+const DevModeContext = createContext<DevMode>({ enabled: false, setEnabled: () => {}, openTrace: null })
+function useDevMode() { return useContext(DevModeContext) }
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -99,6 +105,9 @@ export default function App() {
   const [apiOnline, setApiOnline] = useState<boolean | null>(null)
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [citation, setCitation] = useState<Citation | null>(null)
+  const [devMode, setDevMode] = useState(() => currentDevMode())
+  // 侧栏只留一个位置：trace 与引用抽屉都是右侧 fixed，同时开会叠在一起。
+  const [traceTurn, setTraceTurn] = useState<string | null>(null)
   const [turnResolution, setTurnResolution] = useState<TurnResolution | null>(null)
   // 上下文构成来自服务端实际组装结果；换会话就清空，避免显示上一会话的数字。
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
@@ -110,10 +119,19 @@ export default function App() {
   const stoppedRef = useRef(false)
 
   const i18n = useMemo(() => ({ lang, setLang: (next: Lang) => { setLang(next); setLangState(next) } }), [lang])
+  const openTrace = useCallback((turnId: string) => { setCitation(null); setTraceTurn(turnId) }, [])
+  const dev = useMemo<DevMode>(() => ({
+    enabled: devMode,
+    setEnabled: (on: boolean) => { setCurrentDevMode(on); setDevMode(on); if (!on) setTraceTurn(null) },
+    openTrace: devMode ? openTrace : null,
+  }), [devMode, openTrace])
   const course = useMemo(() => courses.find(item => item.id === workspace.courseId) ?? null, [courses, workspace.courseId])
   const heading = activeSession?.title && view === 'chat' ? activeSession.title : viewName(view)
 
   useEffect(() => { localStorage.setItem('cp-sidebar-collapsed', String(sidebarCollapsed)) }, [sidebarCollapsed])
+  // 换会话就收掉 trace 侧栏：轮次 id 属于上一个会话，留着只会显示成「这一轮没有记录」。
+  // 写成 effect，逐个入口清的话新增打开会话的路径就会漏掉。
+  useEffect(() => { setTraceTurn(null) }, [activeSession?.id])
   const heartbeat = useCallback(async () => {
     try {
       const payload = await api.health()
@@ -153,7 +171,7 @@ export default function App() {
   function switchWorkspace(next: Workspace, options: { keepView?: boolean } = {}) {
     setWorkspace(next)
     if (!options.keepView) setView('chat')
-    setSidebarOpen(false); setCitation(null); setTurnResolution(null); setContextUsage(null)
+    setSidebarOpen(false); setCitation(null); setTraceTurn(null); setTurnResolution(null); setContextUsage(null)
   }
   async function newSession() {
     setCreating(true)
@@ -206,7 +224,7 @@ export default function App() {
     })
     .map(key => (key === 'embedding' ? t('model.embedding') : t('model.reranker')))
     .join(t('common.list_sep'))
-  return <LangContext.Provider value={i18n}><div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+  return <LangContext.Provider value={i18n}><DevModeContext.Provider value={dev}><div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
     {sidebarOpen && <button className="sidebar-backdrop" aria-label={t('a11y.close_nav')} onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label={t('a11y.sidebar')}>
       <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
@@ -252,7 +270,7 @@ export default function App() {
         </div>
       </header>
       {notice && <div className="notice" role="alert"><span>{notice}</span><button aria-label={t('a11y.dismiss_notice')} onClick={() => setNotice('')}>×</button></div>}
-      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} modelNote={modelNote} turnResolution={turnResolution} contextUsage={contextUsage} draftSeed={draftSeed} onSeedUsed={() => setDraftSeed('')} onCitation={setCitation} onUpload={async file => {
+      {view === 'chat' && <ChatView session={activeSession} messages={messages} workspaceName={workspaceName} scope={workspace.scope} modelNote={modelNote} turnResolution={turnResolution} contextUsage={contextUsage} draftSeed={draftSeed} onSeedUsed={() => setDraftSeed('')} onCitation={next => { setTraceTurn(null); setCitation(next) }} onUpload={async file => {
         try {
           let targetSession = activeSession
           if (!targetSession) {
@@ -371,7 +389,8 @@ export default function App() {
       </footer>
     </main>
     {citation && <CitationDrawer citation={citation} onClose={() => setCitation(null)} onOpen={setCitation} />}
-  </div></LangContext.Provider>
+    {devMode && traceTurn && activeSession && <TraceDrawer sessionId={activeSession.id} turnId={traceTurn} onFocus={setTraceTurn} onClose={() => setTraceTurn(null)} />}
+  </div></DevModeContext.Provider></LangContext.Provider>
 }
 
 function ChatView({ session, messages, workspaceName, scope, modelNote, turnResolution, contextUsage, draftSeed, onSeedUsed, onCitation, onUpload, onSend, onStop, busy }: { session: SessionSummary | null; messages: Message[]; workspaceName: string; scope: ScopeMode; modelNote?: string; turnResolution: TurnResolution | null; contextUsage: ContextUsage | null; draftSeed: string; onSeedUsed: () => void; onStop: () => void; onCitation: (citation: Citation) => void; onUpload: (file: File) => Promise<Attachment>; onSend: (content: string, attachmentIds: string[]) => Promise<void>; busy: boolean }) {
@@ -1182,7 +1201,7 @@ function MessageCard({ message, onCitation, showResolution, onRetry, modelNote, 
   const isInterrupted = message.artifact?.kind === 'interrupted' || message.status === 'interrupted'
   // 课程会话的课程是固定的，逐条标注解析结果只会制造噪音；仅通用会话展示。
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? t('message.resolved', { course: message.resolved_course_name ?? message.resolved_course_id ?? t('message.course_fallback') }) : message.resolution_status ? t('message.unresolved') : null
-  return <article className="message assistant-message"><div className="agent-label"><span aria-hidden>❯</span><b>CoursePilot</b></div>{message.activity && message.activity.length > 0 && <ToolActivityRow activity={message.activity} />}
+  return <article className="message assistant-message"><AgentLabel turnId={message.turn_id ?? null} />{message.activity && message.activity.length > 0 && <ToolActivityRow activity={message.activity} />}
     {message.status === 'stopped' && <div className="degraded-notice"><span>{t('message.stopped_note')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}
     {message.degraded && <div className="degraded-notice">{t('message.degraded_note', { note: message.degraded })}</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>{t('message.interrupted')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>{t('message.artifact_public')}</b><span>{message.artifact.kind}</span></div>}{message.choices && message.choices.length > 0 && onChoose && <div className="choices">{message.choices.map(option => <button type="button" className="choice" key={option} onClick={() => onChoose(option)}>{option}</button>)}</div>}</article>
 }
@@ -1567,6 +1586,18 @@ function SkillsCard({ onError }: { onError: (message: string) => void }) {
   </article>
 }
 
+function DeveloperCard() {
+  const { enabled, setEnabled } = useDevMode()
+  return <article className="card dev-card"><h2>{t('settings.dev_title')}</h2>
+    <p>{t('settings.dev_hint')}</p>
+    <label className="dev-toggle">
+      <input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} />
+      <span>{t('settings.dev_toggle')}</span>
+    </label>
+    <small className="help-note">{t('settings.dev_note')}</small>
+  </article>
+}
+
 function SettingsView({ courses, onError, onCourseDeleted }: { courses: Course[]; onError: (message: string) => void; onCourseDeleted: (courseId: string) => void }) {
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [loading, setLoading] = useState(false)
@@ -1574,7 +1605,7 @@ function SettingsView({ courses, onError, onCourseDeleted }: { courses: Course[]
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const rag = (health?.rag ?? null) as Record<string, unknown> | null
   const embedding = (rag?.embedding ?? null) as Record<string, unknown> | null
-  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>{t('nav.settings')}</h1><p>{t('settings.hero')}</p></div><button className="ghost-button" onClick={check} disabled={loading}>{t('settings.check')}</button></div><div className="settings-grid"><article className="card"><h2>{t('settings.courses_title')}</h2><p>{t('settings.courses_count', { n: courses.length })}</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">{t('settings.courses_empty')}</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><article className="card health-card"><h2>{t('settings.health_title')}</h2>{health ? <><dl>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>{t('nav.settings')}</h1><p>{t('settings.hero')}</p></div><button className="ghost-button" onClick={check} disabled={loading}>{t('settings.check')}</button></div><div className="settings-grid"><article className="card"><h2>{t('settings.courses_title')}</h2><p>{t('settings.courses_count', { n: courses.length })}</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">{t('settings.courses_empty')}</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><DeveloperCard /><article className="card health-card"><h2>{t('settings.health_title')}</h2>{health ? <><dl>
     <div><dt>{t('help.fact_model')}</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? t('settings.remote_on') : t('settings.local_demo')}` : t('common.unknown')}</dd></div>
     <div><dt>{t('settings.fact_retrieval')}</dt><dd>{retrievalLabel(rag?.backend as string | undefined)}</dd></div>
     {embedding && <div><dt>{t('settings.fact_embedding')}</dt><dd>{String(embedding.model)} · {embedding.error ? t('settings.embed_failed', { error: String(embedding.error) }) : embedding.loaded ? t('settings.embed_loaded') : t('settings.embed_lazy')}</dd></div>}
@@ -1616,6 +1647,151 @@ function WikiSources({ citation, onOpen }: { citation: Citation; onOpen: (citati
     </div>)}
     {total > sources.length && <p className="citation-location">{t('citation.wiki_sources_more', { n: total, m: sources.length })}</p>}
   </div>
+}
+
+/** Agent 回复开头的名字。开发者模式开着时它是个按钮，点开这一轮的 trace；
+ *  关掉时渲染成普通文本，页面上根本没有那个按钮可点。 */
+function AgentLabel({ turnId }: { turnId: string | null }) {
+  const { openTrace } = useDevMode()
+  const [confirming, setConfirming] = useState(false)
+  useEffect(() => { if (!openTrace) setConfirming(false) }, [openTrace])
+  const name = <><span aria-hidden>❯</span><b>CoursePilot</b></>
+  // 流式中的临时消息还没有 turn_id，那一轮的 trace 也还没写下来。
+  if (!openTrace || !turnId) return <div className="agent-label">{name}</div>
+  return <div className="agent-label agent-label-dev">
+    <button type="button" className="agent-name" title={t('trace.open_hint')} onClick={() => setConfirming(true)}>{name}</button>
+    {confirming && <span className="trace-confirm" role="dialog" aria-label={t('trace.confirm_question')}>
+      <b>{t('trace.confirm_question')}</b>
+      <button type="button" className="trace-confirm-yes" onClick={() => { setConfirming(false); openTrace(turnId) }}>{t('trace.confirm_yes')}</button>
+      <button type="button" onClick={() => setConfirming(false)}>{t('common.cancel')}</button>
+    </span>}
+  </div>
+}
+
+function traceMs(value?: number | null) { return typeof value === 'number' ? t('trace.ms', { n: value }) : '—' }
+
+function TraceFacts({ rows }: { rows: [string, ReactNode][] }) {
+  return <dl className="trace-facts">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+}
+
+function TraceJson({ value }: { value: unknown }) {
+  return <pre className="trace-json">{JSON.stringify(value, null, 2)}</pre>
+}
+
+function TraceBodyBlock({ body }: { body: TraceBody }) {
+  if (body.text === null) return <p className="trace-note trace-warn">{t('trace.body_omitted', { n: body.chars })}</p>
+  return <details className="trace-body"><summary>{t('trace.tool_body', { n: body.chars })}</summary><pre>{body.text}</pre></details>
+}
+
+function TraceBodyList({ title, bodies }: { title: string; bodies: TraceBody[] }) {
+  if (bodies.length === 0) return null
+  return <section><h3>{title}</h3>{bodies.map(body => <div className="trace-loose-body" key={body.call_id}>
+    <div className="trace-tool-head"><b>{tOr(`tool.${body.name}`, body.name)}</b><span className="trace-origin">{body.call_id}</span></div>
+    <TraceBodyBlock body={body} />
+  </div>)}</section>
+}
+
+const PAYLOAD_NOTE: Record<string, string> = {
+  missing: 'trace.payload_missing', invalid: 'trace.payload_invalid',
+  oversized: 'trace.payload_oversized', skipped: 'trace.payload_skipped',
+}
+
+function TraceTurnCard({ turn, ordinal, focused, onFocus }: { turn: TraceTurn; ordinal: number; focused: boolean; onFocus: () => void }) {
+  const head = <button type="button" className="trace-turn-head" onClick={onFocus}>
+    <b>{t('trace.turn_label', { n: ordinal })}</b>
+    <span>{turn.started_at ? timeLabel(turn.started_at) : '—'}</span>
+    <span className="trace-status">{turn.error_code ?? turn.status ?? '—'}</span>
+    <span>{traceMs(turn.duration_ms)}</span>
+    {focused && <i className="trace-badge">{t('trace.focus_badge')}</i>}
+  </button>
+  if (!focused) return <div className="trace-turn">{head}</div>
+  const payloadNote = PAYLOAD_NOTE[turn.payload_state]
+  return <div className="trace-turn focused">{head}
+    {!turn.trace_record && <p className="trace-note trace-warn">{t('trace.no_record')}</p>}
+    {payloadNote && <p className="trace-note trace-warn">{tOr(payloadNote, '')}</p>}
+    {turn.bodies_omitted > 0 && <p className="trace-note trace-warn">{t('trace.bodies_omitted_count', { n: turn.bodies_omitted })}</p>}
+    {turn.trace_record && <section><h3>{t('trace.section_basics')}</h3><TraceFacts rows={[
+      [t('trace.field_turn'), <code key="id">{turn.turn_id}</code>],
+      [t('trace.field_started'), turn.started_at ?? '—'],
+      [t('trace.field_status'), turn.error_code ? `${turn.status ?? '—'} · ${turn.error_code}` : turn.status ?? '—'],
+      [t('trace.field_duration'), traceMs(turn.duration_ms)],
+      [t('trace.field_prompt'), turn.prompt_version ?? '—'],
+      [t('trace.field_scope'), turn.scope_mode ?? '—'],
+      [t('trace.field_answer_chars'), turn.answer_chars ?? '—'],
+      [t('trace.field_citations'), `${turn.citations ?? '—'} / ${turn.citations_retrieved ?? '—'}`],
+      [t('trace.field_tool_rounds'), turn.tool_rounds ?? '—'],
+    ]} /></section>}
+    {turn.resolution && <section><h3>{t('trace.section_resolution')}</h3><TraceJson value={turn.resolution} /></section>}
+    {(turn.responder || turn.usage) && <section><h3>{t('trace.section_model')}</h3>
+      {turn.responder && <TraceJson value={turn.responder} />}
+      {turn.usage && <TraceJson value={turn.usage} />}
+    </section>}
+    <section><h3>{t('trace.section_tools')}</h3>
+      {turn.tools.length === 0 ? <p className="trace-note">{t('trace.no_tools')}</p> : <ol className="trace-tools">
+        {turn.tools.map(tool => {
+          const summary = tool.summary_key ? tOr(tool.summary_key, tool.summary ?? '', tool.summary_args ?? undefined) : tool.summary
+          return <li key={tool.index}>
+            <div className="trace-tool-head">
+              <b>{tOr(`tool.${tool.name}`, tool.name ?? '—')}</b>
+              <span className="trace-origin">{tool.origin ?? '—'}</span>
+              <span>{traceMs(tool.duration_ms)}</span>
+              {tool.reused && <i className="trace-badge">{t('trace.reused')}</i>}
+              {tool.decision === 'denied' && <i className="trace-bad">{t('trace.denied')}</i>}
+              {tool.ok === false && <i className="trace-bad">✕</i>}
+            </div>
+            {summary && <p className="trace-summary">{summary}</p>}
+            {tool.reason && <p className="trace-note trace-warn">{tool.reason}</p>}
+            {tool.arguments_ref
+              ? <p className="trace-note trace-warn">{t('trace.tool_args_dropped', { n: tool.arguments_ref.chars ?? 0 })}</p>
+              : <details className="trace-args"><summary>{t('trace.tool_args')}</summary><TraceJson value={tool.arguments ?? {}} /></details>}
+            {tool.body ? <TraceBodyBlock body={tool.body} /> : <p className="trace-note">{t('trace.tool_body_none')}</p>}
+          </li>
+        })}
+      </ol>}
+    </section>
+    <TraceBodyList title={t('trace.section_subagent')} bodies={turn.subagent_bodies} />
+    <TraceBodyList title={t('trace.section_unmatched')} bodies={turn.unmatched_bodies} />
+    {Object.keys(turn.extras).length > 0 && <section><h3>{t('trace.section_extras')}</h3><TraceJson value={turn.extras} /></section>}
+  </div>
+}
+
+/** 开发者模式侧栏：整个会话的轮次，点中的那一轮展开。
+ *  这里只做观测。trace 可以随时被清理，读不到就照实说，不要在界面上补出一份来。 */
+function TraceDrawer({ sessionId, turnId, onFocus, onClose }: {
+  sessionId: string; turnId: string; onFocus: (turnId: string) => void; onClose: () => void
+}) {
+  const [data, setData] = useState<SessionTrace | null>(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+  useEffect(() => {
+    let alive = true
+    setLoading(true); setError('')
+    api.sessionTrace(sessionId, turnId)
+      .then(payload => { if (alive) setData(payload) })
+      .catch(problem => { if (alive) { setData(null); setError(errorText(problem)) } })
+      .finally(() => { if (alive) setLoading(false) })
+    return () => { alive = false }
+  }, [sessionId, turnId])
+
+  return <aside className="trace-drawer" role="dialog" aria-label={t('a11y.trace_drawer')}>
+    <header>
+      <div><p>{t('trace.title')}</p><h2>{t('trace.subtitle')}</h2></div>
+      <button aria-label={t('a11y.close_trace')} onClick={onClose}>×</button>
+    </header>
+    {loading && <p className="trace-note">{t('trace.loading')}</p>}
+    {error && <p className="trace-note trace-warn">{error}</p>}
+    {data && <>
+      <p className="trace-note">{t('trace.scan_note', { files: data.scan.files.length, lines: data.scan.scanned_lines })}</p>
+      {data.scan.truncated && <p className="trace-note trace-warn">{t('trace.truncated', { turns: data.limits.max_turns, lines: data.limits.max_scan_lines, files: data.limits.max_day_files })}</p>}
+      {!data.focus_found && data.turns.length > 0 && <p className="trace-note trace-warn">{t('trace.focus_missing')}</p>}
+      {data.turns.length === 0 && <p className="trace-empty">{t('trace.empty')}</p>}
+      {/* key 带上序号：同一份 JSONL 里出现两条相同 turn_id 时 turn_id 单独做 key 会撞 */}
+      <ol className="trace-turns">{data.turns.map((turn, index) => <li key={`${index}:${turn.turn_id}`}>
+        <TraceTurnCard turn={turn} ordinal={index + 1} focused={turn.turn_id === data.focus_turn_id}
+          onFocus={() => onFocus(turn.turn_id)} />
+      </li>)}</ol>
+    </>}
+  </aside>
 }
 
 function CitationDrawer({ citation, onClose, onOpen }: { citation: Citation; onClose: () => void; onOpen: (citation: Citation) => void }) {

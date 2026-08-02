@@ -1,10 +1,11 @@
 import { t } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
 const MODEL_KEY = 'cp-model'
 const THINKING_KEY = 'cp-thinking'
+const DEVMODE_KEY = 'cp-devmode'
 
 export function currentUser(): string { return localStorage.getItem(USER_KEY) ?? '' }
 export function setCurrentUser(name: string) { localStorage.setItem(USER_KEY, name) }
@@ -17,6 +18,10 @@ export function setCurrentModel(key: string) { localStorage.setItem(MODEL_KEY, k
 /** 思考档位：off / adaptive / high / max，与后端 THINKING_TIERS 对应。 */
 export function currentThinking(): string { return localStorage.getItem(THINKING_KEY) ?? '' }
 export function setCurrentThinking(tier: string) { localStorage.setItem(THINKING_KEY, tier) }
+
+/** 开发者模式：纯客户端的显示开关，只决定要不要把 trace 入口摆出来。存本地，不进库。 */
+export function currentDevMode(): boolean { return localStorage.getItem(DEVMODE_KEY) === 'on' }
+export function setCurrentDevMode(on: boolean) { localStorage.setItem(DEVMODE_KEY, on ? 'on' : 'off') }
 
 function modelHeaders(): Record<string, string> {
   const headers: Record<string, string> = {}
@@ -101,6 +106,11 @@ export const api = {
     // 工具正文（role='tool'）是给模型跨轮读回的资料，不是对话的一句话。服务端已经滤过，
     // 这里再滤一次：多一道拦截比事后发现检索原文被画成气泡便宜。
     return payload.messages.filter(message => message.role !== 'tool').map(message => ({ ...message, citations: message.citations?.map(citation => ({ ...citation, id: citation.id ?? citation.citation_id, material_name: citation.material_name ?? citation.document, text: citation.text ?? citation.snippet })) }))
+  },
+  /** 开发者模式侧栏：整个会话的轮次，turnId 指出高亮哪一轮（它的工具正文优先返回）。 */
+  sessionTrace: (sessionId: string, turnId?: string) => {
+    const query = turnId ? `?${new URLSearchParams({ turn_id: turnId })}` : ''
+    return request<SessionTrace>(`/sessions/${sessionId}/trace${query}`)
   },
   materials: (courseId: string) => request<Material[]>(`/courses/${courseId}/materials`),
   uploadMaterial: (courseId: string, file: File) => {

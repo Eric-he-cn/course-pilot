@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import Application
 from app.http.deps import current_workspace, model_choice
+from app.http.devtools import build_trace_view
 from contracts.llm import LLMProviderError
 from modules.sessions.api import VisionFeatureDisabledError
 
@@ -121,6 +122,23 @@ def create_core_router() -> APIRouter:
         # 当成对话气泡贴出来只会把检索原文摊满整个会话。
         return {"session": asdict(session) if session else None,
                 "messages": [asdict(message) for message in messages if message.role != "tool"]}
+
+    @router.get("/sessions/{session_id}/trace")
+    def session_trace(session_id: str, turn_id: Optional[str] = None, application: Application = Depends(current_workspace)):
+        """开发者模式的侧栏：这个会话的全部轮次，turn_id 指出点中的是哪一轮。
+
+        纯观测用途。trace 是可以随时清理的旁路设施，读不到就如实报空——
+        别让任何业务功能依赖这个端点的返回。
+        """
+        try:
+            session = application.sessions.get_session(session_id)
+            if session is None:
+                raise LookupError("会话不存在")
+            messages = application.sessions.list_messages(session_id)
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+        return build_trace_view(session=session, messages=messages,
+                                data_dir=application.settings.data_dir, focus_turn_id=turn_id)
 
     @router.post("/sessions/{session_id}/attachments", status_code=201)
     async def upload_attachment(session_id: str, file: UploadFile = File(...), application: Application = Depends(current_workspace)):

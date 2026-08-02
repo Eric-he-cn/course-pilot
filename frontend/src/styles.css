@@ -331,6 +331,59 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .citation-span button { border:1px solid var(--border); border-radius:5px; background:var(--panel); color:var(--text); padding:2px 8px; font-family:var(--mono); font-size:11px }
 .citation-span button:hover { border-color:var(--accent); color:var(--accent) }
 
+/* ---- 开发者模式：Agent 名字的入口与 trace 侧栏 ---- */
+/* 开发者模式关掉时这些样式一条都用不上：那时名字渲染成普通文本，压根没有按钮。 */
+.agent-label-dev { position:relative; gap:0 }
+.agent-label-dev .agent-name { display:inline-flex; align-items:center; gap:7px; border:1px solid transparent; border-radius:6px; padding:1px 6px; margin-left:-6px; background:transparent; color:inherit; font:inherit; cursor:pointer }
+.agent-label-dev .agent-name:hover { border-color:var(--border); background:var(--panel); color:var(--accent) }
+.agent-label-dev .agent-name:hover b { color:var(--accent) }
+.trace-confirm { display:inline-flex; align-items:center; gap:8px; margin-left:10px; padding:4px 8px; border:1px solid var(--border); border-radius:7px; background:var(--panel) }
+.trace-confirm b { font-size:11.5px; font-weight:600; color:var(--text) }
+.trace-confirm button { border:1px solid var(--border); border-radius:5px; padding:2px 9px; background:var(--bg); color:var(--text); font-family:var(--mono); font-size:11px }
+.trace-confirm .trace-confirm-yes { border-color:var(--accent); color:var(--accent) }
+
+.trace-drawer { position:fixed; z-index:11; top:0; right:0; bottom:0; width:min(560px,96vw); padding:20px; border-left:1px solid var(--border); background:var(--bg); box-shadow:-8px 0 24px rgb(0 0 0 / 8%); overflow:auto; animation:cp-slide-in .18s ease-out }
+@keyframes cp-slide-in { from { transform:translateX(100%) } to { transform:translateX(0) } }
+@media (prefers-reduced-motion:reduce) { .trace-drawer { animation:none } }
+.trace-drawer header { display:flex; justify-content:space-between; gap:12px }
+.trace-drawer header p { margin:0; color:var(--accent); font-family:var(--mono); font-size:10px; letter-spacing:.12em }
+.trace-drawer h2 { margin:5px 0; font-size:15.5px; font-weight:650 }
+.trace-drawer header button { width:32px; height:32px; border:0; background:transparent; font-size:21px; color:var(--muted) }
+.trace-note { margin:8px 0 0; color:var(--muted); font-family:var(--mono); font-size:11px; line-height:1.6 }
+.trace-warn { color:var(--danger) }
+.trace-empty { margin:20px 0; padding:16px; border:1px dashed var(--border); border-radius:8px; color:var(--muted); font-size:13px; text-align:center }
+.trace-turns { list-style:none; margin:14px 0 0; padding:0 }
+.trace-turns>li { margin-bottom:8px }
+.trace-turn { border:1px solid var(--border); border-radius:8px; background:var(--panel) }
+.trace-turn.focused { border-color:var(--accent); background:var(--bg) }
+.trace-turn-head { display:flex; flex-wrap:wrap; align-items:center; gap:10px; width:100%; border:0; padding:9px 11px; background:transparent; color:var(--text); font-family:var(--mono); font-size:11.5px; text-align:left }
+.trace-turn-head b { font-weight:650 }
+.trace-turn-head span { color:var(--muted) }
+.trace-turn-head .trace-status { color:var(--text) }
+.trace-badge { padding:1px 6px; border:1px solid var(--accent); border-radius:4px; color:var(--accent); font-size:10px; font-style:normal }
+.trace-bad { padding:1px 6px; border:1px solid var(--danger); border-radius:4px; color:var(--danger); font-size:10px; font-style:normal }
+.trace-turn.focused section { padding:0 11px 12px }
+.trace-turn.focused h3 { margin:12px 0 6px; color:var(--muted); font-family:var(--mono); font-size:10px; font-weight:600; letter-spacing:.1em; text-transform:uppercase }
+.trace-facts { display:grid; grid-template-columns:minmax(96px,auto) minmax(0,1fr); gap:3px 12px; margin:0; font-size:12px }
+.trace-facts>div { display:contents }
+.trace-facts dt { color:var(--muted); font-family:var(--mono); font-size:11px }
+.trace-facts dd { margin:0; overflow-wrap:anywhere }
+.trace-facts code { font-family:var(--mono); font-size:11px }
+.trace-json { overflow-x:auto; margin:0 0 8px; padding:9px 11px; border:1px solid var(--border); border-radius:7px; background:var(--panel); font-family:var(--mono); font-size:11px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere }
+.trace-tools { list-style:none; margin:0; padding:0 }
+.trace-tools>li { margin-bottom:12px; padding-left:10px; border-left:2px solid var(--border) }
+.trace-tool-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; font-family:var(--mono); font-size:11.5px }
+.trace-tool-head span { color:var(--muted); font-size:11px }
+.trace-origin { padding:1px 6px; border:1px solid var(--border); border-radius:4px }
+.trace-summary { margin:5px 0 6px; font-size:12.5px; line-height:1.6 }
+.trace-args>summary,.trace-body>summary { color:var(--muted); font-family:var(--mono); font-size:11px; cursor:pointer; margin:6px 0 }
+.trace-body pre { overflow:auto; max-height:280px; margin:0 0 8px; padding:10px; border:1px solid var(--border); border-radius:7px; background:var(--panel); font-size:12px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere }
+.trace-loose-body { margin-bottom:10px; padding-left:10px; border-left:2px dashed var(--border) }
+.dev-toggle { display:flex; align-items:center; gap:9px; margin:12px 0 4px; font-size:13px }
+.dev-toggle input { width:15px; height:15px }
+/* help-note 是 small，行内元素带边框换行会碎成几段 */
+.dev-card .help-note { display:block }
+
 /* ---- 会话上下文条 ---- */
 .course-heading { display:flex; align-items:center; gap:10px }
 .course-heading i { display:inline-block; flex:0 0 auto; width:11px; height:11px; border-radius:50% }
@@ -377,7 +430,7 @@ button:disabled { cursor:not-allowed; opacity:.5 }
   .hero { display:block }
   .hero-actions { margin:14px 0 0 }
   .library-grid,.settings-grid { grid-template-columns:1fr }
-  .citation-drawer { top:46px }
+  .citation-drawer,.trace-drawer { top:46px }
   .user-message>div { max-width:88% }
 }
 @media (max-width:520px) {
