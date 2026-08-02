@@ -71,9 +71,13 @@ _FRONT_MATTER = re.compile(
 )
 # 层级换成权重：越浅越靠前。列表按 mention_count 倒序取，所以整本书的章节会排在细节小节之前。
 _OUTLINE_MAX_LEVEL_WEIGHT = 10
+# 概念目录的条数上限。截断是浅层优先，所以砍掉的是最细的小节——它们的页码区间由上级
+# 接过去，内容不会漏，只是归到更粗的一层去讲。大部头（d2l 832 条书签）要到这个量级
+# 才覆盖得到节级；概念多了只是多几行数据库，掌握度与错题的归因还更细。
+CONCEPT_LIMIT = 500
 
 
-def from_outline(rows: list[tuple[int, str, int | None]], *, limit: int = 200) -> list[dict]:
+def from_outline(rows: list[tuple[int, str, int | None]], *, limit: int = CONCEPT_LIMIT) -> list[dict]:
     """把目录书签整理成概念候选，带上父节点名与层级。
 
     同名只挂一处：concept_id 由课程 + casefold 名字派生，一个名字在两章下各出现一次时
@@ -142,7 +146,7 @@ def merge_case_variants(candidates: list[dict]) -> list[dict]:
     return list(merged.values())
 
 
-def extract_candidates(segments: list[tuple[int | None, str]], *, limit: int = 200) -> list[dict]:
+def extract_candidates(segments: list[tuple[int | None, str]], *, limit: int = CONCEPT_LIMIT) -> list[dict]:
     """从教材文本抽概念候选，按提及次数排序。
 
     纯规则实现：标题层级与正文强调是教材里最稳定的概念标记，不调用模型，

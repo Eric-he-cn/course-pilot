@@ -30,8 +30,11 @@ HANDWRITTEN_MARKER = "<!-- 以下是手写区，重新生成不会覆盖 -->"
 INDEX_ID = "index"
 # 树的最大深度，index.md 算第一层，所以概念最多用到三层。
 WIKI_MAX_DEPTH = 4
-# 单次构建最多写多少页。先小规模试跑，确认层级和页面质量之后再往上调。
-WIKI_MAX_NODES = 50
+# 单次构建最多写多少页：跑飞的兜底，不是目标值。教材自己的结构（书签小节数，或无书签时
+# 按 MAX_EVIDENCE_CHARS 攒出的段数）在这条线以下就照它来——把作者分好的小节并成更少的页，
+# 只会让每页要概括的原文成倍上涨，同样六百字留下的细节完全不是一个量级。
+# 成本由构建前的预计页数与调用次数交给用户判断，不靠把这个数压小来省。
+WIKI_MAX_NODES = 300
 # 一页约一次模型调用。5 秒是实测均值（五份小教材 51 页共 261 秒），用来给用户一个量级。
 SECONDS_PER_PAGE = 5
 # 一页最多读多少字原文。超过就按分片顺序再切一层，不截断——截断就是漏。
@@ -377,8 +380,31 @@ def plan_sections(
         ))
 
     _split_oversized(sections, material_id=material_id, max_nodes=max_nodes, max_depth=max_depth)
+    _claim_unassigned(sections, chunks)
     # 上限砍掉的节点由上级页接过它的页码区间，所以只是「没单独成页」，不是没读到。
     return sections, {"candidates": len(outline), "capped": len(outline) - len(doc), "dropped": 0}
+
+
+def _claim_unassigned(sections: list[Section], chunks: list[dict]) -> None:
+    """按页码分段会漏掉没有页码的分片（提取不出页号时就是这样），按 ordinal 就近补给叶子。
+
+    兜底放在最后：页码区间怎么算都好，落不到任何一节的分片一律要有人读。
+    """
+    leaves = [section for section in sections if not section.children]
+    if not leaves:
+        return
+    claimed = {chunk["id"] for section in sections for chunk in section.chunks}
+    spans = [(min(c["ordinal"] for c in leaf.chunks), max(c["ordinal"] for c in leaf.chunks), leaf)
+             for leaf in leaves if leaf.chunks]
+    for chunk in chunks:
+        if chunk["id"] in claimed:
+            continue
+        nearest = min(spans, key=lambda span: min(abs(chunk["ordinal"] - span[0]), abs(chunk["ordinal"] - span[1])),
+                      default=None) if spans else None
+        target = nearest[2] if nearest else leaves[0]
+        target.chunks.append(chunk)
+    for leaf in leaves:
+        leaf.chunks.sort(key=lambda chunk: chunk["ordinal"])
 
 
 def _in_pages(chunks: list[dict], first: int, last: int) -> list[dict]:

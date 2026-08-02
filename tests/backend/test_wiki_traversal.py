@@ -505,3 +505,19 @@ def test_a_backwards_bookmark_does_not_leave_a_section_reading_nothing():
         [(s.name, s.first_page, s.last_page) for s in sections]
     assert all(section.chunks for section in sections if not section.children), \
         [s.name for s in sections if not s.children and not s.chunks]
+
+
+def test_chunks_without_a_page_number_still_get_read():
+    """按页码分段会漏掉没有页号的分片。真实教材里就有——d2l 2033 个分片里 51 个没有页号，
+    页码覆盖 1~813 看着是满的，那 51 段却谁都没读。"""
+    from modules.knowledge.wiki import plan_sections
+
+    chunks = _chunks(list(range(1, 11)), size=800)
+    for index in (3, 7):  # 提取不出页号的那几段
+        chunks[index] = {**chunks[index], "page": None}
+    rows = [("章", 1, 0, None)] + [(f"节{index}", index + 1, 1, "章") for index in range(1, 5)]
+    sections, stats = plan_sections(material_id="m1", concepts=_concepts(rows), chunks=chunks)
+
+    read = {chunk["id"] for section in sections for chunk in section.chunks}
+    assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len(chunks) - len(read)} 个"
+    assert stats["dropped"] == 0
