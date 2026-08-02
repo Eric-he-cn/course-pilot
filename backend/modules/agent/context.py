@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 
-from contracts.llm import ChatMessage, ToolCallRequest
+from contracts.llm import ChatMessage, ToolCallRequest, ToolSpec
 from core.settings import PartitionLimits
 
 SEED_CALL_ID = "call_seed_search"
@@ -49,6 +49,15 @@ def estimate_tokens(text: str) -> int:
     而这里对接的是任意 OpenAI 兼容服务。"""
     cjk = len(_CJK_RE.findall(text))
     return cjk + math.ceil((len(text) - cjk) / _LATIN_CHARS_PER_TOKEN)
+
+
+def tool_schema_tokens(tools: Sequence[ToolSpec]) -> int:
+    """本轮下发的工具定义要占多少。它走 tools= 参数、不在 messages 里，却每轮都发，一样吃上游窗口。
+    MAIN 那 18 个工具估 2960 token（deepseek 实测 2417），比系统提示还大；skill 激活或撤掉
+    wiki_*/web_* 都会改变它，所以只能按这一轮实际下发的那份算。"""
+    if not tools:
+        return 0
+    return estimate_tokens(json.dumps([tool.wire() for tool in tools], ensure_ascii=False))
 
 
 # 没显式给配额时按这个软窗口推导，与 settings 的默认一致。
@@ -262,6 +271,7 @@ def assemble_messages(
     today: str = "",
     web_available: bool = True,
     wiki_entries: Sequence[tuple[str, str]] = (),
+    tools: Sequence[ToolSpec] = (),
     limits: PartitionLimits | None = None,
 ) -> AssembledContext:
     """system + 截断后的历史 + 当前问题 + 种子检索（以工具调用的格式注入，
@@ -292,7 +302,9 @@ def assemble_messages(
             wiki_block=wiki_text, conversation_summary=summary_text, today=today)
 
     # 静态开销按真实渲染量，别拿带占位符的模板估——差的那几十 token 正好让配额守不住。
-    overhead = estimate_tokens(render("", "", "", "", "", ""))
+    # 工具定义与系统提示共用这个分区（架构 §5.5），同属这一段动不了的部分。
+    schema_tokens = tool_schema_tokens(tools)
+    overhead = estimate_tokens(render("", "", "", "", "", "")) + schema_tokens
     materials_block, practice_block, skills_block, sys_before, sys_after = _fit_system(
         materials_block, practice_block, skills_block, limits.system, overhead)
     note("context.segment.system", "系统提示", sys_before, sys_after)
@@ -331,6 +343,9 @@ def assemble_messages(
     # 系统提示那段用减法算，各段之和才恰好等于 message_tokens 报出来的总量。
     segments = [
         ContextSegment("context.segment.system", "系统提示", estimate_tokens(system) - estimate_tokens(wiki_block) - estimate_tokens(skills_block) - estimate_tokens(practice_block) - estimate_tokens(memory_block) - estimate_tokens(summary_block)),
+        # 工具定义单开一段而不并进系统提示：它比系统提示还大，混进去用户就看不出
+        # 那一行里有多少是自己改不动的固定开销。
+        ContextSegment("context.segment.tools", "工具定义", schema_tokens),
         ContextSegment("context.segment.wiki", "知识页目录", estimate_tokens(wiki_block)),
         ContextSegment("context.segment.skills", "能力摘要", estimate_tokens(skills_block)),
         ContextSegment("context.segment.practice", "练习状态", estimate_tokens(practice_block)),
@@ -345,9 +360,16 @@ def assemble_messages(
     return AssembledContext(messages, segments, dropped, clipped, tuple(clips), len(kept))
 
 
-def message_tokens(messages: Sequence[ChatMessage]) -> int:
-    """整份上下文的估算 token 数，含工具循环里追加的内容。"""
-    return sum(estimate_tokens(item.content) + sum(estimate_tokens(call.arguments) for call in (item.tool_calls or ())) for item in messages)
+def _message_cost(item: ChatMessage) -> int:
+    """一条消息发出去要占的量。reasoning 思考模式下要随消息回传，一起算进去——
+    厂商收不收它的钱各家不同，宁可高估：低估会顶爆上游窗口。"""
+    return (estimate_tokens(item.content) + estimate_tokens(item.reasoning)
+            + sum(estimate_tokens(call.arguments) for call in (item.tool_calls or ())))
+
+
+def message_tokens(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> int:
+    """整轮发出去的估算 token 数：消息（含工具循环里追加的内容）加本轮的工具定义。"""
+    return sum(_message_cost(item) for item in messages) + tool_schema_tokens(tools)
 
 
 # 总闸的说明文字。工具消息不能整条删掉——厂商要求每个 tool_call 都有配对的 tool 消息，
@@ -373,14 +395,16 @@ class TrimReport:
         return bool(self.tools_cleared or self.history_dropped or self.evidence_clipped)
 
 
-def enforce_context_limit(messages: list[ChatMessage], *, limit: int, history_count: int) -> TrimReport:
+def enforce_context_limit(messages: list[ChatMessage], *, limit: int, history_count: int,
+                          tools: Sequence[ToolSpec] = ()) -> TrimReport:
     """整轮上下文的总闸，就地裁剪 messages。
 
     工具循环每轮都往上下文追加内容，只在组装时算一次挡不住。优先级：较早的工具结果 →
     较早的历史 → 种子证据 → 最近那几条工具结果。系统提示与本轮提问永不裁——
     它们是这一轮要办的事本身；只剩它们还超限时如实报出去，不去动。
+    工具定义同属裁不掉的那一类，但要算进总量：漏算它就会以为还有余量。
     """
-    total = message_tokens(messages)
+    total = message_tokens(messages, tools)
     if total <= limit:
         return TrimReport(before=total, after=total)
     before = total
@@ -397,7 +421,7 @@ def enforce_context_limit(messages: list[ChatMessage], *, limit: int, history_co
         cleared += 1
     cut = 1  # 下标 0 是系统提示，历史紧随其后
     while total > limit and dropped < history_count:
-        total -= estimate_tokens(messages[cut].content)
+        total -= _message_cost(messages[cut])
         cut += 1
         dropped += 1
     if dropped:

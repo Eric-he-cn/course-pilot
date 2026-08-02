@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 
 import pytest
 from conftest import workspace
@@ -17,8 +18,9 @@ from contracts.llm import ChatDelta, ChatFinal, ChatMessage, ChatToolCalls, Tool
 from core.settings import CONTEXT_PARTITION_RATIOS, PartitionLimits, Settings
 from modules.agent.context import (
     GATE_TOOL_NOTE, SEED_CALL_ID, assemble_general_messages, assemble_messages,
-    enforce_context_limit, estimate_tokens, message_tokens,
+    enforce_context_limit, estimate_tokens, message_tokens, tool_schema_tokens,
 )
+from modules.agent.tools import MAIN, MAIN_PROFILE, WIKI_TOOLS, profile_for_skill, specs_for, without_tools
 
 # 各段都远小于配额的一轮，用来证明限额不碰正常对话。
 ORDINARY = dict(
@@ -277,6 +279,83 @@ def test_the_gate_is_a_no_op_below_the_limit():
     assert not report.triggered
 
 
+# ---------------------------------------------------------------- 工具定义与思考内容
+
+MAIN_SPECS = specs_for(MAIN_PROFILE, capabilities=MAIN.capabilities)
+NO_WIKI_SPECS = specs_for(without_tools(MAIN_PROFILE, WIKI_TOOLS), capabilities=MAIN.capabilities)
+
+
+def test_the_tool_schema_is_part_of_what_this_turn_costs():
+    """工具定义走 tools= 参数发出去，不在 messages 里，但每轮都发，一样占上游窗口。"""
+    messages = _loop_messages()
+    schema = tool_schema_tokens(MAIN_SPECS)
+
+    assert schema > 2_000  # 十几份描述与 JSON Schema，比系统提示本身还大
+    assert message_tokens(messages, MAIN_SPECS) == message_tokens(messages) + schema
+
+
+def test_a_smaller_tool_set_costs_less():
+    """工具集按轮变化，估算得跟着变：写死一个常量，撤掉 wiki_* 的那些轮就会报大。"""
+    only_wiki = specs_for(tuple(sorted(WIKI_TOOLS)), capabilities=MAIN.capabilities)
+    gap = tool_schema_tokens(MAIN_SPECS) - tool_schema_tokens(NO_WIKI_SPECS)
+
+    assert gap > 0
+    # 差额就是那两份定义本身（几个 token 的出入来自 JSON 分隔符），不是抹了个平均数
+    assert abs(gap - tool_schema_tokens(only_wiki)) <= 5
+
+
+def test_activating_a_skill_swaps_the_whole_schema():
+    """profile 是整体替换而不是并集，schema 的量也跟着整体换掉。"""
+    profile = profile_for_skill(("search_materials", "note_write"))
+    specs = specs_for(profile.tools, capabilities=profile.capabilities)
+
+    assert 0 < tool_schema_tokens(specs) < tool_schema_tokens(MAIN_SPECS)
+
+
+def test_reasoning_is_charged_to_the_message_that_carries_it():
+    """思考内容要原样回传给厂商，max 档下可能比正文还大。"""
+    plain = [ChatMessage(role="assistant", content="结论。")]
+    thinking = [replace(plain[0], reasoning="先看第一种可能，再看第二种。" * 200)]
+
+    assert message_tokens(thinking) - message_tokens(plain) == estimate_tokens("先看第一种可能，再看第二种。" * 200)
+
+
+def test_the_gate_counts_the_tool_schema_it_cannot_trim():
+    """schema 裁不掉，但要算进总量：只算 messages 会以为还有余量，发出去就顶爆窗口。"""
+    messages = _loop_messages(tool_rounds=3, tool_chars=1_000)
+    limit = message_tokens(messages) + tool_schema_tokens(MAIN_SPECS) // 2
+
+    assert not enforce_context_limit(list(messages), limit=limit, history_count=0).triggered
+    report = enforce_context_limit(messages, limit=limit, history_count=0, tools=MAIN_SPECS)
+
+    assert report.triggered
+    assert message_tokens(messages, MAIN_SPECS) <= limit
+
+
+def test_the_schema_counts_against_the_system_partition():
+    """架构 §5.5：系统提示与 Tool Schema 共用一个配额，默认档下普通一轮离得还很远。"""
+    assembled = assemble_messages(**{**ORDINARY, "limits": PRODUCTION, "tools": MAIN_SPECS})
+    segments = _segments(assembled)
+
+    assert segments["context.segment.tools"] == tool_schema_tokens(MAIN_SPECS)
+    assert sum(item.tokens for item in assembled.segments) == message_tokens(assembled.messages, MAIN_SPECS)
+    assert assembled.clips == ()
+    assert segments["context.segment.system"] + segments["context.segment.tools"] < PRODUCTION.system // 4
+
+
+def test_a_tight_system_partition_makes_room_for_the_schema():
+    """同一份输入只多下发工具定义，这一段就该更早开始裁——共用配额才是真的在共用。"""
+    limits = PartitionLimits.from_window(40_000)
+    crowded = {**ORDINARY, "limits": limits, "materials": [f"第{i}章讲义.pdf" for i in range(200)]}
+
+    plain = assemble_messages(**crowded)
+    with_tools = assemble_messages(**{**crowded, "tools": MAIN_SPECS})
+
+    assert plain.clips == ()
+    assert [item.key for item in with_tools.clips] == ["context.segment.system"]
+    assert len(with_tools.messages[0].content) < len(plain.messages[0].content)
+
+
 # ---------------------------------------------------------------- 正常轮次不受影响
 
 def test_an_ordinary_turn_is_identical_with_and_without_quotas():
@@ -334,9 +413,11 @@ class _Scripted:
     def __init__(self, script):
         self._script = list(script)
         self.calls: list[list[ChatMessage]] = []
+        self.tools: list[tuple] = []
 
     def chat(self, *, messages, tools=()):
         self.calls.append(list(messages))
+        self.tools.append(tuple(tools))
         yield from self._script.pop(0)
 
     def health(self):
@@ -407,6 +488,24 @@ def test_the_breakdown_reports_what_was_actually_sent(client):
                                  json={"client_request_id": "report-1", "message": "再说一遍调度怎么取舍？"}).text)
     last = [data for name, data in events if name == "context_usage"][-1]
 
-    assert last["total_tokens"] == message_tokens(scripted.calls[-1])
+    assert last["total_tokens"] == message_tokens(scripted.calls[-1], scripted.tools[-1])
     # 各段之和不许超过真实总量：超了就说明报了上下文里已经没有的东西
     assert sum(item["tokens"] for item in last["segments"]) <= last["total_tokens"]
+
+
+def test_the_breakdown_shows_what_the_tool_definitions_cost(client):
+    """固定开销也要看得见：用户改不动它，但得知道这一轮为什么起步就几千 token。"""
+    course = client.post("/api/v2/courses", json={"name": "操作系统"}).json()
+    session_id = client.post("/api/v2/sessions", json={"scope_mode": "course", "course_id": course["id"]}).json()["id"]
+
+    scripted = _Scripted([[ChatDelta("先来先服务会堵住短作业。"),
+                           ChatFinal("先来先服务会堵住短作业。", "stop", "example", "example-model", "provider")]])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "tools-1", "message": "护航效应是什么？"}).text)
+    last = [data for name, data in events if name == "context_usage"][-1]
+    reported = next(item for item in last["segments"] if item["label_key"] == "context.segment.tools")
+
+    assert scripted.tools[-1]  # 这一轮确实下发了工具，否则下面两条是空过
+    assert reported["tokens"] == tool_schema_tokens(scripted.tools[-1]) > 1_000
+    assert last["total_tokens"] == message_tokens(scripted.calls[-1], scripted.tools[-1])

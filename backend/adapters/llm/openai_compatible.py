@@ -113,10 +113,7 @@ class OpenAICompatibleChat:
         # extra_body 里置 null 表示移除该字段，留给不认识 stream_options 的服务一个出口。
         payload = {key: value for key, value in payload.items() if value is not None}
         if tools:
-            payload["tools"] = [
-                {"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}}
-                for tool in tools
-            ]
+            payload["tools"] = [tool.wire() for tool in tools]
         attempt = 0
         while True:
             emitted = False

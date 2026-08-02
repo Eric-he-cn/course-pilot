@@ -21,6 +21,11 @@ class ToolSpec:
     description: str
     parameters: dict[str, object]
 
+    def wire(self) -> dict[str, object]:
+        """OpenAI 兼容接口上工具定义的形状。发送与用量估算共用这一份，免得两处各写各的。"""
+        return {"type": "function",
+                "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}
+
 
 @dataclass(frozen=True)
 class ToolCallRequest:

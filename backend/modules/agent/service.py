@@ -5,10 +5,10 @@ import logging
 import re
 import time
 from dataclasses import replace
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
-from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest
+from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest, ToolSpec
 from core.common import utc_now
 from core.settings import PartitionLimits
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
@@ -21,7 +21,7 @@ from modules.sessions.api import (
 from contracts.web import WebSearchPort
 
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
-from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, TrimReport, assemble_general_messages, assemble_messages, clip_to_tokens, enforce_context_limit, estimate_tokens, message_tokens
+from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, TrimReport, assemble_general_messages, assemble_messages, clip_to_tokens, enforce_context_limit, estimate_tokens, message_tokens, tool_schema_tokens
 from .skills import SkillRegistry
 from .tools import MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, profile_for_skill, specs_for, without_tools
 from .trace import TraceWriter
@@ -376,16 +376,17 @@ class TurnService:
             total[key] = total.get(key, 0) + value
 
     def _context_usage(self, messages: list[ChatMessage], base: list[ContextSegment], assembled, summary,
-                       trim: TrimReport | None = None, history_count: int | None = None) -> dict[str, object]:
+                       trim: TrimReport | None = None, history_count: int | None = None,
+                       tools: Sequence[ToolSpec] = ()) -> dict[str, object]:
         """本轮上下文构成。工具循环追加的内容算进"工具结果"，不然看不到真正的大头。
 
-        历史与种子证据按实际发出去的消息重算：总闸裁过之后，组装时的数字就不再是
-        上下文里真有的东西，照着报等于让用户以为那几条还在。分区裁剪与总闸裁剪
-        也随这个事件报出去。字段名刻意避开 text / content / delta：
+        历史、种子证据与工具定义按这一轮实际发出去的东西重算：总闸裁过、或 skill 换掉了
+        工具集之后，组装时的数字就不再是上下文里真有的东西，照着报等于让用户以为那几条还在。
+        分区裁剪与总闸裁剪也随这个事件报出去。字段名刻意避开 text / content / delta：
         前端对这三个键是无条件取值并拼进回答。
         """
-        total = message_tokens(messages)
-        base = self._live_segments(messages, base, history_count)
+        total = message_tokens(messages, tools)
+        base = self._live_segments(messages, base, history_count, tools)
         tool_tokens = max(0, total - sum(item.tokens for item in base))
         segments = [*base, ContextSegment("context.segment.tool_results", "工具结果", tool_tokens)]
         return self._event(
@@ -404,13 +405,14 @@ class TurnService:
 
     @staticmethod
     def _live_segments(messages: list[ChatMessage], base: list[ContextSegment],
-                       history_count: int | None) -> list[ContextSegment]:
-        """把总闸能裁到的两段按当前 messages 重算，其余沿用组装时的数字。
-        没裁过时结果与组装时逐字相同。"""
+                       history_count: int | None, tools: Sequence[ToolSpec] = ()) -> list[ContextSegment]:
+        """把每轮会变的那几段按当前 messages 与工具集重算，其余沿用组装时的数字。
+        没裁过、工具集也没换时，结果与组装时逐字相同。"""
         if history_count is None:
             return base
         live = {"context.segment.history": sum(estimate_tokens(item.content)
-                                               for item in messages[1:1 + history_count])}
+                                               for item in messages[1:1 + history_count]),
+                "context.segment.tools": tool_schema_tokens(tools)}
         seed = next((item for item in messages if item.tool_call_id == SEED_CALL_ID), None)
         if seed is not None:
             wiki = next((item.tokens for item in base if item.key == "context.segment.wiki_evidence"), 0)
@@ -599,6 +601,8 @@ class TurnService:
                 yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, **_summary_fields(seed))
                 activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, **_summary_fields(seed)})
                 trace_tools.append({"origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, **_summary_fields(seed), "duration_ms": int((time.monotonic() - seed_started) * 1000)})
+                allowed_tools = without_tools(MAIN_PROFILE, wiki_off)
+                capabilities = MAIN.capabilities - self._offline
                 assembled = assemble_messages(
                     course_name=context.course_name or "当前课程",
                     materials=self._knowledge.material_names(scope=scope),
@@ -614,6 +618,7 @@ class TurnService:
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
                     memory=self._memory_context(context.course_id),
                     conversation_summary=summary.summary_text if summary else "",
+                    tools=specs_for(allowed_tools, capabilities=capabilities),
                     limits=self._limits,
                 )
                 messages = assembled.messages
@@ -625,9 +630,7 @@ class TurnService:
                 responder = self._responder
                 if self._select_responder and (model_key is not None or thinking is not None):
                     responder = self._select_responder(model_key, thinking)
-                allowed_tools = without_tools(MAIN_PROFILE, wiki_off)
                 budget_notified = False
-                capabilities = MAIN.capabilities - self._offline
                 tool_budget = MAIN.per_tool_budget
                 tool_used: dict[str, int] = {}
                 tool_results: dict[tuple[str, str], object] = {}
@@ -689,16 +692,6 @@ class TurnService:
                     trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
                 try:
                     while response is None:
-                        # 工具循环每轮都在追加内容，总闸必须每轮都过一次，不能只在组装时算。
-                        round_trim = enforce_context_limit(
-                            messages, limit=self._context_token_limit, history_count=history_count)
-                        history_count -= round_trim.history_dropped
-                        trim = replace(
-                            trim, tools_cleared=trim.tools_cleared + round_trim.tools_cleared,
-                            history_dropped=trim.history_dropped + round_trim.history_dropped,
-                            evidence_clipped=trim.evidence_clipped or round_trim.evidence_clipped,
-                        )
-                        yield self._context_usage(messages, base_segments, assembled, summary, trim, history_count)
                         allow_tools = tool_rounds < max_rounds
                         if not allow_tools and not budget_notified:
                             # 只是不下发 tools 的话模型并不知道，它会继续尝试调用、把调用写成正文
@@ -709,10 +702,24 @@ class TurnService:
                                 content="工具调用次数已用完。现在只用上面已经取得的资料作答，不要再尝试调用任何工具；"
                                         "资料不足的部分直接说明缺什么。",
                             ))
+                        # 这一轮真正下发的那份工具定义，总闸、用量与请求共用它。
+                        round_tools = specs_for(allowed_tools, capabilities=capabilities) if allow_tools else ()
+                        # 工具循环每轮都在追加内容，总闸必须每轮都过一次，不能只在组装时算。
+                        round_trim = enforce_context_limit(
+                            messages, limit=self._context_token_limit, history_count=history_count,
+                            tools=round_tools)
+                        history_count -= round_trim.history_dropped
+                        trim = replace(
+                            trim, tools_cleared=trim.tools_cleared + round_trim.tools_cleared,
+                            history_dropped=trim.history_dropped + round_trim.history_dropped,
+                            evidence_clipped=trim.evidence_clipped or round_trim.evidence_clipped,
+                        )
+                        yield self._context_usage(messages, base_segments, assembled, summary, trim,
+                                                  history_count, round_tools)
                         segment_parts: list[str] = []
                         reasoning = ""
                         outcome: ChatToolCalls | ChatFinal | None = None
-                        for item in responder.chat(messages=messages, tools=specs_for(allowed_tools, capabilities=capabilities) if allow_tools else ()):
+                        for item in responder.chat(messages=messages, tools=round_tools):
                             if isinstance(item, ChatDelta):
                                 segment_parts.append(item.text)
                                 answer_parts.append(item.text)
