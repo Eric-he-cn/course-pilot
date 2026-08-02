@@ -713,6 +713,187 @@ def test_no_reminder_when_the_turn_ends_on_ask_user(client):
     assert responder.nudges() == 0, f"模型在等用户选，不该逼它写：{responder.prompts}"
 
 
+PLAN_EXIT_ZH = "就按默认排计划，之后我再调"
+PLAN_EXIT_EN = "Just create the study plan with defaults"
+
+
+def _ask_user_call(call_id: str, question: str, options: list[str]) -> ToolCallRequest:
+    return ToolCallRequest(call_id, "ask_user", json.dumps({"question": question, "options": options}))
+
+
+def _choices(events) -> list[list[str]]:
+    return [data["options"] for name, data in events if name == "choices"]
+
+
+def test_a_plan_question_gets_an_exit_option(client):
+    """反问会让事后检查主动放过这一轮（那时逼它写就是让它自己编日期），于是什么都没落库。
+    选项里得有一条能直接推进下去的路，否则说过「直接排进系统」的用户只能把需求重说一遍。"""
+    _, session_id = _plan_course_session(client)
+    scripted = ScriptedChat([
+        [ChatToolCalls((_ask_user_call("a1", "考试是哪天", ["8 月 20 号", "8 月 27 号"]),))],
+        [ChatDelta("考试哪天？"), ChatFinal("考试哪天？", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-1", "message": "帮我排一份复习计划，直接排进系统"}).text)
+    assert _choices(events) == [["8 月 20 号", "8 月 27 号", PLAN_EXIT_ZH]], f"没补上出口：{_choices(events)}"
+    # 界面只画按钮，正文得跟着说明这条出口，所以补了什么要在工具回执里讲出来
+    told = [m.content for m in scripted.calls[-1]["messages"] if m.role == "tool" and "按默认排" in m.content]
+    assert told, "补了出口却没告诉模型，正文会漏掉它"
+
+
+def test_a_weak_exit_written_by_the_model_gets_rewritten(client):
+    """模型自己留的出口常常少了「计划」两个字，那样它就带不动后面那道兜底。"""
+    _, session_id = _plan_course_session(client)
+    scripted = ScriptedChat([
+        [ChatToolCalls((_ask_user_call("a1", "排到哪天为止", ["排到本周日", "就按默认策略排", "排到月底"]),))],
+        [ChatDelta("排到哪天？"), ChatFinal("排到哪天？", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-weak", "message": "帮我排一份复习计划，直接排进系统"}).text)
+    assert _choices(events) == [["排到本周日", PLAN_EXIT_ZH, "排到月底"]], f"没改写弱出口：{_choices(events)}"
+
+
+def test_the_exit_option_is_capped_at_four_buttons(client):
+    """上限是界面读得过来的量，出口不能把反问撑成第五个按钮。"""
+    _, session_id = _plan_course_session(client)
+    scripted = ScriptedChat([
+        [ChatToolCalls((_ask_user_call("a1", "每天能学多久", ["半小时", "1 小时", "1.5 小时", "2 小时"]),))],
+        [ChatDelta("每天多久？"), ChatFinal("每天多久？", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-cap", "message": "帮我排一份复习计划，直接排进系统"}).text)
+    assert _choices(events) == [["半小时", "1 小时", "1.5 小时", PLAN_EXIT_ZH]], f"选项超了四个：{_choices(events)}"
+
+
+def test_the_exit_option_follows_the_language_of_the_ask(client):
+    """英文轮里冒出一个中文按钮，用户会以为自己点错了地方。"""
+    _, session_id = _plan_course_session(client)
+    scripted = ScriptedChat([
+        [ChatToolCalls((_ask_user_call("a1", "When is your exam?", ["Aug 20", "Aug 27"]),))],
+        [ChatDelta("When is it?"), ChatFinal("When is it?", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-en", "message": "make me a study plan for the exam"}).text)
+    assert _choices(events) == [["Aug 20", "Aug 27", PLAN_EXIT_EN]], f"英文轮该给英文出口：{_choices(events)}"
+
+
+def test_the_exit_option_stays_out_of_unrelated_questions(client):
+    """写权限在会话里是粘住的，后面每一次反问都还看得见它。与计划无关的澄清
+    冒出一个「按默认排计划」的按钮，只会让人以为点错了地方。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+    scripted = ScriptedChat([
+        [ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))],
+        [ChatDelta("排好了。"), ChatFinal("排好了。", "stop", "example", "example-model", "provider")],
+        [ChatToolCalls((_ask_user_call("a1", "想从哪个角度看调度", ["先看吞吐", "先看公平"]),))],
+        [ChatDelta("从哪个角度？"), ChatFinal("从哪个角度？", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "exit-off-1", "message": "帮我排一份复习计划，直接排进系统"})
+    assert client.get(f"/api/v2/courses/{course}/plan").json()["plan"], "首轮没写进去，粘性写权限就测不到了"
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-off-2", "message": "讲讲调度"}).text)
+    assert _choices(events) == [["先看吞吐", "先看公平"]], f"与计划无关的反问被塞了出口：{_choices(events)}"
+
+
+def test_no_exit_option_without_plan_write_permission(client):
+    """拿不到的出口比没有出口更糟：点下去只会撞上写权限闸门。"""
+    _, session_id = _plan_course_session(client)
+    scripted = ScriptedChat([
+        [ChatToolCalls((_ask_user_call("a1", "周末的内容挪到哪几天", ["匀到周一到周五", "只挪周日的"]),))],
+        [ChatDelta("挪到哪几天？"), ChatFinal("挪到哪几天？", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-noperm",
+                                       "message": "周末我要出差，把周末的内容都匀到工作日去"}).text)
+    assert _choices(events) == [["匀到周一到周五", "只挪周日的"]], f"没有写权限却给了出口：{_choices(events)}"
+
+
+def test_clicking_the_exit_option_writes_the_plan(client):
+    """主判据：用户点出口等于发一条新的用户消息，那一轮必须真的落库。
+    出口的措辞因此要能被「这一轮必须写计划」判据认出来——模型再只说不写就会被补一轮。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class AsksThenStalls(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:
+                yield ChatToolCalls((_ask_user_call("a1", "考试是哪天", ["8 月 20 号", "8 月 27 号"]),))
+            elif self.calls == 2:
+                yield ChatFinal("考试哪天？", "stop", self.provider, self.model, self.mode)
+            elif self.calls == 3:  # 用户点了出口，模型却又只把安排写在正文里
+                yield ChatFinal("那就 8/11 第一章、8/12 第二章。", "stop", self.provider, self.model, self.mode)
+            elif self.calls == 4:
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                yield ChatFinal("写进系统了。", "stop", self.provider, self.model, self.mode)
+
+    responder = AsksThenStalls()
+    workspace(client).turns._responder = responder
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "exit-click-1",
+                                       "message": "帮我排一份复习计划，直接排进系统"}).text)
+    clicked = _choices(events)[0][-1]
+    assert clicked == PLAN_EXIT_ZH, f"第一轮就没给出口：{_choices(events)}"
+    assert not client.get(f"/api/v2/courses/{course}/plan").json()["plan"], "反问那一轮不该写计划"
+
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "exit-click-2", "message": clicked})
+    assert responder.nudges() == 1, f"点了出口那一轮没认出「必须写计划」：{responder.prompts}"
+    plan = client.get(f"/api/v2/courses/{course}/plan").json()["plan"]
+    assert plan and plan["items"], "点了出口，这一轮还是什么都没落库"
+
+
+def test_which_questions_count_as_planning_the_schedule():
+    """判断这次反问是不是在排计划。误判只是多一个没人点的按钮，漏判等于缺陷照旧，
+    所以判据宁可宽一点——但选择题和与计划无关的澄清一定要滤掉。"""
+    from modules.agent.tools import _is_plan_ask
+
+    for question, options in (("考试是哪天", ["8 月 20 号", "8 月 27 号"]),
+                              ("每天能学多久", ["1 小时", "2 小时"]),
+                              ("要不要占用周末", ["占用", "不占用"]),
+                              ("复习范围到第几章", ["前三章", "全书"]),
+                              # 真模型问得最多的一句，字面上一个「计划」都没有
+                              ("排到哪天为止", ["排到本周日", "排到月底"]),
+                              ("When is your exam?", ["Aug 20", "Aug 27"])):
+        assert _is_plan_ask(question, options), f"该给出口却没给：{question}"
+    for question, options in (("想从哪个角度看调度", ["先看吞吐", "先看公平"]),
+                              ("画哪种图", ["流程图", "思维导图"]),
+                              # 出选择题：题干里带「考试」「复习」的题目一抓一大把，光看词会误判
+                              ("考试范围里哪种调度周转时间最短", ["A", "B", "C", "D"]),
+                              ("这道复习题选哪个", ["A.", "B.", "C.", "D."])):
+        assert not _is_plan_ask(question, options), f"不该给出口却给了：{question}"
+
+
+def test_the_exit_option_is_normalised_to_wording_the_fallback_still_recognises():
+    """真模型实测：让它自己留出口，它写的是「就按默认策略排」——少了「计划」两个字，
+    用户点完，「这一轮必须写计划」的兜底就不再武装，模型第二次只说不写照样没人拦。"""
+    from modules.agent.service import _wants_plan_change
+    from modules.agent.tools import _PLAN_EXIT_ANCHOR, _with_plan_exit
+
+    # 措辞留得住兜底的，原样保留
+    kept, changed = _with_plan_exit("考试是哪天", ["8 月 20 号", "就按默认排计划，之后我再调"])
+    assert kept == ["8 月 20 号", "就按默认排计划，之后我再调"] and not changed
+    # 留不住的，就地换成标准措辞，位置不动
+    fixed, changed = _with_plan_exit("考试是哪天", ["8 月 20 号", "就按默认策略排", "8 月 27 号"])
+    assert fixed == ["8 月 20 号", PLAN_EXIT_ZH, "8 月 27 号"] and changed
+    # 一条都没有就补在末尾
+    added, changed = _with_plan_exit("考试是哪天", ["8 月 20 号", "8 月 27 号"])
+    assert added == ["8 月 20 号", "8 月 27 号", PLAN_EXIT_ZH] and changed
+    assert _with_plan_exit("When is your exam?", ["Aug 20"])[0][-1] == PLAN_EXIT_EN
+
+    # 两个模块各存了一份判据，走散了这个功能就静默失效
+    for text in (PLAN_EXIT_ZH, PLAN_EXIT_EN, "就按默认排复习计划", "just make the review schedule"):
+        assert _PLAN_EXIT_ANCHOR.search(text), f"锚点认不出：{text}"
+        assert _wants_plan_change(text), f"兜底认不出，出口等于没有：{text}"
+
+
 def test_a_version_conflict_stays_on_its_own_retry_path(client):
     """冲突已经有一条重试路径（失败不计预算、工具文案让它重读重算）。
     再叠一条补救轮就成了两套机制抢同一次额度。"""

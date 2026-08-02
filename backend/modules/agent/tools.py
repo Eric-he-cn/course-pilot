@@ -36,6 +36,59 @@ _MAX_CHOICES = 4
 # 把问题原样问回给自己——所以带问号的选项一律打回，让它重新组织成一问多答。
 _QUESTION_MARK = re.compile(r"[?？]")
 
+# 排计划的反问要留一条出口。用户已经说了「直接排进系统」，模型还是反问，而反问会让
+# 事后检查主动放过这一轮（那时逼它写就是让它自己编日期），于是这一轮什么都没落库。
+# 补一条「按默认排」的选项，用户点一下就能推进，不必把需求重说一遍。
+# 措辞里必须留着「排计划 / study plan」：用户点它等于发一条新的用户消息，
+# 服务端的「这一轮必须写计划」判据要认得出来，模型再不写就会被补一轮。
+_PLAN_EXIT_ZH = "就按默认排计划，之后我再调"
+_PLAN_EXIT_EN = "Just create the study plan with defaults"
+# 这次反问在排计划的迹象。宁可宽一点：误判只多一个没人点的按钮，漏判等于缺陷照旧。
+_PLAN_ASK = re.compile(
+    r"计划|排期|日程|课表|安排|备考|考试|复习|每天|每周|周末|工作日|排到|排几|排多久"
+    r"|\bplans?\b|\bschedule\b|timetable|\bexams?\b|revision|weekend|per\s+day|study\s+time",
+    re.IGNORECASE)
+# 模型自己给的出口长什么样。已经有了就别再补一条：两个意思相近的按钮比没有出口更让人犹豫。
+_PLAN_EXIT_HINT = re.compile(
+    r"默认|你(?:决定|来定|定|看着|拿主意)|都行|随便|听你的|按你的?建议|直接排|先排|不用再(?:确认|问)"
+    r"|default|you\s+decide|your\s+call|whatever|go\s+ahead|just\s+(?:do|make|create|schedule)",
+    re.IGNORECASE)
+# 出口留得住兜底的最低要求：措辞里点到「排计划 / study plan」。实测模型爱写「就按默认策略排」，
+# 那样用户点完，服务端的「这一轮必须写计划」判据不认，模型第二次只说不写就没人拦了。
+# 这是 service._wants_plan_change 的一个子集，测试守着两边不许走散。
+_PLAN_EXIT_ANCHOR = re.compile(
+    r"排[一二三下份个张点\s]{0,4}(?:复习|学习|备考)?计划"
+    r"|(?:study|review|revision|exam|reading)\s*(?:plan|schedule|timetable)",
+    re.IGNORECASE)
+# 选择题的选项就是 A/B/C/D 这样的裸标签，那种反问不该被塞进排计划的出口。
+_CHOICE_LABEL = re.compile(r"^\**[A-D]\**[.、)]?$", re.IGNORECASE)
+_LATIN = re.compile(r"[A-Za-z]")
+_CJK = re.compile(r"[一-鿿]")
+
+
+def _is_plan_ask(question: str, options: Sequence[str]) -> bool:
+    """这次反问是在排计划。plan_intent 与 plan_update 在册已经挡掉了绝大多数场合，
+    这里只再滤掉同一个 profile 里的选择题和与计划无关的澄清。"""
+    if sum(bool(_CHOICE_LABEL.match(option)) for option in options) >= 2:
+        return False  # A/B/C/D 那是在出选择题
+    return bool(_PLAN_ASK.search(question) or any(_PLAN_ASK.search(option) for option in options))
+
+
+def _with_plan_exit(question: str, options: Sequence[str]) -> tuple[list[str], bool]:
+    """保证选项里有一条「按默认排」的出口，且它的措辞留得住服务端那道兜底。"""
+    text = question + " ".join(options)
+    # 英文轮里冒出一个中文按钮，用户会以为自己点错了地方。
+    exit_option = _PLAN_EXIT_EN if len(_LATIN.findall(text)) > len(_CJK.findall(text)) else _PLAN_EXIT_ZH
+    for index, option in enumerate(options):
+        if not _PLAN_EXIT_HINT.search(option):
+            continue
+        if _PLAN_EXIT_ANCHOR.search(option):
+            return list(options), False  # 模型自己给的这条够用
+        return [*options[:index], exit_option, *options[index + 1:]], True
+    # 挤掉最后一个候选而不是加成第五个：上限是界面读得过来的量，不是配额。
+    return [*options[:_MAX_CHOICES - 1], exit_option], True
+
+
 # history_read 一次最多回看几轮。追问指向的几乎都是最近几轮，再往前该由对话摘要代表。
 HISTORY_MAX_TURNS = 5
 # history_read 单次返回的字符上限。一轮密集检索的引用原文约 6 段 × 280 字 ≈ 1.7k，
@@ -322,6 +375,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "用户点一下等于回你一句话，你在下一轮才会看到他的选择——"
             "所以调完它就把问题写完收住，不要在同一轮里替他选一个继续做。"
             "需求本身明确、又不是在出选择题时不要用，多问一轮比直接答更烦人。"
+            "问的是排计划或改计划要用的参数时，最后一个选项留给「就按默认排计划，之后我再调」这类出口，"
+            "他点它你下一轮就按合理默认写进系统。用户已经说过「直接排」「不用再确认」时，"
+            "每天时长、要不要占周末、先排到哪天这些取得了默认的参数就别问，排完再告诉他能改哪里；"
+            "缺的是考试日期这种编不出来的信息才反问。"
         ),
         parameters={
             "type": "object",
@@ -714,7 +771,9 @@ class ToolExecutor:
             return ToolOutcome(text="工具参数不是合法的 JSON 对象，请修正后重试。", ok=False, summary="参数无效", summary_key="summary.invalid_args", reason="invalid_args")
         try:
             if name == "ask_user":
-                return self._ask_user(parsed)
+                # 出口只在这一轮真能写计划时给：写权限开着、plan_update 也在册。
+                # 拿不到的出口比没有出口更糟——点下去只会撞上闸门。
+                return self._ask_user(parsed, plan_exit=plan_intent and "plan_update" in allowed)
             if name == "search_materials":
                 return self._search(scope, parsed, registry)
             if name == "list_materials":
@@ -786,7 +845,7 @@ class ToolExecutor:
         )
 
     @staticmethod
-    def _ask_user(parsed: dict) -> ToolOutcome:
+    def _ask_user(parsed: dict, *, plan_exit: bool = False) -> ToolOutcome:
         """只把选项带回去，不等用户——回合等人会被心跳判失活（见架构里的单活跃 turn 约束）。
         选项经 ToolOutcome.choices 挂到本轮消息上，用户点击等于发一条普通用户消息。"""
         question = str(parsed.get("question") or "").strip()
@@ -800,10 +859,17 @@ class ToolExecutor:
                      "question 放那句问题，options 放它的几个候选答案（短标签）。要问的事情有好几件就先问最关键的一件。",
                 ok=False, summary="选项写成了问题", summary_key="summary.choices_are_question", reason="invalid_args",
             )
-        options = list(dict.fromkeys(options))[:_MAX_CHOICES]
+        options = list(dict.fromkeys(options))
+        changed = False
+        if plan_exit and _is_plan_ask(question, options):
+            options, changed = _with_plan_exit(question, options)
+        options = options[:_MAX_CHOICES]
+        note = ("选项里那条「按默认排计划」的出口是系统改过的——用户已经要求过排计划，"
+                "不该因为缺一个参数就得把需求重说一遍。正文里按现在的措辞把它一并说明；"
+                "他点了这一条，下一轮就用合理默认把计划写进系统，不要再问。") if changed else ""
         return ToolOutcome(
             text=f"已把这 {len(options)} 个选项摆成按钮，等他这一轮结束后点选。"
-                 "界面上不显示 question，所以现在把完整题干（选择题连各选项的内容一起）写进正文再收住，不要替他选。",
+                 "界面上不显示 question，所以现在把完整题干（选择题连各选项的内容一起）写进正文再收住，不要替他选。" + note,
             ok=True, summary=f"请用户选择（{len(options)} 项）", summary_key="summary.ask_user",
             summary_args={"n": len(options)}, choices=options,
         )
