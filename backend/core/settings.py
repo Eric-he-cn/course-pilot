@@ -206,6 +206,12 @@ class Settings:
     # 联网检索（SerpAPI）：未配置或未开启远端调用时，network 类工具整体不下发。
     web_search_api_key: str = ""
     web_timeout_seconds: float = 20
+    # MCP 接入。默认拒绝指向本机与内网的地址；打开这个开关只放开回环（127.0.0.0/8、::1），
+    # 供本机跑着一台 MCP server 的情形使用。私网与 169.254.169.254 这类元数据端点
+    # 无论开关如何都拒绝。
+    mcp_allow_loopback: bool = False
+    mcp_connect_timeout_seconds: float = 10
+    mcp_timeout_seconds: float = 30
     # 厂商私有的请求字段（如关闭思考模式），原样并入 chat/completions 请求体。
     text_extra_body: dict[str, object] = field(default_factory=dict)
     # 可选的对话模型。第一项等同上面那组 text_* 字段，界面按它们的顺序给用户切换。
@@ -319,6 +325,9 @@ class Settings:
             default_user=value("COURSEPILOT_DEFAULT_USER", "local"),
             web_search_api_key=value("RESEARCH_SERPAPI_API_KEY"),
             web_timeout_seconds=max(1.0, float(value("WEB_TIMEOUT_SECONDS", "20"))),
+            mcp_allow_loopback=value("MCP_ALLOW_LOOPBACK", "0").lower() in {"1", "true", "yes"},
+            mcp_connect_timeout_seconds=max(0.1, float(value("MCP_CONNECT_TIMEOUT_SECONDS", "10"))),
+            mcp_timeout_seconds=max(1.0, float(value("MCP_TIMEOUT_SECONDS", "30"))),
             text_extra_body=_parse_extra_body(value("TEXT_EXTRA_BODY")),
             text_models=_read_models(value),
             hardware=machine.as_dict(),

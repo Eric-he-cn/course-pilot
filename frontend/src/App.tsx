@@ -6,7 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { api, clearCurrentUser, currentDevMode, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentDevMode, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceTurn, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, McpServer, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceTurn, WikiEstimate, WikiPageSummary } from './types'
 
 /** 开发者模式。关掉时 openTrace 为 null——入口靠这一个判断决定要不要渲染成可点的元素，
  *  免得出现「按钮还在、只是点了没反应」这种状态。 */
@@ -33,7 +33,7 @@ const TOOL_CAPABILITY_HINT: Record<string, string> = {
   get_archive: 'read_course', concept_search: 'read_course', note_read: 'read_course',
   history_read: 'read_course', wiki_index: 'read_course', wiki_read: 'read_course',
   plan_update: 'write_state', emit_evidence: 'write_state', memory_patch: 'write_state',
-  artifact_append: 'write_state', note_write: 'write_note',
+  artifact_append: 'write_state', mcp_propose: 'write_state', note_write: 'write_note',
   web_search: 'network', web_fetch: 'network',
   use_skill: 'free', artifact_read: 'free', calculator: 'free', ask_user: 'free',
   delegate: 'delegate',
@@ -1598,6 +1598,72 @@ function DeveloperCard() {
   </article>
 }
 
+/** 接入的 MCP server。工具清单是连接那一刻拉下来的快照，运行期只用它。 */
+function McpCard({ onError }: { onError: (message: string) => void }) {
+  const [servers, setServers] = useState<McpServer[] | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [form, setForm] = useState({ label: '', url: '', credential: '' })
+  const [confirming, setConfirming] = useState('')
+  async function reload() {
+    try { setServers((await api.mcpServers()).servers) }
+    catch (error) { setServers([]); onError(errorText(error)) }
+  }
+  useEffect(() => { void reload() }, [])
+  async function run(action: () => Promise<unknown>) {
+    setBusy(true)
+    try { await action(); await reload() } catch (error) { onError(errorText(error)) } finally { setBusy(false) }
+  }
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!form.url.trim()) return
+    await run(async () => {
+      await api.addMcpServer({ label: form.label.trim() || form.url.trim(), url: form.url.trim(), credential: form.credential })
+      setForm({ label: '', url: '', credential: '' })
+    })
+  }
+  return <article className="card"><h2>{t('mcp.title')}</h2>
+    <p>{t('mcp.hint')}</p>
+    {servers === null ? <p className="empty-inline">{t('common.loading')}</p>
+      : servers.length === 0 ? <p className="empty-inline">{t('mcp.empty')}</p>
+      : servers.map(server => <div className="skill-row" key={server.id}>
+        <div className="skill-copy">
+          <b>{server.label}<em>{server.origin === 'model' ? t('mcp.origin_model') : t('mcp.origin_user')}</em></b>
+          <small className="skill-tools">{server.url}</small>
+          <small>{server.tools.length ? t('mcp.tools_count', { n: server.tools.length }) : t('mcp.tools_none')}
+            {server.has_credential ? ` · ${t('mcp.has_credential')}` : ''}
+            {server.server_info ? ` · ${server.server_info}` : ''}</small>
+          {server.status === 'proposed' && <small className="help-note">{t('mcp.pending_note')}</small>}
+          {server.dropped_at_snapshot > 0 && <small className="skill-denied">{t('mcp.dropped_snapshot', { total: server.tools_total, kept: server.tools.length, n: server.dropped_at_snapshot })}</small>}
+          {server.dropped_at_downlink > 0 && <small className="skill-denied">{t('mcp.dropped_downlink', { n: server.dropped_at_downlink })}</small>}
+          {server.last_error_code && <small className="skill-denied" title={server.last_error_detail}>
+            {tOr(`mcp.error.${server.last_error_code}`, server.last_error_detail)}</small>}
+          {confirming === server.id && <DangerConfirm
+            what={t('mcp.delete_what')}
+            consequences={[t('mcp.delete.c1'), t('mcp.delete.c2')]}
+            onConfirm={() => { setConfirming(''); void run(() => api.deleteMcpServer(server.id)) }}
+            onCancel={() => setConfirming('')} />}
+        </div>
+        <div className="skill-actions">
+          <span className={`skill-status ${server.status}`}>{tOr(`mcp.status.${server.status}`, server.status)}</span>
+          <button className="ghost-button" disabled={busy} onClick={() => void run(() => api.connectMcpServer(server.id))}>
+            {server.status === 'proposed' ? t('mcp.approve') : t('mcp.reconnect')}
+          </button>
+          {server.tools.length > 0 && server.status !== 'proposed' && <button className="ghost-button" disabled={busy} onClick={() => void run(() => api.setMcpEnabled(server.id, server.status !== 'connected'))}>
+            {server.status === 'connected' ? t('mcp.disable') : t('mcp.enable')}
+          </button>}
+          <button className="ghost-button danger" disabled={busy} onClick={() => setConfirming(server.id)}>{t('common.delete')}</button>
+        </div>
+      </div>)}
+    <form className="mcp-form" onSubmit={submit}>
+      <input value={form.label} placeholder={t('mcp.label_placeholder')} aria-label={t('mcp.label')} onChange={event => setForm({ ...form, label: event.target.value })} />
+      <input value={form.url} placeholder={t('mcp.url_placeholder')} aria-label={t('mcp.url')} onChange={event => setForm({ ...form, url: event.target.value })} />
+      <input value={form.credential} type="password" placeholder={t('mcp.credential_placeholder')} aria-label={t('mcp.credential')} onChange={event => setForm({ ...form, credential: event.target.value })} />
+      <button className="ghost-button" type="submit" disabled={busy || !form.url.trim()}>{t('mcp.add')}</button>
+    </form>
+    <small className="help-note">{t('mcp.credential_note')}</small>
+  </article>
+}
+
 function SettingsView({ courses, onError, onCourseDeleted }: { courses: Course[]; onError: (message: string) => void; onCourseDeleted: (courseId: string) => void }) {
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [loading, setLoading] = useState(false)
@@ -1605,7 +1671,7 @@ function SettingsView({ courses, onError, onCourseDeleted }: { courses: Course[]
   const llm = (health?.llm ?? null) as Record<string, unknown> | null
   const rag = (health?.rag ?? null) as Record<string, unknown> | null
   const embedding = (rag?.embedding ?? null) as Record<string, unknown> | null
-  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>{t('nav.settings')}</h1><p>{t('settings.hero')}</p></div><button className="ghost-button" onClick={check} disabled={loading}>{t('settings.check')}</button></div><div className="settings-grid"><article className="card"><h2>{t('settings.courses_title')}</h2><p>{t('settings.courses_count', { n: courses.length })}</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">{t('settings.courses_empty')}</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><DeveloperCard /><article className="card health-card"><h2>{t('settings.health_title')}</h2>{health ? <><dl>
+  return <section className="page"><div className="page-inner"><div className="hero"><div><h1>{t('nav.settings')}</h1><p>{t('settings.hero')}</p></div><button className="ghost-button" onClick={check} disabled={loading}>{t('settings.check')}</button></div><div className="settings-grid"><article className="card"><h2>{t('settings.courses_title')}</h2><p>{t('settings.courses_count', { n: courses.length })}</p>{courses.length ? courses.map(course => <CourseSettingRow key={course.id} course={course} onDelete={onCourseDeleted} onError={onError} />) : <p className="empty-inline">{t('settings.courses_empty')}</p>}</article><MemoryCard courses={courses} onError={onError} /><SkillsCard onError={onError} /><McpCard onError={onError} /><DeveloperCard /><article className="card health-card"><h2>{t('settings.health_title')}</h2>{health ? <><dl>
     <div><dt>{t('help.fact_model')}</dt><dd>{llm ? `${String(llm.provider)} / ${String(llm.model)} · ${llm.enabled ? t('settings.remote_on') : t('settings.local_demo')}` : t('common.unknown')}</dd></div>
     <div><dt>{t('settings.fact_retrieval')}</dt><dd>{retrievalLabel(rag?.backend as string | undefined)}</dd></div>
     {embedding && <div><dt>{t('settings.fact_embedding')}</dt><dd>{String(embedding.model)} · {embedding.error ? t('settings.embed_failed', { error: String(embedding.error) }) : embedding.loaded ? t('settings.embed_loaded') : t('settings.embed_lazy')}</dd></div>}

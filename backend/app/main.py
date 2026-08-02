@@ -37,6 +37,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     from app.http.core import create_core_router
     from app.http.errors import error_response, normalize_http_detail
     from app.http.knowledge import build_knowledge_router
+    from app.http.mcp import build_mcp_router
     from app.http.skills import build_skills_router
     from app.http.study import build_study_router
 
@@ -74,6 +75,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     app.include_router(create_core_router())
     app.include_router(build_knowledge_router(legacy_data_pending=workspaces.legacy_data_pending))
     app.include_router(build_skills_router())
+    app.include_router(build_mcp_router())
     app.include_router(build_study_router())
     return app
 

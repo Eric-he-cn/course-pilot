@@ -7,6 +7,7 @@ from pathlib import Path
 
 from adapters.cloud_retrieval import CloudEmbedder, CloudReranker
 from adapters.embedding import BgeEmbedder
+from adapters.mcp_http import StreamableHttpTransport
 from adapters.reranker import CrossEncoderReranker
 from adapters.web import HttpWebAccess
 from adapters.llm import DemoAgentChat, OpenAICompatibleChat, VisionOcrTranscriber
@@ -24,6 +25,8 @@ from modules.knowledge.service import KnowledgeService
 from modules.knowledge.worker import KnowledgeJobWorker
 from modules.learning.repository import LearningRepository
 from modules.learning.service import LearningService
+from modules.mcp.repository import McpRepository
+from modules.mcp.service import McpService
 from modules.memory.store import MemoryStore
 from modules.notes.store import NoteStore
 from modules.planning.repository import PlanningRepository
@@ -55,6 +58,7 @@ class Application:
     skills: SkillRegistry
     notes: NoteStore
     memory: MemoryStore
+    mcp: McpService
     vision: VisionTranscriberPort | None = None
     web: WebSearchPort | None = None
 
@@ -124,6 +128,8 @@ class SharedRuntime:
     chat_vision: VisionTranscriberPort | None
     web: WebSearchPort | None
     embedder: object | None
+    # MCP 传输是无状态的，一个实例服务所有 server：每次调用自带地址与凭据。
+    mcp_transport: StreamableHttpTransport | None = None
     reranker: object | None = None
     # (模型 key, 是否开思考) → 适配器。空表示没配远端，一律走 fallback。
     responders: dict[tuple[str, str], AgentChatPort] = field(default_factory=dict)
@@ -144,7 +150,7 @@ class SharedRuntime:
 
     def close(self) -> None:
         for item in (self.llm, self.fallback, self.classifier, self.vision, self.chat_vision,
-                     self.embedder, self.reranker, *self.responders.values()):
+                     self.embedder, self.reranker, self.mcp_transport, *self.responders.values()):
             close = getattr(item, "close", None)
             if callable(close):
                 try: close()
@@ -244,7 +250,13 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
     # provider 开关：模型与它在哪跑是同一件事，分成两个配置项迟早会互相矛盾。
     embedder = _build_embedder(settings)
     reranker = _build_reranker(settings)
-    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, chat_vision=chat_vision, web=web, embedder=embedder, reranker=reranker, responders=responders)
+    # MCP 传输不看 enable_remote_llm：它连的是用户自己的 server，和对话模型是两回事。
+    mcp_transport = StreamableHttpTransport(
+        connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
+        total_timeout_seconds=settings.mcp_timeout_seconds,
+        allow_loopback=settings.mcp_allow_loopback,
+    )
+    return SharedRuntime(llm=llm, fallback=fallback, classifier=classifier, vision=vision, chat_vision=chat_vision, web=web, embedder=embedder, mcp_transport=mcp_transport, reranker=reranker, responders=responders)
 
 
 def build_application(settings: Settings, shared: SharedRuntime | None = None) -> Application:
@@ -296,6 +308,11 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
     )
     learning = LearningService(LearningRepository(store))
     planning = PlanningService(PlanningRepository(store), concept_exists=knowledge.concept_exists)
+    mcp = McpService(
+        McpRepository(store),
+        runtime.mcp_transport or StreamableHttpTransport(allow_loopback=settings.mcp_allow_loopback),
+        allow_loopback=settings.mcp_allow_loopback,
+    )
     # 内建 skill 目录随代码走（架构 §6）；导入的 skill 存库，启用后并入同一注册表。
     skills = SkillRegistry.from_directory(Path(__file__).resolve().parents[2] / "skills" / "builtin", user_skills=UserSkillStore(store))
     choices = settings.models
@@ -313,7 +330,7 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         sessions, knowledge, planning, learning, llm, fallback,
         select_responder=select_responder,
         plan_writer=planning, evidence=learning, artifacts=ArtifactStore(store), compactions=CompactionStore(store), skills=skills, memory=memory,
-        web=web, notes=notes,
+        web=web, notes=notes, mcp=mcp,
         trace=TraceWriter(settings.data_dir / "traces"),
         search_limit=settings.top_k_results,
         history_token_budget=settings.agent_history_token_budget,
@@ -321,4 +338,4 @@ def build_application(settings: Settings, shared: SharedRuntime | None = None) -
         partitions=settings.context_partitions,
         compact_threshold_ratio=settings.agent_compact_threshold_ratio,
     )
-    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, notes, memory, vision, web)
+    return Application(settings, store, courses, knowledge, jobs, sessions, llm, turns, learning, planning, skills, notes, memory, mcp, vision, web)

@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import html
-import ipaddress
 import re
-import socket
 
 import httpx
 
 from contracts.web import WebAccessError, WebPage, WebResult, WebSearchOutcome
+from core.netguard import BlockedAddress, resolved_public_ips
 
 _SEARCH_ENDPOINT = "https://serpapi.com/search"
 # 抓回的正文进上下文，必须有上界。
@@ -22,22 +21,11 @@ _BLANKS = re.compile(r"\n{3,}")
 
 
 def _resolved_ips(host: str, port: int) -> list[str]:
-    """解析出的每一个地址都要校验：只看第一条就是 DNS rebinding 的入口。"""
+    """地址校验与 MCP 共用 core.netguard；网页抓取一律只连公网。"""
     try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as error:
-        raise WebAccessError("dns_failed", f"无法解析域名 {host}：{error}") from error
-    addresses = []
-    for info in infos:
-        address = info[4][0]
-        # 十进制/八进制/短写法（2130706433、0x7f000001、127.1）过不了 ipaddress
-        # 但过得了解析器，所以校验只能放在解析之后。
-        if not ipaddress.ip_address(address).is_global:
-            raise WebAccessError("blocked_address", f"{host} 解析到非公网地址 {address}，已拒绝")
-        addresses.append(address)
-    if not addresses:
-        raise WebAccessError("dns_failed", f"域名 {host} 没有解析结果")
-    return addresses
+        return resolved_public_ips(host, port)
+    except BlockedAddress as error:
+        raise WebAccessError(error.code, str(error)) from error
 
 
 def _html_to_text(body: str) -> tuple[str, str]:

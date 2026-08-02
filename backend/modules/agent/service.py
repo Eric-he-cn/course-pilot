@@ -13,6 +13,7 @@ from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, Chat
 from core.common import utc_now
 from core.settings import PartitionLimits
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
+from modules.mcp.api import McpToolProviderPort
 from modules.memory.api import MemoryStorePort
 from modules.planning.api import PlanReaderPort, PlanWriterPort
 from modules.notes.api import NoteStorePort
@@ -24,7 +25,7 @@ from contracts.web import WebSearchPort
 from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summarize
 from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, TrimReport, assemble_general_messages, assemble_messages, clip_to_tokens, enforce_context_limit, estimate_tokens, message_tokens, tool_schema_tokens
 from .skills import SkillRegistry
-from .tools import DELEGATE_TOOLS, MAIN, MAIN_PROFILE, NETWORK, SEARCH_LIMIT, SUBAGENT_CAPABILITIES, SUBAGENT_TOOLS, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, cited_only, is_repeatable, persisted_tool_body, profile_for_skill, specs_for, without_tools
+from .tools import DELEGATE_TOOLS, MAIN, MAIN_PROFILE, MCP_PROPOSE_TOOLS, NETWORK, SEARCH_LIMIT, SUBAGENT_CAPABILITIES, SUBAGENT_TOOLS, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, budget_key, cited_only, external_specs, is_repeatable, persisted_tool_body, profile_for_skill, specs_for, with_external_budget, without_tools
 from .trace import TraceWriter
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,23 @@ _DELEGATE_INTENT = re.compile(
 def _has_delegate_intent(text: str) -> bool:
     # 图片转录不算：一张写着「深入研究」的讲义照片不该换来一次子任务。
     return bool(_DELEGATE_INTENT.search(_typed_text(text)))
+
+
+# 这一轮在谈「把某台 MCP server 接进来」。不命中就整体不下发 mcp_propose：
+# 摆在那儿模型迟早会拿它当「我来帮你装个插件」用，而管理页本来就是主路径，
+# 漏放的代价只是用户自己去设置页填一次。
+_MCP_INTENT = re.compile(
+    r"(?:mcp|模型上下文协议)[^\n]{0,20}(?:server|服务器|服务|地址|端点|配置|接入|连接|连上|加上|添加)"
+    r"|(?:接入|连接|连上|添加|加一个|配置|用上)[^\n]{0,12}(?:mcp|模型上下文协议)"
+    r"|(?:add|connect|hook\s*up|set\s*up|register)\s+(?:an?\s+|the\s+|my\s+)?mcp\b"
+    r"|mcp\s+(?:server|endpoint|config)",
+    re.IGNORECASE)
+
+
+def _has_mcp_intent(text: str) -> bool:
+    # 和写计划、派子任务同一条规矩：只认用户亲手键入的原话。一张写着 MCP 配置的
+    # 截图转录不该换来一次提议——那正是「外部内容只作资料」要挡的东西。
+    return bool(_MCP_INTENT.search(_typed_text(text)))
 
 
 # 子任务的系统提示。它看不到用户、也无法反问，所以背景全靠 task 自带。
@@ -375,6 +393,7 @@ class TurnService:
         memory: MemoryStorePort,
         web: WebSearchPort | None = None,
         notes: NoteStorePort | None = None,
+        mcp: McpToolProviderPort | None = None,
         trace: TraceWriter | None = None,
         select_responder: Callable[[str | None, str | None], AgentChatPort] | None = None,
         max_tool_rounds: int = 10,
@@ -393,10 +412,11 @@ class TurnService:
         self._artifacts = artifacts
         self._compactions = compactions
         self._memory = memory
+        self._mcp = mcp
         self._executor = ToolExecutor(
             knowledge=knowledge, plans=plans, plan_writer=plan_writer, archive=archive,
             evidence=evidence, artifacts=artifacts, skills=skills, memory=memory,
-            web=web, notes=notes, sessions=sessions, search_limit=search_limit,
+            web=web, notes=notes, sessions=sessions, mcp=mcp, search_limit=search_limit,
         )
         # 没配联网就不下发 network 类工具。下发了模型也只会拿回 not_configured，
         # 白烧一轮工具（core/settings.py 的 web_search_api_key 注释写的就是这条约定）。
@@ -617,7 +637,7 @@ class TurnService:
                         budget=budget, used=used,
                     )
                     if result.reason is None:
-                        used[call.name] = used.get(call.name, 0) + 1
+                        used[budget_key(call.name)] = used.get(budget_key(call.name), 0) + 1
                     calls += 1
                     new_citations += result.new_citations
                     messages.append(ChatMessage(role="tool", content=result.text, tool_call_id=call.id))
@@ -815,7 +835,15 @@ class TurnService:
                 # 工具集这一层，schema 下发与运行期准入读同一份名单）。一次子任务就是好几次
                 # 模型调用，摆在那儿模型迟早会拿它当检索用。
                 delegate_off = frozenset() if _has_delegate_intent(message) else DELEGATE_TOOLS
-                allowed_tools = without_tools(MAIN_PROFILE, wiki_off | delegate_off)
+                # 用户没在这一轮谈接 MCP server 就不下发 mcp_propose（照 delegate 的先例）。
+                mcp_off = frozenset() if _has_mcp_intent(message) else MCP_PROPOSE_TOOLS
+                # 外部工具按已批准的快照下发：这一步只读库，一次网络请求都不发——
+                # 运行期不向 server 发现工具，它事后偷换定义也换不掉批准过的那份。
+                mcp_specs, mcp_dropped = external_specs(self._mcp.external_tools()) if self._mcp else ((), 0)
+                if mcp_specs or mcp_dropped:
+                    trace_record["mcp"] = {"tools": len(mcp_specs), "dropped": mcp_dropped}
+                allowed_tools = (without_tools(MAIN_PROFILE, wiki_off | delegate_off | mcp_off)
+                                 + tuple(spec.name for spec in mcp_specs))
                 capabilities = MAIN.capabilities - self._offline
                 assembled = assemble_messages(
                     course_name=context.course_name or "当前课程",
@@ -833,7 +861,7 @@ class TurnService:
                     practice_digest=self._artifacts.practice_digest(session_id=session_id),
                     memory=self._memory_context(context.course_id),
                     conversation_summary=summary.summary_text if summary else "",
-                    tools=specs_for(allowed_tools, capabilities=capabilities),
+                    tools=specs_for(allowed_tools, capabilities=capabilities, extra=mcp_specs),
                     limits=self._limits,
                 )
                 messages = assembled.messages
@@ -846,7 +874,8 @@ class TurnService:
                 if self._select_responder and (model_key is not None or thinking is not None):
                     responder = self._select_responder(model_key, thinking)
                 budget_notified = False
-                tool_budget = MAIN.per_tool_budget
+                # 外部工具共用一个总额度：按工具名各算各的等于没有上限。
+                tool_budget = with_external_budget(MAIN.per_tool_budget)
                 tool_used: dict[str, int] = {}
                 tool_results: dict[tuple[str, str], object] = {}
                 # 只认用户键入的原话：一张写着「记住」的教材照片不该触发。
@@ -920,7 +949,7 @@ class TurnService:
                                         "资料不足的部分直接说明缺什么。",
                             ))
                         # 这一轮真正下发的那份工具定义，总闸、用量与请求共用它。
-                        round_tools = specs_for(allowed_tools, capabilities=capabilities) if allow_tools else ()
+                        round_tools = specs_for(allowed_tools, capabilities=capabilities, extra=mcp_specs) if allow_tools else ()
                         # 工具循环每轮都在追加内容，总闸必须每轮都过一次，不能只在组装时算。
                         round_trim = enforce_context_limit(
                             messages, limit=self._context_token_limit, history_count=history_count,
@@ -1047,7 +1076,8 @@ class TurnService:
                                         ),
                                     )
                                     if result.reason is None:
-                                        tool_used[call.name] = tool_used.get(call.name, 0) + 1
+                                        spent = budget_key(call.name)
+                                        tool_used[spent] = tool_used.get(spent, 0) + 1
                                         tool_results[repeat_key] = result
                                 if call.name == "memory_patch" and result.ok:
                                     memory_written = True

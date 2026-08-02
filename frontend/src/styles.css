@@ -289,6 +289,13 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .skill-actions .ghost-button { padding:3px 8px; font-size:11.5px }
 .skill-actions .ghost-button.danger { color:var(--danger) }
 .skill-import { display:flex; gap:8px; margin-top:14px }
+.mcp-form { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px }
+.mcp-form input { flex:1 1 140px; min-width:0; padding:5px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel); color:inherit; font-size:12px }
+/* help-note 是 inline 的 small，跟在表单后面时上外边距推不动它，会压到输入框上。 */
+.mcp-form + .help-note { display:block }
+.skill-status.connected { color:var(--accent) }
+.skill-status.proposed { color:var(--warning) }
+.skill-status.error { color:var(--danger) }
 .card > .skill-denied { display:block; margin-top:6px; color:var(--warning); font-size:11.5px }
 .skill-status { font-family:var(--mono); font-size:10.5px; color:var(--muted) }
 .skill-status.enabled { color:var(--accent) }

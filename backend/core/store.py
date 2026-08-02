@@ -183,6 +183,23 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC); CR
         );
         CREATE INDEX IF NOT EXISTS idx_evidence_concept ON evidence_events(concept_id, created_at);
     """),
+    # 用户自己接的 MCP server。tools_json 是「点连接那一刻」拉到的工具快照：运行期只认它，
+    # 不再向 server 发现工具，server 事后偷换定义也换不掉已经批准过的那份。
+    # credential 只由调用路径读，不进任何对外响应（见 repository.credential）。
+    # status：proposed 是模型提议、还没人批准，这种行连一次网络请求都没发过。
+    (24, """
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, label TEXT NOT NULL, url TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('proposed','connected','disabled','error')),
+            origin TEXT NOT NULL CHECK(origin IN ('user','model')),
+            credential TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+            tools_json TEXT NOT NULL DEFAULT '[]', tools_total INTEGER NOT NULL DEFAULT 0,
+            protocol_version TEXT NOT NULL DEFAULT '', server_info TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '', connected_at TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mcp_status ON mcp_servers(status, slug);
+    """),
 )
 
 # 靠 ALTER 增删的列，以及依赖它们的残留索引。ALTER 没有 IF EXISTS，写成编号迁移的话，

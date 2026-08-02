@@ -1,5 +1,5 @@
 import { t } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, McpOverview, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
@@ -130,6 +130,14 @@ export const api = {
   },
   setSkillEnabled: (name: string, enabled: boolean) => request<{ name: string; status: string }>(`/skills/${name}`, json('PATCH', { enabled })),
   deleteSkill: (name: string) => request<void>(`/skills/${name}`, { method: 'DELETE' }),
+  mcpServers: () => request<McpOverview>('/mcp/servers'),
+  // credential 只往上传，读接口从不带它回来。
+  addMcpServer: (body: { label: string; url: string; credential?: string; note?: string }) =>
+    request<McpOverview>('/mcp/servers', json('POST', body)),
+  connectMcpServer: (id: string, credential?: string) =>
+    request<McpOverview>(`/mcp/servers/${id}/connect`, json('POST', credential === undefined ? {} : { credential })),
+  setMcpEnabled: (id: string, enabled: boolean) => request<McpOverview>(`/mcp/servers/${id}`, json('PATCH', { enabled })),
+  deleteMcpServer: (id: string) => request<void>(`/mcp/servers/${id}`, { method: 'DELETE' }),
   indexMaterial: (materialId: string) => request<Job>(`/materials/${materialId}/index`, json('POST')),
   estimateOcr: (materialId: string) => request<OcrEstimate>(`/materials/${materialId}/ocr/estimate`, json('POST')),
   startOcr: (materialId: string) => request<Job>(`/materials/${materialId}/ocr`, json('POST')),

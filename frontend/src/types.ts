@@ -78,6 +78,42 @@ export interface SkillInfo {
   examples?: string[]
 }
 
+export interface McpTool {
+  name: string
+  raw_name: string
+  description: string
+  /** 本轮真的下发给模型了吗。超出 schema 配额的那几个不会下发。 */
+  downlinked: boolean
+}
+
+export interface McpServer {
+  id: string
+  slug: string
+  label: string
+  url: string
+  status: 'proposed' | 'connected' | 'disabled' | 'error'
+  origin: 'user' | 'model'
+  note: string
+  /** 凭据只进不出：后端只报有没有配。 */
+  has_credential: boolean
+  protocol_version: string
+  server_info: string
+  /** 失败原因分两半：码按语言渲染，详情是后端原文，只作补充。 */
+  last_error_code: string
+  last_error_detail: string
+  connected_at: string | null
+  updated_at: string
+  tools: McpTool[]
+  tools_total: number
+  dropped_at_snapshot: number
+  dropped_at_downlink: number
+}
+
+export interface McpOverview {
+  servers: McpServer[]
+  limits: { max_tools_per_server: number; max_downlinked_tools: number }
+}
+
 export interface NoteSummary {
   title: string
   chars: number
