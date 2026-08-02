@@ -140,6 +140,44 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
         require_course(application, course_id)
         return {"concepts": [asdict(node) for node in application.knowledge.concept_tree(course_id=course_id)]}
 
+    @router.get("/courses/{course_id}/structure")
+    def course_structure(course_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """每份教材的目录结构状态：抽到多少概念、其中多少条带层级。都从 concepts 表推导。"""
+        require_course(application, course_id)
+        return {"materials": application.knowledge.structure_status(course_id=course_id)}
+
+    @router.post("/materials/{material_id}/structure/preview")
+    def preview_structure(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """重建目录结构会新增、删掉哪些概念，其中多少挂着掌握度或错题。只算不写。"""
+        try:
+            return application.knowledge.preview_structure(material_id=material_id)
+        except MaterialNotIndexedError as error:
+            raise HTTPException(status_code=409, detail={"code": "material_not_indexed", "message": str(error)}) from error
+        except ValueError as error:
+            raise _not_found(str(error)) from error
+
+    @router.post("/materials/{material_id}/structure")
+    def parse_structure(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """重算概念与层级。实测亚秒级，所以同步返回，不进 jobs 表。"""
+        try:
+            return application.knowledge.parse_structure(material_id=material_id)
+        except MaterialNotIndexedError as error:
+            raise HTTPException(status_code=409, detail={"code": "material_not_indexed", "message": str(error)}) from error
+        except ValueError as error:
+            raise _not_found(str(error)) from error
+
+    @router.get("/materials/{material_id}/wiki/estimate")
+    def estimate_wiki(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """构建前的账单：预计页数与模型调用次数。离线算，不调模型，所以是 GET。"""
+        try:
+            return application.knowledge.estimate_wiki(material_id=material_id)
+        except KnowledgeFeatureDisabledError as error:
+            raise HTTPException(status_code=409, detail={"code": "feature_disabled", "message": str(error)}) from error
+        except MaterialNotIndexedError as error:
+            raise HTTPException(status_code=409, detail={"code": "material_not_indexed", "message": str(error)}) from error
+        except ValueError as error:
+            raise _not_found(str(error)) from error
+
     @router.post("/materials/{material_id}/wiki")
     def build_wiki(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:

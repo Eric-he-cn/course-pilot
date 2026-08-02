@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import replace
 from itertools import zip_longest
@@ -20,6 +21,8 @@ from .extract import SUPPORTED_SUFFIXES, extract_pages, pdf_outline
 from .wiki import WikiStore
 from .models import ConceptNode, Job, Material
 from .repository import KnowledgeRepository
+
+_LOG = logging.getLogger(__name__)
 
 
 class KnowledgeService:
@@ -131,7 +134,7 @@ class KnowledgeService:
             return self.get_job(job_id=job_id)
         material = self._material_or_error(job.material_id)
         if job.type == "index":
-            return self._run_index(job, material)
+            return self._run_upload_pipelines(job, material)
         if job.type == "wiki":
             return self._run_wiki(job, material)
         return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message="未知任务类型")
@@ -144,6 +147,88 @@ class KnowledgeService:
         if job is None or job.status != "queued":
             return job
         return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=reason)
+
+    def _run_upload_pipelines(self, job: Job, material: Material) -> Job:
+        """一次上传跑两条流水线：先检索索引，再目录结构，用户不必点第二次。
+
+        两条都收工才把作业记成完成——界面靠这一下刷新概念目录，早一步就会显示上一版。
+        """
+        indexed = self._run_index(job, material)
+        if indexed.status != "running":  # 索引失败，或停在等 OCR 确认
+            return indexed
+        self._parse_structure_quietly(material)
+        return self._repository.update_job(job.id, status="completed", stage="completed", progress=100)
+
+    # ---- 目录结构：概念与层级。和检索索引共享文本准备，之后各走各的 ----
+
+    def structure_status(self, *, course_id: str) -> list[dict[str, object]]:
+        """每份教材的目录结构状态。有没有概念、有没有层级都从 concepts 表现算，不存状态列。"""
+        return [
+            {**row, "has_structure": row["concepts"] > 0, "has_levels": row["leveled"] > 0}
+            for row in self._repository.material_concept_stats(course_id=course_id)
+        ]
+
+    def preview_structure(self, *, material_id: str) -> dict[str, object]:
+        """重建目录结构之前的影响预告。删概念会连带删掉掌握度与错题，用户有权先看见。"""
+        material = self._material_or_error(material_id)
+        candidates = self._structure_candidates(material)
+        return {
+            **self._repository.preview_material_concepts(
+                course_id=material.course_id, material_id=material.id, candidates=candidates),
+            "material_id": material.id,
+            "has_levels": any(candidate.get("level") is not None for candidate in candidates),
+        }
+
+    def parse_structure(self, *, material_id: str) -> dict[str, object]:
+        """重算这份教材的概念与层级。不重新提取、不重新向量化，chunks 一行都不动。
+
+        实测亚秒级（813 页的书读书签 0.39 秒），所以是同步接口，不进 jobs 表。
+        """
+        material = self._material_or_error(material_id)
+        candidates = self._structure_candidates(material)
+        # 预告与执行用同一份候选，报出的数字就是真正发生的事。
+        applied = self._repository.preview_material_concepts(
+            course_id=material.course_id, material_id=material.id, candidates=candidates)
+        self._repository.replace_material_concepts(
+            course_id=material.course_id, material_id=material.id, candidates=candidates)
+        current = next((row for row in self.structure_status(course_id=material.course_id)
+                        if row["material_id"] == material.id), {})
+        return {**applied, **current, "material_id": material.id}
+
+    def _structure_candidates(self, material: Material) -> list[dict]:
+        """目录结构只吃文本准备的产物：有书签的 PDF 读文件，没书签的读已落库的 chunk 正文。"""
+        chunks = self._repository.list_material_chunks(material_id=material.id)
+        if not chunks:
+            raise MaterialNotIndexedError("这份教材还没有可读的正文，先重建索引")
+        return self._concepts_for(
+            self._repository.material_storage_path(material.id), material.filename,
+            [(row["page"], row["content"]) for row in chunks],
+        )
+
+    def _parse_structure_quietly(self, material: Material) -> None:
+        """结构解析失败不该把检索索引一起拖垮。它随时可以单独重算，检索却要重跑向量化。"""
+        try:
+            self.parse_structure(material_id=material.id)
+        except Exception as error:
+            _LOG.warning("目录结构解析失败，检索索引不受影响：%s", error)
+
+    def estimate_wiki(self, *, material_id: str) -> dict[str, object]:
+        """知识页构建前的账单。离线跑一次 plan_sections 数页数，一次模型调用都不发。"""
+        material = self._material_or_error(material_id)
+        if not self._wiki_is_enabled(material.course_id):
+            raise KnowledgeFeatureDisabledError("该课程尚未启用 Wiki")
+        if material.index_status != "indexed":
+            raise MaterialNotIndexedError("教材尚未完成索引")
+        chunks = self._repository.list_material_chunks(material_id=material.id)
+        if not chunks:
+            raise MaterialNotIndexedError("这份教材还没有可读的正文，先重建索引")
+        concepts = self._repository.list_material_concept_tree(material_id=material.id)
+        sections, stats = wiki.plan_sections(material_id=material.id, chunks=chunks, concepts=concepts)
+        pages = len(sections) + 1  # 课程首页
+        seconds = pages * wiki.SECONDS_PER_PAGE
+        return {"pages": pages, "calls": pages, "seconds": seconds, "minutes": round(seconds / 60, 1),
+                "sections": len(sections), "candidates": stats["candidates"], "merged": stats["capped"],
+                "has_levels": any(row.get("level") is not None for row in concepts)}
 
     def _run_wiki(self, job: Job, material: Material) -> Job:
         """按教材目录自底向上把整份教材写成一棵知识页，全程不走检索。
@@ -222,11 +307,13 @@ class KnowledgeService:
         return len(pages)
 
     def wiki_pages(self, *, course_id: str) -> list[dict[str, object]]:
+        """层级一并下发：页面 frontmatter 里本来就记着，丢在服务层界面就画不出树。"""
         if self._wiki is None:
             return []
         return [
             {"concept_id": page.concept_id, "concept_name": page.concept_name,
-             "updated_at": page.updated_at, "chars": page.chars}
+             "updated_at": page.updated_at, "chars": page.chars,
+             "parent_id": page.parent_id, "level": page.level, "order": page.order}
             for page in self._wiki.list_pages(course_id=course_id)
         ]
 
@@ -409,6 +496,8 @@ class KnowledgeService:
         return {"database": database, "rag": rag}
 
     def _run_index(self, job: Job, material: Material) -> Job:
+        """检索索引这一路：提取 → 切块 → 向量化 → 写 chunks。概念与层级不在这里，
+        它们由目录结构那一路单独重算（见 parse_structure）。"""
         try:
             self._repository.set_material_status(material.id, "indexing")
             self._repository.update_job(job.id, status="running", stage="extracting", progress=15)
@@ -438,25 +527,20 @@ class KnowledgeService:
             backend = "hybrid_bge" if embeddings else "sqlite_fts"
             self._repository.update_job(job.id, status="running", stage="indexing", progress=85)
             self._repository.replace_chunks(material_id=material.id, course_id=material.course_id, chunks=chunks, embeddings=embeddings)
-            # 概念目录是归因的 ID 真源，每次索引完都按同一份文本重跑一次（§8.1）。
-            self._repository.update_job(job.id, status="running", stage="concepts", progress=95)
-            self._repository.replace_material_concepts(
-                course_id=material.course_id, material_id=material.id,
-                candidates=self._concepts_for(path, material.filename, chunks),
-            )
             self._repository.set_material_status(material.id, "indexed")
-            return self._repository.update_job(job.id, status="completed", stage="completed", progress=100, retrieval_backend=backend)
+            # 停在 running 交给调用方收尾：目录结构那一路还要跑，作业不能在这里就报完成。
+            return self._repository.update_job(job.id, status="running", stage="structure", progress=95, retrieval_backend=backend)
         except Exception as error:
             self._repository.set_material_status(material.id, "failed")
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error), retrieval_backend="sqlite_fts")
 
-    def _concepts_for(self, path: Path, filename: str, chunks: list[tuple[int | None, str]]) -> list[dict]:
+    def _concepts_for(self, path: Path | None, filename: str, chunks: list[tuple[int | None, str]]) -> list[dict]:
         """有目录书签就用它，没有才从正文刮标题。
 
         刮标题在代码和表格多的教材上假阳性很高——markdown 标题正则会命中 Python 注释，
         编号标题正则会命中表格行，页码还常常指到目录页。书签是作者写的，这些问题都没有。
         """
-        if Path(filename).suffix.lower() == ".pdf":
+        if path is not None and path.is_file() and Path(filename).suffix.lower() == ".pdf":
             candidates = from_outline(pdf_outline(path))
             if candidates:
                 return candidates

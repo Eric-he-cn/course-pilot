@@ -188,12 +188,52 @@ export interface ConceptNode {
   material_id: string | null
 }
 
-// Wiki 知识页：一个概念一页
+// Wiki 知识页：一个概念一页。层级来自页面 frontmatter，没有层级的教材三个字段都是默认值。
 export interface WikiPageSummary {
   concept_id: string
   concept_name: string
   updated_at: string
   chars: number
+  parent_id?: string
+  level?: number
+  order?: number
+}
+
+// 一份教材的目录结构状态，从概念表推导，没有对应的状态列。
+export interface MaterialStructure {
+  material_id: string
+  filename: string
+  index_status: string
+  concepts: number
+  leveled: number
+  has_structure: boolean
+  has_levels: boolean
+}
+
+// 重建目录结构的影响预告：删概念会连带删掉掌握度与错题。
+export interface StructurePreview {
+  material_id: string
+  empty: boolean
+  candidates: number
+  added: number
+  removed: number
+  kept: number
+  at_risk: number
+  removed_names: string[]
+  at_risk_names: string[]
+  has_levels: boolean
+}
+
+// 知识页构建前的账单，离线算出来的，不含模型调用
+export interface WikiEstimate {
+  pages: number
+  calls: number
+  seconds: number
+  minutes: number
+  sections: number
+  candidates: number
+  merged: number
+  has_levels: boolean
 }
 
 export interface Job {

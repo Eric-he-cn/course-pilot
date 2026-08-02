@@ -32,6 +32,8 @@ INDEX_ID = "index"
 WIKI_MAX_DEPTH = 4
 # 单次构建最多写多少页。先小规模试跑，确认层级和页面质量之后再往上调。
 WIKI_MAX_NODES = 50
+# 一页约一次模型调用。5 秒是实测均值（五份小教材 51 页共 261 秒），用来给用户一个量级。
+SECONDS_PER_PAGE = 5
 # 一页最多读多少字原文。超过就按分片顺序再切一层，不截断——截断就是漏。
 MAX_EVIDENCE_CHARS = 6000
 MAX_PAGE_BYTES = 128 * 1024

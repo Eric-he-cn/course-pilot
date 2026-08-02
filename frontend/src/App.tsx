@@ -6,7 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, ContextUsage, Course, Job, Material, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, ToolActivity, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, StructurePreview, ToolActivity, WikiEstimate, WikiPageSummary } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -810,58 +810,157 @@ function NotesPanel({ course, onError }: { course: Course; onError: (message: st
   </article>
 }
 
+/** 可折叠树的一个节点。概念目录与知识页共用，各自把自己的行映射成这个形状。 */
+interface TreeItem { id: string; parentId: string; label: string; meta: string; onOpen?: () => void }
+
+/** 按 parent_id 分组。父节点不在列表里的当作根节点，不硬造一层假的根。 */
+function groupByParent(items: TreeItem[]): Map<string, TreeItem[]> {
+  const grouped = new Map<string, TreeItem[]>()
+  const known = new Set(items.map(item => item.id))
+  for (const item of items) {
+    const key = item.parentId && known.has(item.parentId) ? item.parentId : ''
+    grouped.set(key, [...(grouped.get(key) ?? []), item])
+  }
+  return grouped
+}
+
+/** 共用的行渲染：缩进按深度，有子项的才画折叠箭头。兄弟顺序沿用传入顺序。 */
+function treeRows(children: Map<string, TreeItem[]>, collapsed: Set<string>, toggle: (id: string) => void,
+                  parentId = '', depth = 0): ReactElement[] {
+  return (children.get(parentId) ?? []).flatMap(item => {
+    const kids = children.get(item.id) ?? []
+    const shut = collapsed.has(item.id)
+    return [
+      <div className="concept-row" key={item.id} style={{ paddingLeft: `${depth * 18}px` }}>
+        {kids.length > 0
+          ? <button type="button" className={shut ? 'concept-toggle' : 'concept-toggle open'} aria-expanded={!shut} aria-label={item.label} onClick={() => toggle(item.id)}>›</button>
+          : <span className="concept-bullet" aria-hidden />}
+        {item.onOpen ? <button type="button" className="tree-open" onClick={item.onOpen}>{item.label}</button> : <b>{item.label}</b>}
+        <small>{item.meta}{kids.length > 0 && ` · ${t('library.concepts_children', { n: kids.length })}`}</small>
+      </div>,
+      ...(shut ? [] : treeRows(children, collapsed, toggle, item.id, depth + 1)),
+    ]
+  })
+}
+
+/** 折叠状态与「全部展开/折叠」按钮。两个树面板的行为要一致，写一处。 */
+function useCollapse(resetKey: unknown) {
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  useEffect(() => { setCollapsed(new Set()) }, [resetKey])
+  const toggle = (id: string) =>
+    setCollapsed(current => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next })
+  const toggleAll = (branches: TreeItem[]) =>
+    setCollapsed(collapsed.size ? new Set() : new Set(branches.map(item => item.id)))
+  return { collapsed, toggle, toggleAll }
+}
+
 /** 概念目录：层级来自教材自带的目录书签，没有书签就平铺。 */
 function ConceptTreePanel({ course, refreshKey, onError }: { course: Course; refreshKey: number; onError: (message: string) => void }) {
   const [nodes, setNodes] = useState<ConceptNode[] | null>(null)
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const { collapsed, toggle, toggleAll } = useCollapse(`${course.id}:${refreshKey}`)
   useEffect(() => {
-    setNodes(null); setCollapsed(new Set())
+    setNodes(null)
     api.concepts(course.id).then(payload => setNodes(payload.concepts)).catch(error => { setNodes([]); onError(errorText(error)) })
   }, [course.id, refreshKey])
   // 后端按目录顺序返回，这里只按 parent_id 分组，兄弟节点的先后原样保留。
-  const children = useMemo(() => {
-    const grouped = new Map<string, ConceptNode[]>()
-    const known = new Set((nodes ?? []).map(node => node.id))
-    for (const node of nodes ?? []) {
-      const key = node.parent_id && known.has(node.parent_id) ? node.parent_id : ''
-      grouped.set(key, [...(grouped.get(key) ?? []), node])
-    }
-    return grouped
-  }, [nodes])
-  const branches = useMemo(() => (nodes ?? []).filter(node => (children.get(node.id) ?? []).length > 0), [nodes, children])
-  function toggle(id: string) {
-    setCollapsed(current => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next })
-  }
-  function rows(parentId: string, depth: number): ReactElement[] {
-    return (children.get(parentId) ?? []).flatMap(node => {
-      const kids = children.get(node.id) ?? []
-      const shut = collapsed.has(node.id)
-      return [
-        <div className="concept-row" key={node.id} style={{ paddingLeft: `${depth * 18}px` }}>
-          {kids.length > 0
-            ? <button type="button" className={shut ? 'concept-toggle' : 'concept-toggle open'} aria-expanded={!shut} aria-label={node.name} onClick={() => toggle(node.id)}>›</button>
-            : <span className="concept-bullet" aria-hidden />}
-          <b>{node.name}</b>
-          <small>{node.page ? t('library.concepts_page', { page: node.page }) : t('library.concepts_no_page')}
-            {kids.length > 0 && ` · ${t('library.concepts_children', { n: kids.length })}`}</small>
-        </div>,
-        ...(shut ? [] : rows(node.id, depth + 1)),
-      ]
-    })
-  }
+  const items = useMemo(() => (nodes ?? []).map(node => ({
+    id: node.id, parentId: node.parent_id ?? '', label: node.name,
+    meta: node.page ? t('library.concepts_page', { page: node.page }) : t('library.concepts_no_page'),
+  })), [nodes])
+  const children = useMemo(() => groupByParent(items), [items])
+  const branches = useMemo(() => items.filter(item => (children.get(item.id) ?? []).length > 0), [items, children])
   return <article className="card">
     <div className="card-heading">
       <div><h2>{nodes ? t('library.concepts_title_n', { n: nodes.length }) : t('library.concepts_title')}</h2>
         <p>{t('library.concepts_hint')}</p></div>
-      {branches.length > 0 && <button className="text-button" onClick={() => setCollapsed(collapsed.size ? new Set() : new Set(branches.map(node => node.id)))}>
+      {branches.length > 0 && <button className="text-button" onClick={() => toggleAll(branches)}>
         {collapsed.size ? t('library.concepts_expand_all') : t('library.concepts_collapse_all')}</button>}
     </div>
     {nodes === null ? <p className="mini-empty">{t('common.loading')}</p>
       : nodes.length === 0 ? <div className="empty-inline">{t('library.concepts_empty')}</div>
         : <div className="concept-tree">
             {branches.length === 0 && <p className="wiki-note">{t('library.concepts_flat_note')}</p>}
-            {rows('', 0)}
+            {treeRows(children, collapsed, toggle)}
           </div>}
+  </article>
+}
+
+/** 目录结构：概念与层级单独一条流水线，重算不重新提取也不重新向量化。
+ *  没有层级的教材在这里说清楚，并给出重新解析的入口。 */
+function StructurePanel({ course, refreshKey, onError, onParsed }: {
+  course: Course; refreshKey: number; onError: (message: string) => void; onParsed: () => void
+}) {
+  const [rows, setRows] = useState<MaterialStructure[] | null>(null)
+  const [target, setTarget] = useState<MaterialStructure | null>(null)
+  const [preview, setPreview] = useState<StructurePreview | null>(null)
+  const [running, setRunning] = useState(false)
+  const [done, setDone] = useState<{ added: number; removed: number } | null>(null)
+  useEffect(() => {
+    setRows(null); setTarget(null)
+    api.structure(course.id).then(payload => setRows(payload.materials)).catch(error => { setRows([]); onError(errorText(error)) })
+  }, [course.id, refreshKey])
+  function ask(row: MaterialStructure) {
+    // 预告要现算，所以点开就发请求，拿到再显示数字
+    setTarget(row); setPreview(null); setDone(null)
+    api.previewStructure(row.material_id).then(setPreview).catch(error => { onError(errorText(error)); setTarget(null) })
+  }
+  async function confirm() {
+    if (!target) return
+    setRunning(true)
+    try {
+      const result = await api.parseStructure(target.material_id)
+      setDone({ added: result.added, removed: result.removed }); setTarget(null); onParsed()
+    } catch (error) { onError(errorText(error)) } finally { setRunning(false) }
+  }
+  function status(row: MaterialStructure): string {
+    if (!row.has_structure) return row.index_status === 'indexed' ? t('library.structure_none') : t('library.structure_not_indexed')
+    return t(row.has_levels ? 'library.structure_leveled' : 'library.structure_flat', { n: row.concepts })
+  }
+  return <article className="card">
+    <div className="card-heading"><div><h2>{t('library.structure_title')}</h2>
+      <p>{t('library.structure_hint')}</p></div></div>
+    {done && <p className="help-note">{done.added || done.removed
+      ? t('library.structure_done', { added: done.added, removed: done.removed })
+      : t('library.structure_done_none')}</p>}
+    {rows === null ? <p className="mini-empty">{t('common.loading')}</p>
+      : rows.length === 0 ? <div className="empty-inline">{t('library.materials_empty')}</div>
+        : rows.map(row => <div className="material-row" key={row.material_id}>
+            <div className="file-mark">TOC</div>
+            <div className="material-copy"><b>{row.filename}</b><small>{status(row)}</small>
+              {row.has_structure && !row.has_levels && <small className="wiki-note">{t('library.structure_flat_note')}</small>}</div>
+            <button className="ghost-button" disabled={row.index_status !== 'indexed' || running} onClick={() => ask(row)}>
+              {row.has_structure ? t('library.structure_reparse') : t('library.structure_parse')}</button>
+          </div>)}
+    {target && <StructurePreviewPanel filename={target.filename} preview={preview} running={running}
+      onConfirm={() => void confirm()} onCancel={() => setTarget(null)} />}
+  </article>
+}
+
+/** 重建目录结构的影响预告。删概念会连带删掉掌握度与错题，先说清楚再让用户点。 */
+function StructurePreviewPanel({ filename, preview, running, onConfirm, onCancel }: {
+  filename: string; preview: StructurePreview | null; running: boolean
+  onConfirm: () => void; onCancel: () => void
+}) {
+  const shown = (preview?.removed_names ?? []).slice(0, 8)
+  const rest = (preview?.removed_names.length ?? 0) - shown.length
+  const names = [...shown, ...(rest > 0 ? [t('structure.and_more', { n: rest })] : [])].join(t('common.list_sep'))
+  return <article className="card ocr-card">
+    <h2>{t('structure.title', { name: filename })}</h2>
+    <p>{t('structure.body')}</p>
+    {preview === null ? <p className="mini-empty">{t('structure.loading')}</p>
+      : preview.empty ? <p className="danger-text">{t('structure.empty')}</p>
+        : <>
+            <p>{t('structure.result', { added: preview.added, kept: preview.kept, removed: preview.removed })}</p>
+            {preview.removed > 0 && <p className="help-note">{t('structure.removed_list', { names })}</p>}
+            <p className={preview.at_risk > 0 ? 'danger-text' : 'help-note'}>
+              {preview.at_risk > 0 ? t('structure.at_risk', { n: preview.at_risk }) : t('structure.safe')}</p>
+            <small className="help-note">{preview.has_levels ? t('structure.levels_yes') : t('structure.levels_no')}</small>
+          </>}
+    <div className="danger-actions">
+      <button className="primary-button" disabled={preview === null || running} onClick={onConfirm}>
+        {running ? t('structure.running') : t('structure.confirm')}</button>
+      <button className="ghost-button" onClick={onCancel}>{t('common.cancel')}</button>
+    </div>
   </article>
 }
 
@@ -871,10 +970,12 @@ function stripFrontmatter(raw: string): string {
   return match ? raw.slice(match[0].length).trimStart() : raw
 }
 
-/** 已生成的 Wiki 页。正文里的 [p.N] 与 frontmatter 的 source_refs 对得上。 */
+/** 已生成的 Wiki 页，按教材目录嵌成一棵可折叠的树。没有层级的教材照旧平铺。
+ *  正文里的 [p.N] 与 frontmatter 的 source_refs 对得上。 */
 function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refreshKey: number; onError: (message: string) => void }) {
   const [pages, setPages] = useState<WikiPageSummary[] | null>(null)
   const [open, setOpen] = useState<{ title: string; content: string } | null>(null)
+  const { collapsed, toggle, toggleAll } = useCollapse(`${course.id}:${refreshKey}`)
   useEffect(() => {
     setPages(null); setOpen(null)
     api.wikiPages(course.id).then(payload => setPages(payload.pages)).catch(error => { setPages([]); onError(errorText(error)) })
@@ -885,15 +986,26 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
       setOpen({ title: page.concept_name, content: stripFrontmatter(raw) })
     } catch (error) { onError(errorText(error)) }
   }
+  const items = useMemo(() => (pages ?? []).map(page => ({
+    id: page.concept_id, parentId: page.parent_id ?? '', label: page.concept_name,
+    meta: t('library.updated_at', { time: page.updated_at.slice(0, 16).replace('T', ' ') }),
+    onOpen: () => void read(page),
+  })), [pages])
+  const children = useMemo(() => groupByParent(items), [items])
+  const branches = useMemo(() => items.filter(item => (children.get(item.id) ?? []).length > 0), [items, children])
   if (pages !== null && pages.length === 0) return null
   return <article className="card">
-    <div className="card-heading"><div><h2>{pages ? t('library.wiki_pages_title_n', { n: pages.length }) : t('library.wiki_pages_title')}</h2>
-      <p>{t('library.wiki_pages_hint')}</p></div></div>
-    {pages === null ? <p className="mini-empty">{t('common.loading')}</p> : pages.map(page => <div className="material-row" key={page.concept_id}>
-      <div className="file-mark">WIKI</div>
-      <div className="material-copy"><b>{page.concept_name}</b><small>{t('library.updated_at', { time: page.updated_at.slice(0, 16).replace('T', ' ') })}</small></div>
-      <button className="ghost-button" onClick={() => void read(page)}>{t('common.view')}</button>
-    </div>)}
+    <div className="card-heading">
+      <div><h2>{pages ? t('library.wiki_pages_title_n', { n: pages.length }) : t('library.wiki_pages_title')}</h2>
+        <p>{t('library.wiki_pages_hint')}</p></div>
+      {branches.length > 0 && <button className="text-button" onClick={() => toggleAll(branches)}>
+        {collapsed.size ? t('library.concepts_expand_all') : t('library.concepts_collapse_all')}</button>}
+    </div>
+    {pages === null ? <p className="mini-empty">{t('common.loading')}</p>
+      : <div className="concept-tree">
+          {branches.length === 0 && <p className="wiki-note">{t('library.wiki_pages_flat_note')}</p>}
+          {treeRows(children, collapsed, toggle)}
+        </div>}
     {open && <div className="note-viewer">
       <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label={t('a11y.close_wiki')}>×</button></div>
       <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{open.content}</ReactMarkdown></div>
@@ -1054,6 +1166,9 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   const [ragBackend, setRagBackend] = useState<string>('')
   const polling = useRef(false)
   const [ocrTarget, setOcrTarget] = useState<string>(''); const [ocrEstimate, setOcrEstimate] = useState<OcrEstimate | null>(null); const [ocrRunning, setOcrRunning] = useState(false)
+  const [wikiEstimates, setWikiEstimates] = useState<Record<string, WikiEstimate>>({})
+  // 单独重算过目录结构：概念目录与结构面板都要跟着刷新
+  const [structureRuns, setStructureRuns] = useState(0)
   const reload = async () => { try { setMaterials(await api.materials(course.id)) } catch (error) { onError(errorText(error)) } }
   const removeMaterial = async (materialId: string) => {
     try { await api.deleteMaterial(materialId); await reload() }
@@ -1102,19 +1217,44 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   async function buildWiki(materialId: string) { try { const job = await api.buildWiki(materialId); setJobs(current => ({ ...current, [job.id]: job })) } catch (error) { onError(errorText(error)) } }
   // Wiki 页列表要在构建结束后重新拉一次，否则新写的页要刷新整页才看得到
   const wikiDone = Object.values(jobs).filter(job => job.type === 'wiki' && job.status === 'completed').length
-  // 概念目录同理，跟着索引任务的完成数刷新
+  // 概念目录同理，跟着索引任务的完成数刷新；单独重算过结构也要刷新
   const indexDone = Object.values(jobs).filter(job => job.type !== 'wiki' && job.status === 'completed').length
+  // 构建前的账单。离线算的，不花额度，所以进 Wiki 标签页就一次性把每份资料都估出来。
+  useEffect(() => {
+    if (tab !== 'wiki' || !course.wiki_enabled) return
+    let cancelled = false
+    void (async () => {
+      const pairs = await Promise.all(indexedMaterials.map(async item => {
+        try { return [item.id, await api.estimateWiki(item.id)] as const } catch { return null }
+      }))
+      if (!cancelled) setWikiEstimates(Object.fromEntries(pairs.filter(Boolean) as [string, WikiEstimate][]))
+    })()
+    return () => { cancelled = true }
+  }, [tab, course.id, course.wiki_enabled, indexedMaterials.length, wikiDone])
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)); setSearched(searchQuery) } catch (error) { onError(errorText(error)); setResults([]); setSearched('') } finally { setLoading(false) } }
   const backendLabel = retrievalLabel(ragBackend, true)
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">{t('nav.library')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('library.hero')}{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>{t('library.refresh_status')}</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>{t('library.tab_rag')}</button><button className={tab === 'concepts' ? 'active' : ''} onClick={() => setTab('concepts')}>{t('library.tab_concepts')}</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>{t('library.tab_wiki')} {course.wiki_enabled ? '' : t('library.tab_wiki_off')}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>{t('library.notes_title')}</button></div>
     {tab === 'notes' && <NotesPanel course={course} onError={onError} />}
-    {tab === 'concepts' && <ConceptTreePanel course={course} refreshKey={indexDone} onError={onError} />}
+    {tab === 'concepts' && <>
+      <StructurePanel course={course} refreshKey={indexDone + structureRuns} onError={onError} onParsed={() => setStructureRuns(runs => runs + 1)} />
+      <ConceptTreePanel course={course} refreshKey={indexDone + structureRuns} onError={onError} />
+    </>}
     {tab === 'rag' ? <><div className="library-grid"><article className="card upload-card"><h2>{t('library.upload_title')}</h2><p>{t('library.upload_body')}</p><p className="upload-hint">{t('library.upload_ocr_hint')}</p><input ref={fileInput} type="file" accept=".pdf,.txt,.md,.docx,.doc,.pptx,.ppt,text/plain,application/pdf,text/markdown" onChange={upload} hidden /><button className="primary-button" onClick={() => fileInput.current?.click()} disabled={loading}>{t('library.upload_button', { name: course.name })}</button><small>{t('library.upload_limits')}</small></article><article className="card search-card"><h2>{t('library.search_title')}</h2><p>{t('library.search_body', { name: course.name })}</p><form onSubmit={search}><input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder={t('library.search_placeholder')} /><button className="primary-button" disabled={loading}>{t('library.search_button')}</button></form></article></div><article className="card material-card"><div className="card-heading"><div><h2>{t('library.materials_title')}</h2><p>{t('library.materials_hint')}</p></div><button className="text-button" onClick={() => void reload()}>{t('common.refresh')}</button></div>{materials.length ? materials.map(material => <MaterialRow material={material} jobs={jobs} key={material.id} onReindex={reindex} onDelete={removeMaterial} onOcr={askOcr} />) : <div className="empty-inline">{t('library.materials_empty')}</div>}</article>{searched && <article className="card results-card"><h2>{t('library.results_title')}</h2>{results.length === 0 && <div className="empty-inline"><b>{t('library.results_empty_title')}</b><p>{t('library.results_empty_body', { query: searched })}</p></div>}{results.map((result, index) => <div className="result" key={result.id ?? result.chunk_id ?? index}><b>{result.material_name ?? t('library.result_fallback_name')} {result.page ? `· p.${result.page}` : ''}</b><p>{result.text ?? t('library.result_no_text')}</p><small>{result.score !== undefined ? t('library.result_score', { score: result.score.toFixed(4) }) : t('library.result_cited')}</small></div>)}</article>}{ocrTarget && <OcrEstimatePanel filename={materials.find(item => item.id === ocrTarget)?.filename ?? t('library.ocr_fallback_name')} estimate={ocrEstimate} running={ocrRunning} onConfirm={() => void confirmOcr()} onCancel={() => setOcrTarget('')} />}</> : tab !== 'wiki' ? null : <><article className="card wiki-card"><div className="switch-row"><div><h2>{t('library.wiki_enable_title')} <span>{t('library.experimental')}</span></h2><p>{t('library.wiki_toggle_body')}</p></div><button className={`switch ${course.wiki_enabled ? 'on' : ''}`} aria-label={t('a11y.toggle_wiki')} onClick={toggleWiki}><i /></button></div>{course.wiki_enabled ? <><p className="wiki-note">{t('library.wiki_pick_hint')}</p>{indexedMaterials.length ? indexedMaterials.map(material => {
       // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
       const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
-      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? tOr(`stage.${String(wikiJob.stage ?? wikiJob.status)}`, String(wikiJob.status)) : t('library.wiki_ready')}</small>{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <WikiBuildNote job={wikiJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
+      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? stageLabel(wikiJob.stage ?? wikiJob.status, String(wikiJob.status)) : t('library.wiki_ready')}</small>{!running && <WikiEstimateNote estimate={wikiEstimates[material.id]} />}{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <WikiBuildNote job={wikiJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
     }) : <div className="empty-inline">{t('library.wiki_needs_material')}</div>}</> : <div className="empty-inline"><b>{t('library.wiki_off_title')}</b><p>{t('library.wiki_off_body')}</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} />}</>}</div></section>
+}
+
+/** 构建前的账单。页数与调用次数是离线算的，分钟数按每页约 5 秒外推。 */
+function WikiEstimateNote({ estimate }: { estimate?: WikiEstimate }) {
+  if (!estimate) return <small className="wiki-coverage">{t('library.wiki_estimating')}</small>
+  return <small className="wiki-coverage">
+    {t('library.wiki_estimate', { pages: estimate.pages, calls: estimate.calls, minutes: estimate.minutes })}
+    {estimate.merged > 0 && ` ${t('library.wiki_estimate_merged', { n: estimate.merged })}`}
+    {!estimate.has_levels && ` ${t('library.wiki_estimate_flat')}`}
+  </small>
 }
 
 /** Wiki 构建的收尾提示。成功时后端给的是覆盖率字段串，按语言渲染；失败时原样显示报错。 */
@@ -1127,21 +1267,33 @@ function WikiBuildNote({ job }: { job: Job }) {
     fields[key] = Number(value) || 0
   }
   return <small className="wiki-coverage">
-    {t('library.wiki_coverage', { concepts: fields.concepts, pages: fields.pages, merged: fields.merged })}
+    {t('library.wiki_coverage', { concepts: fields.concepts, pages: fields.pages })}
+    {fields.merged > 0 && ` ${t('library.wiki_coverage_merged', { merged: fields.merged })}`}
     {' '}{t('library.wiki_coverage_detail', { written: fields.written, skipped: fields.skipped })}
     {fields.dropped > 0 && ` ${t('library.wiki_coverage_dropped', { dropped: fields.dropped })}`}
   </small>
 }
 
+/** 后端把进度写成 `wiki 12/51`、`ocr 3/10`：拆出数字渲染成正常文案，别把原始串摆给用户。 */
+function stageLabel(stage: string | undefined, fallback: string): string {
+  const progress = /^(wiki|ocr) (\d+)\/(\d+)$/.exec(stage ?? '')
+  if (progress) {
+    return t(progress[1] === 'wiki' ? 'stage.wiki_progress' : 'stage.ocr_progress',
+             { done: progress[2], total: progress[3] })
+  }
+  return tOr(`stage.${String(stage ?? fallback)}`, fallback)
+}
+
 // 阶段名在字典里（`stage.<name>` 与 `pipeline.<name>`）：后端加新阶段时界面显示原始值。
-const INDEX_PIPELINE = ['extracting', 'chunking', 'embedding', 'indexing'] as const
+// 前四步是检索索引，最后一步是目录结构——两条流水线，共享前面的文本准备。
+const INDEX_PIPELINE = ['extracting', 'chunking', 'embedding', 'indexing', 'structure'] as const
 
 function MaterialRow({ material, jobs, onReindex, onDelete, onOcr }: { material: Material; jobs: Record<string, Job>; onReindex: (materialId: string) => void; onDelete?: (materialId: string) => Promise<void>; onOcr?: (materialId: string) => void }) {
   const [confirming, setConfirming] = useState(false)
   // 只看索引任务，且取最后一个：jobs 只增不删，wiki 任务与上一次重建都在里面。
   const job = Object.values(jobs).filter(item => item.material_id === material.id && item.type !== 'wiki').at(-1)
   const rawStatus = job?.stage ?? job?.status ?? material.index_status ?? material.status ?? 'uploaded'
-  const statusLabel = tOr(`stage.${String(rawStatus)}`, String(rawStatus))
+  const statusLabel = stageLabel(String(rawStatus), String(rawStatus))
   const failed = String(job?.status ?? rawStatus).toLowerCase().includes('fail')
   const jobActive = job ? !['completed', 'failed'].includes(job.status) : false
   const indexed = (material.index_status ?? material.status) === 'indexed'

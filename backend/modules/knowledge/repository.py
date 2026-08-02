@@ -297,6 +297,52 @@ class KnowledgeRepository:
                 )
             return int(conn.execute("SELECT count(*) FROM concepts WHERE course_id = ?", (course_id,)).fetchone()[0])
 
+    def preview_material_concepts(self, *, course_id: str, material_id: str, candidates: list[dict]) -> dict:
+        """算出重建目录结构会新增、删除多少概念，删掉的里面有多少挂着掌握度或错题。
+
+        只读不写，判据与 replace_material_concepts 同源：候选先过大小写合并再按派生 id 对账。
+        """
+        if not candidates:
+            # 抽取为空时重建是空操作（见 replace_material_concepts），预告也要照这个口径。
+            return {"empty": True, "candidates": 0, "added": 0, "removed": 0, "kept": 0,
+                    "at_risk": 0, "removed_names": [], "at_risk_names": []}
+        merged = merge_case_variants(candidates)
+        keep = [concept_id_for(course_id, candidate["name"]) for candidate in merged]
+        marks = ",".join("?" * len(keep))
+        with self._store.read() as conn:
+            doomed = conn.execute(
+                f"SELECT id, name FROM concepts WHERE course_id = ? AND material_id = ? AND id NOT IN ({marks})",
+                (course_id, material_id, *keep),
+            ).fetchall()
+            existing = {row["id"] for row in conn.execute("SELECT id FROM concepts WHERE course_id = ?", (course_id,))}
+            risky: set[str] = set()
+            if doomed:
+                ids = [row["id"] for row in doomed]
+                spots = ",".join("?" * len(ids))
+                for table in ("concept_mastery", "mistake_records"):
+                    risky |= {row["concept_id"] for row in
+                              conn.execute(f"SELECT concept_id FROM {table} WHERE concept_id IN ({spots})", ids)}
+        names = {row["id"]: row["name"] for row in doomed}
+        added = [concept_id for concept_id in keep if concept_id not in existing]
+        return {
+            "empty": False, "candidates": len(merged),
+            "added": len(added), "removed": len(doomed), "kept": len(keep) - len(added),
+            "removed_names": sorted(names.values()),
+            "at_risk": len(risky), "at_risk_names": sorted(names[concept_id] for concept_id in risky),
+        }
+
+    def material_concept_stats(self, *, course_id: str) -> list[dict]:
+        """每份教材抽到多少概念、其中多少条带层级。结构状态由这两个数推导，不另存状态列。"""
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT m.id AS material_id, m.filename, m.index_status,"
+                " (SELECT count(*) FROM concepts c WHERE c.material_id = m.id) AS concepts,"
+                " (SELECT count(*) FROM concepts c WHERE c.material_id = m.id AND c.level IS NOT NULL) AS leveled"
+                " FROM materials m WHERE m.course_id = ? ORDER BY m.created_at DESC",
+                (course_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_concepts(self, *, course_id: str, limit: int = 60) -> list[dict]:
         with self._store.read() as conn:
             rows = conn.execute(

@@ -1,5 +1,5 @@
 import { t } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, TurnEvent, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, Message, OcrEstimate, Plan, SearchResult, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
@@ -123,7 +123,11 @@ export const api = {
   startOcr: (materialId: string) => request<Job>(`/materials/${materialId}/ocr`, json('POST')),
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   buildWiki: (materialId: string) => request<Job>(`/materials/${materialId}/wiki`, json('POST')),
+  estimateWiki: (materialId: string) => request<WikiEstimate>(`/materials/${materialId}/wiki/estimate`),
   concepts: (courseId: string) => request<{ concepts: ConceptNode[] }>(`/courses/${courseId}/concepts`),
+  structure: (courseId: string) => request<{ materials: MaterialStructure[] }>(`/courses/${courseId}/structure`),
+  previewStructure: (materialId: string) => request<StructurePreview>(`/materials/${materialId}/structure/preview`, json('POST')),
+  parseStructure: (materialId: string) => request<StructurePreview & MaterialStructure>(`/materials/${materialId}/structure`, json('POST')),
   wikiPages: (courseId: string) => request<{ pages: WikiPageSummary[] }>(`/courses/${courseId}/wiki`),
   wikiPage: (courseId: string, conceptId: string) => request<{ concept_id: string; content: string }>(`/courses/${courseId}/wiki/${conceptId}`),
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),

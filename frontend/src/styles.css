@@ -248,6 +248,9 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .concept-toggle { width:20px; height:20px; padding:0; border:1px solid var(--border); border-radius:5px; background:var(--panel); color:var(--muted); font-size:12px; line-height:1 }
 .concept-toggle.open { transform:rotate(90deg) }
 .concept-bullet { display:block; width:4px; height:4px; margin-left:8px; border-radius:50%; background:var(--border) }
+/* 知识页的标题可点开阅读；样式跟着同一棵树里的普通节点走，只是多一个手型。 */
+.tree-open { overflow:hidden; padding:0; border:0; background:transparent; color:var(--text); font-size:13.5px; font-weight:550; white-space:nowrap; text-align:left; text-overflow:ellipsis; cursor:pointer }
+.tree-open:hover { text-decoration:underline }
 /* 错题本：尾部标签包一层，让「复发 + 已清掉」同时出现时只占一个网格列。 */
 .mistake-tags { display:flex; gap:6px; justify-content:flex-end }
 .card > .mistake-more { margin:10px 0 0; font-size:12px }
