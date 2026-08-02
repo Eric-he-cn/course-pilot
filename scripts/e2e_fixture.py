@@ -60,6 +60,19 @@ SLICES = (
           ("Gaussian", "Product of Gaussian Densities")),
 )
 
+# 大切片：整整一章，几十页、上百条书签，用来压知识页构建的节点上限与树深度。
+# 上面那几份只有十来页，任何上限都碰不到，「超出上限会丢内容」这类 bug 在它们身上走不到。
+#
+# 单独一个元组，不并进 SLICES：eval_dataset.py 与 example_setup.py 会把 SLICES 里
+# 同课程的切片全部装进课程，多一份几十页的教材会改掉评测的检索基线，也会拖慢示例数据准备。
+BIG_SLICES = (
+    # d2l 第 4 章「多层感知机」。选它的理由：自成体系（从模型讲到过拟合、正则、
+    # 数值稳定性，最后落到一场 Kaggle 实战），四层书签，同名标题（章与 4.1 同叫
+    # 「多层感知机」）也在里面，概念去重那条路顺带走得到。
+    Slice("深度学习-多层感知机.pdf", "d2l-zh", 147, 212, "深度学习",
+          ("K折交叉验证", "暂退法", "Xavier", "协变量偏移")),
+)
+
 # OCR 提问用的图片：从这份切片里取一页光栅化，内容仍是真实教材页。
 IMAGE_FROM = ("os-cpu-scheduling.pdf", 7)
 
@@ -134,15 +147,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default=str(ROOT / "testdata" / "fixtures"), help="fixture 输出目录")
     parser.add_argument("--data-dir", default=str(ROOT / "testdata" / "e2e"), help="e2e 后端数据目录，会被清空")
+    parser.add_argument("--only", action="append", metavar="文件名",
+                        help="只重切指定的切片，可重复。教材的 sha256 是评测的硬门，别无谓重切。")
     args = parser.parse_args()
 
     out = Path(args.out)
     source_dir = out / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
-    downloads = {source.key: fetch(source, source_dir) for source in SOURCES}
+    wanted = [spec for spec in SLICES + BIG_SLICES if not args.only or spec.out in args.only]
+    if args.only and (unknown := set(args.only) - {spec.out for spec in wanted}):
+        raise SystemExit(f"没有这几份切片：{sorted(unknown)}")
+    downloads = {source.key: fetch(source, source_dir)
+                 for source in SOURCES if source.key in {spec.source for spec in wanted}}
 
     print("\n课程与教材（页码为切片内页码，可直接对照引用）：")
-    for spec in SLICES:
+    for spec in wanted:
         target, pages = cut(downloads[spec.source], spec, out)
         joined = "\n".join(pages)
         missing = [anchor for anchor in spec.anchors if anchor not in joined]
@@ -151,10 +170,11 @@ def main() -> None:
         print(f"  [{spec.course}] {target.name}  原书 p{spec.first_page}-{spec.last_page} → {len(pages)} 页 · "
               + "，".join(f"{anchor}@p{page}" for anchor, page in located.items()))
 
-    image = out / "教材页-提问.png"
-    rasterize(out / IMAGE_FROM[0], IMAGE_FROM[1], image)
-    assert image.stat().st_size > 20_000, "图片过小，OCR 可能读不出文字"
-    print(f"\nOCR 图片：{image.name}（{IMAGE_FROM[0]} 第 {IMAGE_FROM[1]} 页，{image.stat().st_size // 1024} KB）")
+    if any(spec.out == IMAGE_FROM[0] for spec in wanted):
+        image = out / "教材页-提问.png"
+        rasterize(out / IMAGE_FROM[0], IMAGE_FROM[1], image)
+        assert image.stat().st_size > 20_000, "图片过小，OCR 可能读不出文字"
+        print(f"\nOCR 图片：{image.name}（{IMAGE_FROM[0]} 第 {IMAGE_FROM[1]} 页，{image.stat().st_size // 1024} KB）")
 
     # 浏览器里没有文件选择器可用，改由页面 fetch 再注入 input；
     # vite.config.ts 的 server.fs.allow 已放开这个目录。

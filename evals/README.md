@@ -20,7 +20,8 @@
 
 ## 怎么跑
 
-教材切片先准备好（`testdata/fixtures/` 下五份，`scripts/e2e_fixture.py` 生成），然后另起一套实例：
+教材切片先准备好（`scripts/e2e_fixture.py` 的 `SLICES`，五份，落在 `testdata/fixtures/`），
+然后另起一套实例：
 
 ```bash
 CP_PORT_OFFSET=3 STORAGE_DATA_DIR=testdata/eval ./scripts/dev.sh
@@ -45,6 +46,10 @@ CP_PORT_OFFSET=3 STORAGE_DATA_DIR=testdata/eval ./scripts/dev.sh
 `dataset.yaml` 的 `materials` 记了每份切片的 sha256。教材内容一变，标注的页码就是错的，
 这时候脚本**直接报错退出**，不会给出一个基于错页码的结论。切片是从固定 URL 下载 + 固定页范围
 裁切，所以只要源没换版就能复现；真换了就得重新标页码。
+
+这个段只记**样本标注依赖的**教材。`e2e_fixture.py` 的 `BIG_SLICES`（几十页的整章，
+给 `scripts/e2e_library.py` 压知识页的节点上限用）没有样本引用它，所以不进这个段，
+也不在 `SLICES` 里——评测会把同课程的切片全装进去，多一份几十页的教材会改掉检索基线。
 
 ## 标注约定
 

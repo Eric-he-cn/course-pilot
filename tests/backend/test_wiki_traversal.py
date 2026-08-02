@@ -27,6 +27,8 @@ from modules.knowledge.worker import KnowledgeJobWorker
 FIXTURES = Path(__file__).resolve().parents[2] / "testdata" / "fixtures"
 DEEP_LEARNING = FIXTURES / "深度学习-批量规范化.pdf"
 NO_OUTLINE = FIXTURES / "os-cpu-scheduling.pdf"
+# 大切片：d2l 第 4 章整章。上面两份只有十来页，任何上限都碰不到。
+BIG = FIXTURES / "深度学习-多层感知机.pdf"
 DEEP_LEARNING_PAGES = 10
 NO_OUTLINE_PAGES = 13
 
@@ -34,6 +36,8 @@ needs_deep_learning = pytest.mark.skipif(
     not DEEP_LEARNING.exists(), reason=f"缺少切片教材 {DEEP_LEARNING.name}（scripts/e2e_fixture.py 生成）")
 needs_no_outline = pytest.mark.skipif(
     not NO_OUTLINE.exists(), reason=f"缺少切片教材 {NO_OUTLINE.name}（scripts/e2e_fixture.py 生成）")
+needs_big = pytest.mark.skipif(
+    not BIG.exists(), reason=f"缺少大切片教材 {BIG.name}（scripts/e2e_fixture.py 生成）")
 
 
 class RecordingResponder:
@@ -94,6 +98,19 @@ def _build(tmp_path, pdf: Path) -> Built:
     try:
         material, job = _index_and_build(service, worker, course_id=course.id, filename=pdf.name,
                                          mime_type="application/pdf", content=pdf.read_bytes())
+    finally:
+        worker.shutdown()
+    return Built(course.id, material.id, service, wiki_store, responder, job)
+
+
+def _index_only(tmp_path, pdf: Path) -> Built:
+    """只索引不写页。切段是纯函数，判「漏没漏」不需要真生成页面。"""
+    course, service, worker, wiki_store, responder = _env(tmp_path)
+    try:
+        material = service.upload_material(course_id=course.id, filename=pdf.name,
+                                           mime_type="application/pdf", content=pdf.read_bytes())
+        job = _wait(service, worker, service.enqueue_index(material_id=material.id).id)
+        assert job.status == "completed", job.error_message
     finally:
         worker.shutdown()
     return Built(course.id, material.id, service, wiki_store, responder, job)
@@ -238,6 +255,75 @@ def test_the_build_reports_its_coverage(tmp_path):
     assert int(fields["concepts"]) >= 13
     assert int(fields["pages"]) >= 10
     assert "merged" in fields and "skipped" in fields
+
+
+# ---- 大切片：整整一章，概念数远超节点上限 ----
+
+@needs_big
+def test_a_whole_chapter_over_the_node_cap_still_reads_every_chunk(tmp_path):
+    """d2l 第 4 章整章：66 页、99 条书签、88 个概念，节点上限 50 一定会砍。
+
+    十来页的切片碰不到任何上限，「超出上限会丢内容」这条路在它们身上走不到。
+    """
+    built = _build(tmp_path, BIG)
+    fields = dict(item.split("=", 1) for item in (built.job.error_message or "").split()[1:])
+
+    assert int(fields["concepts"]) > int(fields["pages"]), \
+        f"这份教材本来就该顶到上限，不然测不到东西：{fields}"
+    assert int(fields["dropped"]) == 0, fields
+
+    _pages, covered_chunks = _read_material(built)
+    chunks = _chunk_ids(built)
+    assert covered_chunks == chunks, \
+        f"只读到 {len(covered_chunks & chunks)}/{len(chunks)} 个分片"
+
+
+@needs_big
+@pytest.mark.parametrize("max_nodes", [4, 12, 50])
+def test_the_chapter_loses_nothing_at_any_node_cap(tmp_path, max_nodes):
+    """真实教材上重跑「不漏」：切段是纯函数，不用真写页也能判。"""
+    from modules.knowledge.wiki import plan_sections
+
+    built = _index_only(tmp_path, BIG)
+    chunks = built.service._repository.list_material_chunks(material_id=built.material_id)
+    sections, stats = plan_sections(
+        material_id=built.material_id,
+        concepts=built.service._repository.list_material_concept_tree(material_id=built.material_id),
+        chunks=chunks, max_nodes=max_nodes)
+
+    read = {chunk["id"] for section in sections for chunk in section.chunks}
+    assert len(sections) <= max_nodes
+    assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len(chunks) - len(read)} 个分片"
+    assert stats["dropped"] == 0
+
+
+@needs_big
+@pytest.mark.parametrize("max_nodes", [4, 50])
+def test_a_library_indexed_before_the_level_columns_existed_loses_nothing(tmp_path, max_nodes):
+    """老库的概念行没有 level/parent_id/ordinal，取不到目录就该退回按分片切段。
+
+    作者拿真书踩到的就是这个形态：三列是后加的，加之前索引过的教材一列都没有。
+    低上限那一档不能省：这条路上没有上级页接住被砍掉的段，段数顶到上限时
+    要靠把段放大来装下，砍掉尾巴就是整段原文一个字都不进知识页。
+    """
+    from modules.knowledge.wiki import plan_sections
+
+    built = _index_only(tmp_path, BIG)
+    with built.service._repository._store.write() as connection:
+        connection.execute(
+            "UPDATE concepts SET level = NULL, parent_id = NULL, ordinal = NULL WHERE material_id = ?",
+            (built.material_id,))
+    concepts = built.service._repository.list_material_concept_tree(material_id=built.material_id)
+    assert concepts and all(row["level"] is None for row in concepts), "这个用例要的就是三列全空"
+
+    chunks = built.service._repository.list_material_chunks(material_id=built.material_id)
+    sections, stats = plan_sections(material_id=built.material_id, concepts=concepts, chunks=chunks,
+                                    max_nodes=max_nodes)
+
+    read = {chunk["id"] for section in sections for chunk in section.chunks}
+    assert len(sections) <= max_nodes
+    assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len(chunks) - len(read)} 个分片"
+    assert stats["dropped"] == 0
 
 
 # ---- 无书签教材走同一条流程 ----
