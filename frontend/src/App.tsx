@@ -813,13 +813,31 @@ function NotesPanel({ course, onError }: { course: Course; onError: (message: st
 /** 可折叠树的一个节点。概念目录与知识页共用，各自把自己的行映射成这个形状。 */
 interface TreeItem { id: string; parentId: string; label: string; meta: string; onOpen?: () => void }
 
-/** 按 parent_id 分组。父节点不在列表里的当作根节点，不硬造一层假的根。 */
+/** 按 parent_id 分组。父节点不在列表里的当作根节点，不硬造一层假的根。
+ *  知识页的 frontmatter 用户可以手改，改成父子互指时环里的节点从根走不到，
+ *  整棵树会少画几行还不出声。这里把够不到的节点提回根，一行都不少。 */
 function groupByParent(items: TreeItem[]): Map<string, TreeItem[]> {
   const grouped = new Map<string, TreeItem[]>()
   const known = new Set(items.map(item => item.id))
+  const push = (key: string, item: TreeItem) => grouped.set(key, [...(grouped.get(key) ?? []), item])
+  for (const item of items) push(item.parentId && known.has(item.parentId) ? item.parentId : '', item)
+  const rooted = new Set<string>()
+  const absorb = (roots: TreeItem[]) => {
+    const queue = [...roots]
+    while (queue.length) {
+      const item = queue.shift()!
+      if (rooted.has(item.id)) continue
+      rooted.add(item.id)
+      queue.push(...(grouped.get(item.id) ?? []))
+    }
+  }
+  absorb(grouped.get('') ?? [])
   for (const item of items) {
-    const key = item.parentId && known.has(item.parentId) ? item.parentId : ''
-    grouped.set(key, [...(grouped.get(key) ?? []), item])
+    if (rooted.has(item.id)) continue
+    // 断掉这一条回边，环就成了以它为根的一棵树，它的子孙也跟着走得到了。
+    grouped.set(item.parentId, (grouped.get(item.parentId) ?? []).filter(kid => kid.id !== item.id))
+    push('', item)
+    absorb([item])
   }
   return grouped
 }
@@ -858,15 +876,17 @@ function useCollapse(resetKey: unknown) {
 function ConceptTreePanel({ course, refreshKey, onError }: { course: Course; refreshKey: number; onError: (message: string) => void }) {
   const [nodes, setNodes] = useState<ConceptNode[] | null>(null)
   const { collapsed, toggle, toggleAll } = useCollapse(`${course.id}:${refreshKey}`)
+  const { lang } = useI18n()
   useEffect(() => {
     setNodes(null)
     api.concepts(course.id).then(payload => setNodes(payload.concepts)).catch(error => { setNodes([]); onError(errorText(error)) })
   }, [course.id, refreshKey])
   // 后端按目录顺序返回，这里只按 parent_id 分组，兄弟节点的先后原样保留。
+  // lang 要进依赖：memo 里调了 t()，换语言时数据没变，缓存的旧译文会和现算的部分混排。
   const items = useMemo(() => (nodes ?? []).map(node => ({
     id: node.id, parentId: node.parent_id ?? '', label: node.name,
     meta: node.page ? t('library.concepts_page', { page: node.page }) : t('library.concepts_no_page'),
-  })), [nodes])
+  })), [nodes, lang])
   const children = useMemo(() => groupByParent(items), [items])
   const branches = useMemo(() => items.filter(item => (children.get(item.id) ?? []).length > 0), [items, children])
   return <article className="card">
@@ -899,6 +919,8 @@ function StructurePanel({ course, refreshKey, onError, onParsed }: {
     setRows(null); setTarget(null)
     api.structure(course.id).then(payload => setRows(payload.materials)).catch(error => { setRows([]); onError(errorText(error)) })
   }, [course.id, refreshKey])
+  // 重算的结果只属于这门课。不能跟着 refreshKey 一起清——重算完 refreshKey 就变，那句话会来不及看见。
+  useEffect(() => { setDone(null) }, [course.id])
   function ask(row: MaterialStructure) {
     // 预告要现算，所以点开就发请求，拿到再显示数字
     setTarget(row); setPreview(null); setDone(null)
@@ -951,6 +973,7 @@ function StructurePreviewPanel({ filename, preview, running, onConfirm, onCancel
       : preview.empty ? <p className="danger-text">{t('structure.empty')}</p>
         : <>
             <p>{t('structure.result', { added: preview.added, kept: preview.kept, removed: preview.removed })}</p>
+            {preview.owned_elsewhere > 0 && <p className="help-note">{t('structure.owned_elsewhere', { n: preview.owned_elsewhere })}</p>}
             {preview.removed > 0 && <p className="help-note">{t('structure.removed_list', { names })}</p>}
             <p className={preview.at_risk > 0 ? 'danger-text' : 'help-note'}>
               {preview.at_risk > 0 ? t('structure.at_risk', { n: preview.at_risk }) : t('structure.safe')}</p>
@@ -976,6 +999,7 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
   const [pages, setPages] = useState<WikiPageSummary[] | null>(null)
   const [open, setOpen] = useState<{ title: string; content: string } | null>(null)
   const { collapsed, toggle, toggleAll } = useCollapse(`${course.id}:${refreshKey}`)
+  const { lang } = useI18n()
   useEffect(() => {
     setPages(null); setOpen(null)
     api.wikiPages(course.id).then(payload => setPages(payload.pages)).catch(error => { setPages([]); onError(errorText(error)) })
@@ -986,11 +1010,12 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
       setOpen({ title: page.concept_name, content: stripFrontmatter(raw) })
     } catch (error) { onError(errorText(error)) }
   }
+  // lang 要进依赖：memo 里调了 t()，换语言时数据没变，缓存的旧译文会和现算的部分混排。
   const items = useMemo(() => (pages ?? []).map(page => ({
     id: page.concept_id, parentId: page.parent_id ?? '', label: page.concept_name,
     meta: t('library.updated_at', { time: page.updated_at.slice(0, 16).replace('T', ' ') }),
     onOpen: () => void read(page),
-  })), [pages])
+  })), [pages, lang])
   const children = useMemo(() => groupByParent(items), [items])
   const branches = useMemo(() => items.filter(item => (children.get(item.id) ?? []).length > 0), [items, children])
   if (pages !== null && pages.length === 0) return null
@@ -1175,6 +1200,7 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
     catch (error) { onError(errorText(error)) }
   }
   const indexedMaterials = materials.filter(item => (item.index_status ?? item.status) === 'indexed')
+  const indexedIds = indexedMaterials.map(item => item.id).join(',')
   useEffect(() => { api.health().then(payload => setRagBackend(((payload.rag as Record<string, unknown>)?.backend as string) ?? '')).catch(() => {}) }, [])
   useEffect(() => { setMaterials([]); setJobs({}); setResults([]); setSearched(''); void reload() }, [course.id])
   // 只轮询未终态的 job：jobs 只增不删，把已完成的也一起问一遍是白跑。
@@ -1219,18 +1245,25 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
   const wikiDone = Object.values(jobs).filter(job => job.type === 'wiki' && job.status === 'completed').length
   // 概念目录同理，跟着索引任务的完成数刷新；单独重算过结构也要刷新
   const indexDone = Object.values(jobs).filter(job => job.type !== 'wiki' && job.status === 'completed').length
-  // 构建前的账单。离线算的，不花额度，所以进 Wiki 标签页就一次性把每份资料都估出来。
+  // 账单只在教材内容变过之后作废：它按已落库的正文与概念目录算，构建知识页不影响它。
+  useEffect(() => { setWikiEstimates({}) }, [course.id, indexDone, structureRuns])
+  // 离线算的，不花额度，但每份教材都要全量读一遍正文。已经估过的不再重估，
+  // 依赖用 id 列表而不是条数——同一轮里删掉一份、另一份索引完时长度不变。
   useEffect(() => {
     if (tab !== 'wiki' || !course.wiki_enabled) return
+    const missing = indexedMaterials.filter(item => !wikiEstimates[item.id])
+    if (!missing.length) return
     let cancelled = false
     void (async () => {
-      const pairs = await Promise.all(indexedMaterials.map(async item => {
+      const pairs = await Promise.all(missing.map(async item => {
         try { return [item.id, await api.estimateWiki(item.id)] as const } catch { return null }
       }))
-      if (!cancelled) setWikiEstimates(Object.fromEntries(pairs.filter(Boolean) as [string, WikiEstimate][]))
+      const fresh = pairs.filter(Boolean) as [string, WikiEstimate][]
+      // 一条都没拿到就别写 state：写了会换掉对象身份，这个 effect 会被自己叫醒，转成死循环。
+      if (!cancelled && fresh.length) setWikiEstimates(current => ({ ...current, ...Object.fromEntries(fresh) }))
     })()
     return () => { cancelled = true }
-  }, [tab, course.id, course.wiki_enabled, indexedMaterials.length, wikiDone])
+  }, [tab, course.id, course.wiki_enabled, indexedIds, wikiEstimates])
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)); setSearched(searchQuery) } catch (error) { onError(errorText(error)); setResults([]); setSearched('') } finally { setLoading(false) } }
   const backendLabel = retrievalLabel(ragBackend, true)
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">{t('nav.library')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('library.hero')}{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>{t('library.refresh_status')}</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>{t('library.tab_rag')}</button><button className={tab === 'concepts' ? 'active' : ''} onClick={() => setTab('concepts')}>{t('library.tab_concepts')}</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>{t('library.tab_wiki')} {course.wiki_enabled ? '' : t('library.tab_wiki_off')}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>{t('library.notes_title')}</button></div>

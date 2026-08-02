@@ -1,8 +1,6 @@
 """目录结构解析从 RAG 索引流水线里拆出来，可以单独重算。
 
-两条流水线共享「文本准备」（提取 → 切块 → 写 chunks），之后分叉：检索索引管向量与 FTS，
-目录结构管概念与层级。所以想拿回层级不必重新向量化，也不必冒「概念被换掉、掌握度和错题
-连带删除」的险——重算之前先给用户看一遍影响。
+检索索引管向量与 FTS，目录结构管概念与层级，两条共享已落库的正文。
 """
 from __future__ import annotations
 
@@ -18,6 +16,12 @@ from test_concept_outline_tree import _outlined_pdf
 
 FULL_OUTLINE = [("第 1 章 调度", ["1.1 FIFO", "1.2 SJF"]), ("第 2 章 内存", ["2.1 分页"])]
 TRIMMED_OUTLINE = [("第 1 章 调度", ["1.1 FIFO"])]
+# 标题与 FULL_OUTLINE 完全重合：同名概念归先抽到它的那份教材，这一份一个都不归它。
+SHARED_OUTLINE = [("第 1 章 调度", ["1.1 FIFO"])]
+MARKDOWN_NOTES = "\n\n".join(
+    f"## {title}\n这一节讲 {title} 的做法与代价，篇幅足够被切成一块正文。"
+    for title in ("进程调度", "虚拟内存", "文件系统")
+)
 
 
 @pytest.fixture
@@ -52,6 +56,26 @@ def _indexed_pdf(client: TestClient, *, chapters=FULL_OUTLINE, name="操作系�
     job = client.post(f"/api/v2/materials/{material_id}/index").json()
     assert _await_job(client, job["id"])["status"] == "completed"
     return course["id"], material_id
+
+
+def _index_more(client: TestClient, course_id: str, *, chapters, filename="second.pdf") -> str:
+    """往同一门课再加一份教材并索引完。"""
+    upload = client.post(f"/api/v2/courses/{course_id}/materials",
+                         files={"file": (filename, _outlined_pdf(chapters), "application/pdf")})
+    assert upload.status_code == 201, upload.text
+    job = client.post(f"/api/v2/materials/{upload.json()['id']}/index").json()
+    assert _await_job(client, job["id"])["status"] == "completed"
+    return upload.json()["id"]
+
+
+def _status_of(client: TestClient, course_id: str, material_id: str) -> dict:
+    payload = client.get(f"/api/v2/courses/{course_id}/structure").json()
+    return next(row for row in payload["materials"] if row["material_id"] == material_id)
+
+
+def _index_status(client: TestClient, course_id: str, material_id: str) -> str:
+    rows = client.get(f"/api/v2/courses/{course_id}/materials").json()
+    return next(row["status"] for row in rows if row["id"] == material_id)
 
 
 def _chunk_rows(client: TestClient) -> list[tuple]:
@@ -235,6 +259,77 @@ def test_the_preview_reports_the_no_op_when_nothing_can_be_extracted(client):
     assert len(_concept_rows(client, course_id)) == 5
 
 
+def test_the_preview_does_not_credit_this_file_with_concepts_another_file_owns(client):
+    """同名概念归第一次抽到它的那份教材，重建不会改归属。
+
+    预告里「保留」必须是这份教材自己的数，否则用户看到「保留 2 个」，
+    确认后紧挨着的状态行却写「0 个概念」。
+    """
+    course_id, _first = _indexed_pdf(client)
+    second = _index_more(client, course_id, chapters=SHARED_OUTLINE)
+
+    predicted = client.post(f"/api/v2/materials/{second}/structure/preview").json()
+    before = _status_of(client, course_id, second)
+
+    # 两个候选（调度、FIFO）的名字都归第一份教材，这一份自己什么都没有。
+    assert predicted["candidates"] == 2
+    assert predicted["kept"] == before["concepts"] == 0
+    assert predicted["owned_elsewhere"] == 2
+    assert predicted["added"] == 0 and predicted["removed"] == 0
+    assert predicted["kept"] + predicted["added"] + predicted["owned_elsewhere"] == predicted["candidates"]
+    # 删除也是教材级：第一份独有的概念不在这一份的预告里。
+    assert predicted["removed_names"] == []
+    # 层级同理只落在自己的行上，别让用户先被告知「这次能解析出层级」再看到相反的状态。
+    assert predicted["has_levels"] is before["has_levels"] is False
+
+    assert client.post(f"/api/v2/materials/{second}/structure").status_code == 200
+
+    after = _status_of(client, course_id, second)
+    assert after["concepts"] == predicted["kept"] + predicted["added"]
+    assert after["has_levels"] is predicted["has_levels"]
+
+
+def test_the_preview_merges_case_variants_the_same_way_the_rebuild_does(client):
+    """预告与执行同源：候选先合并只差大小写的名字，再按派生 id 对账。
+
+    少了这一步预告会把 Attention / ATTENTION 报成两个概念，执行只会落一行。
+    """
+    course_id, material_id = _indexed_pdf(client)
+    workspace(client).knowledge._concepts_for = lambda *_args, **_kwargs: [
+        {"name": "Attention", "page": 1, "mention_count": 3, "level": 0, "ordinal": 0},
+        {"name": "ATTENTION", "page": 2, "mention_count": 1, "level": 0, "ordinal": 1},
+    ]
+
+    predicted = client.post(f"/api/v2/materials/{material_id}/structure/preview").json()
+    assert client.post(f"/api/v2/materials/{material_id}/structure").status_code == 200
+
+    assert predicted["candidates"] == 1 and predicted["added"] == 1
+    assert set(_concept_rows(client, course_id)) == {"Attention"}
+
+
+def test_rebuilding_only_replays_the_projections_when_a_concept_comes_back(client):
+    """回填闸门是「概念又回来了」的补救开关。概念集合没变化时别整门课重置它，
+    否则预告说「记录不受影响」而实际上闸门已经开了。"""
+    course_id, material_id = _indexed_pdf(client)
+    space = workspace(client)
+    with space.store.write() as conn:
+        conn.execute("INSERT INTO mistake_backfills(course_id, completed_at) VALUES (?, 'now')", (course_id,))
+
+    def gate_open() -> bool:
+        with space.store.read() as conn:
+            return conn.execute("SELECT 1 FROM mistake_backfills WHERE course_id = ?", (course_id,)).fetchone() is None
+
+    # 概念一个没变：闸门保持关着。
+    assert client.post(f"/api/v2/materials/{material_id}/structure").json()["added"] == 0
+    assert gate_open() is False
+
+    # 概念回来了（先删掉一个，再重建）：投影必须重放，闸门要打开。
+    with space.store.write() as conn:
+        conn.execute("DELETE FROM concepts WHERE course_id = ? AND name = 'SJF'", (course_id,))
+    assert client.post(f"/api/v2/materials/{material_id}/structure").json()["added"] == 1
+    assert gate_open() is True
+
+
 def test_rebuilding_the_structure_keeps_the_history_of_concepts_that_survive(client):
     """留下来的概念保住 id，掌握度与错题不断档——这是「别整批删了再插」的全部意义。"""
     course_id, material_id = _indexed_pdf(client)
@@ -247,6 +342,90 @@ def test_rebuilding_the_structure_keeps_the_history_of_concepts_that_survive(cli
         assert conn.execute("SELECT count(*) FROM concept_mastery WHERE concept_id = ?", (fifo_id,)).fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM mistake_records WHERE concept_id = ?", (fifo_id,)).fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+# ---- 组合流水线的收尾与重启恢复 ----
+
+def _interrupt(client: TestClient, material_id: str, stage: str) -> None:
+    """把这份教材的索引作业按下在指定 stage 上，模拟进程在那一刻被杀。"""
+    with workspace(client).store.write() as conn:
+        conn.execute("UPDATE jobs SET status='running', stage=? WHERE material_id = ? AND type='index'",
+                     (stage, material_id))
+
+
+def test_a_restart_after_the_index_leg_finished_keeps_the_material_usable(client):
+    """chunks 与向量都在，只是结构那一段没跑完。作业记成中断，教材不能跟着降级——
+    降了就只能整份重索引（重新提取 + 重新向量化）才解得开。"""
+    course_id, material_id = _indexed_pdf(client)
+    client.patch(f"/api/v2/courses/{course_id}", json={"wiki_enabled": True})
+    chunks_before = _chunk_rows(client)
+    _interrupt(client, material_id, "structure")
+
+    workspace(client).knowledge._repository.recover_jobs_after_restart()
+
+    assert _index_status(client, course_id, material_id) == "indexed"
+    assert _chunk_rows(client) == chunks_before
+    assert client.get(f"/api/v2/materials/{material_id}/wiki/estimate").status_code == 200
+    assert client.post(f"/api/v2/materials/{material_id}/wiki").status_code in {200, 201, 202}
+    with workspace(client).store.read() as conn:
+        assert conn.execute("SELECT status FROM jobs WHERE material_id = ? AND type='index'",
+                            (material_id,)).fetchone()[0] == "failed"
+
+
+def test_a_restart_before_the_index_leg_finished_still_fails_the_material(client):
+    """向量化半途被打断时 chunks 是残缺的，教材照旧降级，用户得重新索引。"""
+    course_id, material_id = _indexed_pdf(client)
+    _interrupt(client, material_id, "embedding")
+
+    workspace(client).knowledge._repository.recover_jobs_after_restart()
+
+    assert _index_status(client, course_id, material_id) == "failed"
+
+
+def test_the_pipeline_moves_on_only_when_the_index_leg_says_it_finished(client):
+    """收尾判据对齐索引那一段自己报的 stage。拿 status 当哨兵是借来的：
+    以后 _run_index 多一种 running 的返回，结构就会在半成品上跑。"""
+    course_id, material_id = _indexed_pdf(client)
+    knowledge = workspace(client).knowledge
+    parsed: list[str] = []
+    knowledge._parse_structure_quietly = lambda material: parsed.append(material.id)
+    knowledge._run_index = lambda job, _material: knowledge._repository.update_job(
+        job.id, status="running", stage="awaiting_user", progress=50)
+    job = knowledge._repository.create_job(type="index", material_id=material_id, course_id=course_id)
+
+    result = knowledge._run_upload_pipelines(job, knowledge._material_or_error(material_id))
+
+    assert parsed == []
+    assert result.status == "running" and result.stage == "awaiting_user"
+
+
+def test_a_scanned_pdf_waits_for_the_ocr_bill_instead_of_parsing_the_outline(client):
+    """停在等 OCR 确认时两条流水线都不该往下走，作业也不能被记成完成。"""
+    course = client.post("/api/v2/courses", json={"name": "操作系统"}).json()
+    knowledge = workspace(client).knowledge
+    knowledge._is_scanned_pdf = lambda _material, _path: True
+    parsed: list[str] = []
+    knowledge._parse_structure_quietly = lambda material: parsed.append(material.id)
+    upload = client.post(f"/api/v2/courses/{course['id']}/materials",
+                         files={"file": ("scan.pdf", _outlined_pdf(FULL_OUTLINE), "application/pdf")})
+    job = client.post(f"/api/v2/materials/{upload.json()['id']}/index").json()
+
+    finished = _await_job(client, job["id"])
+
+    assert finished["status"] == "failed" and finished["stage"] == "needs_ocr"
+    assert _index_status(client, course["id"], upload.json()["id"]) == "needs_ocr"
+    assert parsed == [] and _concept_rows(client, course["id"]) == {}
+
+
+def test_reparsing_survives_the_original_file_being_gone(client):
+    """重算只吃已落库的正文。原文件被清掉时退回从正文刮标题，不该炸。"""
+    course_id, material_id = _indexed_pdf(client)
+    workspace(client).knowledge._repository.material_storage_path(material_id).unlink()
+
+    response = client.post(f"/api/v2/materials/{material_id}/structure")
+
+    assert response.status_code == 200, response.text
+    assert _concept_rows(client, course_id)
 
 
 # ---- 知识页：层级下发 + 构建前的成本预估 ----
@@ -295,13 +474,49 @@ def test_the_wiki_estimate_counts_pages_without_calling_the_model(client):
     assert payload["has_levels"] is True and payload["candidates"] == 5
 
 
-def test_the_wiki_estimate_needs_indexed_text(client):
+def test_the_wiki_estimate_waits_for_the_index_to_finish(client):
+    """正文已经落库、索引还没收工时也要挡住：概念目录那时还没写完，账单会算少。"""
+    course_id, material_id = _indexed_pdf(client)
+    client.patch(f"/api/v2/courses/{course_id}", json={"wiki_enabled": True})
+    workspace(client).knowledge._repository.set_material_status(material_id, "indexing")
+
+    assert client.get(f"/api/v2/materials/{material_id}/wiki/estimate").status_code == 409
+
+
+def test_the_wiki_estimate_needs_text_in_the_database(client):
+    """状态写着 indexed 但正文没了（老库、手工清理过）：说清楚，别报出 1 页的空账单。"""
+    course_id, material_id = _indexed_pdf(client)
+    client.patch(f"/api/v2/courses/{course_id}", json={"wiki_enabled": True})
+    with workspace(client).store.write() as conn:
+        conn.execute("DELETE FROM chunks WHERE material_id = ?", (material_id,))
+
+    assert client.get(f"/api/v2/materials/{material_id}/wiki/estimate").status_code == 409
+
+
+def test_the_wiki_estimate_is_refused_while_wiki_is_off(client):
+    """课程没启用 Wiki 时连账单都不给算，和构建接口同一道闸门。"""
+    _course_id, material_id = _indexed_pdf(client)
+
+    assert client.get(f"/api/v2/materials/{material_id}/wiki/estimate").status_code == 409
+
+
+def test_a_file_without_bookmarks_reports_no_hierarchy_in_both_the_preview_and_the_bill(client):
+    """没有目录书签的教材解析不出层级。预告与账单都得说 False——界面靠这句提醒用户。"""
     course = client.post("/api/v2/courses", json={"name": "操作系统"}).json()
     client.patch(f"/api/v2/courses/{course['id']}", json={"wiki_enabled": True})
     upload = client.post(f"/api/v2/courses/{course['id']}/materials",
-                         files={"file": ("book.pdf", _outlined_pdf(FULL_OUTLINE), "application/pdf")})
+                         files={"file": ("notes.md", MARKDOWN_NOTES, "text/markdown")})
+    material_id = upload.json()["id"]
+    job = client.post(f"/api/v2/materials/{material_id}/index").json()
+    assert _await_job(client, job["id"])["status"] == "completed"
 
-    assert client.get(f"/api/v2/materials/{upload.json()['id']}/wiki/estimate").status_code == 409
+    predicted = client.post(f"/api/v2/materials/{material_id}/structure/preview").json()
+    estimate = client.get(f"/api/v2/materials/{material_id}/wiki/estimate").json()
+
+    assert predicted["empty"] is False and predicted["candidates"] > 0
+    assert predicted["has_levels"] is False
+    assert estimate["has_levels"] is False
+    assert _status_of(client, course["id"], material_id)["has_levels"] is False
 
 
 def test_structure_endpoints_reject_an_unknown_material(client):

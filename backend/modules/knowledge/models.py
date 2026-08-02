@@ -20,6 +20,11 @@ class Material:
     ocr_approved: bool = False
 
 
+# 索引那一段收工时作业停在这个 stage 上，等目录结构那一段收尾。重启恢复靠它分辨
+# 「chunks 与向量都写好了」和「提取/向量化半途中断」。
+STAGE_INDEX_DONE = "structure"
+
+
 @dataclass(frozen=True)
 class Job:
     id: str

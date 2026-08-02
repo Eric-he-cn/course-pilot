@@ -19,7 +19,7 @@ from .concepts import extract_candidates, from_outline
 from . import scanned, wiki
 from .extract import SUPPORTED_SUFFIXES, extract_pages, pdf_outline
 from .wiki import WikiStore
-from .models import ConceptNode, Job, Material
+from .models import STAGE_INDEX_DONE, ConceptNode, Job, Material
 from .repository import KnowledgeRepository
 
 _LOG = logging.getLogger(__name__)
@@ -154,7 +154,7 @@ class KnowledgeService:
         两条都收工才把作业记成完成——界面靠这一下刷新概念目录，早一步就会显示上一版。
         """
         indexed = self._run_index(job, material)
-        if indexed.status != "running":  # 索引失败，或停在等 OCR 确认
+        if indexed.stage != STAGE_INDEX_DONE:  # 索引失败，或停在等 OCR 确认
             return indexed
         self._parse_structure_quietly(material)
         return self._repository.update_job(job.id, status="completed", stage="completed", progress=100)
@@ -171,18 +171,17 @@ class KnowledgeService:
     def preview_structure(self, *, material_id: str) -> dict[str, object]:
         """重建目录结构之前的影响预告。删概念会连带删掉掌握度与错题，用户有权先看见。"""
         material = self._material_or_error(material_id)
-        candidates = self._structure_candidates(material)
         return {
             **self._repository.preview_material_concepts(
-                course_id=material.course_id, material_id=material.id, candidates=candidates),
+                course_id=material.course_id, material_id=material.id,
+                candidates=self._structure_candidates(material)),
             "material_id": material.id,
-            "has_levels": any(candidate.get("level") is not None for candidate in candidates),
         }
 
     def parse_structure(self, *, material_id: str) -> dict[str, object]:
         """重算这份教材的概念与层级。不重新提取、不重新向量化，chunks 一行都不动。
 
-        实测亚秒级（813 页的书读书签 0.39 秒），所以是同步接口，不进 jobs 表。
+        亚秒级，所以是同步接口，不进 jobs 表。
         """
         material = self._material_or_error(material_id)
         candidates = self._structure_candidates(material)

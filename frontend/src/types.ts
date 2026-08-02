@@ -218,6 +218,8 @@ export interface StructurePreview {
   added: number
   removed: number
   kept: number
+  // 名字已经归本课程别的教材：概念还在，但重建不会把它改挂到这一份下面
+  owned_elsewhere: number
   at_risk: number
   removed_names: string[]
   at_risk_names: string[]

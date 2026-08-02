@@ -158,7 +158,7 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
 
     @router.post("/materials/{material_id}/structure")
     def parse_structure(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
-        """重算概念与层级。实测亚秒级，所以同步返回，不进 jobs 表。"""
+        """重算概念与层级，同步返回。"""
         try:
             return application.knowledge.parse_structure(material_id=material_id)
         except MaterialNotIndexedError as error:

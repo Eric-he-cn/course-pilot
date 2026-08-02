@@ -8,7 +8,7 @@ from core.store import SQLiteStore
 from contracts.knowledge import Citation, KnowledgeHit
 
 from .concepts import concept_id_for, merge_case_variants
-from .models import Chunk, Job, Material
+from .models import STAGE_INDEX_DONE, Chunk, Job, Material
 
 
 _CJK = re.compile(r"[一-鿿]")
@@ -100,6 +100,34 @@ def _purge_materials(connection, material_ids: list[str]) -> None:
         connection.execute(statement, material_ids)
 
 
+class _ConceptPlan:
+    """预告与执行共用的一份账：候选先合并大小写，再按派生 id 与当前归属分堆。
+
+    `kept` 与 `added` 会落到这份教材名下；`elsewhere` 的名字已经归同课别的教材，
+    upsert 不改归属，所以它们既不是新增也不算这份教材的概念。
+    """
+
+    def __init__(self, connection, *, course_id: str, material_id: str, candidates: list[dict]) -> None:
+        self.candidates = merge_case_variants(candidates)
+        self.keep = [concept_id_for(course_id, candidate["name"]) for candidate in self.candidates]
+        marks = ",".join("?" * len(self.keep))
+        owners = {row["id"]: row["material_id"] for row in connection.execute(
+            f"SELECT id, material_id FROM concepts WHERE course_id = ? AND id IN ({marks})",
+            (course_id, *self.keep))}
+        self.kept = [key for key in self.keep if owners.get(key) == material_id]
+        self.elsewhere = [key for key in self.keep if key in owners and owners[key] != material_id]
+        self.added = [key for key in self.keep if key not in owners]
+        self.doomed = connection.execute(
+            f"SELECT id, name FROM concepts WHERE course_id = ? AND material_id = ? AND id NOT IN ({marks})",
+            (course_id, material_id, *self.keep)).fetchall()
+        # 层级只会写到落在这份教材名下的行上，归别人的那些一个字都不动。
+        landing = set(self.kept) | set(self.added)
+        self.has_levels = any(
+            candidate.get("level") is not None
+            for candidate, key in zip(self.candidates, self.keep) if key in landing
+        )
+
+
 class KnowledgeRepository:
     """Owns the knowledge tables; other modules must use its public service/port."""
 
@@ -175,10 +203,17 @@ class KnowledgeRepository:
         return _job(row) if row else None
 
     def recover_jobs_after_restart(self) -> list[str]:
-        """Fail interrupted work and return durable queued jobs for resubmission."""
+        """Fail interrupted work and return durable queued jobs for resubmission.
+
+        停在 STAGE_INDEX_DONE 上的作业里 chunks 与向量已经写完，只差目录结构那一段。
+        教材跟着降级会逼用户整份重索引（重新提取 + 重新向量化），而结构随时可以单独重算。
+        """
         message = "应用重启时任务中断；请重新发起任务。"
         with self._store.write() as conn:
-            interrupted = conn.execute("SELECT material_id FROM jobs WHERE status = 'running' AND type = 'index'").fetchall()
+            interrupted = conn.execute(
+                "SELECT material_id FROM jobs WHERE status = 'running' AND type = 'index' AND stage != ?",
+                (STAGE_INDEX_DONE,),
+            ).fetchall()
             conn.execute(
                 "UPDATE jobs SET status='failed', stage='failed', error_message=?, updated_at=? WHERE status='running'",
                 (message, utc_now()),
@@ -259,11 +294,11 @@ class KnowledgeRepository:
             # 都没了"。这时候什么都不动，免得把用户的错题与掌握度一起清掉。
             with self._store.read() as conn:
                 return int(conn.execute("SELECT count(*) FROM concepts WHERE course_id = ?", (course_id,)).fetchone()[0])
-        candidates = merge_case_variants(candidates)
-        keep = [concept_id_for(course_id, candidate["name"]) for candidate in candidates]
-        condition = f"course_id = ? AND material_id = ? AND id NOT IN ({','.join('?' * len(keep))})"
-        doomed, params = f"SELECT id FROM concepts WHERE {condition}", (course_id, material_id, *keep)
         with self._store.write() as conn:
+            plan = _ConceptPlan(conn, course_id=course_id, material_id=material_id, candidates=candidates)
+            candidates, keep = plan.candidates, plan.keep
+            condition = f"course_id = ? AND material_id = ? AND id NOT IN ({','.join('?' * len(keep))})"
+            doomed, params = f"SELECT id FROM concepts WHERE {condition}", (course_id, material_id, *keep)
             for statement in (
                 f"DELETE FROM concept_mastery WHERE concept_id IN ({doomed})",
                 f"DELETE FROM mistake_records WHERE concept_id IN ({doomed})",
@@ -271,10 +306,11 @@ class KnowledgeRepository:
                 f"DELETE FROM concepts WHERE {condition}",
             ):
                 conn.execute(statement, params)
-            # 每次索引作业跑完都清，不判概念集合有没有变化。要重算的时刻是概念"回来"而不是
-            # "离开"：id 由课程 + 名字派生，掉了一轮再被抽到还是同一个 id，而投影已经删了。
-            # 判变化要多查一次、还容易漏掉边界；相比索引本身的解析与嵌入，一次全量重放可忽略。
-            conn.execute("DELETE FROM mistake_backfills WHERE course_id = ?", (course_id,))
+            if plan.added:
+                # 要重算投影的时刻是概念"回来"：id 由课程 + 名字派生，掉了一轮再被抽到还是
+                # 同一个 id，而投影已经跟着上一次删除没了。清掉标记，下次读档案就整门课重放。
+                # 概念集合没有新面孔时没有这个问题，别白重放一遍。
+                conn.execute("DELETE FROM mistake_backfills WHERE course_id = ?", (course_id,))
             for candidate in candidates:
                 conn.execute(
                     _CONCEPT_UPSERT,
@@ -300,33 +336,28 @@ class KnowledgeRepository:
     def preview_material_concepts(self, *, course_id: str, material_id: str, candidates: list[dict]) -> dict:
         """算出重建目录结构会新增、删除多少概念，删掉的里面有多少挂着掌握度或错题。
 
-        只读不写，判据与 replace_material_concepts 同源：候选先过大小写合并再按派生 id 对账。
+        只读不写，判据与 replace_material_concepts 用同一份账（`_ConceptPlan`），
+        所以报出的数字就是真正会发生的事。
         """
         if not candidates:
             # 抽取为空时重建是空操作（见 replace_material_concepts），预告也要照这个口径。
             return {"empty": True, "candidates": 0, "added": 0, "removed": 0, "kept": 0,
+                    "owned_elsewhere": 0, "has_levels": False,
                     "at_risk": 0, "removed_names": [], "at_risk_names": []}
-        merged = merge_case_variants(candidates)
-        keep = [concept_id_for(course_id, candidate["name"]) for candidate in merged]
-        marks = ",".join("?" * len(keep))
         with self._store.read() as conn:
-            doomed = conn.execute(
-                f"SELECT id, name FROM concepts WHERE course_id = ? AND material_id = ? AND id NOT IN ({marks})",
-                (course_id, material_id, *keep),
-            ).fetchall()
-            existing = {row["id"] for row in conn.execute("SELECT id FROM concepts WHERE course_id = ?", (course_id,))}
+            plan = _ConceptPlan(conn, course_id=course_id, material_id=material_id, candidates=candidates)
             risky: set[str] = set()
-            if doomed:
-                ids = [row["id"] for row in doomed]
+            if plan.doomed:
+                ids = [row["id"] for row in plan.doomed]
                 spots = ",".join("?" * len(ids))
                 for table in ("concept_mastery", "mistake_records"):
                     risky |= {row["concept_id"] for row in
                               conn.execute(f"SELECT concept_id FROM {table} WHERE concept_id IN ({spots})", ids)}
-        names = {row["id"]: row["name"] for row in doomed}
-        added = [concept_id for concept_id in keep if concept_id not in existing]
+        names = {row["id"]: row["name"] for row in plan.doomed}
         return {
-            "empty": False, "candidates": len(merged),
-            "added": len(added), "removed": len(doomed), "kept": len(keep) - len(added),
+            "empty": False, "candidates": len(plan.candidates),
+            "added": len(plan.added), "removed": len(plan.doomed), "kept": len(plan.kept),
+            "owned_elsewhere": len(plan.elsewhere), "has_levels": plan.has_levels,
             "removed_names": sorted(names.values()),
             "at_risk": len(risky), "at_risk_names": sorted(names[concept_id] for concept_id in risky),
         }
