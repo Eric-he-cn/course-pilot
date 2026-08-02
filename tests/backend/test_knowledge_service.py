@@ -358,6 +358,92 @@ def test_restart_recovers_queued_and_marks_running_failed(env):
         restarted.shutdown()
 
 
+def _indexed_wiki_material(env):
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode(),
+    )
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    env.wiki_enabled = True
+    return material
+
+
+def _coverage(job) -> dict[str, int]:
+    return {key: int(value) for key, _, value
+            in (item.partition("=") for item in (job.error_message or "").split()[1:]) if value.isdigit()}
+
+
+def test_a_restart_during_a_wiki_build_leaves_the_material_alone(env):
+    """知识页构建被重启打断：作业记成中断，教材不能跟着降级——它的 chunks 与向量一个没动，
+    降了就要整份重索引才解得开。"""
+    material = _indexed_wiki_material(env)
+    interrupted = env.service.enqueue_wiki_build(material_id=material.id)
+    env.service._repository.claim_queued_job(interrupted.id)
+    env.worker.shutdown()
+
+    restarted = KnowledgeJobWorker(env.service, workers=1, queue_capacity=4)
+    restarted.start()
+    try:
+        assert env.service.get_job(job_id=interrupted.id).status == "failed"
+        assert env.service.list_materials(course_id=env.math.id)[0].index_status == "indexed"
+        # 重启之后还能原地再建一次，用户不必先去重新索引。
+        again = env.service.enqueue_wiki_build(material_id=material.id)
+        assert restarted.submit(again.id)
+        assert env.wait_terminal(again.id).status == "completed"
+    finally:
+        restarted.shutdown()
+    assert env.service.wiki_pages(course_id=env.math.id)
+
+
+def test_a_queued_wiki_build_is_picked_up_after_a_restart(env):
+    """排着队还没跑的构建，重启后要有人接着跑。丢掉的话界面上那一行会一直转圈。"""
+    material = _indexed_wiki_material(env)
+    queued = env.service.enqueue_wiki_build(material_id=material.id)
+    env.worker.shutdown()
+
+    restarted = KnowledgeJobWorker(env.service, workers=1, queue_capacity=4)
+    restarted.start()
+    try:
+        recovered = env.wait_terminal(queued.id)
+    finally:
+        restarted.shutdown()
+
+    assert (recovered.status, recovered.stage) == ("completed", "wiki_completed")
+    assert env.service.wiki_pages(course_id=env.math.id)
+
+
+def test_clicking_build_twice_writes_each_page_once(env):
+    """同一份教材连点两次构建。第二次要全部命中已有页——重写一遍既费一轮模型调用，
+    也会把同一节换个说法再生成一版。"""
+    material = _indexed_wiki_material(env)
+    first = env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+    calls_after_first = len(env.responder.prompts)
+    pages_after_first = {page["concept_id"]: page["chars"] for page in env.service.wiki_pages(course_id=env.math.id)}
+
+    second = env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+
+    assert _coverage(first)["written"] > 0 and _coverage(second)["written"] == 0, second.error_message
+    assert _coverage(second)["skipped"] == _coverage(first)["written"]
+    assert len(env.responder.prompts) == calls_after_first, "第二次不该再花模型调用"
+    assert {page["concept_id"]: page["chars"] for page in env.service.wiki_pages(course_id=env.math.id)} \
+        == pages_after_first
+
+
+def test_indexing_the_same_material_twice_leaves_one_set_of_chunks(env):
+    """连点两次索引：第二遍替换掉第一遍的分片，不是叠上去。叠了检索会同一段返回两次。"""
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode(),
+    )
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    once = env.service._repository.list_material_chunks(material_id=material.id)
+
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+
+    twice = env.service._repository.list_material_chunks(material_id=material.id)
+    assert len(twice) == len(once)
+    assert [row["content"] for row in twice] == [row["content"] for row in once]
+    assert len(env.service.search_course(course_id=env.math.id, query="极限")) == 2
+
+
 def test_wiki_prune_removes_pages_whose_concept_is_gone(env):
     """重建索引会换掉概念列表（比如从刮标题改成读目录书签）。旧概念的页文件不会
     自己消失，知识页里就混着一堆不存在的概念——看上去像功能坏了。"""

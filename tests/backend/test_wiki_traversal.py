@@ -23,6 +23,7 @@ from modules.knowledge.repository import KnowledgeRepository
 from modules.knowledge.service import KnowledgeService
 from modules.knowledge.wiki import WikiStore
 from modules.knowledge.worker import KnowledgeJobWorker
+from test_concept_outline_tree import _outlined_pdf
 
 FIXTURES = Path(__file__).resolve().parents[2] / "testdata" / "fixtures"
 DEEP_LEARNING = FIXTURES / "深度学习-批量规范化.pdf"
@@ -354,6 +355,109 @@ def test_building_one_material_keeps_the_other_materials_pages(tmp_path):
     after = {page.concept_id for page in store.list_pages(course_id=course.id)}
     assert first <= after, f"第一份教材的页被清掉了：{sorted(first - after)}"
     assert len(after) > len(first), "第二份教材应当写出新的页"
+
+
+def test_the_course_index_merges_the_top_pages_of_every_material(tmp_path):
+    """一门课的几份教材共用一张课程首页。只装过一份教材时，跨教材聚合这条路走不到——
+    首页会看着很对，其实只有最后构建的那一份在里面。"""
+    course, service, worker, store, _responder = _env(tmp_path)
+    try:
+        _index_and_build(service, worker, course_id=course.id, filename="调度.pdf",
+                         mime_type="application/pdf",
+                         content=_outlined_pdf([("第 1 章 调度", ["1.1 FIFO"])]))
+        _index_and_build(service, worker, course_id=course.id, filename="内存.pdf",
+                         mime_type="application/pdf",
+                         content=_outlined_pdf([("第 2 章 内存", ["2.1 分页"])]))
+    finally:
+        worker.shutdown()
+
+    index = store.read(course_id=course.id, concept_id="index")
+    for name in ("调度", "FIFO", "内存", "分页"):
+        assert name in index, f"首页目录里少了 {name}"
+    # 目录列全了还不够：首页正文读的是顶层页，两份教材的顶层页都要进证据。
+    assert sorted(_refs(index)) == ["顶层页 内存", "顶层页 调度"], _refs(index)
+
+
+# ---- 孤儿页清理：三条判断分支都要真的把文件删掉 ----
+
+def _pruned(job) -> int:
+    fields = dict(item.split("=", 1) for item in (job.error_message or "").split()[1:])
+    return int(fields.get("pruned", -1))
+
+
+def _ids_of(store: WikiStore, course_id: str, material_id: str) -> set[str]:
+    return {page.concept_id for page in store.list_pages(course_id=course_id)
+            if page.material_id == material_id}
+
+
+def test_deleting_a_material_takes_its_pages_away_at_the_next_build(tmp_path):
+    """删掉一份教材后它的知识页还留在盘上，读起来像这门课还讲着那些内容。
+    下一次构建要把它们清掉，同课别的教材的页一页不少。"""
+    course, service, worker, store, _responder = _env(tmp_path)
+    try:
+        gone, _job = _index_and_build(service, worker, course_id=course.id, filename="要删的.md",
+                                      mime_type="text/markdown", content="# 极限\n\n极限描述趋势。\n".encode())
+        kept, _job = _index_and_build(service, worker, course_id=course.id, filename="留下的.md",
+                                      mime_type="text/markdown", content="# 连续性\n\n连续建立在极限之上。\n".encode())
+        doomed = _ids_of(store, course.id, gone.id)
+        survivors = _ids_of(store, course.id, kept.id)
+        assert doomed and survivors, "两份教材都得各自写出页，不然测不到删谁留谁"
+
+        service._repository.delete_material(gone.id)
+        rebuilt = _wait(service, worker, service.enqueue_wiki_build(material_id=kept.id).id)
+    finally:
+        worker.shutdown()
+
+    left = {page.concept_id for page in store.list_pages(course_id=course.id)}
+    assert not doomed & left, f"被删教材的页还在：{sorted(doomed & left)}"
+    assert survivors <= left, f"别的教材的页被误删：{sorted(survivors - left)}"
+    assert "index" in left, "课程首页是课程级的，任何时候都不删"
+    assert _pruned(rebuilt) == len(doomed), rebuilt.error_message
+
+
+def test_a_new_edition_drops_the_pages_of_sections_that_no_longer_exist(tmp_path):
+    """教材换版后目录变了，小节 id 跟着变。旧页不清掉，知识页里就并排摆着两版的小节。"""
+    course, service, worker, store, _responder = _env(tmp_path)
+    try:
+        material, _job = _index_and_build(
+            service, worker, course_id=course.id, filename="教材.pdf", mime_type="application/pdf",
+            content=_outlined_pdf([("第 1 章 调度", ["1.1 FIFO", "1.2 SJF"])]))
+        before = _ids_of(store, course.id, material.id)
+
+        # 换版：正文不动，只把目录换掉，重算概念后小节 id 只剩「调度」还对得上。
+        path = service._repository.material_storage_path(material.id)
+        path.write_bytes(_outlined_pdf([("第 1 章 调度", ["1.1 轮转"])]))
+        service.parse_structure(material_id=material.id)
+        rebuilt = _wait(service, worker, service.enqueue_wiki_build(material_id=material.id).id)
+    finally:
+        worker.shutdown()
+
+    after = _ids_of(store, course.id, material.id)
+    stale = {concept_id_for(course.id, name) for name in ("FIFO", "SJF")}
+    assert not stale & after, f"上一版的小节页还在：{sorted(stale & after)}"
+    assert concept_id_for(course.id, "调度") in after, "两版都有的那一节不该被顺手删掉"
+    assert _pruned(rebuilt) == len(before - after), rebuilt.error_message
+
+
+def test_pages_written_before_ownership_was_recorded_are_judged_by_the_concept_table(tmp_path):
+    """老版本写的页没记教材归属，只能照概念表判：概念还在就留，概念没了就清。"""
+    course, service, worker, store, _responder = _env(tmp_path)
+    try:
+        material, _job = _index_and_build(service, worker, course_id=course.id, filename="讲义.md",
+                                          mime_type="text/markdown", content="# 极限\n\n极限描述趋势。\n".encode())
+        alive = sorted(service._repository.concept_ids(course_id=course.id))[0]
+        for concept_id in (alive, "legacy_gone"):
+            store.write(course_id=course.id, concept_id=concept_id, concept_name=concept_id,
+                        body="老版本写下的正文", source_hash="legacy", source_refs=[],
+                        updated_at="2026-07-01T00:00:00+00:00")
+        rebuilt = _wait(service, worker, service.enqueue_wiki_build(material_id=material.id).id)
+    finally:
+        worker.shutdown()
+
+    left = {page.concept_id for page in store.list_pages(course_id=course.id)}
+    assert "legacy_gone" not in left, "概念表里没有的老页应当被清掉"
+    assert alive in left, "概念还在的老页不能删"
+    assert _pruned(rebuilt) == 1, rebuilt.error_message
 
 
 # ---- 纯函数：页码切段的三种边界与节点上限 ----

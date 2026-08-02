@@ -121,17 +121,39 @@ def db(data_dir: Path) -> sqlite3.Connection:
     return connection
 
 
-def wait_indexed(base: str, material_id: str, job_id: str) -> str:
-    deadline = time.monotonic() + 600
+def wait_job(base: str, job_id: str, *, timeout: int = 900) -> dict:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         job = call(base, f"/jobs/{job_id}")
         if job["status"] in {"completed", "failed"}:
-            return job["status"]
+            return job
         time.sleep(3)
-    return "timeout"
+    return {"status": "timeout", "error": f"{timeout}s 内没进终态"}
 
 
-def journey(base: str, data_dir: Path) -> None:
+def seed_citations(turn: Turn) -> list[dict]:
+    """种子检索那一次登记的引用：从 origin=seed 的 tool_call 到紧随其后的 tool_result 之间。
+
+    模型自己再检索一次会追加别的引用，混在一起就比不出「教材席位有没有被挤掉」。
+    """
+    picked: list[dict] = []
+    inside = False
+    for name, data in turn.events:
+        if name == "tool_call":
+            inside = data.get("origin") == "seed"
+        elif name == "tool_result":
+            if inside:
+                break
+        elif name == "citation" and inside:
+            picked.append(data)
+    return picked
+
+
+def citation_key(item: dict) -> tuple:
+    return (item.get("kind"), item.get("document"), item.get("page"), item.get("chunk_id"))
+
+
+def journey(base: str, data_dir: Path, *, wiki_budget: int) -> None:
     # ---- 第 1 步：建课并上传教材 ----
     print("\n[1] 新建课程与教材索引")
     course = call(base, "/courses", {"name": "操作系统"})
@@ -140,7 +162,7 @@ def journey(base: str, data_dir: Path) -> None:
 
     material = upload(base, course["id"], FIXTURES / "os-cpu-scheduling.pdf")
     job = call(base, f"/materials/{material['id']}/index", {})
-    status = wait_indexed(base, material["id"], job["id"])
+    status = wait_job(base, job["id"])["status"]
     check("教材索引完成", status == "completed", f"job 状态 {status}")
     materials = call(base, f"/courses/{course['id']}/materials")
     indexed = next((m for m in materials if m["id"] == material["id"]), {})
@@ -150,7 +172,7 @@ def journey(base: str, data_dir: Path) -> None:
     # 第二门课上传另一学科教材，用于验证课程隔离
     other_material = upload(base, other["id"], FIXTURES / "深度学习-批量规范化.pdf")
     other_job = call(base, f"/materials/{other_material['id']}/index", {})
-    wait_indexed(base, other_material["id"], other_job["id"])
+    wait_job(base, other_job["id"])
 
     # ---- 第 2 步：课程会话里提问，要求带引用 ----
     print("\n[2] 课程会话提问与取证")
@@ -257,16 +279,78 @@ def journey(base: str, data_dir: Path) -> None:
     check("trace 记录工具决策", any(t.get("decision") for line in lines for t in line.get("tools", [])))
     check("trace 带提示词版本", all(line.get("prompt_version") for line in lines))
 
+    # ---- 第 12 步：知识页成为第三类可引用来源 ----
+    # 放在最后：这一步会给这门课开知识页，前面几步的引用构成就不再是纯教材的了。
+    wiki_citation_step(base, course, material["id"], wiki_budget)
+
+
+# 既要有教材原文答得上的部分（SJF 的周转时间），也要有只有知识页答得上的部分（整体分几块）。
+# 只问后者的话教材那一路会空，「教材席位一条不少」就变成两个空列表相等，等于没测。
+WIKI_QUESTION = "这门课整体分成哪几部分？SJF 的平均周转时间为什么更短？"
+
+
+def wiki_citation_step(base: str, course: dict, material_id: str, budget: int) -> None:
+    """知识页要能在真实一轮里被引用，而且不能挤掉教材席位。
+
+    此前只验到「知识页进了 chunks 表」。进了表不等于用得上：种子检索的两个名额是固定的，
+    引用编号、kind、页码留空这几件事都在对话这一层才发生。
+    """
+    print("\n[12] 知识页作为第三类可引用来源")
+
+    def fresh_ask(tag: str) -> Turn:
+        session = call(base, "/sessions", {"scope_mode": "course", "course_id": course["id"]})["id"]
+        return ask(base, session, WIKI_QUESTION, tag)
+
+    before = fresh_ask("j-wiki-before")
+    seeded = [citation_key(item) for item in seed_citations(before)]
+    baseline = [key for key in seeded if key[0] == "material"]
+    # 基线为空的话「教材席位一条不少」就退化成两个空列表相等，那条判据等于没写。
+    check("基线里本来就有教材引用", bool(baseline), "种子检索一条都没召回，后面的比对失去意义")
+    check("开知识页之前没有知识页引用", baseline == seeded, str(seeded))
+    print(f"  INFO  基线种子引用 {len(baseline)} 条")
+
+    call(base, f"/courses/{course['id']}", {"wiki_enabled": True}, method="PATCH")
+    estimate = call(base, f"/materials/{material_id}/wiki/estimate")
+    print(f"  INFO  预计 {estimate['pages']} 页 · {estimate['calls']} 次模型调用")
+    if estimate["calls"] > budget:
+        check("知识页构建在预算之内", False, f"预计 {estimate['calls']} 次 > --wiki-budget {budget}")
+        return
+    built = wait_job(base, call(base, f"/materials/{material_id}/wiki", {})["id"])
+    if not check("知识页构建完成", built["status"] == "completed", str(built.get("error"))):
+        return
+    print(f"  INFO  {built.get('error')}")
+
+    after = fresh_ask("j-wiki-after")
+    citations = after.named("citation")
+    wiki_hits = [item for item in citations if item.get("kind") == "wiki"]
+    print("  INFO  这一轮的引用列表：")
+    for item in citations:
+        print(f"          [{item['number']}] kind={item['kind']} "
+              f"{item.get('document') or item.get('concept_name')} "
+              f"page={item.get('page')} {(item.get('snippet') or '')[:40]!r}")
+    check("回答里出现了知识页引用", bool(wiki_hits),
+          str([(item["kind"], item.get("document") or item.get("concept_name")) for item in citations]))
+    check("知识页引用标得出是转述",
+          all(item.get("page") is None and item.get("concept_name") for item in wiki_hits), str(wiki_hits[:1]))
+    # 正文里标不标它是模型的选择：从教材原文答同一句也是对的，所以只报不判。
+    marked = [item["number"] for item in wiki_hits if f"[{item['number']}]" in after.answer]
+    print(f"  INFO  这一轮正文里标了知识页编号 {marked or '无'}")
+
+    kept = [citation_key(item) for item in seed_citations(after) if item.get("kind") == "material"]
+    check("教材席位一条不少", kept == baseline, f"{baseline} → {kept}")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8001")
     parser.add_argument("--data-dir", default="testdata/e2e-fresh")
+    parser.add_argument("--wiki-budget", type=int, default=20,
+                        help="第 12 步给这门课写知识页的模型调用上限，预计超过就不建")
     args = parser.parse_args()
     data_dir = ROOT / args.data_dir
 
     try:
-        journey(args.base, data_dir)
+        journey(args.base, data_dir, wiki_budget=args.wiki_budget)
     except urllib.error.HTTPError as error:
         print(f"\nHTTP 错误：{error.code} {error.read().decode()[:300]}")
         return 2
