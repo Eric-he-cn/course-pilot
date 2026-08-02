@@ -262,7 +262,7 @@ def test_the_build_reports_its_coverage(tmp_path):
 
 @needs_big
 def test_a_whole_chapter_over_the_node_cap_still_reads_every_chunk(tmp_path):
-    """d2l 第 4 章整章：66 页、99 条书签、88 个概念，节点上限 50 一定会砍。
+    """d2l 第 4 章整章：66 页、99 条书签、88 个概念，会被节点上限砍到装得下。
 
     十来页的切片碰不到任何上限，「超出上限会丢内容」这条路在它们身上走不到。
     """
@@ -271,7 +271,6 @@ def test_a_whole_chapter_over_the_node_cap_still_reads_every_chunk(tmp_path):
 
     assert int(fields["concepts"]) > int(fields["pages"]), \
         f"这份教材本来就该顶到上限，不然测不到东西：{fields}"
-    assert int(fields["dropped"]) == 0, fields
 
     _pages, covered_chunks = _read_material(built)
     chunks = _chunk_ids(built)
@@ -295,7 +294,6 @@ def test_the_chapter_loses_nothing_at_any_node_cap(tmp_path, max_nodes):
     read = {chunk["id"] for section in sections for chunk in section.chunks}
     assert len(sections) <= max_nodes
     assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len(chunks) - len(read)} 个分片"
-    assert stats["dropped"] == 0
 
 
 @needs_big
@@ -324,7 +322,6 @@ def test_a_library_indexed_before_the_level_columns_existed_loses_nothing(tmp_pa
     read = {chunk["id"] for section in sections for chunk in section.chunks}
     assert len(sections) <= max_nodes
     assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len(chunks) - len(read)} 个分片"
-    assert stats["dropped"] == 0
 
 
 # ---- 无书签教材走同一条流程 ----
@@ -546,7 +543,6 @@ def test_a_material_without_an_outline_is_sliced_by_chunk_order():
     assert len(sections) >= 2, "一段读不完就该切开"
     assert all(section.name == "" for section in sections), "段名留给模型读完自己起"
     assert _leaf_pages(sections) == set(range(1, 11))
-    assert stats["dropped"] == 0
 
 
 def test_a_section_too_long_to_read_in_one_go_is_split_further():
@@ -570,7 +566,6 @@ def test_the_node_cap_makes_pages_bigger_it_never_drops_content():
 
     assert len(sections) <= 4
     assert stats["candidates"] > 4, "这个用例本来就该顶到上限，不然测不到东西"
-    assert stats["dropped"] == 0
     assert stats["capped"] == stats["candidates"] - len(sections), "合并了多少要报出来"
     assert _leaf_pages(sections) == set(range(1, 21))
 
@@ -589,7 +584,6 @@ def test_every_chunk_is_read_by_some_section(max_nodes, with_outline):
 
     read = {chunk["id"] for section in sections for chunk in section.chunks}
     assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len({c['id'] for c in chunks}) - len(read)} 个分片"
-    assert stats["dropped"] == 0
 
 
 def test_a_backwards_bookmark_does_not_leave_a_section_reading_nothing():
@@ -624,4 +618,3 @@ def test_chunks_without_a_page_number_still_get_read():
 
     read = {chunk["id"] for section in sections for chunk in section.chunks}
     assert read == {chunk["id"] for chunk in chunks}, f"漏读 {len(chunks) - len(read)} 个"
-    assert stats["dropped"] == 0

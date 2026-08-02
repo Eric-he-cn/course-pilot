@@ -1303,7 +1303,6 @@ function WikiBuildNote({ job }: { job: Job }) {
     {t('library.wiki_coverage', { concepts: fields.concepts, pages: fields.pages })}
     {fields.merged > 0 && ` ${t('library.wiki_coverage_merged', { merged: fields.merged })}`}
     {' '}{t('library.wiki_coverage_detail', { written: fields.written, skipped: fields.skipped })}
-    {fields.dropped > 0 && ` ${t('library.wiki_coverage_dropped', { dropped: fields.dropped })}`}
   </small>
 }
 

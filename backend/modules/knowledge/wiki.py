@@ -299,7 +299,7 @@ def _by_chunk_order(*, material_id: str, chunks: list[dict], max_nodes: int,
         total = sum(len(chunk["content"]) for chunk in chunks)
         groups = _merge_to_fit(_groups_by_size(chunks, target=max(1, -(-total // max_nodes))), max_nodes)
     sections = [_group_section(material_id, group, level=0, parent_id=None) for group in groups]
-    return sections, {"candidates": len(natural), "capped": len(natural) - len(groups), "dropped": 0}
+    return sections, {"candidates": len(natural), "capped": len(natural) - len(groups)}
 
 
 def plan_sections(
@@ -382,7 +382,7 @@ def plan_sections(
     _split_oversized(sections, material_id=material_id, max_nodes=max_nodes, max_depth=max_depth)
     _claim_unassigned(sections, chunks)
     # 上限砍掉的节点由上级页接过它的页码区间，所以只是「没单独成页」，不是没读到。
-    return sections, {"candidates": len(outline), "capped": len(outline) - len(doc), "dropped": 0}
+    return sections, {"candidates": len(outline), "capped": len(outline) - len(doc)}
 
 
 def _claim_unassigned(sections: list[Section], chunks: list[dict]) -> None:
@@ -574,5 +574,5 @@ def coverage_summary(counts: dict[str, int]) -> str:
             f"concepts={counts.get('candidates', 0)} "
             f"pages={counts.get('written', 0) + counts.get('skipped', 0)} "
             f"written={counts.get('written', 0)} skipped={counts.get('skipped', 0)} "
-            f"merged={counts.get('capped', 0)} dropped={counts.get('dropped', 0)} "
+            f"merged={counts.get('capped', 0)} "
             f"empty={counts.get('ungrounded', 0)} pruned={counts.get('pruned', 0)}")
