@@ -808,7 +808,7 @@ class TurnService:
                     yield self._event("citation", **citation)
                 yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, **_summary_fields(seed))
                 activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, **_summary_fields(seed)})
-                trace_tools.append({"origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, **_summary_fields(seed), "duration_ms": int((time.monotonic() - seed_started) * 1000)})
+                trace_tools.append({"call_id": SEED_CALL_ID, "origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, **_summary_fields(seed), "duration_ms": int((time.monotonic() - seed_started) * 1000)})
                 self._persist_tool_body(session_id=session_id, turn_id=turn.id, call_id=SEED_CALL_ID,
                                         name="search_materials", result=seed)
                 # 没明说要做一件成规模的调研，就整体不下发 delegate（照 wiki_off 的先例摘在
@@ -893,7 +893,7 @@ class TurnService:
                     activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True,
                                      "summary": f"自动加载 {auto_skill.name}", "summary_key": "summary.skill_auto_loaded_short",
                                      "summary_args": {"name": auto_skill.name}})
-                    trace_tools.append({"origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载",
+                    trace_tools.append({"call_id": call_id, "origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载",
                                         "summary_key": "summary.skill_auto_loaded_short", "summary_args": {"name": auto_skill.name},
                                         "decision": "allowed", "reason": None, "duration_ms": 0})
                     skill_body = clip_to_tokens(auto_skill.body, self._limits.skill, _SKILL_BODY_CLIP)
@@ -1077,7 +1077,7 @@ class TurnService:
                                 shown = _summary_fields(result, reused=cached is not None)
                                 yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, **shown)
                                 activity.append({"call_id": call.id, "name": call.name, "origin": "model", "ok": result.ok, **_summary_fields(result, reused=cached is not None)})
-                                trace_tools.append({"origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, **_summary_fields(result, reused=cached is not None), "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
+                                trace_tools.append({"call_id": call.id, "origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, **_summary_fields(result, reused=cached is not None), "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
                                 messages.append(ChatMessage(role="tool", content=result.text, tool_call_id=call.id))
                                 if cached is None:
                                     # 复用那次的正文已经在库里了，别存第二份。

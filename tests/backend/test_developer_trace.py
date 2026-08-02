@@ -618,3 +618,26 @@ def test_a_payload_ref_pointing_outside_the_payload_directory_is_refused(client)
     view = next(item for item in _fetch(client, session_id).json()["turns"] if item["turn_id"] == "escapee")
     assert view["payload_state"] == "invalid"
     assert view["tools"][0]["arguments"] is None
+
+
+def test_bodies_pair_by_call_id_even_when_they_arrive_out_of_order():
+    """按工具名先来先接只在「正文与 span 同序」时才对。span 现在记了 call_id，
+    乱序也认得出来——同名工具连调几次时，接错一位就是「查 A 拿回了 B 的结果」。"""
+    from app.http.devtools import _attach_bodies
+
+    view = {
+        "tools": [
+            {"call_id": "c1", "name": "search_materials", "origin": "model", "body": None},
+            {"call_id": "c2", "name": "search_materials", "origin": "model", "body": None},
+            {"call_id": "c3", "name": "search_materials", "origin": "model", "body": None},
+        ],
+        "subagent_bodies": [],
+    }
+    # 落库顺序与 span 顺序不一致（重试、并发写都会这样）
+    bodies = [{"call_id": "c3", "name": "search_materials", "text": "第三次"},
+              {"call_id": "c1", "name": "search_materials", "text": "第一次"},
+              {"call_id": "c2", "name": "search_materials", "text": "第二次"}]
+    _attach_bodies(view, bodies)
+
+    assert [tool["body"]["text"] for tool in view["tools"]] == ["第一次", "第二次", "第三次"]
+    assert view["unmatched_bodies"] == []

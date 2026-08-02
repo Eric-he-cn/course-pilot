@@ -155,14 +155,19 @@ def _can_have_body(span: dict) -> bool:
 def _attach_bodies(view: dict, bodies: list[dict]) -> None:
     """把正文接到对应的 span 上。
 
-    trace 的 span 不记 call_id，所以只有种子检索能按 id 认；模型那几次按工具名先来先接。
+    优先按 call_id 精确认；老 trace 的 span 没记这个字段，那些退回按工具名先来先接。
     子任务的正文（call_id 带 sub: 前缀）父轮根本没有对应的 span，单列一栏——
     硬接到某个 span 底下会让人以为那次调用取回的是子任务查到的东西。
     """
+    by_id = {tool["call_id"]: tool for tool in view["tools"] if tool.get("call_id")}
     pending: dict[str, deque[dict]] = {}
     for body in bodies:
         if is_subagent_call(body["call_id"]):
             view["subagent_bodies"].append(body)
+            continue
+        exact = by_id.get(body["call_id"])
+        if exact is not None and exact["body"] is None:
+            exact["body"] = body
             continue
         if is_seed_call(body["call_id"]):
             seed = next((tool for tool in view["tools"] if tool.get("origin") == "seed"), None)
