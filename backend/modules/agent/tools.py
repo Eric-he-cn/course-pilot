@@ -6,7 +6,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope
+from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope, WikiSources
 from contracts.llm import ToolSpec
 from modules.learning.api import GRADUATE_STREAK, ArchiveReaderPort, EvidenceWriterPort
 from modules.planning.api import PlanConflictError, PlanReaderPort, PlanWriterPort
@@ -505,12 +505,20 @@ class CitationRegistry:
         )
 
     def register_wiki(self, *, concept_id: str, concept_name: str, snippet: str,
-                      score: float = 0.0) -> tuple[int, bool]:
+                      score: float = 0.0, sources: WikiSources | None = None) -> tuple[int, bool]:
         """一页知识页就是一条来源，检索到与 wiki_read 读到的是同一条，不编两个号。
-        不给 page：它是转述稿，页码无从核对，界面据此标成知识页而不是教材页。"""
+        不给 page：它是转述稿，页码无从核对，界面据此标成知识页而不是教材页。
+
+        sources 是这一页转述时依据的教材页，挂在这条引用底下让用户点得开原文。
+        它们不单独编号——模型没读过那几页，标 [n] 就成了没有依据的引用。
+        """
+        sources = sources or WikiSources((), 0)
         return self._add(f"wiki:{concept_id}", {
             "kind": "wiki", "concept_id": concept_id, "concept_name": concept_name,
             "page": None, "snippet": snippet, "score": score,
+            "sources": [{"document": item.document, "page": item.page,
+                         "chunk_id": item.chunk_id, "snippet": item.snippet} for item in sources.anchors],
+            "source_pages": sources.pages,
         })
 
     def register_web(self, *, url: str, title: str, snippet: str) -> tuple[int, bool]:
@@ -893,6 +901,7 @@ class ToolExecutor:
         # 读回来的正文也要能标引用，否则模型越用知识页，回答里越多结论没有出处可点。
         number, is_new = registry.register_wiki(
             concept_id=concept_id, concept_name=page.concept_name, snippet=page.body[:280],
+            sources=self._knowledge.wiki_sources(scope=scope, concept_id=concept_id),
         )
         parts = [f"{_WIKI_PAGE_HEADER}\n[{number}] 知识页\n\n# {page.concept_name}\n\n{page.body}"]
         if page.handwritten:
@@ -961,7 +970,7 @@ class ToolExecutor:
                 new_citations.append(registry.citations[number - 1])
             page = f"，第 {hit.citation.page} 页" if hit.citation.page is not None else ""
             blocks.append(f"[{number}] 文档：{hit.citation.document}{page}；片段：{hit.citation.chunk_id}\n{hit.content}")
-        wiki_text = self._wiki_blocks(wiki_hits, registry, new_citations)
+        wiki_text = self._wiki_blocks(scope, wiki_hits, registry, new_citations)
         text = "\n\n".join(blocks) + wiki_text
         if wiki_hits:
             return ToolOutcome(
@@ -977,8 +986,8 @@ class ToolExecutor:
             new_citations=new_citations,
         )
 
-    @staticmethod
-    def _wiki_blocks(wiki_hits: list, registry: CitationRegistry, new_citations: list[dict]) -> str:
+    def _wiki_blocks(self, scope: ResolvedKnowledgeScope, wiki_hits: list,
+                     registry: CitationRegistry, new_citations: list[dict]) -> str:
         """知识页那几条单起一段，和教材原文分开摆。声明放在这几条之前——
         混在原文后面，模型会把它们一并当成有页码的教材证据。"""
         if not wiki_hits:
@@ -988,6 +997,7 @@ class ToolExecutor:
             number, is_new = registry.register_wiki(
                 concept_id=hit.citation.concept_id, concept_name=hit.citation.concept_name,
                 snippet=hit.citation.snippet, score=hit.citation.score,
+                sources=self._knowledge.wiki_sources(scope=scope, concept_id=hit.citation.concept_id),
             )
             if is_new:
                 new_citations.append(registry.citations[number - 1])

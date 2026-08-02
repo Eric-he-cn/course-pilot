@@ -272,6 +272,18 @@ class KnowledgeRepository:
                      embeddings[ordinal] if embeddings else None, page["concept_id"], page["concept_name"]),
                 )
 
+    def chunk_snippets(self, *, course_id: str, ids: list[str], limit: int) -> dict[str, str]:
+        """按分片 id 取本课程的正文开头。重建索引会换 id，取不到的那几个交给调用方降级处理。"""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        with self._store.read() as conn:
+            rows = conn.execute(
+                f"SELECT id, content FROM chunks WHERE course_id = ? AND source_kind = 'chunk'"
+                f" AND id IN ({placeholders})", (course_id, *ids),
+            ).fetchall()
+        return {row["id"]: row["content"][:limit] for row in rows}
+
     def list_wiki_rows(self, *, course_id: str) -> list[dict]:
         with self._store.read() as conn:
             rows = conn.execute(

@@ -6,7 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { api, clearCurrentUser, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, StructurePreview, ToolActivity, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionSummary, SkillInfo, StructurePreview, ToolActivity, WikiEstimate, WikiPageSummary } from './types'
 
 type View = 'chat' | 'library' | 'plan' | 'archive' | 'settings' | 'help'
 type Workspace = { scope: ScopeMode; courseId?: string }
@@ -369,7 +369,7 @@ export default function App() {
         <span className="right">CoursePilot v2.0</span>
       </footer>
     </main>
-    {citation && <CitationDrawer citation={citation} onClose={() => setCitation(null)} />}
+    {citation && <CitationDrawer citation={citation} onClose={() => setCitation(null)} onOpen={setCitation} />}
   </div></LangContext.Provider>
 }
 
@@ -1585,12 +1585,44 @@ function CoursePickerState({ view, courses, onPick, onCreate }: { view: View; co
     <div className="picker-grid">{courses.map(item => <button className="picker-card" key={item.id} onClick={() => onPick(item.id)}><i style={{ backgroundColor: item.color }} /><b>{item.name}</b>{item.wiki_enabled && <em>Wiki</em>}</button>)}<button className="picker-card picker-create" onClick={onCreate}>{t('course.new')}</button></div>
   </div></section>
 }
-function CitationDrawer({ citation, onClose }: { citation: Citation; onClose: () => void }) {
+/** 一页知识页依据的教材页，按文档归一成「文档 第 9–11 页」。列出的页可能被截断，
+ *  所以两端由服务端保证准确，中间少几页只影响能点开哪几页。 */
+function sourceSpans(sources: CitationSource[]): { document: string; pages: string; items: CitationSource[] }[] {
+  const byDocument = new Map<string, CitationSource[]>()
+  for (const item of sources) byDocument.set(item.document, [...(byDocument.get(item.document) ?? []), item])
+  return [...byDocument].map(([document, items]) => {
+    const numbers = items.map(item => item.page).filter((page): page is number => typeof page === 'number')
+    const range = numbers.length === 0 ? '' : numbers[0] === numbers[numbers.length - 1]
+      ? String(numbers[0]) : `${numbers[0]}–${numbers[numbers.length - 1]}`
+    return { document, pages: range, items }
+  })
+}
+
+/** 出处那一页点开后仍是教材原文的抽屉，只是它不占引用编号。 */
+function asMaterial(source: CitationSource): Citation {
+  return { kind: 'material', material_name: source.document, page: source.page, chunk_id: source.chunk_id, text: source.snippet }
+}
+
+function WikiSources({ citation, onOpen }: { citation: Citation; onOpen: (citation: Citation) => void }) {
+  const sources = citation.sources ?? []
+  if (sources.length === 0) return null
+  const total = citation.source_pages ?? sources.length
+  return <div className="citation-sources">
+    <p className="citation-location">{t('citation.wiki_sources')}</p>
+    {sourceSpans(sources).map(span => <div className="citation-span" key={span.document}>
+      <b>{span.pages ? t('citation.wiki_source_span', { document: span.document, pages: span.pages }) : span.document}</b>
+      <div>{span.items.map(item => <button type="button" key={`${item.document}:${item.page}`} onClick={() => onOpen(asMaterial(item))}>{t('citation.page_short', { n: item.page ?? 0 })}</button>)}</div>
+    </div>)}
+    {total > sources.length && <p className="citation-location">{t('citation.wiki_sources_more', { n: total, m: sources.length })}</p>}
+  </div>
+}
+
+function CitationDrawer({ citation, onClose, onOpen }: { citation: Citation; onClose: () => void; onOpen: (citation: Citation) => void }) {
   const isWiki = citation.kind === 'wiki'
   // 抽屉头部就要说清这是转述稿：正文没有页码，用户不该以为自己在看教材原文。
   const heading = isWiki ? (citation.concept_name || citation.concept_id || t('citation.wiki_fallback')) : (citation.material_name ?? t('citation.fallback_name'))
   const location = isWiki ? t('citation.wiki_location')
     : citation.page ? t('citation.page', { n: citation.page })
     : citation.chunk_id ? t('citation.chunk', { id: citation.chunk_id }) : t('citation.location_unknown')
-  return <aside className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{isWiki ? t('citation.wiki_title') : t('citation.title')}</p><h2>{heading}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{location}</p><blockquote>{citation.text ?? t('citation.no_text')}</blockquote>{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside>
+  return <aside className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{isWiki ? t('citation.wiki_title') : t('citation.title')}</p><h2>{heading}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{location}</p><blockquote>{citation.text ?? t('citation.no_text')}</blockquote>{isWiki && <WikiSources citation={citation} onOpen={onOpen} />}{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside>
 }

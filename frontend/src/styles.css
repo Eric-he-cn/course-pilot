@@ -323,6 +323,13 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .citation-location { color:var(--muted); font-family:var(--mono); font-size:11px }
 .citation-drawer blockquote { margin:16px 0; padding:12px; border:1px solid var(--border); border-radius:8px; background:var(--panel); color:var(--text); line-height:1.75; font-size:13.5px }
 .citation-drawer>p { color:var(--muted); font-family:var(--mono); font-size:11px }
+/* 知识页抽屉里的教材出处：每份教材一行区间，页码是可点开的按钮 */
+.citation-sources { margin:14px 0 4px; padding-top:12px; border-top:1px solid var(--border) }
+.citation-span { margin:8px 0 0 }
+.citation-span b { display:block; font-size:12.5px; font-weight:600 }
+.citation-span div { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px }
+.citation-span button { border:1px solid var(--border); border-radius:5px; background:var(--panel); color:var(--text); padding:2px 8px; font-family:var(--mono); font-size:11px }
+.citation-span button:hover { border-color:var(--accent); color:var(--accent) }
 
 /* ---- 会话上下文条 ---- */
 .course-heading { display:flex; align-items:center; gap:10px }

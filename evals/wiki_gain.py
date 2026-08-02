@@ -5,6 +5,10 @@
 而知识页是转述稿、按设计不产生教材页码，收益必须绕道才显形。这里补上事实锚点
 （evals/wiki_anchors.yaml），直接判「远处那一页的事实有没有出现在回答正文里」。
 
+第四个判据是追溯：知识页引用现在带着它转述时依据的教材页，所以「这一轮能追到哪几页」
+不再等于「有几条 kind=material 的引用」。三个口径并排报——只数教材引用、把知识页的
+依据页也算上、再只算回答里真标了 [n] 的那几条。
+
 两侧靠用户隔离：每个用户一份数据目录，同一套实例上跑得了 A 和 B，模型、教材、样本全同。
 
 用法（另起实例，别对着开发库跑）：
@@ -189,6 +193,39 @@ def material_refs(turn: Turn) -> list[tuple[str, int]]:
             if item.get("kind", "material") == "material" and isinstance(item.get("page"), int)]
 
 
+def citations(turn: Turn) -> list[dict]:
+    """引用条目留在结果文件里：追溯口径能改，改完重出报表不用重跑模型。"""
+    return [{"number": item.get("number"), "kind": item.get("kind", "material"),
+             "document": item.get("document") or "", "page": item.get("page"),
+             "concept_name": item.get("concept_name") or item.get("concept_id") or "",
+             "sources": [{"document": s.get("document") or "", "page": s.get("page")}
+                         for s in (item.get("sources") or [])],
+             "source_pages": item.get("source_pages") or 0}
+            for item in turn.named("citation")]
+
+
+def trace_refs(rows: list[dict], *, marked: set[int] | None = None) -> list[tuple[str, int]]:
+    """这一轮的回答能追溯到哪几个教材页。
+
+    教材引用给出自己那一页；知识页引用给出它转述时依据的那几页——转述稿本身没有页码，
+    但它是从哪几页写出来的有据可查，用户点得开。`marked` 非空时只算回答里真标了 [n] 的。
+    """
+    out = []
+    for item in rows:
+        if marked is not None and item.get("number") not in marked:
+            continue
+        if item["kind"] == "material":
+            if isinstance(item.get("page"), int):
+                out.append((item["document"], item["page"]))
+            continue
+        out += [(s["document"], s["page"]) for s in item.get("sources") or [] if isinstance(s.get("page"), int)]
+    return out
+
+
+def marked_numbers(answer: str) -> set[int]:
+    return {int(number) for number in re.findall(r"\[(\d+)\]", answer)}
+
+
 def wiki_ref_names(turn: Turn) -> list[str]:
     return sorted({item.get("concept_name") or item.get("concept_id") or "?"
                    for item in turn.named("citation") if item.get("kind") == "wiki"})
@@ -245,6 +282,7 @@ def run(base: str, user: str, tag: str, samples: list[dict], workers: int) -> li
         entry = {
             "tag": tag, "user": user, "id": sample["id"], "category": sample["category"],
             "retrieval": score_retrieval(sample, material_refs(turn)),
+            "citations": citations(turn),
             "tools": tools,
             "wiki_read": tools.count("wiki_read"),
             "wiki_index": tools.count("wiki_index"),
@@ -260,8 +298,9 @@ def run(base: str, user: str, tag: str, samples: list[dict], workers: int) -> li
                 entry["anchor_strict"] = score_anchor(spec["strict"], turn.answer)
         mark = "" if "anchor" not in entry else f" 锚点 {'HIT ' if entry['anchor']['hit'] else 'miss'}"
         print(f"[{tag} {index}/{len(samples)}] {sample['id']:<12} 召回 {entry['retrieval']['recall']:.2f} "
-              f"精确 {entry['retrieval']['precision']:.2f} wiki_read {entry['wiki_read']} "
-              f"wiki引用 {len(entry['wiki_cited'])} 工具 {len(tools)}{mark} {entry['seconds']}s", flush=True)
+              f"精确 {entry['retrieval']['precision']:.2f} 出处页 {len(set(trace_refs(entry['citations'])))} "
+              f"wiki_read {entry['wiki_read']} wiki引用 {len(entry['wiki_cited'])} "
+              f"工具 {len(tools)}{mark} {entry['seconds']}s", flush=True)
         return entry
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -277,17 +316,19 @@ def _mean(values) -> float:
     return statistics.mean(values) if values else 0.0
 
 
-def report(groups: dict[str, list[list[dict]]]) -> None:
+def report(groups: dict[str, list[list[dict]]], labels: tuple[str, str] = ("A 侧（无知识页）", "B 侧（有知识页）")) -> None:
     """groups: {'A': [第1遍, 第2遍, 第3遍], 'B': [...]}，每遍是逐条结果。"""
     print("\n" + "=" * 78)
-    print("一、两类样本 × 三个维度（每格是「各遍的最小 ~ 最大（各遍均值）」）")
+    print("一、两类样本 × 各维度（每格是「各遍的最小 ~ 最大（各遍均值）」）")
     print("=" * 78)
-    header = f"{'':<18}{'A 侧（无知识页）':<30}{'B 侧（有知识页）':<30}"
-    print(header)
+    print(f"{'':<18}{labels[0]:<30}{labels[1]:<30}")
     for category in CATEGORIES:
         print(f"\n[{category}]")
         for label, pick in (("检索召回", lambda r: r["retrieval"]["recall"]),
                             ("引用精确", lambda r: r["retrieval"]["precision"]),
+                            ("追溯召回", lambda r: r["trace"]["recall"]),
+                            ("追溯精确", lambda r: r["trace"]["precision"]),
+                            ("无出处轮次占比", lambda r: 0.0 if r["trace"]["cited"] else 1.0),
                             ("事实锚点命中率", None),
                             ("wiki_read 次数", lambda r: r["wiki_read"]),
                             ("知识页引用条数", lambda r: len(r["wiki_cited"]))):
@@ -341,7 +382,7 @@ def report(groups: dict[str, list[list[dict]]]) -> None:
                   f"A {strict['A'][0]}/{strict['A'][1]}    B {strict['B'][0]}/{strict['B'][1]}")
 
     print("\n" + "=" * 78)
-    print("三、知识页实际被用了几次（B 侧逐条，各遍合计）")
+    print(f"三、知识页实际被用了几次（{labels[1]} 逐条，各遍合计）")
     print("=" * 78)
     ids = sorted({r["id"] for rows in groups.get("B", []) for r in rows})
     print(f"  {'样本':<12}{'wiki_read':<12}{'wiki_index':<12}{'知识页引用':<12}{'引到的页'}")
@@ -355,34 +396,43 @@ def report(groups: dict[str, list[list[dict]]]) -> None:
     print("四、cited_qa 有没有变差（逐条，各遍均值）")
     print("=" * 78)
     ids = sorted({r["id"] for rows in groups.get("A", []) for r in rows if r["category"] == "cited_qa"})
-    print(f"  {'样本':<10}{'A 召回':<10}{'B 召回':<10}{'A 精确':<10}{'B 精确':<10}{'B wiki引用'}")
+    print(f"  {'样本':<10}{'左 召回':<10}{'右 召回':<10}{'左 追溯':<10}{'右 追溯':<10}{'右 wiki引用'}")
     for sid in ids:
         cell = {}
         for side in ("A", "B"):
             rows = [r for rounds in groups.get(side, []) for r in rounds if r["id"] == sid]
             cell[side] = (_mean(r["retrieval"]["recall"] for r in rows),
-                          _mean(r["retrieval"]["precision"] for r in rows),
+                          _mean(r["trace"]["recall"] for r in rows),
                           sum(len(r["wiki_cited"]) for r in rows))
         print(f"  {sid:<10}{cell['A'][0]:<10.3f}{cell['B'][0]:<10.3f}"
               f"{cell['A'][1]:<10.3f}{cell['B'][1]:<10.3f}{cell['B'][2]}")
 
     print("\n" + "=" * 78)
-    print("五、一条教材引用都没有的轮次（召回口径的分母塌成 0 就出在这里）")
+    print("五、追不到教材页的轮次（主判据）")
+    print("  「教材引用」只数 kind=material；「教材出处」把知识页引用携带的依据页也算进来；")
+    print("  「标注口径」再收一道：只算回答正文里真标了 [n] 的那几条引用。")
     print("=" * 78)
-    for side in ("A", "B"):
+    for side, label in (("A", labels[0]), ("B", labels[1])):
         for category in CATEGORIES:
             rows = [r for rounds in groups.get(side, []) for r in rounds if r["category"] == category]
-            empty = [f"{r['tag']}/{r['id']}" for r in rows if not r["retrieval"]["cited"]]
-            print(f"  {side} 侧 {category:<18} {len(empty)}/{len(rows)} 轮" + (f"  {empty}" if empty else ""))
+            if not rows:
+                continue
+            no_material = [f"{r['tag']}/{r['id']}" for r in rows if not r["retrieval"]["cited"]]
+            no_trace = [f"{r['tag']}/{r['id']}" for r in rows if not r["trace"]["cited"]]
+            no_marked = [f"{r['tag']}/{r['id']}" for r in rows if not r["trace_marked"]["cited"]]
+            print(f"  {label} {category:<18} 无教材引用 {len(no_material)}/{len(rows)}"
+                  f"    无教材出处 {len(no_trace)}/{len(rows)}    标注口径 {len(no_marked)}/{len(rows)}")
+            if no_trace:
+                print(f"      追不到的轮次：{no_trace}")
 
     print("\n" + "=" * 78)
     print("六、越界与禁页（两侧都要为 0，否则上面的数字不可信）")
     print("=" * 78)
-    for side in ("A", "B"):
+    for side, label in (("A", labels[0]), ("B", labels[1])):
         bad = [(r["tag"], r["id"], r["retrieval"]["out_of_course"], r["retrieval"]["forbidden_pages"])
                for rows in groups.get(side, []) for r in rows
                if r["retrieval"]["out_of_course"] or r["retrieval"]["forbidden_pages"]]
-        print(f"  {side} 侧：{len(bad)} 条" + ("" if not bad else f" {bad}"))
+        print(f"  {label}：{len(bad)} 条" + ("" if not bad else f" {bad}"))
 
 
 # ---------------------------------------------------------------- CLI
@@ -401,6 +451,8 @@ def main() -> int:
     # 用 --a / --b 分组，不用裸 -- 分隔：argparse 会把第一个 -- 吃掉，两侧文件会全落进 A。
     parser.add_argument("--a", action="append", default=[], help="report 用：A 侧（无知识页）的一遍结果，可重复")
     parser.add_argument("--b", action="append", default=[], help="report 用：B 侧（有知识页）的一遍结果，可重复")
+    parser.add_argument("--a-label", default="A 侧（无知识页）")
+    parser.add_argument("--b-label", default="B 侧（有知识页）")
     parser.add_argument("--base", default="http://127.0.0.1:8004")
     parser.add_argument("--user", default="")
     parser.add_argument("--tag", default="")
@@ -415,11 +467,18 @@ def main() -> int:
         # 改判据不用重跑模型，也不会出现「表里的数字和 yaml 里的正则对不上」。
         anchors = {row["id"]: row for row in yaml.safe_load(ANCHORS.read_text(encoding="utf-8"))["anchors"]}
 
+        by_id = {sample["id"]: sample for sample in load_samples()}
+
         def rounds(names: list[str]) -> list[list[dict]]:
             out = []
             for name in names:
                 rows = [json.loads(line) for line in Path(name).read_text(encoding="utf-8").splitlines() if line]
                 for row in rows:
+                    cited = row.get("citations") or []
+                    sample = by_id[row["id"]]
+                    row["trace"] = score_retrieval(sample, trace_refs(cited))
+                    row["trace_marked"] = score_retrieval(
+                        sample, trace_refs(cited, marked=marked_numbers(row["answer"])))
                     if not (spec := anchors.get(row["id"])):
                         continue
                     row["anchor"] = score_anchor(spec["primary"], row["answer"])
@@ -430,7 +489,7 @@ def main() -> int:
             return out
         if not args.a or not args.b:
             raise SystemExit("report 要 --a 与 --b 各至少一份")
-        report({"A": rounds(args.a), "B": rounds(args.b)})
+        report({"A": rounds(args.a), "B": rounds(args.b)}, (args.a_label, args.b_label))
         return 0
 
     if not args.user:

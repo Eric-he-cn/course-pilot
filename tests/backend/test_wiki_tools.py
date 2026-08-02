@@ -13,7 +13,7 @@ from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from contracts.knowledge import ConceptRef, ResolvedKnowledgeScope, WikiDocument, WikiEntry
+from contracts.knowledge import ConceptRef, ResolvedKnowledgeScope, WikiDocument, WikiEntry, WikiSources
 from contracts.llm import ChatDelta, ChatFinal, ChatToolCalls, ToolCallRequest
 from core.settings import Settings
 from core.store import SQLiteStore
@@ -60,6 +60,9 @@ class FakeKnowledge:
         if concept_id not in self._pages:
             raise LookupError(concept_id)
         return self._pages[concept_id]
+
+    def wiki_sources(self, *, scope: ResolvedKnowledgeScope, concept_id: str) -> WikiSources:
+        return WikiSources((), 0)
 
 
 def _run(knowledge: FakeKnowledge, name: str, arguments: str = "{}", registry: CitationRegistry | None = None):

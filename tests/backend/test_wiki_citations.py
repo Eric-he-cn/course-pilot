@@ -13,7 +13,9 @@ from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from contracts.knowledge import Citation, KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope, WikiDocument
+from contracts.knowledge import (
+    Citation, KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope, WikiDocument, WikiSource, WikiSources,
+)
 from contracts.llm import ChatDelta, ChatFinal, ChatToolCalls, ToolCallRequest
 from core.settings import Settings
 from core.store import SQLiteStore
@@ -29,6 +31,7 @@ from modules.courses.repository import CourseRepository
 from modules.courses.service import CourseService
 from modules.knowledge.repository import KnowledgeRepository
 from modules.knowledge.service import KnowledgeService
+from modules.knowledge import wiki
 from modules.knowledge.wiki import WikiStore
 from test_agent_loop import ScriptedChat, _events, _indexed_course_session, _settings
 
@@ -59,6 +62,7 @@ class FakeKnowledge:
         self._materials = [_material_hit(i) for i in range(1, materials + 1)]
         self._wiki = [_wiki_hit(f"cpt_{i}", f"概念{i}") for i in range(1, wiki + 1)]
         self.limits: dict[str, int] = {}
+        self.source_calls: list[str] = []
 
     def search(self, *, scope, query, limit=6):
         self.limits["material"] = limit
@@ -73,6 +77,11 @@ class FakeKnowledge:
 
     def wiki_read(self, *, scope, concept_id):
         return WikiDocument(concept_id, "护航效应", "一句话定义：长作业拖住短作业。", "")
+
+    def wiki_sources(self, *, scope, concept_id):
+        self.source_calls.append(concept_id)
+        return WikiSources((WikiSource("os.pdf", 9, "chunk_src_9", "第 9 页原文：护航效应。"),
+                            WikiSource("os.pdf", 11, "chunk_src_11", "第 11 页原文：STCF。")), 5)
 
 
 def _run(knowledge, name: str, arguments: str = "{}", registry: CitationRegistry | None = None):
@@ -166,6 +175,60 @@ def test_the_page_still_says_it_is_not_the_textbook():
     for text in (description, body):
         assert "不是教材原文" in text and "没有页码" in text
         assert "知识页" in text
+
+
+# ------------------------------------------------------- 转述带着自己的教材出处
+
+def test_a_cited_wiki_page_carries_the_pages_it_was_written_from():
+    """知识页引用要带上这一页依据的教材页。模型读完转述就不再回教材，
+    这几页是回答唯一还能追回原文的路。"""
+    registry = CitationRegistry()
+    _run(FakeKnowledge(), "wiki_read", '{"concept_id": "cpt_convoy"}', registry)
+
+    entry = registry.citations[0]
+    assert [(item["document"], item["page"]) for item in entry["sources"]] == [("os.pdf", 9), ("os.pdf", 11)]
+    assert entry["sources"][0]["chunk_id"] and entry["sources"][0]["snippet"]
+    assert entry["source_pages"] == 5  # 截断了也要说得出总共几页
+
+
+def test_the_seed_search_path_carries_them_too():
+    """一半的知识页是种子检索自动端上来的，那条路上不带出处等于只补了一半。"""
+    knowledge = FakeKnowledge(materials=0, wiki=1)
+    registry = CitationRegistry()
+    _run(knowledge, "search_materials", '{"query": "整体结构"}', registry)
+
+    assert knowledge.source_calls == ["cpt_1"]
+    assert registry.citations[0]["sources"]
+
+
+def test_the_pages_behind_a_wiki_citation_are_not_extra_numbered_sources():
+    """出处挂在知识页那一条底下，不另编号：模型没读过那几页，标 [n] 就是没有依据的引用。
+    教材那几个席位也因此一条不少。"""
+    registry = CitationRegistry()
+    _run(FakeKnowledge(), "search_materials", '{"query": "调度"}', registry)
+
+    kinds = [item["kind"] for item in registry.citations]
+    assert len(registry.citations) == SEARCH_LIMIT + WIKI_SEARCH_LIMIT
+    assert kinds.count("material") == SEARCH_LIMIT
+    materials = [item for item in registry.citations if item["kind"] == "material"]
+    assert [item["chunk_id"] for item in materials] == [f"chunk_{i}" for i in range(1, SEARCH_LIMIT + 1)]
+
+
+def test_the_sources_stay_out_of_the_tool_text():
+    """出处只走引用通道，不进工具正文。摆到模型眼前，它就会把自己没读过的页码抄进回答，
+    那是没有依据的引用。这一条也保证这次改动不会顺带改掉模型看到的东西。"""
+    page = _run(FakeKnowledge(), "wiki_read", '{"concept_id": "cpt_1"}')
+    hits = _run(FakeKnowledge(), "search_materials", '{"query": "调度"}')
+
+    for text in (page.text, hits.text):
+        assert "第 9 页原文" not in text and "chunk_src_9" not in text
+
+
+def test_the_port_declares_the_wiki_source_capability():
+    """出处也是服务端给的：模型指定不了要拿哪一页的出处，更改不了它指向哪几页。"""
+    assert hasattr(KnowledgeSearchPort, "wiki_sources")
+    assert "scope" in KnowledgeSearchPort.wiki_sources.__annotations__
+    assert "course_id" not in KnowledgeSearchPort.wiki_sources.__annotations__
 
 
 def test_the_port_declares_the_wiki_search_capability():
@@ -292,6 +355,95 @@ def test_wiki_search_is_empty_while_the_course_has_wiki_off(indexed):
     assert service.search_wiki(scope=scope, query="这门课整体分成哪几部分") == []
 
 
+def _write_leaf_page(wiki_store: WikiStore, course_id: str, material_id: str, refs: list[str],
+                     *, concept_id: str = "cpt_fifo", parent_id: str | None = None) -> None:
+    wiki_store.write(
+        course_id=course_id, concept_id=concept_id, concept_name="先来先服务",
+        body="长作业排在前面会拖住后面的短作业。[p.1]", source_hash="h2", source_refs=refs,
+        updated_at="2026-08-01T00:00:00Z", material_id=material_id, parent_id=parent_id, level=1, order=1,
+    )
+
+
+def _refs_of(service: KnowledgeService, repository: KnowledgeRepository, material_id: str) -> list[str]:
+    """按构建时的写法拼出处行：文档名 + 页码 + 分片 id。"""
+    return [f"os.md p.{chunk['page']} #{chunk['id']}"
+            for chunk in repository.list_material_chunks(material_id=material_id)]
+
+
+def test_a_wiki_page_reports_the_textbook_pages_behind_it(indexed):
+    """落盘的 frontmatter 里本来就记着出处，把它读出来标准化成可点开的页。"""
+    service, repository, wiki_store, course_id, material_id = indexed
+    _write_leaf_page(wiki_store, course_id, material_id, _refs_of(service, repository, material_id))
+
+    sources = service.wiki_sources(
+        scope=ResolvedKnowledgeScope(turn_id="t1", course_id=course_id, resolver_version="v1"),
+        concept_id="cpt_fifo")
+
+    assert [(item.document, item.page) for item in sources.anchors] == [("os.md", 1), ("os.md", 2)]
+    assert sources.pages == 2
+    assert "护航效应" in sources.anchors[0].snippet
+
+
+def test_an_overview_page_collects_the_pages_of_its_children(indexed):
+    """总览页自己不读原文，记的是子页。出处得顺着子页收上来，
+    否则最常被引的那几页（首页、章节页）反而一页都追不到。"""
+    service, repository, wiki_store, course_id, material_id = indexed
+    _write_leaf_page(wiki_store, course_id, material_id, _refs_of(service, repository, material_id),
+                     parent_id="cpt_chapter")
+    wiki_store.write(course_id=course_id, concept_id="cpt_chapter", concept_name="调度",
+                     body="这一章从 FIFO 讲到 STCF。", source_hash="h3",
+                     source_refs=["子页 先来先服务 <cpt_fifo>"], updated_at="2026-08-01T00:00:00Z",
+                     material_id=material_id, level=0, order=0)
+    _write_index_page(wiki_store, course_id, material_id)
+    scope = ResolvedKnowledgeScope(turn_id="t1", course_id=course_id, resolver_version="v1")
+
+    chapter = service.wiki_sources(scope=scope, concept_id="cpt_chapter")
+    index = service.wiki_sources(scope=scope, concept_id="index")
+
+    assert [(item.document, item.page) for item in chapter.anchors] == [("os.md", 1), ("os.md", 2)]
+    assert [(item.document, item.page) for item in index.anchors] == [("os.md", 1), ("os.md", 2)]
+
+
+def test_a_page_whose_chunks_were_reindexed_still_names_them(indexed):
+    """重建索引会换分片 id。取不到原文时仍要给出文档与页码——出处不能整条消失。"""
+    service, _repository, wiki_store, course_id, material_id = indexed
+    _write_leaf_page(wiki_store, course_id, material_id, ["os.md p.7 #chunk_gone"])
+
+    sources = service.wiki_sources(
+        scope=ResolvedKnowledgeScope(turn_id="t1", course_id=course_id, resolver_version="v1"),
+        concept_id="cpt_fifo")
+
+    assert [(item.document, item.page, item.snippet) for item in sources.anchors] == [("os.md", 7, "")]
+
+
+def test_each_document_lists_at_most_a_handful_of_pages(indexed):
+    """一门大课的首页依据整本书，全摆出来会淹掉抽屉。截断后区间两端仍要准。"""
+    service, _repository, wiki_store, course_id, material_id = indexed
+    _write_leaf_page(wiki_store, course_id, material_id,
+                     [f"os.md p.{page} #chunk_{page}" for page in range(1, 31)])
+
+    sources = service.wiki_sources(
+        scope=ResolvedKnowledgeScope(turn_id="t1", course_id=course_id, resolver_version="v1"),
+        concept_id="cpt_fifo")
+
+    pages = [item.page for item in sources.anchors]
+    assert len(pages) == wiki.WIKI_SOURCE_MAX_PAGES and sources.pages == 30
+    assert pages[0] == 1 and pages[-1] == 30
+
+
+def test_a_course_with_wiki_off_reports_no_sources(indexed):
+    """和 wiki_index、search_wiki 同一个口径：课程没开知识页就当作没有页。"""
+    service, repository, wiki_store, course_id, material_id = indexed
+    _write_leaf_page(wiki_store, course_id, material_id, _refs_of(service, repository, material_id))
+    service._wiki_is_enabled = lambda _course_id: False
+
+    sources = service.wiki_sources(
+        scope=ResolvedKnowledgeScope(turn_id="t1", course_id=course_id, resolver_version="v1"),
+        concept_id="cpt_fifo")
+
+    assert sources.anchors == () and sources.pages == 0
+
+
 def test_deleting_the_material_takes_its_wiki_rows_with_it(indexed):
     """检索行挂在 chunks 上就是为了这个：删教材、删课程那两条既有的清理链路照样收走它们，
     不必再各自加一句。留下来就是孤儿——教材没了，转述还在被检索到。"""
@@ -336,6 +488,40 @@ def test_the_turn_streams_material_and_wiki_citations(tmp_path):
 
     kinds = {data.get("kind") for name, data in events if name == "citation"}
     assert kinds == {"material", "wiki"}
+
+
+def test_the_turn_streams_the_pages_behind_a_wiki_citation(tmp_path):
+    """整条链路走通才算：出处要跟着 SSE 上屏，界面才有东西可展开。"""
+    with TestClient(create_app(settings=_settings(tmp_path))) as client:
+        session_id = _indexed_course_session(client, name="操作系统", text="FIFO 调度会产生护航效应。")
+        course_id = _course_id(client, "操作系统")
+        client.patch(f"/api/v2/courses/{course_id}", json={"wiki_enabled": True})
+        space = workspace(client)
+        material_id = client.get(f"/api/v2/courses/{course_id}/materials").json()[0]["id"]
+        # markdown 上传没有页码，这里换成带页码的分片，出处那一页才有东西可标。
+        space.knowledge._repository.replace_chunks(
+            material_id=material_id, course_id=course_id, chunks=[(4, "FIFO 调度会产生护航效应。")])
+        chunk = space.knowledge._repository.list_material_chunks(material_id=material_id)[0]
+        WikiStore(space.settings.data_dir).write(
+            course_id=course_id, concept_id="index", concept_name="课程总览",
+            body="这门课整体分成三大块：进程与调度、内存管理、文件系统。",
+            source_hash="h1", source_refs=[f"notes.md p.4 #{chunk['id']}"],
+            updated_at="2026-08-01T00:00:00Z", material_id=material_id, level=0, order=-1,
+        )
+        space.knowledge.reindex_wiki_pages(course_id=course_id, material_id=material_id)
+        space.turns._responder = ScriptedChat([
+            [ChatDelta("分成三大块 [1]。"),
+             ChatFinal("分成三大块 [1]。", "stop", "example", "example-model", "provider")],
+        ])
+
+        events = _events(client.post(
+            f"/api/v2/sessions/{session_id}/turns",
+            json={"client_request_id": "cite-src", "message": "这门课整体分成哪几部分？"},
+        ).text)
+
+    wiki_citation = next(data for name, data in events if name == "citation" and data.get("kind") == "wiki")
+    assert [(item["document"], item["page"]) for item in wiki_citation["sources"]] == [("notes.md", 4)]
+    assert wiki_citation["source_pages"] == 1
 
 
 def test_the_context_reports_wiki_body_apart_from_textbook_evidence(tmp_path):

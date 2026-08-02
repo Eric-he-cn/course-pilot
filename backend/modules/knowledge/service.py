@@ -10,7 +10,9 @@ from typing import Callable
 from core.common import new_id, utc_now
 from core.settings import Settings
 from contracts.embedding import EmbedderPort
-from contracts.knowledge import ConceptRef, KnowledgeHit, ResolvedKnowledgeScope, WikiDocument, WikiEntry
+from contracts.knowledge import (
+    ConceptRef, KnowledgeHit, ResolvedKnowledgeScope, WikiDocument, WikiEntry, WikiSource, WikiSources,
+)
 from contracts.llm import ChatFinal
 from contracts.reranker import RerankerPort
 
@@ -381,6 +383,49 @@ class KnowledgeService:
         raw = self.wiki_page(course_id=scope.course_id, concept_id=concept_id)
         return wiki.split_page(concept_id=concept_id, document=raw)
 
+    def wiki_sources(self, *, scope: ResolvedKnowledgeScope, concept_id: str) -> WikiSources:
+        """Agent-only：这一页转述时依据的教材页，让引用它的回答仍然点得开原文。"""
+        if not self._wiki_is_enabled(scope.course_id):
+            return WikiSources((), 0)
+        return self.wiki_page_sources(course_id=scope.course_id, concept_id=concept_id)
+
+    def wiki_page_sources(self, *, course_id: str, concept_id: str) -> WikiSources:
+        """总览页自己不读原文，出处顺着子页递归收上来；按（文档、页）去重后每份教材各截几页。"""
+        if self._wiki is None:
+            return WikiSources((), 0)
+        chunk_by_page: dict[tuple[str, int | None], str] = {}
+        for page_id in self._wiki_family(course_id=course_id, concept_id=concept_id):
+            refs = self._wiki.source_refs(course_id=course_id, concept_id=page_id)
+            for document, page, chunk_id in wiki.parse_source_refs(refs):
+                chunk_by_page.setdefault((document, page), chunk_id)
+        ordered = sorted(chunk_by_page, key=lambda key: (key[0], key[1] or 0))
+        kept = _cap_per_document(ordered, wiki.WIKI_SOURCE_MAX_PAGES)
+        snippets = self._repository.chunk_snippets(
+            course_id=course_id, ids=[chunk_by_page[key] for key in kept], limit=wiki.WIKI_SOURCE_SNIPPET)
+        anchors = tuple(
+            WikiSource(document=document, page=page, chunk_id=chunk_by_page[(document, page)],
+                       snippet=snippets.get(chunk_by_page[(document, page)], ""))
+            for document, page in kept
+        )
+        return WikiSources(anchors, len(ordered))
+
+    def _wiki_family(self, *, course_id: str, concept_id: str) -> list[str]:
+        """这一页与它的全部子孙。首页是课程根，顶层页没记父节点，挂到它下面才收得齐。"""
+        children: dict[str, list[str]] = {}
+        for page in self._wiki.list_pages(course_id=course_id):
+            if page.concept_id == wiki.INDEX_ID:
+                continue
+            children.setdefault(page.parent_id or wiki.INDEX_ID, []).append(page.concept_id)
+        family, seen, queue = [], set(), [concept_id]
+        while queue:
+            node = queue.pop(0)
+            if node in seen:
+                continue
+            seen.add(node)
+            family.append(node)
+            queue += children.get(node, [])
+        return family
+
     def concept_exists(self, course_id: str, concept_id: str) -> bool:
         """按 id 精确判断，不受概念清单的展示上限影响。"""
         return self._repository.concept_exists(course_id=course_id, concept_id=concept_id)
@@ -589,3 +634,15 @@ class KnowledgeService:
         if material is None:
             raise ValueError("教材不存在")
         return material
+
+
+def _cap_per_document(keys: list[tuple[str, int | None]], limit: int) -> list[tuple[str, int | None]]:
+    """每份教材最多留几页。超了留最前面几页加最后一页，页码区间的两端不会因此说小。"""
+    grouped: dict[str, list[tuple[str, int | None]]] = {}
+    for key in keys:
+        grouped.setdefault(key[0], []).append(key)
+    out: list[tuple[str, int | None]] = []
+    for document in sorted(grouped):
+        group = grouped[document]
+        out += group if len(group) <= limit else group[: limit - 1] + group[-1:]
+    return out

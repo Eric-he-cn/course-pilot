@@ -40,6 +40,10 @@ SECONDS_PER_PAGE = 5
 # 一页最多读多少字原文。超过就按分片顺序再切一层，不截断——截断就是漏。
 MAX_EVIDENCE_CHARS = 6000
 MAX_PAGE_BYTES = 128 * 1024
+# 一页知识页最多摆出每份教材的几页出处。总览页依据整本书，全列出来只会淹掉抽屉。
+WIKI_SOURCE_MAX_PAGES = 8
+# 出处那几页各带多长的原文，够看出「这页在讲什么」即可。
+WIKI_SOURCE_SNIPPET = 200
 _ALLOWED = re.compile(r"[^\w一-鿿\-_.]", re.UNICODE)
 _TITLE_LINE = re.compile(r"^\s*(?:#+\s*)?标题[：:]\s*(.+)$")
 
@@ -137,6 +141,17 @@ class WikiStore:
             raise LookupError(f"没有 {concept_id} 的 Wiki 页")
         return path.read_text(encoding="utf-8")
 
+    def source_refs(self, *, course_id: str, concept_id: str) -> list[str]:
+        """读一页 frontmatter 里记的证据出处。读不到就当这页没有出处，不报错。"""
+        try:
+            text = self.read(course_id=course_id, concept_id=concept_id)
+        except (LookupError, ValueError, OSError):
+            return []
+        match = re.search(r"^source_refs:\n((?:[ \t]+- .*\n)*)", text, re.MULTILINE)
+        if not match:
+            return []
+        return [line.strip()[2:].strip() for line in match.group(1).splitlines() if line.strip().startswith("- ")]
+
     def source_hash(self, *, course_id: str, concept_id: str) -> str:
         """读已有页的证据指纹，用来判断要不要重写。读不到就返回空串。"""
         try:
@@ -221,6 +236,21 @@ class WikiStore:
     def delete_course(self, *, course_id: str) -> None:
         """删课程时由组装根调用。目录布局是本模块自己的事，别处不该知道。"""
         shutil.rmtree(self._course_dir(course_id), ignore_errors=True)
+
+
+# 叶子页的出处形如「math-gaussian.pdf p.10 #chunk_9a7d…」，见 _raw_evidence。
+# 中间页记的是子页（「子页 X <id>」），对不上这个形状，由调用方顺着子页往下收。
+_SOURCE_REF = re.compile(r"^(?P<document>.+?)(?: p\.(?P<page>\d+))? #(?P<chunk_id>\S+)$")
+
+
+def parse_source_refs(refs: list[str]) -> list[tuple[str, int | None, str]]:
+    """把 frontmatter 的出处行拆成（文档、页码、分片 id）。拆不出教材位置的行跳过。"""
+    out = []
+    for ref in refs:
+        if match := _SOURCE_REF.match(ref.strip()):
+            page = match.group("page")
+            out.append((match.group("document"), int(page) if page else None, match.group("chunk_id")))
+    return out
 
 
 def split_page(*, concept_id: str, document: str) -> WikiDocument:

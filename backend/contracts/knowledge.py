@@ -31,6 +31,15 @@ class WikiDocument:
     """一页知识页，按落盘格式拆好：body 是系统按教材生成的，handwritten 是用户自己写的。
     拆分放在 knowledge 模块，页面格式（frontmatter、分隔标记）不外泄给调用方。"""
     concept_id: str; concept_name: str; body: str; handwritten: str
+@dataclass(frozen=True)
+class WikiSource:
+    """知识页转述时依据的一个教材位置。给的是整页的来源，不是「这句话在第几页」。"""
+    document: str; page: int | None; chunk_id: str; snippet: str
+@dataclass(frozen=True)
+class WikiSources:
+    """一页知识页的教材出处：anchors 是可点开的那几页，pages 是去重后的总页数。
+    总览页依据的页可能成百上千，anchors 会截断，pages 让界面说得出截了多少。"""
+    anchors: tuple[WikiSource, ...]; pages: int
 class KnowledgeSearchPort(Protocol):
     def search(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 6) -> list[KnowledgeHit]: ...
     def search_wiki(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 2) -> list[KnowledgeHit]: ...
@@ -39,3 +48,4 @@ class KnowledgeSearchPort(Protocol):
     def wiki_enabled(self, *, scope: ResolvedKnowledgeScope) -> bool: ...
     def wiki_index(self, *, scope: ResolvedKnowledgeScope) -> list[WikiEntry]: ...
     def wiki_read(self, *, scope: ResolvedKnowledgeScope, concept_id: str) -> WikiDocument: ...
+    def wiki_sources(self, *, scope: ResolvedKnowledgeScope, concept_id: str) -> WikiSources: ...

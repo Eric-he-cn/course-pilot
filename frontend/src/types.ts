@@ -19,6 +19,14 @@ export interface SessionSummary {
   updated_at: string
 }
 
+/** 知识页转述时依据的一个教材位置。挂在知识页引用底下，本身不占引用编号。 */
+export interface CitationSource {
+  document: string
+  page?: number | null
+  chunk_id?: string
+  snippet?: string
+}
+
 export interface Citation {
   id?: string
   // 服务端给出的引用编号，与回答正文里的 [n] 对应
@@ -37,6 +45,9 @@ export interface Citation {
   chunk_id?: string
   text?: string
   score?: number
+  // 知识页引用带着它转述时依据的教材页；source_pages 是去重后的总页数，sources 可能截断
+  sources?: CitationSource[]
+  source_pages?: number
 }
 
 export interface ToolActivity {
