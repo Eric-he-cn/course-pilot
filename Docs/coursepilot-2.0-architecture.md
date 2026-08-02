@@ -9,9 +9,9 @@
 3. **LLM 负责判断与内容，关键副作用走确定性代码**：模型生成讲解、题目、评分和计划提案，也自行判断练习处于出题、作答还是讲评阶段；代码只硬校验跨模块 envelope、证据事件、计划日期、权限和幂等，不把教学流程写成状态机。
 4. **自研 Agent 循环，不用编排框架**：主循环本身只有几百行，LangGraph 这类框架带来的抽象成本大于收益。四个参考产品全部是自研循环。
 5. **上下文按需组装、原始历史永不修改**：发请求时做读时投影（裁剪、摘要），存储层始终保留全量原文。
-6. **定性记忆用 Markdown，定量状态用 SQLite**：画像、情景记忆是人类可读的 markdown 文件（git 版本化）；掌握度、错题、排期是事件流投影。Markdown 源文件不持久化掌握度数字；前端展示 Wiki 时再从 SQLite 读取并动态渲染。
+6. **定性记忆用 Markdown，定量状态用 SQLite**：画像、情景记忆与知识页是人类可读的 markdown 文件，Agent 只改受管区块；掌握度、错题、排期是事件流投影。Markdown 源文件不持久化掌握度数字，读页时现算。
 7. **会话 scope 与工具 scope 分离**：会话可为默认 `general` 或固定 `course`。课程会话的 `course_id` 生命周期内不变；通用会话每轮先由服务端 Course Resolver 产生受控 `ResolvedCourseContext`。工具永远只接受运行时注入的解析结果，不接受模型自由填写课程路径。
-8. **模块化单体、接口优先**：课程、会话、Skill、Wiki、学习档案、计划、渠道各自拥有数据和服务边界；模块只能依赖公开 Protocol/DTO 或类型化领域事件，禁止跨模块导入实现类、直接查对方表或层层回调。
+8. **模块化单体、接口优先**：课程、会话、Skill、知识库、学习档案、计划、渠道各自拥有数据和服务边界；模块只能依赖公开 Protocol/DTO 或类型化领域事件，禁止跨模块导入实现类、直接查对方表或层层回调。
 
 ## 2. 技术选型总表
 
@@ -22,13 +22,13 @@
 | LLM 接入 | 自有统一协议 + provider adapter | 参考 1.0 `core/llm/openai_compat.py`，但不让 OpenAI SDK 响应结构泄漏到 Agent；文本与视觉模型独立配置 |
 | 结构化存储 | SQLite（WAL 模式），单文件 `data/coursepilot.db` | 存放事件流、会话、计划、调度任务；零运维，量级远够 |
 | SQLite 访问层 | 标准库 `sqlite3` + typed repository + 显式 migration | 单文件不需要 ORM；阻塞调用统一放入 worker thread，写事务在 Store 层串行化 |
-| 记忆/Wiki 存储 | Markdown 文件 + git（GitPython） | user.md / memory.md / wiki 页面；版本、diff、回滚免费；人类可读可编辑 |
-| 向量检索 | BGE 向量（sentence-transformers）+ SQLite FTS 词面，RRF 融合 | 沿用 1.0 的模型与融合策略；万级 chunk 用 numpy 暴力点积即可，FAISS 与 rerank 留待规模需要 |
+| 记忆/知识页存储 | Markdown 文件（受管区块 marker） | user.md / memory.md / 知识页；人类可读可编辑，Agent 只改 marker 之间的部分 |
+| 向量检索 | BGE 向量（sentence-transformers）+ SQLite FTS 词面，cross-encoder 精排，退化时 RRF 融合 | 沿用 1.0 的模型与融合策略；万级 chunk 用 numpy 暴力点积即可，不引入 FAISS |
 | 复习排期 | py-fsrs | FSRS 官方 Python 实现，不自研排期算法 |
 | BKT | 自实现（约 30 行贝叶斯更新） | 固定参数的经典四参数 BKT 就是几行公式，pyBKT 是为拟合大数据集设计的，用不上 |
 | 定时调度 | APScheduler 单一 interval tick（无持久化 job store） | 每分钟扫描到期条目，计划变更不需要增删大量 job；SQLite 中的计划与 delivery 才是真源 |
 | IM 渠道 | IM 平台官方 SDK，WebSocket 长连接模式 | 长连接不需要公网回调地址，本地部署可直接跑 |
-| 前端 | React + Vite + TypeScript（SPA） | 替换 Streamlit；会话列表、wiki 浏览、计划视图需要真实前端；构建产物由 FastAPI 静态托管 |
+| 前端 | React + Vite + TypeScript（SPA） | 替换 Streamlit；会话列表、知识仓库、计划视图需要真实前端；构建产物由 FastAPI 静态托管 |
 | OCR | Vision LLM 结构化转录 + 文本主模型讲解 | 转录与推理分步，便于置信度门控、用户确认和独立评测 |
 | Trace | 自研薄封装，JSONL 落盘 | 单用户本地产品不上 OpenTelemetry 全家桶 |
 
@@ -43,15 +43,15 @@
 │  Scheduler tick ─────────────┘              │            ├ 档案服务   │
 │  （每分钟扫描到期项并进入隐藏系统会话）          │            ├ 计划服务   │
 │                                             │            ├ 记忆服务   │
-│                                             │            └ Wiki 服务  │
-│  Index worker process        存储：SQLite + git + FAISS + JSONL trace │
+│                                             │            └ 知识页服务 │
+│  后台作业执行器              存储：SQLite + Markdown 文件 + JSONL trace │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 - IM 渠道的长连接作为 asyncio task 与 FastAPI 同进程运行，随进程启停；首版只接一个 IM，其余渠道只保留 `Channel` 接口。
 - 渠道入站消息必须先解析到 `session_id + scope_mode`。Web 默认创建通用会话，也可进入固定课程工作区；IM 渠道每个用户只使用一个通用会话。通用会话在每轮 Agent 执行前解析相关课程，解析不唯一时进入澄清回复，不执行课程工具。
 - Scheduler 每分钟执行一次 tick，查询到期且未投递的计划/复习项；它不直接调 LLM，而是把系统消息投进每门课程唯一的隐藏系统会话。系统会话不出现在用户会话列表、使用独立 turn lock，因此不会与用户正在聊天的 session 抢锁。
-- FAISS 查询、GitPython 操作和 sqlite3 调用使用 `asyncio.to_thread`；PDF 解析、切块与索引构建进入 `ProcessPoolExecutor(max_workers=1)`。任何可能超过 100 ms 的同步调用都不得直接运行在事件循环。
+- 向量点积、markdown 落盘和 sqlite3 调用使用 `asyncio.to_thread`。教材索引与知识页构建是持久化作业：`jobs` 表是真源，内存里的有界线程池（`BACKGROUND_JOB_WORKERS` / `BACKGROUND_JOB_QUEUE_CAPACITY`）只负责调度排队的行，进程重启后按表恢复。任何可能超过 100 ms 的同步调用都不得直接运行在事件循环。
 - 服务器化路径：同一进程部署到服务器 + 前端改为纯静态托管，代码不变。
 
 ### 3.1 模块边界与依赖方向
@@ -61,16 +61,16 @@ app / web / im / scheduler
               ↓
        application use cases
               ↓
-courses | conversations | skills | artifacts | wiki | learning | planning
+courses | sessions | agent | knowledge | learning | planning | memory | notes
               ↓                         ↑
           ports / DTOs / typed domain events
               ↓                         ↑
-     SQLite | RAG | Git | LLM | OCR adapters
+     SQLite | RAG | Markdown | LLM | OCR adapters
 ```
 
 - `modules/<feature>` 只暴露 `api.py`（用例接口）、`models.py`（稳定 DTO）和 `events.py`；实现类、repository 与表结构是模块私有。
 - 跨模块同步请求通过 Protocol 端口；一对多联动通过带版本的类型化事件，如 `EvidenceRecorded`、`PlanChanged`、`MaterialIndexed`。需要可靠投递的事件与业务变更同事务写入 SQLite outbox，后台 dispatcher 成功后标记完成；handler 失败按退避时间重试并记 trace，不反向调用发布者。纯 UI 通知可以是进程内 best-effort 事件。
-- `app/bootstrap.py` 是唯一 composition root，负责注入 adapter；业务模块不得自行构造数据库、LLM、Git 或渠道 client。
+- `app/bootstrap.py` 是唯一 composition root，负责注入 adapter；业务模块不得自行构造数据库、LLM 或渠道 client。
 - CI 使用 import boundary test（可用 `import-linter`）禁止越层依赖；代码 review 固定检查“是否绕过公开接口、是否直接访问别的模块数据、是否把副作用藏在回调中”。
 
 ## 4. Agent 核心
@@ -81,7 +81,7 @@ courses | conversations | skills | artifacts | wiki | learning | planning
 
 每轮先调用确定性的 `CourseResolverPort.resolve(message, session_summary, attachment_refs, candidate_courses)`，优先级为：用户本轮明确课程名/别名 → 附件所属课程 → 课程会话固定绑定 → 通用会话近期可靠解析 → 候选课程检索分数。只在唯一候选超过阈值时产生 `ResolvedCourseContext(course_id, confidence, reasons)`；否则返回 `needs_clarification`。模型可以生成澄清文案，但不能自行构造解析结果。
 
-`ResolvedCourseContext` 是服务端上下文，不是模型参数。`rag_search`、`wiki_read/write`、`archive_query`、`artifact_read/append` 等工具从调用上下文取课程，JSON Schema 中不暴露 `course_id`。通用模式允许不同轮次解析到不同课程，但单轮首版只允许一个课程 scope；跨课程比较必须拆成显式的多 scope 只读用例，首版不实现。
+`ResolvedCourseContext` 是服务端上下文，不是模型参数。`rag_search`、`wiki_index / wiki_read`、`archive_query`、`artifact_read/append` 等工具从调用上下文取课程，JSON Schema 中不暴露 `course_id`。通用模式允许不同轮次解析到不同课程，但单轮首版只允许一个课程 scope；跨课程比较必须拆成显式的多 scope 只读用例，首版不实现。
 
 ### 4.2 主循环
 
@@ -100,14 +100,14 @@ while turn_count < MAX_TURNS and budget.remaining > 0:
 
 - 每条退出路径记录 `turn_exit_reason`（预算耗尽 / 达到轮次上限 / 正常结束 / 用户中断 / 工具门控拒绝），写入 trace。
 - 流式输出：LLM delta 经渠道抽象层分发——Web 走 SSE，IM 渠道聚合成整条消息后发送。
-- 普通讲解和规划是主循环默认能力，不需要先激活 skill。只有练习或 Wiki 维护才通过 `use_skill` 加载专项规程；图片在进入主循环前已由附件处理层转换为 `VisionTranscriptionV1`，主 Agent 按常驻规则完成确认和点评。
+- 普通讲解、规划和读知识页是主循环默认能力，不需要先激活 skill。练习、联网查证、错题复盘、学习卡片和图解才通过 `use_skill` 加载专项规程；图片在进入主循环前已由附件处理层转换为 `VisionTranscriptionV1`，主 Agent 按常驻规则完成确认和点评。
 
 ### 4.3 Tutor 默认行为
 
 Tutor 不是独立角色或 skill，而是系统提示词中常驻的课程问答合约：
 
-1. 回答课程事实、定义、公式或教材观点前，必须先调用 `rag_search` 或读取已有引用的 Wiki 页。
-2. 教材证据必须显示文档名和页码；引用不支持结论时不得强行使用。
+1. 回答课程事实、定义、公式或教材观点前，必须先取证据：系统每轮已用用户原话做过一次种子检索，不够就再调 `rag_search`，问整体结构或要并起好几节时读知识页。
+2. 教材证据必须显示文档名和页码；知识页是转述、没有页码，标引用时按它自己那一类标。引用不支持结论时不得强行使用。
 3. 未找到证据时明确说明。可继续提供通用知识，但必须标注“以下不是当前教材结论”。
 4. 只有用户展示了可判定的理解或作答信号时，才调用 `emit_evidence`；普通阅读、礼貌性回复不产生掌握度事件。
 
@@ -115,11 +115,11 @@ Tutor 不是独立角色或 skill，而是系统提示词中常驻的课程问�
 
 每轮请求的上下文由组装器现场构建，分五段（各段的具体提示词写法见第 7 节）：
 
-1. **系统提示**：Tutor 证据合约 + 工具总则 + 可用 skill 摘要列表（只有 name + when_to_use 一句话，不含正文）。
-2. **本轮课程上下文**：课程会话使用固定绑定；通用会话注入本轮不可变 `turn_course_context`、解析理由、课程名称、教材列表和可用概念集。这一段是服务端事实，不允许模型修改；未解析时不注入任何课程资料或课程工具。
-3. **学习档案注入**：user.md + 当前课程 memory.md + 掌握度概要（由 mastery 表渲染）+ 进行中计划状态 + 相关 wiki 页——按 token 预算截断，弱项优先。
+1. **系统提示**：Tutor 证据合约 + 工具总则 + 可用 skill 摘要列表（只有 name + when_to_use 一句话，不含正文）。语言规则前置在最开头——它管全局，编号排到底下会被后面的中文教材证据压住。
+2. **本轮课程上下文**：课程会话使用固定绑定；通用会话注入本轮不可变 `turn_course_context`、解析理由、课程名称、教材列表和知识页目录。这一段是服务端事实，不允许模型修改；未解析时不注入任何课程资料或课程工具。
+3. **学习档案注入**：user.md + 当前课程 memory.md + 掌握度概要（由 mastery 表渲染）+ 进行中计划状态 + 对话摘要——按 token 预算截断。
 4. **会话历史与结构化产物**：原始消息 append-only 存 SQLite；近期练习题、作答和评分作为 artifact 一并注入。是否正在出题或评分由模型根据用户消息与这些事实判断，不引入硬编码阶段枚举。旧工具输出在读时投影中被裁剪或摘要，原文始终保留。
-5. **本轮用户消息**。
+5. **本轮用户消息**，以及用它做的一次种子检索取回的教材片段与知识页正文。
 
 分层压缩的设计直接采纳源码调研结论：零成本裁剪先行（工具输出占上下文大头）、LLM 摘要兜底、失败降级，原文永远保留在存储层可回查。
 
@@ -170,7 +170,7 @@ class LLMClient(Protocol):
 
 | 槽位 | 必需能力 | 主要用途 | 可否同一 provider |
 | --- | --- | --- | --- |
-| `text` | text + tools + streaming | 主 Agent、Tutor、内建规划、practice / wiki skill | 可以 |
+| `text` | text + tools + streaming | 主 Agent、Tutor、内建规划、各内置 skill、知识页构建 | 可以 |
 | `vision` | vision + structured output | 题干、手写解答、公式与表格转录 | 可以 |
 | `judge` | text + structured output | 离线评测 | 可选，建议与生成模型分开 |
 
@@ -234,8 +234,8 @@ token 数是估算的：中日韩文字按 1 字 1 token，其余按 3.5 字符 
 
 系统提示与本轮提问永远不裁：它们是这一轮要办的事本身。只剩这两段仍然超限时如实报出去，不去动它们。
 
-- 主 Agent、规划、practice 和 wiki 工具链显式传 `thinking.disabled`，保证延迟可控且无需保存隐式推理；离线 judge 可用 `thinking.enabled + reasoning_effort=high`。是否为具体 Skill 开启 thinking 必须先过 A/B eval。
-- 非思考模式按任务设置温度：Tutor/评分/Wiki 为 `0.2`，练习题创作为 `0.7`；thinking 模式不发送 `temperature / top_p / presence_penalty / frequency_penalty`，因为官方说明这些参数无效。
+- 思考档位是厂商私有字段，从配置里的 `TEXT_EXTRA_BODY` 推出默认值（`off / adaptive / high / max`），用户可在界面上按轮切换；知识页构建、课程分类这些后台链路沿用默认档，不各自写死。是否为具体 Skill 固定开启 thinking 必须先过 A/B eval。
+- thinking 模式不发送 `temperature / top_p / presence_penalty / frequency_penalty`，因为官方说明这些参数无效。
 - 上下文组装保持“稳定系统提示 → 稳定课程信息 → 动态历史/RAG”的顺序，让支持 prompt cache 的服务能命中前缀缓存；usage 里的缓存命中字段（如 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`）有则记录。
 - 请求传入内部用户 ID 的 HMAC 作为 `user_id`，用于 provider 侧 KV cache 与调度隔离，不发送邮箱、IM 用户标识等隐私标识。
 
@@ -257,7 +257,7 @@ OCR 不与讲解合并成一次黑盒调用：
   -> vision 槽位转录
   -> VisionTranscriptionV1 Schema 校验
   -> 关键公式或文字不确定：展示转录并等待用户更正
-  -> 转录确定：文本主模型结合 RAG / Wiki 讲解或评分
+  -> 转录确定：文本主模型结合检索证据与知识页讲解或评分
   -> 确认后才允许 emit_evidence
 ```
 
@@ -300,7 +300,7 @@ OCR 不与讲解合并成一次黑盒调用：
 | `SSE_HEARTBEAT_SECONDS` | 15 | 空闲期间发送注释帧，帮助发现断线 |
 | `SESSION_MAX_ACTIVE_TURNS` | 1 | 用户会话和系统会话分别加锁 |
 | `SQLITE_BUSY_TIMEOUT_MS` | 5000 | 短写事务，超时返回 typed error |
-| `BACKGROUND_JOB_WORKERS` | 1 | 教材索引与 Wiki 本地后台线程数 |
+| `BACKGROUND_JOB_WORKERS` | 1 | 教材索引与知识页构建的本地后台线程数 |
 | `BACKGROUND_JOB_QUEUE_CAPACITY` | 8 | 持久化任务进入本地执行器的有界容量 |
 | `SCHEDULER_TICK_SECONDS` | 60 | 单 tick 扫描 due items |
 | `APPROVAL_TIMEOUT_SECONDS` | 120 | 超时、断连或进程退出均视为 deny |
@@ -326,9 +326,9 @@ RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿�
 
 明确二分（Hermes 与 Claude Code 的共同结论）：
 
-**Skill = 同上下文的专项操作规程。** Tutor、规划与图片点评都是系统提示词中的默认能力，不做成 skill。系统内置只保留两个专项 skill：`practice`、`wiki_curator`；用户还可以导入自己的纯提示词 Skill。
+**Skill = 同上下文的专项操作规程。** Tutor、规划与图片点评都是系统提示词中的默认能力，不做成 skill。系统内置五个专项 skill：`practice`、`research`、`mistake_review`、`flashcards`、`diagram`；用户还可以导入自己的纯提示词 Skill。知识页构建不是 skill——它是确定性流水线（见 §8.2），模型只被调来写每一页的正文，不决定读哪些原文、写哪些页。
 
-- 内置 skill 位于 `skills/builtin/<name>/SKILL.md`；用户 skill 位于 `data/skills/<skill_id>/<version>/SKILL.md`（编写规范见第 7 节）。
+- 内置 skill 位于 `skills/builtin/<name>/SKILL.md`；用户 skill 存在库里，导入时压成单份文本（编写规范见第 7 节）。
 - **两段式注入**（照搬 Claude Code / opencode）：系统提示只放 skill 摘要列表；模型调用 `use_skill` 工具时，SKILL.md 正文才注入对话。能力说明书不常驻上下文。
 - skill 声明 `allowed_tools`，激活期间工具集收窄到声明范围——这是权限门控的主要形式。
 - `use_skill` 只加载当轮所需的操作规程，不创建独立 Agent，也不引入持久化阶段状态。一轮只有一个前台 skill，但该 skill 可在同一循环内调用多个受控工具。
@@ -376,25 +376,30 @@ RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿�
 ---
 name: practice
 description: 组织完整练习过程，包括出题、评分、讲评和变式题
-when_to_use: 用户想练习、提交了对最近练习的作答、要求讲评错题，或每日小测触发时
-allowed_tools: [rag_search, wiki_read, concept_search, archive_query, skill_resource_read, artifact_read, artifact_append, emit_evidence]
+when_to_use: 用户想练习或要做题、提交了对最近练习的作答、要求讲评错题或要同考点的变式题，以及每日小测触发时
+allowed_tools: [search_materials, list_materials, concept_search, get_archive, emit_evidence, artifact_read, artifact_append, history_read, web_search, web_fetch]
+examples: 出三道题考考我 | 我觉得答案是 B | 讲讲我刚才那道题为什么错
 ---
 （正文：操作规程）
 ```
 
-正文统一按五段结构写：**目标 → 步骤 → 输出格式 → 边界（明确不该做什么）→ 一个精简示例**。正文控制在 500–1500 字；更长的参考材料（如评分细则表）放 Skill 同目录附属文件，正文里给出相对路径，激活后由受限 `skill_resource_read` 按需读取——该工具只能读取当前 Skill 不可变版本内已校验的文件，不能访问任意路径。
+正文统一按五段结构写：**目标 → 步骤 → 输出格式 → 边界（明确不该做什么）→ 一个精简示例**。正文控制在 500–1500 字。附属参考材料随规程一起注入，没有按需读取：导入时把整份 Skill 压成单份文本（`SKILL.md` 打头，其余 UTF-8 文本文件按相对路径追加），合起来受 64 KiB 限制。
 
 `when_to_use` 是路由准确率的决定因素，写法要求：描述**触发场景**（用户会说什么话、什么系统事件发生），不描述能力本身。反例："出题技能，可以生成各种题型"；正例：如上 frontmatter 所示。每个 skill 的 when_to_use 需与冒烟集中的路由用例一一对应。
 
-### 7.3 内建能力与两个核心 skill
+### 7.3 内建能力与内置 skill
 
 | 类型 | 能力 | 关键规程 |
 | --- | --- | --- |
 | 内建 | Tutor | 回答课程事实前先取证据；引用教材页码；证据不足时明确区分教材结论与通用知识 |
 | 内建 | 规划 | 用户要求制定或调整计划时直接调用 `plan_read / plan_update`；输出严格遵循 `plan_v1`（里程碑 → 每日条目）；重排只改未来条目，每条关联 `concept_id`；日期、版本和历史保护由计划服务再次校验 |
 | 内建 | 图片点评 | 附件处理层先生成 `VisionTranscriptionV1`；主 Agent 先展示完整转录并标注不确定处，待用户确认后再点评；图片是练习作答时激活 `practice`，未确认内容不得触发 `emit_evidence` |
+| 内建 | 知识页导航 | 知识页目录常驻系统提示；问整体结构、学习顺序或要并起好几节才答得全时读两到四页，问具体定义、数字、公式时不读（见 §8.4） |
 | Skill | `practice` 练习 | 根据用户消息、会话历史和最近 artifact 自主判断出题/评分/讲评/变式题；不使用阶段状态机；出题前取教材证据和弱项；答案与 rubric 可写入模型私有 artifact，用户提交前不得展示；评分后再产生概念证据事件 |
-| Skill | `wiki_curator` 维护 | 增量更新而非重写整页；用户手工编辑的段落不覆盖；掌握度区块是状态层渲染的，禁止手写；每次写入附来源事件 id |
+| Skill | `research` 联网查证 | 教材外的内容才联网；网络结论与教材结论分开写，必须给来源链接 |
+| Skill | `mistake_review` 错题复盘 | 读学习档案定位弱项与错题，区分概念错与计算错，给针对性讲解 |
+| Skill | `flashcards` 学习卡片 | 把教材内容做成可反复看的卡片，用 `note_write` 落成课程笔记 |
+| Skill | `diagram` 图解 | 用 mermaid 画流程图、思维导图、时序图讲清结构与流程 |
 
 ### 7.4 Practice Skill 数据约定（非代码状态机）
 
@@ -425,50 +430,100 @@ trace 的每个 skill span 记录 SKILL.md 的 git hash → judge 抽检评分�
 
 这些保障的必要性有实测支撑：只靠提示词时冒烟用例通过率约 2/3，逐层补齐后到 8/9。剩余不稳定项（变式题落 artifact）在不同运行间摆动，作为已知的可靠性上限记录在案，不做第四层侵入式兜底。
 
-## 8. 记忆与 Wiki 体系
+## 8. 记忆与知识页体系
 
-定性记忆采用主流的 markdown 文件方案，与定量状态严格分工：
+定性记忆采用主流的 markdown 文件方案，与定量状态严格分工。每个用户一份工作区目录，隔离靠目录不靠 `WHERE owner_id`：
 
 ```
-data/
-├─ coursepilot.db                 # 定量：事件流、会话、计划、调度
-├─ user.md                        # 全局用户画像（跨课程）
-├─ skills/<skill_id>/<version>/   # 用户导入的只读 prompt/reference 文件
-├─ courses/
-│  └─ <course>/
-│     ├─ memory.md                # 该课程的情景记忆
-│     ├─ wiki/*.md                # 课程 wiki
-│     └─ index/                   # FAISS + BM25 索引
+data/users/<user_id>/
+├─ coursepilot.db              # 定量：事件流、会话、计划、分块、概念
+├─ user.md                     # 全局用户画像（跨课程）
+├─ courses/<course>/memory.md  # 该课程的情景记忆
+├─ materials/                  # 教材原件，落盘用生成的文件名
+├─ notes/<course>/*.md         # Agent 用 note_write 整理的课程笔记
+├─ wiki/<course>/*.md          # 课程知识页
 └─ traces/*.jsonl
 ```
 
 - **user.md**：学习习惯、偏好（讲解详略、语言风格）、长期目标。跨课程生效，每轮注入。
 - **courses/\<course\>/memory.md**：课程级情景记忆——学到哪一章、遗留问题、和用户的约定（"下次从习题 5.3 开始"）。仅当前课程注入，"有记忆的开场"直接由它驱动。
-- **维护方式**：会话结束或发生重要节点时，Agent 通过 `memory_patch` 工具增量更新受管区块；文件与 wiki 同属一个 git 仓库，每次更新即 commit，可 diff 可回滚。
+- **维护方式**：出现值得长期记住的事实时，Agent 通过 `memory_patch` 增量更新受管区块（`<!-- agent:managed:<section> -->` 之间）。marker 以外是用户自己写的，自动更新不碰。用户也可以在界面上整份改写。
 - **分工红线**：掌握度数值、错题记录、复习排期永远不写入 markdown（memory.md 里可以写"链式法则还没掌握"这类叙述，但判断依据在事件流里）。SQLite 可以存会话原文和练习 artifact，但它们不作为画像叙事的可编辑真源。查询定量状态用 `archive_query`，读取记忆直接随上下文注入。
 
-这一设计吸收了 Hermes（MEMORY.md/USER.md 文件记忆）的形态，但用两条改进规避其缺陷：git 版本化解决"覆写不可审计"，定量/定性分工解决"LLM 覆写污染关键数值"。
+这一设计吸收了 Hermes（MEMORY.md/USER.md 文件记忆）的形态，用定量/定性分工规避它"LLM 覆写污染关键数值"的缺陷。markdown 层不引入 git：受管区块 marker 已经把"哪些字归 Agent、哪些字归用户"划清了，为版本历史再拖一个 GitPython 依赖和一把 repo 级锁不划算。
 
-### 8.1 概念目录与可选 Wiki 构建
+### 8.1 两条流水线与概念目录
 
-概念目录是证据归因的基础，不等于 Wiki 功能。每次教材完成 RAG 索引后都运行一次轻量、可重放的概念目录任务：
+教材上传后跑的是两条独立的流水线，它们共享前半段的文本准备：
 
-1. 从目录、标题层级、粗体和索引页提取概念候选。
-2. 合并同义词，产生稳定 `concept_id`、标准名称、别名、章节与教材引用。
-3. 写入 SQLite `concepts / concept_aliases`，不自动生成 Wiki 页面。
-4. 新增教材时用新候选与旧概念做 diff；默认不改变已有 `concept_id`。合并或拆分概念必须经管理页确认。
+```text
+提取（PDF/Word/PPT/TXT，扫描件走 OCR）→ 切块 → 写 chunks 表
+                    ├──→ 检索索引：向量化 + FTS 索引
+                    └──→ 目录结构：概念候选 + parent_id / level / ordinal
+```
 
-课程字段 `wiki_enabled` 默认 `false`。教材上传和 RAG 建索引不受影响；用户在课程设置打开 Wiki 后，仍需对某本教材点击“解析到 Wiki”，才创建独立 `wiki_build_job`。任务先展示预计页数/概念数，后台生成草稿并逐页提交；失败、取消或重试都不回滚已完成的 RAG 索引。
+**拆开的理由是变更代价不同。** 向量化属于检索，概念层级属于结构；绑在一起意味着"改一条概念抽取规则要把 813 页教材重新向量化一遍"。切块的产物两边都要用，所以留在共享段。
 
-`emit_evidence` 优先接受 `concepts` 表内的 ID。无法归因时写入 `concept_id=NULL / attribution_status=unattributed / topic_hint`，不更新掌握度；管理页按高频 topic 聚合，用户补录或映射概念后写一条 re-attribution 事件。Wiki 页只是概念的人类可读投影，不反过来充当概念 ID 真源。
+- **检索索引**是 `jobs` 表里的后台作业（`type='index'`），阶段走 `extracting → chunking → embedding → indexing`，进度上报到界面。
+- **目录结构**只读已落库的 `chunks` 正文（有书签的 PDF 直接读文件目录），亚秒级跑完，因此做成同步接口 `POST /materials/{id}/structure`，不进 `jobs` 表——`jobs.type` 的 CHECK 只有 `index` 和 `wiki`，SQLite 改不了 CHECK。
+- 上传时两条依次跑完才把作业记成完成：界面靠这一下刷新概念目录，早一步就会显示上一版。结构解析失败只记 warning，不把已完成的检索索引一起拖垮——它随时可以单独重算，检索却要重跑向量化。
 
-### 8.2 Wiki 写入规则
+#### 概念目录与层级
 
-- `wiki_curator` 只在获得新的课程内容事实、经用户确认的纠错，或用户明确要求整理时写 Wiki。普通提问、单次答错和掌握度变化不改写正文。
-- 页面 frontmatter 保存 `concept_id / source_refs / schema_version`。Agent 管理区块使用显式 marker，用户手工区块不被自动覆盖。
-- 写入前传入 `expected_git_head`；如果用户在 Agent 生成期间已修改页面，工具返回 `conflict` 并要求重读，不强制覆盖。
-- 掌握度、复习日期和错题数量在请求 Wiki 页时由服务端动态渲染，不写入 Markdown 和 git 历史。
-- `wiki_enabled=false` 时隐藏 `wiki_read / wiki_patch / wiki_curator`，Tutor 只使用 RAG；关闭开关不删除既有页面，重新开启后继续使用。
+概念目录是证据归因的 ID 真源，纯规则抽取、不调模型，所以同一份教材每次重建结果相同。
+
+1. 有目录书签的 PDF 用书签（`pdf_outline` → `from_outline`），剥掉章节编号、滤掉前言目录索引这类非概念标题。没有书签就从正文刮候选：标题层级与 `**强调**`、`「」`，剔除跨页页眉、公式碎片和 PDF 提取乱码。**无书签是主路径而不是兜底**——讲义、扫描件与很多真实教材都没有书签，两条路同等对待，质量差距由界面上的"有无目录层级"如实呈现。
+2. `concept_id = sha1(course_id + casefold(name))`，同名概念在同一课程里永远是同一个 id，重放与增量索引都不改动它。只差大小写的候选（`Attention` / `attention`）合成一个。
+3. 写入 `concepts`，条数上限 `CONCEPT_LIMIT = 500`。截断浅层优先，砍掉的是最细的小节；它们的内容由更粗的上级概念覆盖，不会消失。
+4. `parent_id / level / ordinal` 三列记录教材目录的树形结构。`level` 是所得树里的深度而不是书签的原始层级——祖先被过滤掉时两者会差一层，按树深度算父子关系与缩进才对得上。`ordinal` 是教材里的先后，不能靠 rowid：upsert 保留旧行，同一份教材改版重索引后 rowid 顺序还停在上一版，而知识页按目录顺序切段会整段切错。
+5. 同名概念只挂一处，留最浅的那处（并列时留最先出现的）。其余位置不建节点，它们的子节点改挂最近的存活祖先，不会凭空多出一层。
+
+**重建目录结构是破坏性操作，必须先预告。** 概念被删会连带删掉它的掌握度与错题记录，所以 `POST /materials/{id}/structure/preview` 先只读地算一遍：新增几个、保留几个、删除几个，删掉的里面有多少挂着掌握度或错题（"删掉不可恢复"），以及这次能不能解析出层级。预告与执行共用同一份候选和同一套判据，报出的数字就是真正会发生的事。抽取为空时重建是空操作，预告也照这个口径说，不把"抽取失败"读成"这本教材的概念都没了"。
+
+`emit_evidence` 只接受 `concepts` 表内的 ID。无法归因时写入 `concept_id=NULL / attribution_status=unattributed / topic_hint`，不更新掌握度；档案页按 topic 聚合展示这一队列。知识页只是概念的人类可读投影，不反过来充当概念 ID 真源。
+
+### 8.2 Course Wiki：按教材目录自底向上全量遍历
+
+课程字段 `wiki_enabled` 默认 `false`，打开后仍需对某本已索引的教材显式点"生成知识页"，创建 `type='wiki'` 的作业。失败、取消或重试都不回滚已完成的检索索引。
+
+**构建路径上没有检索。** 早先的做法是拿概念名去检索 6 条证据来写一页——一个概念在十处讲了也只看得到六条，知识页于是完整继承了 RAG 的召回缺陷。现在按教材自己的目录切成一棵 Section 树，自底向上写：
+
+| 页类型 | 读什么 | 出处 |
+| --- | --- | --- |
+| 叶子页 | 它那一节页码区间内的**全部原文**（`MAX_EVIDENCE_CHARS = 6000` 字，超了按分片顺序再切一层，不截断） | 教材页码 `[p.12]` |
+| 中间页 | 它各个子页**已经写好的正文**，讲清子小节之间的关系 | 子页名，明令不许标页码——它读的不是原文，页码无从核对 |
+| 课程首页 `index.md` | 全部顶层页正文；末尾附的页面目录由落盘清单拼出，不过模型，所以列不出不存在的页 | 顶层页名 |
+
+没有可用目录（无书签、或一页页码都取不到）时按分片顺序切成等大的段，段名让模型读完自己起。
+
+**"不漏"是这条改造的全部意义**，三处设计都服务于它：
+
+- 页码区间由目录顺序推出，首个子节点从父节点起算（章节导语在它之前），最后一节以总页数兜底，区间结尾多带一页（书签指的是标题所在页，跨页标题会指到上一页）。目录里页码倒退时把终点夹到起点，那一节至少读得到自己那一页。落不到任何区间的分片（提取不出页号）按 ordinal 就近补给叶子。
+- **节点上限只让页变大，不让内容消失。** `WIKI_MAX_NODES = 300` 是跑飞的兜底，不是目标值：有目录时 BFS 截断砍掉的是最深的那批，它们的页码区间被上级页接过去；无目录时把段合并到刚好装得下，而不是丢掉尾巴。教材自己的结构在这条线以下就照它来——把作者分好的小节并成更少的页，只会让每页要概括的原文成倍上涨。成本交给构建前的账单让用户判断，不靠压小上限来省。
+- **判据落在分片上，不落在页码上。** 页码粒度太粗：几段各查几页就能凑满整本书，漏的是页里的分片。旧实现在页码判据下是全绿的，实际每份教材只读到了一半分片。回归测试因此断言"每个分片都被某一节读到"，并在真实教材上按 2 / 4 / 7 / 50 几档节点上限各跑一遍。
+
+其余三条硬约束：**只用教材原文**（写不出来就少写一条，不许拿通用知识补）、**增量刷新**（证据指纹 `source_hash` 没变就跳过，省 token 也省得每次生成一个不一样的版本）、**手写区不动**（`HANDWRITTEN_MARKER` 以下归用户，重新生成只换上半部分）。页面 frontmatter 记 `concept_id / material_id / parent_id / level / order / source_hash / prompt_version / source_refs`；掌握度不写进文件，读页时现算才不会过期。
+
+构建前后都要把覆盖率说出来：`GET /materials/{id}/wiki/estimate` 离线跑一次切段，报预计页数、模型调用次数和耗时（实测约 5 秒一页）；作业结束时回一行 `wiki_coverage concepts=… pages=… written=… skipped=… merged=… dropped=… empty=… pruned=…`，界面按字段渲染。静默截断读起来像"这本书就这些"。
+
+### 8.3 知识页是第三类可引用来源
+
+知识页正文写进 `chunks` 表（`source_kind='wiki'`，另带 `concept_id / concept_name`，无页码），整课替换。挂在 `chunks` 上是为了让删教材、删课程那两条既有的清理链路照样收走它们。
+
+- **一次种子检索同时覆盖两边，名额固定：教材 6 条 + 知识页 2 条**，各按自己那一路排序，不做统一排序也不做路由。不合排的理由：知识页用概括的语言写、提问也常是概括的语言，放进同一个列表比相似度它会占便宜，把教材原文挤出去，结果是照着转述回答。固定名额也意味着调整知识页那一路的阈值不会挤占教材席位。
+- 教材那一路的检索必须带 `source_kind='chunk'` 过滤，词面、向量、FTS 三条路都要带。漏一条，知识页构建就会把自己上一轮的输出当成教材证据读回来，分片覆盖立刻掉下去。
+- `CitationRegistry` 里三类来源共用一套编号，`kind` 区分：教材按 chunk 去重、知识页按 `concept_id` 去重、网页按 URL 去重。`wiki_read` 读到的页和检索命中的同一页是同一条来源，不编两个号。
+- **知识页是转述，没有页码，界面必须让用户一眼看出来。** 教材引用是深色带页码，知识页是灰色标「知识页 · 概念名」，网络是蓝色链接。要教材出处就回 `search_materials` 查原文，用那一次返回的编号。这句话既写在工具描述里，也写在返回正文的头部——只写在描述里的话，模型读完长正文就只记得内容，转头把它当成有页码的教材证据。
+- 知识页正文单开一个上下文分段 `context.segment.wiki_evidence` 上报，不并进"教材证据"那一行：把转述算进教材证据会让用户读错那一行。
+
+### 8.4 知识页目录常驻系统提示
+
+知识页只靠模型主动去取时，实测 20 个样本轮次里只有 2 次进过。所以把目录（`concept_id | 概念名`，上限 60 条）直接注入系统提示，摆在教材清单之后，随之给出"什么时候该读知识页"的规则；`wiki_index` 退化成注入上限之外才用的补充工具。
+
+- 位置比措辞更要紧：明说"分成哪几块"的问句改前就有 17/24 会读知识页，而"没明说全貌、但要把好几节并起来才答得全"的那类只有 5/24。前置并写硬后，两类分别到 23/24 和 17/24，单点问答没有过度触发（1/32 → 2/32）。
+- 措辞里留了两条约束，都是踩过的坑：目录一摆出来模型想整份读完（单轮 `wiki_read` 26 次、预算 10、后面全是空转），所以明写"挑两到四页"；`concept_id` 摆进提示词会被抄进回答，所以明写"id 只用于调工具，回答里只说概念名"。
+- 目录进的是 knowledge 分区，超限时最先减的就是它——少列的页用 `wiki_index` 补得回来。实测 20 页课占 660 token、60 页封顶 1271。
+- 课程没开知识页时，目录段与 `wiki_index / wiki_read` 一起撤下，共用 `wiki_entries` 这一个判据，不会各撤各的。推荐读不到的东西，模型会口头答应去读而实际读不到。
 
 ## 9. 工具系统
 
@@ -483,7 +538,7 @@ data/
 ```text
 ToolRegistry
   -> capability health filter       # provider、依赖和 feature flag 是否可用
-  -> AgentProfile filter            # main / practice / wiki / research-judge
+  -> AgentProfile filter            # main / 各内置 skill / 用户导入 skill
   -> CoursePolicy filter            # 当前课程和渠道允许什么
   -> ToolProjection                 # 只把最终可见工具 schema 发给模型
 
@@ -505,19 +560,23 @@ model tool call
 
 | Agent profile | 可见工具 | 说明 |
 | --- | --- | --- |
-| 主 Agent（无前台 skill） | `rag_search`、`wiki_read`、`concept_search`、`archive_query`、`plan_read`、`history_read`、`memory_patch`、`emit_evidence`、`plan_update`、`use_skill` | 覆盖讲解、规划、档案维护和能力加载；Wiki 关闭时自动移除 Wiki 工具 |
-| `practice` profile | `rag_search`、`wiki_read`、`concept_search`、`archive_query`、`skill_resource_read`、`history_read`、`emit_evidence`、`artifact_read`、`artifact_append` | 使用通用 artifact 保存必要事实与私有 answer key；看不到计划与 Wiki 写工具 |
-| `wiki_curator` profile | `rag_search`、`wiki_read`、`concept_search`、`wiki_patch` | 对 Agent 管理区块做带 `expected_git_head` 的增量 patch；看不到学习档案、计划和练习写工具 |
-| 用户 Skill | 其 frontmatter 请求集合与 policy 的交集，另可使用受限 `skill_resource_read` | 默认关闭；不能获得 Shell、任意文件、数据库、调度、渠道发送或未注册工具 |
-| Research subagent | `web_search`、`web_fetch` | 与主会话隔离；结果视为不可信外部数据，必须带来源 |
+| 主 Agent（无前台 skill） | `search_materials`、`list_materials`、`concept_search`、`wiki_index`、`wiki_read`、`get_plan`、`plan_update`、`get_archive`、`history_read`、`note_read`、`note_write`、`memory_patch`、`emit_evidence`、`calculator`、`web_search`、`web_fetch`、`use_skill`、`ask_user` | 覆盖讲解、规划、档案维护和能力加载 |
+| `practice` profile | `search_materials`、`list_materials`、`concept_search`、`get_archive`、`history_read`、`web_search`、`web_fetch`、`emit_evidence`、`artifact_read`、`artifact_append`（+ 基座工具） | 使用通用 artifact 保存必要事实与私有 answer key；看不到计划与笔记写工具 |
+| 其余内置 skill | 各自 frontmatter 声明的集合（+ 基座工具） | `research` 加联网、`mistake_review` 加档案读、`flashcards` / `diagram` 加笔记读写 |
+| 用户 Skill | 其 frontmatter 请求集合与白名单的交集 | 默认关闭；`memory_patch` / `plan_update` / `use_skill` 一律不授予，也不能获得 Shell、任意文件、数据库、调度或未注册工具 |
+| Research subagent | `web_search`、`web_fetch` | 与主会话隔离；结果视为不可信外部数据，必须带来源。尚未实现 |
+
+工具名里 `search_materials / get_plan / get_archive` 分别对应本文其他章节使用的历史名 `rag_search / plan_read / archive_query`。
 
 skill 激活时切换到其完整 profile，而不是在默认工具上做无限并集；退出该轮后恢复主 Agent profile。这与对话阶段无关，只是当轮最小权限。
+
+课程没开知识页时 `wiki_index / wiki_read` 整体不下发，且系统提示里的知识页目录同时撤下。这一摘发生在工具集这一层而不是能力这一层——它们和 `search_materials` 同属 `read_course`，按能力摘会把整档一起摘掉；摘在工具集上，schema 下发与运行期准入读的才是同一份名单。`wiki_read` 的每轮额度给到 10 次：一页正文只有几百字，看全貌就是要连读好几页，这个数是防它把几十页索引一路读完，不是配给。
 
 `history_read` 是只读工具：跨轮历史按 role 投影，工具正文从不进入下一轮，模型要看早先某轮检索到什么就得回捞。它一次最多回看 5 轮、6000 字符，每轮 3 次额度，只回放当前课程轮次的工具痕迹与引用原文，不碰模型私有 artifact（那里存着答案）。
 
 `memory_patch` 与 `ask_user` 是基座工具，每份 profile 都补上，不由各 skill 自己声明：整体替换意味着不兜住就会在 skill 激活后消失，而「记下值得长期记住的事」和「把选项摆给用户挑」在任何规程执行期间都可能需要，两者又都不碰课程数据。`ask_user` 只把选项挂到本轮消息上就收住，用户点击等于发一条新的用户消息，不占住当前 turn 等人。
 
-不向模型暴露通用 Shell、任意文件路径、SQLite、Git、`schedule_job` 或 `send_to_channel`。Git commit、调度 tick 和渠道发送由确定性服务执行。图片点评也不注册模型工具：附件处理器把 `VisionTranscriptionV1` 作为结构化上下文交给主 Agent。
+不向模型暴露通用 Shell、任意文件路径、SQLite、`schedule_job` 或 `send_to_channel`。知识页构建、调度 tick 和渠道发送由确定性服务执行。图片点评也不注册模型工具：附件处理器把 `VisionTranscriptionV1` 作为结构化上下文交给主 Agent。
 
 ### 9.3 注册合约与调用上下文
 
@@ -554,15 +613,15 @@ class ToolCallContext:
 
 `ToolPolicy` 使用显式规则而非在 handler 内散落 `if`。规则匹配 `tool name + side_effect + trigger + active_skill + arguments + course boundary`，输出 `allow / confirm / deny` 和稳定 reason code；高优先级 deny 永远不能被低优先级 allow 覆盖。
 
-“用户明确要求”只认当前已持久化用户消息中的具体修改请求或计划页提交的结构化操作；系统 job、掌握度触发和含糊表达一律按推断修改处理并进入 `confirm`。`memory_patch` 是明确例外：仅能修改受管区块、使用 repo 级 Git 锁且可回滚，因此会话结束/重要节点的自动维护直接 `allow`，不弹确认。
+“用户明确要求”只认当前已持久化用户消息中的具体修改请求或计划页提交的结构化操作；系统 job、掌握度触发和含糊表达一律按推断修改处理并进入 `confirm`。`memory_patch` 是明确例外：仅能修改受管区块、文件层加进程内锁，因此会话结束/重要节点的自动维护直接 `allow`，不弹确认。
 
 | 调用类型 | 默认决策 | 例子 |
 | --- | --- | --- |
-| 当前课程只读 | `allow` | RAG、Wiki、档案和计划读取 |
+| 当前课程只读 | `allow` | 检索、知识页、档案和计划读取 |
 | 追加式、可纠错的内部记录 | `allow`，前端显示工具回执 | `emit_evidence`、通用 artifact |
 | 受限且可回滚的自动记忆维护 | `allow` | `memory_patch` 仅修改 Agent 管理区块 |
 | 用户本轮明确要求的可回滚修改 | `allow`，成功回执必须包含 diff | “把考试计划延后一周”触发的 `plan_update` |
-| Agent 自己推断出的计划/Wiki 修改 | `confirm` | 因一次答错而想重排计划；未经明确要求整理 Wiki |
+| Agent 自己推断出的计划修改 | `confirm` | 因一次答错而想重排计划 |
 | 外部发送、跨课程、伪造概念 ID、越权 skill | `deny` | 主 Agent 直接发 IM、写另一课程、提交不存在的非空 `concept_id` |
 
 无法可靠归因时允许提交 `concept_id=null + topic_hint`，事件进入未归因队列且不更新掌握度；这不等于允许模型编造概念 ID。
@@ -572,9 +631,9 @@ class ToolCallContext:
 ### 9.5 写入、结果与并发合约
 
 - `plan_update` 必须携带 `expected_plan_version`，先生成结构化 diff，再校验 `plan_v1`、日期、概念 ID 和“历史条目不可修改”；成功后只提交新版本，调度 tick 会自然读取当前有效的未来条目，不维护逐条 job。
-- `wiki_patch` 必须携带 `expected_git_head` 和区块级 operation；`memory_patch` 只能修改受管 section。冲突返回 `version_conflict`，要求重读后重算，不做 last-write-wins。
+- `memory_patch` 只能修改受管 section，marker 以外的用户手写内容不动。知识页没有模型可调的写工具：正文由 §8.2 的构建流水线整页替换，手写区始终保留。
 - 写工具的幂等键由服务端计算为 `request_id + tool_name + canonical_args_hash`。重试命中已成功审计记录时返回原 `effects`，不重复写入。
-- 同一轮 `side_effect=none` 的读工具可并发；写工具按模型输出顺序串行。SQLite 资源按 `course_id + resource_type` 加锁；所有 GitPython add/commit/revert 使用进程内 **repo 级全局锁**，避免不同课程争抢 `.git/index.lock`。取消、超时或流中断后不得自动重放已开始的非幂等写入。
+- 同一轮 `side_effect=none` 的读工具可并发；写工具按模型输出顺序串行。SQLite 资源按 `course_id + resource_type` 加锁。取消、超时或流中断后不得自动重放已开始的非幂等写入。
 - 所有工具统一返回下列 envelope，模型不从异常字符串猜测执行结果：
 
 ```json
@@ -587,7 +646,7 @@ class ToolCallContext:
 }
 ```
 
-失败时 `error` 至少包含 `code / retryable / repair_hint`。工具输出统一标记为 `untrusted_data`；教材、Wiki、OCR 或网页里的命令性文字不能改变系统提示、可见工具或 policy。
+失败时 `error` 至少包含 `code / retryable / repair_hint`。工具输出统一标记为 `untrusted_data`；教材、知识页、OCR 或网页里的命令性文字不能改变系统提示、可见工具或 policy。
 
 ### 9.6 可观测性与验收
 
@@ -597,12 +656,13 @@ class ToolCallContext:
 
 ## 10. 存储层
 
-SQLite 单文件（`data/coursepilot.db`，WAL），核心表：
+SQLite 单文件（`data/users/<user_id>/coursepilot.db`，WAL），核心表：
 
 | 表 | 性质 | 说明 |
 | --- | --- | --- |
-| `courses` / `concepts` / `concept_aliases` | 可变 | 课程工作区和稳定概念 ID；课程含 `wiki_enabled=false` 开关 |
-| `materials` / `index_jobs` / `wiki_build_jobs` | 可变 / append-oriented | 教材元数据、RAG 索引任务与用户显式触发的 Wiki 解析任务；两类任务互不依赖 |
+| `courses` / `concepts` / `concept_aliases` | 可变 | 课程工作区和稳定概念 ID；课程含 `wiki_enabled=false` 开关；概念带 `parent_id / level / ordinal` 三列还原教材目录树 |
+| `materials` / `jobs` | 可变 / append-oriented | 教材元数据与后台作业；`jobs.type` 只有 `index`（检索索引）与 `wiki`（知识页构建），目录结构解析是同步接口不入表 |
+| `chunks` / `chunks_fts` | 可变 | 教材切块与知识页正文共用一张表，`source_kind` 区分（`chunk` / `wiki`）；FTS 只索引教材原文，知识页页数以十计走 LIKE 兜底 |
 | `sessions` | 可变 | `scope_mode=general/course`；course 必须有不可变 `course_id`，general 必须为空；`last_resolved_course_id` 仅作列表投影；另含 `kind=user/system` |
 | `turn_course_context` | append-only | 每个 turn 唯一的 `resolved/ambiguous/unresolved` 结果、课程、resolver version 与理由；是本轮工具 scope 真源 |
 | `turn_requests` | append-oriented | `request_id`、`session_id`、`client_request_id`、`running / completed / failed` 与执行结果；`(session_id, client_request_id)` 唯一 |
@@ -618,10 +678,11 @@ SQLite 单文件（`data/coursepilot.db`，WAL），核心表：
 | `tool_audits` | append-only | 工具可见性、policy、审批、幂等与执行审计 |
 
 - **SQLite 事务**：证据事件写入与当前 mastery / review_queue 投影更新在同一事务内完成；投影失败则整体回滚。所有表由显式 schema migration 管理，不在运行时隐式改表。
-- **连接与并发**：启动时固定设置 `journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout`。Store 层串行化短写事务，读请求可并发。每个 session 同时只执行一个 turn；用户 session 与课程隐藏 system session 使用独立锁。所有 Git 写操作另受 repo 级全局锁保护。
-- **Markdown 层**（user.md、memory.md、wiki）：git 管理，写入工具带 expected head 做乐观并发控制。掌握度在读页时动态渲染，不回写 Wiki Markdown。
-- **回滚与纠错**：定量状态不物理截断正式事件流；写入 `correction / supersede` 事件后重放。调试可按任意 seq 做只读投影。Markdown 使用 git revert。
-- **Trace**：`data/traces/<date>.jsonl`，每 span 一行。
+- **连接与并发**：启动时固定设置 `journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout`。Store 层串行化短写事务，读请求可并发。每个 session 同时只执行一个 turn；用户 session 与课程隐藏 system session 使用独立锁。
+- **迁移**：编号迁移之外，增删列走按 `PRAGMA` 对账的 `ADDED_COLUMNS`。`ALTER` 没有 `IF EXISTS`，写成编号迁移的话同一批里后面一句失败会让版本号没落库，下次重跑必撞 duplicate column，工作区就再也起不来；按现存结构对账则重复执行天然安全。
+- **Markdown 层**（user.md、memory.md、notes、wiki）：落盘文件，写入前校验落点仍在本课程目录内且不是符号链接。Agent 只改受管区块或整页替换，用户手写部分不动。掌握度在读页时动态渲染，不回写 markdown。
+- **回滚与纠错**：定量状态不物理截断正式事件流；写入 `correction / supersede` 事件后重放。调试可按任意 seq 做只读投影。
+- **Trace**：`data/users/<user_id>/traces/<date>.jsonl`，每 span 一行。
 
 ## 11. 学习档案服务（掌握度实现）
 
@@ -640,7 +701,8 @@ Tutor、practice 或经用户确认的图片点评输出结构化归因（概念
 - 当前展示值定义为 `mastery_score = BKT_posterior * FSRS_retention(now)`，只用于展示和排序，不作为计划重排阈值。UI 同时展示证据数和最近证据日期，不把单一百分比包装成精确测量。
 - 少于 3 个可归因客观事件的概念对外呈现“数据不足”。`user_override` 单独展示为用户标记，不伪装成多次客观答题。
 - 自动建议重排只由可解释信号触发：同一概念连续 N 次答错、FSRS 到期、计划进度明显偏离；真正写入计划仍遵循 `plan_update` 的用户确认规则。用户也可随时明确要求重排。
-- 管理页展示“未归因主题”队列，按 `topic_hint` 聚合频次。用户映射到已有/新增概念后写入 re-attribution 事件并重放投影，原事件不被覆盖。
+- 档案页展示“未归因主题”队列，按 `topic_hint` 聚合频次。把它映射回概念的补录入口还没做——映射后要写一条 re-attribution 事件再重放投影，原事件不覆盖。
+- 概念因重建目录结构而消失又被重新抽到时，`concept_id` 由课程加名字派生所以仍是同一个，但投影已经跟着上一次删除没了。这时清掉 `mistake_backfills` 的完成标记，下次读档案整门课按事件流重放一遍。
 
 ## 12. 计划与调度
 
@@ -677,10 +739,16 @@ class Channel(Protocol):
 | `POST` | `/courses` | 创建课程工作区 |
 | `PATCH` | `/courses/{course_id}` | 修改课程设置，包括默认关闭的 `wiki_enabled` |
 | `POST` | `/courses/{course_id}/materials` | 上传教材，返回 `material_id` |
-| `POST` | `/courses/{course_id}/index-jobs` | 触发 RAG 索引与概念目录构建 |
-| `POST` | `/materials/{material_id}/wiki-jobs` | 用户点击后将指定教材解析到 Wiki；Wiki 未开启时返回 `feature_disabled` |
-| `GET` | `/jobs/{job_id}` | 查询索引或 Wiki 构建任务状态与错误摘要 |
-| `POST` | `/jobs/{job_id}/cancel` | 请求取消尚未完成的后台任务；已完成步骤保留并明确返回 |
+| `POST` | `/materials/{material_id}/index` | 触发检索索引作业；完成后自动跑一次目录结构解析 |
+| `POST` | `/materials/{material_id}/ocr/estimate` · `/ocr` | 扫描版 PDF 先按两页量出 OCR 账单，用户确认后才走 OCR 重新索引 |
+| `GET` | `/courses/{course_id}/structure` | 每份教材抽到多少概念、其中多少条带层级 |
+| `POST` | `/materials/{material_id}/structure/preview` | 重建目录结构的影响预告：新增/保留/删除多少概念，多少挂着掌握度或错题。只算不写 |
+| `POST` | `/materials/{material_id}/structure` | 重算概念与层级，同步返回，不重新提取也不重新向量化 |
+| `GET` | `/courses/{course_id}/concepts` | 概念目录，按教材目录顺序，层级用 `parent_id` 表示 |
+| `GET` | `/materials/{material_id}/wiki/estimate` | 知识页构建前的账单：预计页数、模型调用次数与耗时。离线算，不调模型 |
+| `POST` | `/materials/{material_id}/wiki` | 把指定教材构建成知识页；Wiki 未开启或教材未索引时返回 `feature_disabled` / `material_not_indexed` |
+| `GET` | `/courses/{course_id}/wiki` · `/wiki/{concept_id}` | 列出知识页（带 `parent_id / level / order`）与读取单页原文 |
+| `GET` | `/jobs/{job_id}` | 查询索引或知识页构建任务的状态、阶段与错误摘要 |
 | `POST` | `/sessions` | 创建 `{scope_mode: general}` 或 `{scope_mode: course, course_id}` 会话；默认 general |
 | `GET` | `/sessions` | 按 `workspace=general|course:<id>` 可选过滤，返回课程色点与最近解析投影 |
 | `GET` | `/sessions/{session_id}/messages` | 读取原始消息与 artifact 引用 |
@@ -736,17 +804,18 @@ turn_failed       {error_code, retryable, partial_message_id?}
 
 - FastAPI 默认只监听 `127.0.0.1`，前端与 API 同源托管；CORS 不使用 `* + credentials`。如显式暴露到局域网或服务器，必须开启 Bearer/API token 校验。
 - 教材与图片按扩展名、MIME、文件头、大小和页数/像素上限校验，流式写入随机生成的内部文件名，不使用用户文件名拼路径。
-- 教材、RAG 片段、Wiki 与 OCR 转录均视为不可信内容；其中的“忽略系统指令”等文本不能改变工具权限或课程边界。ToolPolicy 只信任服务端上下文和注册的 Schema。
-- IM 渠道、LLM 和 Git 凭据只从环境变量/密钥环读取；日志过滤 `Authorization`、API Key、bot token 和带签名的图片 URL。
+- 教材、检索片段、知识页与 OCR 转录均视为不可信内容；其中的“忽略系统指令”等文本不能改变工具权限或课程边界。教材文件名与概念名会进系统提示，因此逐条压成单行、截断并加引号包裹，只能被读成数据。ToolPolicy 只信任服务端上下文和注册的 Schema。
+- IM 渠道与 LLM 凭据只从环境变量/密钥环读取；日志过滤 `Authorization`、API Key、bot token 和带签名的图片 URL。
 
 ## 15. 前端
 
 React SPA 的视觉系统、组件状态和响应式规范独立维护在 [coursepilot-2.0-frontend-design.md](./coursepilot-2.0-frontend-design.md)。本章只保留后端对前端的产品合约：
 
 1. **对话**：默认通用模式，左栏可进入课程工作区；切换工作区不修改旧会话。会话列表始终可见并以课程稳定色点标记，通用会话顶部区分“本轮解析课程”和永久绑定。
-2. **知识仓库**：全局导航名称，进入后必须明确选择课程；默认打开 RAG 资料库，完整展示上传、解析、切块、嵌入、索引和检索验证。Wiki 是同级可选 tab，默认关闭并按教材显式构建。
+2. **知识仓库**：全局导航名称，进入后必须明确选择课程。默认打开资料库，完整展示上传、解析、切块、嵌入、索引和检索验证；同级还有「目录结构」（概念数、有无层级、重建入口与影响预告）、「概念目录」（按教材目录画的可折叠树）、「课程笔记」，以及默认关闭的「知识页」tab。
 3. **计划**：日历视图 + 完成情况 + 手动调整入口。
-4. **管理**：课程/教材上传、RAG 索引、可选 Wiki 构建、概念合并与未归因队列、用户 Skill 导入/预览/启停、模型槽位能力检查、trace 查看器。OCR 未配置时显示“未启用”，不影响文本学习。
+4. **管理**：课程/教材上传、检索索引、目录结构重建、知识页构建、未归因队列、用户 Skill 导入/预览/启停、模型槽位能力检查、trace 查看器。OCR 未配置时显示“未启用”，不影响文本学习。
+5. **花钱与不可逆的动作先给账单**：OCR 按两页实测外推、知识页按切段结果报预计页数与调用次数、重建目录结构报会删掉哪些概念（其中多少挂着掌握度或错题）。用户点确认才执行。
 
 Streamlit 完全退役，不保留。
 
@@ -790,38 +859,24 @@ tokens_in, tokens_out, latency_ms, error_code, ts
 
 ```
 course-pilot/
-├─ app/                         # composition root；唯一负责装配依赖
-│  ├─ bootstrap.py
-│  └─ http/                     # FastAPI、SSE、serializer
-├─ agent/                       # 主循环、上下文投影、系统提示
-├─ modules/
-│  ├─ courses/                  # api.py / models.py / events.py / service.py / repository.py
-│  ├─ conversations/
-│  ├─ skills/
-│  ├─ artifacts/
-│  ├─ learning/
-│  ├─ planning/
-│  └─ wiki/
-├─ tools/                       # registry / projection / policy / executor / audit
-├─ infrastructure/
-│  ├─ llm/                      # openai_compatible / vision_ocr / demo adapters
-│  ├─ rag/                      # 1.0 RAG 通过 port 接入
-│  ├─ store/                    # SQLite + migrations
-│  ├─ git/
-│  ├─ scheduler/                # 单 interval tick
-│  └─ channels/im/
-├─ skills/builtin/              # practice / wiki_curator
+├─ backend/
+│  ├─ app/                      # composition root：bootstrap.py 是唯一装配点，http/ 放 FastAPI 与 SSE
+│  ├─ contracts/                # 跨层 Port 与 DTO：llm / knowledge / embedding / reranker / web
+│  ├─ core/                     # settings、SQLite store 与 migrations、身份、硬件探测
+│  ├─ adapters/                 # openai_compatible / vision_ocr / demo、BGE 向量与重排、联网
+│  └─ modules/
+│     ├─ agent/                 # 主循环、上下文投影、系统提示、工具系统、trace
+│     ├─ courses/ sessions/     # 课程工作区、会话与 Course Resolver
+│     ├─ knowledge/             # 提取、切块、检索、概念目录、知识页构建
+│     ├─ learning/ planning/    # 掌握度与错题投影、计划
+│     └─ memory/ notes/         # markdown 记忆与课程笔记
+├─ skills/builtin/              # practice / research / mistake_review / flashcards / diagram
 ├─ frontend/                    # React SPA
-├─ trace/
-├─ scripts/
-└─ tests/
-   ├─ architecture/             # import-linter、模块依赖方向
-   ├─ contract/
-   ├─ integration/
-   └─ regression/
+├─ evals/ scripts/
+└─ tests/backend/               # 含 test_module_boundaries.py：模块依赖方向的守门
 ```
 
-跨模块协作只允许三种方式：同步 port 接口、不可变 DTO、带版本 typed event。禁止模块直接读写别人的表、导入内部 service、从 handler 反向调用 HTTP 路由或共享可变全局对象。数据库可以同库，但每张表有唯一 owner；跨 owner 写入必须调用公开接口。CI 用 import-linter 和 architecture tests 固化这些边界，代码 review 必查依赖方向、事务归属、幂等和事件版本。
+跨模块协作只允许三种方式：同步 port 接口、不可变 DTO、带版本 typed event。禁止模块直接读写别人的表、导入内部 service、从 handler 反向调用 HTTP 路由或共享可变全局对象。数据库可以同库，但每张表有唯一 owner；跨 owner 写入必须调用公开接口。`tests/backend/test_module_boundaries.py` 固化这些边界，代码 review 必查依赖方向、事务归属、幂等和事件版本。
 
 ## 18. 1.0 资产迁移
 
@@ -842,9 +897,10 @@ course-pilot/
 - **练习对象歧义**：不使用硬状态机后，多份未评分练习可能让用户的简短答案存在归属歧义。缓解：注入近期 artifact、使用稳定 ID；无法唯一确定时询问用户。
 - **归因质量**：证据事件的概念归因是 LLM 输出，归因错误会写入错误概念的掌握度。缓解：归因微提示词限定概念列表 + schema 校验挡住幻觉概念 + 未归因队列 + judge 抽检。
 - **用户 Skill 的提示注入与权限膨胀**：导入内容可能要求越权调用。缓解：只允许 prompt-only 文件、权限取交集、默认禁用、版本预览；系统提示与 ToolPolicy 优先级不可覆盖。
-- **Wiki 构建质量不稳定**：自动生成页面可能重复或错链。缓解：默认关闭、按教材显式触发、独立 job、可预览/回滚，不影响 RAG 主链路。
+- **知识页的收益还没测出来**：A/B 只差"课程有没有知识页"时，引用召回逐条一致。逐页核对过内容与页码都对，问题在链条：这一维量的是引用，而模型不主动去取时知识页产生不了引用。已做的两件事是把目录常驻系统提示（调用率不再是瓶颈）和让知识页可引用（§8.3）；还缺一个直接判"远处那个事实有没有出现在回答里"的判据。
+- **知识页的检索阈值没有单独标定**：`rag_min_rerank_score` 是按教材片段标定的，现在也在管概括语言写成的知识页。固定名额意味着调低它不会挤占教材席位，代价只是多一页不相关的，但该调到多少还没测过。
 - **IM 渠道联调**：首版唯一外部渠道，卡片回调、长连接重连和幂等回执仍需真实环境验证；其他渠道不占首版工期。
-- **前端从 Streamlit 换 React 的工作量**：四个页面中 wiki 与计划视图是新增工作量的主体，可按"对话 → 管理 → wiki → 计划"顺序分批交付。
+- **前端从 Streamlit 换 React 的工作量**：四个页面中知识仓库与计划视图是新增工作量的主体，可按"对话 → 管理 → 知识仓库 → 计划"顺序分批交付。
 - **OCR 不阻塞主线**：视觉槽位未配置时禁用图片入口，文本学习、练习和计划正常工作。后续选型以真实手写公式样本评测为准。
 
 ## 20. 建议实施顺序
@@ -856,7 +912,7 @@ course-pilot/
 3. **Super Agent + Tutor**：新主循环、读时上下文、Tutor 证据合约、新工具系统接管 `rag_search`。通过特性开关与 1.0 learn baseline 对比。
 4. **Practice skill**：引入通用 artifact 读写与 `practice` SKILL.md，覆盖文本出题、作答、评分、讲评、变式题和对象歧义；不增加阶段状态机，再退役 QuizMaster / Grader 旧链路。
 5. **学习档案**：完成 EvidenceEvent、未归因队列、BKT/FSRS 投影与 replay；掌握度只消费已归因事件。
-6. **可选 Wiki**：实现课程开关、按教材触发的 `wiki_build_job`、页面预览/回滚和读时掌握度渲染；关闭时不影响 RAG、Tutor 与练习。
+6. **可选知识页**：实现课程开关、按教材触发的构建作业、目录自底向上全量遍历、构建前账单与覆盖率回报，再让它成为可引用的来源；关闭时不影响检索、Tutor 与练习。
 7. **主动化与 IM 渠道**：实现内建规划规则、`plan_read / plan_update`、版本化 plan item、单调度 tick、隐藏 system session 与 Web 通知；本地幂等和补投稳定后接 IM 渠道。其他渠道仅保留协议。
 8. **OCR（可选）**：实现视觉槽位、attachment API、`VisionTranscriptionV1` 预处理和系统提示中的图片确认规则；未配置时不影响前七步交付。
 
