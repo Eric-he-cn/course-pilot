@@ -429,6 +429,83 @@ def test_empty_answer_from_length_is_reported_as_truncated():
     assert caught.value.code == "output_truncated"
 
 
+# ---- finish_reason 与 reasoning 字段名：原样带出来，供开发者模式显示 ----
+
+def test_the_provider_finish_reason_is_carried_out_of_a_tool_call_response():
+    """工具调用轮也有 finish_reason（厂商一般给 tool_calls），而 ChatToolCalls
+    原来一个字都没带出来，开发者模式看不见这一轮是怎么收的。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "search_materials", "arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))
+
+    calls = items[-1]
+    assert isinstance(calls, ChatToolCalls)
+    assert calls.provider_finish_reason == "tool_calls"
+
+
+def test_a_provider_that_never_sends_finish_reason_leaves_it_null():
+    """取不到就报 null，不许编一个。上报给客户端的 finish_reason 仍然兜底成 stop——
+    两个字段各管一件事，混成一个就分不出「厂商说 stop」和「厂商没说」。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse({"choices": [{"delta": {"content": "好"}}]}))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        final = list(_adapter(client).chat(messages=_messages()))[-1]
+
+    assert isinstance(final, ChatFinal)
+    assert final.provider_finish_reason is None
+    assert final.finish_reason == "stop"
+
+
+def test_a_truncated_answer_keeps_the_provider_length_verbatim():
+    """厂商说 length 就记 length，不归一化成别的说法。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"content": "先求外层，"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        final = list(_adapter(client).chat(messages=_messages()))[-1]
+
+    assert isinstance(final, ChatFinal)
+    assert final.provider_finish_reason == "length"
+    assert final.finish_reason == "length"
+
+
+def test_the_reasoning_field_name_is_the_one_the_provider_actually_used():
+    """思考内容的字段名不统一：DeepSeek 系用 reasoning_content，另一些服务用 reasoning。
+    开发者模式要显示我们实际收到的那个名字。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"reasoning": "先看看教材"}}]},
+            {"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages()))
+
+    assert [item.field for item in items if isinstance(item, ChatReasoning)] == ["reasoning"]
+
+
+def test_the_deepseek_reasoning_field_name_is_reported_as_such():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            {"choices": [{"delta": {"reasoning_content": "先看看教材"}}]},
+            {"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]},
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages()))
+
+    assert [item.field for item in items if isinstance(item, ChatReasoning)] == ["reasoning_content"]
+
+
 def test_error_detail_recognizes_top_level_shapes():
     """vLLM / FastAPI 系服务的错误不在 error.message 里，而是顶层 detail 或 message。"""
     def handler(request: httpx.Request) -> httpx.Response:

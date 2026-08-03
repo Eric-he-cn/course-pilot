@@ -32,8 +32,9 @@ _CARRIED = frozenset({
 })
 _SPAN_FIELDS = ("round", "origin", "name", "ok", "summary", "summary_key", "summary_args",
                 "duration_ms", "decision", "reason", "reused")
-_STEP_FIELDS = ("round", "injected", "outcome", "calls", "reasoning", "reasoning_chars",
-                "text", "text_chars")
+# finish_reason 是厂商原样返回的，outcome 是服务端自己的判断。两者含义不同，都要带出来。
+_STEP_FIELDS = ("round", "injected", "outcome", "finish_reason", "reasoning_field", "calls",
+                "reasoning", "reasoning_chars", "text", "text_chars")
 
 
 def build_trace_view(*, session: SessionSummary, messages: Sequence[Message],

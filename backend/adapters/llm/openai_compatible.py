@@ -127,6 +127,9 @@ class OpenAICompatibleChat:
                     reasoning_parts: list[str] = []
                     tool_calls_acc: dict[int, dict[str, str]] = {}
                     finish_reason, usage = "stop", {}
+                    # 厂商到底返回了什么，与上面那个兜底成 stop 的分开留：
+                    # 混成一个就分不出「厂商说 stop」和「厂商一个字没说」。
+                    raw_finish_reason: str | None = None
                     for line in response.iter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -149,21 +152,25 @@ class OpenAICompatibleChat:
                         # 思考内容单独走一路：它不进答案，但要回传给厂商。
                         # 刻意不设 emitted——答案还没开始，网络抖动时整轮重试仍然安全。
                         # 字段名不统一：reasoning_content 之外也有服务用 reasoning。
+                        # 实际用的是哪个名字随增量带出去，开发者模式要显示它。
+                        thinking_field = "reasoning_content" if delta.get("reasoning_content") else "reasoning"
                         thinking = delta.get("reasoning_content") or delta.get("reasoning")
                         if isinstance(thinking, str) and thinking:
                             reasoning_parts.append(thinking)
-                            yield ChatReasoning(thinking)
+                            yield ChatReasoning(thinking, field=thinking_field)
                         for raw_call in delta.get("tool_calls") or []:
                             self._accumulate_tool_call(tool_calls_acc, raw_call)
                         if choices[0].get("finish_reason"):
-                            finish_reason = str(choices[0]["finish_reason"])
+                            raw_finish_reason = str(choices[0]["finish_reason"])
+                            finish_reason = raw_finish_reason
                     if tool_calls_acc:
                         calls = tuple(
                             ToolCallRequest(id=acc["id"] or f"call_{index}", name=acc["name"], arguments=acc["arguments"])
                             for index, acc in sorted(tool_calls_acc.items())
                         )
                         self._record_success()
-                        yield ChatToolCalls(calls=calls, usage=usage, reasoning="".join(reasoning_parts))
+                        yield ChatToolCalls(calls=calls, usage=usage, reasoning="".join(reasoning_parts),
+                                            provider_finish_reason=raw_finish_reason)
                         return
                     text = "".join(parts).strip()
                     if not text:
@@ -176,7 +183,8 @@ class OpenAICompatibleChat:
                         self._record_failure(code)
                         raise LLMProviderError(code, f"{self._provider} {why}", retryable=False)
                     self._record_success()
-                    yield ChatFinal(text=text, finish_reason=finish_reason, provider=self.provider, model=self.model, mode=self.mode, usage=usage)
+                    yield ChatFinal(text=text, finish_reason=finish_reason, provider=self.provider, model=self.model,
+                                    mode=self.mode, usage=usage, provider_finish_reason=raw_finish_reason)
                     return
             except httpx.HTTPStatusError as error:
                 # raise_for_status 在拿到任何 delta 之前触发，可以安全重试。

@@ -139,9 +139,15 @@ class ReactLog:
         self._dropped = 0
 
     def record(self, *, round_index: int, injected: str | None, reasoning: str, text: str,
-               calls: Sequence[str], outcome: str) -> dict:
-        """记下刚跑完的这一次模型调用。返回这一步，调用方后续可以改写 outcome。"""
+               calls: Sequence[str], outcome: str, finish_reason: str | None = None,
+               reasoning_field: str | None = None) -> dict:
+        """记下刚跑完的这一次模型调用。返回这一步，调用方后续可以改写 outcome。
+
+        finish_reason 是厂商原样返回的值（没返回就是 None），outcome 是服务端自己的判断。
+        两者含义不同，别合并：补救轮的 outcome 是 remediation，而厂商那次说的是 stop。
+        """
         step: dict = {"round": round_index, "injected": injected, "outcome": outcome,
+                      "finish_reason": finish_reason, "reasoning_field": reasoning_field,
                       "calls": list(calls)}
         for name, value in (("reasoning", reasoning), ("text", text)):
             step[name], step[f"{name}_chars"] = self._fit(value, self._room)

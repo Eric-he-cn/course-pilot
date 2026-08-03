@@ -812,6 +812,7 @@ class TurnService:
                     if self._select_responder and (model_key is not None or thinking is not None):
                         responder = self._select_responder(model_key, thinking)
                     reasoning = ""
+                    reasoning_field: str | None = None
                     for item in responder.chat(messages=messages, tools=()):
                         if isinstance(item, ChatDelta):
                             answer_parts.append(item.text)
@@ -820,11 +821,14 @@ class TurnService:
                             last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
                         elif isinstance(item, ChatReasoning):
                             reasoning += item.text
+                            reasoning_field = item.field
                         elif isinstance(item, ChatFinal):
                             response = item
                             self._merge_usage(usage_total, item.usage)
                     react.record(round_index=1, injected=None, reasoning=reasoning,
-                                 text="".join(answer_parts), calls=(), outcome="final")
+                                 text="".join(answer_parts), calls=(), outcome="final",
+                                 finish_reason=response.provider_finish_reason if response else None,
+                                 reasoning_field=reasoning_field)
                     answer = "".join(answer_parts) or (response.text if response else "")
                     finish_reason = response.finish_reason if response else "stop"
                     responder_mode = response.mode if response else "unknown"
@@ -990,6 +994,7 @@ class TurnService:
                                                   history_count, round_tools)
                         segment_parts: list[str] = []
                         reasoning = ""
+                        round_reasoning_field: str | None = None
                         outcome: ChatToolCalls | ChatFinal | None = None
                         for item in responder.chat(messages=messages, tools=round_tools):
                             if isinstance(item, ChatDelta):
@@ -1005,6 +1010,7 @@ class TurnService:
                                 if not reasoning:
                                     yield self._event("reasoning_started")
                                 reasoning += item.text
+                                round_reasoning_field = item.field
                             else:
                                 outcome = item
                                 break
@@ -1017,6 +1023,9 @@ class TurnService:
                             # 供应商流完了却没有终态时下面会抛错，那一步不能记成 final
                             outcome=("tool_calls" if isinstance(outcome, ChatToolCalls)
                                      else "final" if isinstance(outcome, ChatFinal) else "no_response"),
+                            # 厂商说的那个值。下面几个分支会改写 outcome，这一项始终不动。
+                            finish_reason=outcome.provider_finish_reason if outcome is not None else None,
+                            reasoning_field=round_reasoning_field,
                         )
                         injected = None
                         if isinstance(outcome, ChatFinal):
@@ -1194,7 +1203,8 @@ class TurnService:
                             break
                     react_round += 1
                     react.record(round_index=react_round, injected="provider_fallback", reasoning="",
-                                 text="".join(fallback_parts), calls=(), outcome="final")
+                                 text="".join(fallback_parts), calls=(), outcome="final",
+                                 finish_reason=response.provider_finish_reason if response else None)
                     if response is None:
                         raise LLMProviderError("invalid_response", "本地 responder 没有给出终态响应", retryable=False)
                 # 三层各覆盖一条路径，都不是冗余：主路按轮次收段落进 answer_segments；

@@ -55,9 +55,14 @@ class ChatDelta:
 
 @dataclass(frozen=True)
 class ChatReasoning:
-    """思考内容增量。它不是答案的一部分，但要回传给厂商，也用来告诉界面「还在想」。"""
+    """思考内容增量。它不是答案的一部分，但要回传给厂商，也用来告诉界面「还在想」。
+
+    field 是厂商实际用的那个字段名（DeepSeek 系 reasoning_content，另一些服务 reasoning），
+    只供开发者模式显示。
+    """
 
     text: str
+    field: str = "reasoning_content"
 
 
 @dataclass(frozen=True)
@@ -67,16 +72,22 @@ class ChatToolCalls:
     calls: tuple[ToolCallRequest, ...]
     usage: dict[str, int] = field(default_factory=dict)
     reasoning: str = ""
+    # 厂商原样返回的 finish_reason，没返回就是 None。纯观测，不参与任何判断。
+    provider_finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class ChatFinal:
     text: str
+    # 上报给客户端的收尾原因。多数时候就是厂商那个值，但服务端也会派生自己的
+    # （tool_budget_exhausted、course_unresolved）——要看厂商说了什么请读下面那个。
     finish_reason: str
     provider: str
     model: str
     mode: str
     usage: dict[str, int] = field(default_factory=dict)
+    # 厂商原样返回的 finish_reason，没返回就是 None。纯观测，不参与任何判断。
+    provider_finish_reason: str | None = None
 
 
 @dataclass(frozen=True)

@@ -1818,22 +1818,40 @@ function TraceSubagentSteps({ subagent }: { subagent: TraceSubagent }) {
   </details>
 }
 
-/** 模型的一次调用：想了什么 → 说了什么 → 调了哪几个工具。思考很长，默认收起。 */
+/** outcome 是服务端派生的标签，光看枚举名说不清发生了什么，这几个补一句。 */
+const OUTCOME_NOTE: Record<string, string> = {
+  budget_exhausted: 'trace.outcome_note_budget_exhausted',
+  remediation: 'trace.outcome_note_remediation',
+  no_response: 'trace.outcome_note_no_response',
+}
+
+/** 老 trace 没记字段名，退到 OpenAI 兼容接口上的通用名。 */
+function reasoningField(step: TraceStep) { return step.reasoning_field ?? 'reasoning_content' }
+
+/** 一次 chat completion：reasoning_content → assistant.content → tool_calls。思考很长，默认收起。
+ *  finish_reason 是厂商说的、outcome 是我们判的，两个 chip 分开摆，别让人以为是同一件事。 */
 function TraceStepCard({ step, calls, sessionId, turnId, subagents }: {
   step: TraceStep; calls: TraceTool[]; sessionId: string; turnId: string; subagents: TraceSubagent[]
 }) {
+  const outcomeNote = step.outcome ? OUTCOME_NOTE[step.outcome] : undefined
   return <li className="trace-step">
     <div className="trace-step-head">
       <b>{t('trace.flow_step', { n: step.round })}</b>
-      {step.injected && <i className="trace-badge">{tOr(`trace.injected_${step.injected}`, step.injected)}</i>}
-      {step.outcome === 'budget_exhausted' && <i className="trace-bad">{t('trace.outcome_budget_exhausted')}</i>}
+      <i className="trace-chip-provider" title={t('trace.hint_finish_reason')}>
+        {t('trace.chip_finish_reason', { v: step.finish_reason ?? 'null' })}</i>
+      {step.outcome && <i className="trace-chip-server" title={t('trace.hint_outcome')}>
+        {t('trace.chip_outcome', { v: step.outcome })}</i>}
+      {step.injected && <i className="trace-chip-server" title={t('trace.hint_injected')}>
+        {t('trace.chip_injected', { v: step.injected })}</i>}
     </div>
+    {step.injected && <p className="trace-note">{tOr(`trace.injected_${step.injected}`, '')}</p>}
+    {outcomeNote && <p className="trace-note">{tOr(outcomeNote, '')}</p>}
     {step.reasoning !== null
-      ? <details className="trace-thinking"><summary>{t('trace.thinking', { n: step.reasoning_chars })}</summary><pre>{step.reasoning}</pre></details>
-      : step.reasoning_chars > 0 && <p className="trace-note trace-warn">{t('trace.thinking_missing', { n: step.reasoning_chars })}</p>}
-    {step.text !== null && <div className="trace-step-text"><h4>{t('trace.step_text')}</h4><pre>{step.text}</pre></div>}
-    {step.text === null && step.text_chars > 0 && <p className="trace-note trace-warn">{t('trace.step_text_missing', { n: step.text_chars })}</p>}
-    {step.text === null && step.text_chars === 0 && calls.length > 0 && <p className="trace-note">{t('trace.step_silent')}</p>}
+      ? <details className="trace-thinking"><summary>{t('trace.reasoning', { field: reasoningField(step), n: step.reasoning_chars })}</summary><pre>{step.reasoning}</pre></details>
+      : step.reasoning_chars > 0 && <p className="trace-note trace-warn">{t('trace.reasoning_missing', { field: reasoningField(step), n: step.reasoning_chars })}</p>}
+    {step.text !== null && <div className="trace-step-text"><h4>{t('trace.step_content')}</h4><pre>{step.text}</pre></div>}
+    {step.text === null && step.text_chars > 0 && <p className="trace-note trace-warn">{t('trace.step_content_missing', { n: step.text_chars })}</p>}
+    {step.text === null && step.text_chars === 0 && <p className="trace-note">{t('trace.step_content_empty')}</p>}
     {calls.length > 0 && <ol className="trace-tools">{calls.map(tool => (
       <TraceCall key={tool.index} tool={tool} sessionId={sessionId} turnId={turnId}
         subagent={subagents.find(item => item.call_id === tool.call_id)} />
@@ -1914,10 +1932,8 @@ function TraceTurnCard({ turn, ordinal, focused, sessionId, onFocus }: {
         [t('trace.field_tool_rounds'), turn.tool_rounds ?? '—'],
       ]} /></section>
       {turn.resolution && <section><h3>{t('trace.section_resolution')}</h3><TraceJson value={turn.resolution} /></section>}
-      {(turn.responder || turn.usage) && <section><h3>{t('trace.section_model')}</h3>
-        {turn.responder && <TraceJson value={turn.responder} />}
-        {turn.usage && <TraceJson value={turn.usage} />}
-      </section>}
+      {turn.responder && <section><h3>{t('trace.section_responder')}</h3><TraceJson value={turn.responder} /></section>}
+      {turn.usage && <section><h3>{t('trace.section_usage')}</h3><TraceJson value={turn.usage} /></section>}
       {Object.keys(turn.extras).length > 0 && <section><h3>{t('trace.section_extras')}</h3><TraceJson value={turn.extras} /></section>}
     </details>}
   </div>

@@ -236,9 +236,14 @@ export interface TraceTool {
  *  正文为 null 而字数大于 0，表示这一段超出 trace 的记录上限没有留下来。 */
 export interface TraceStep {
   round: number
-  // 服务端往这一轮塞了什么：四种补救轮、工具额度用尽的通知、降级到兜底模型
+  // 服务端往这一轮塞了什么：四种补救轮、降级到兜底模型
   injected: string | null
+  // 服务端对这一轮的判断，不是 API 字段
   outcome: string | null
+  // 厂商原样返回的 finish_reason，null 表示它没返回
+  finish_reason: string | null
+  // 厂商实际用的思考字段名：reasoning_content 或 reasoning
+  reasoning_field: string | null
   calls: string[]
   reasoning: string | null
   reasoning_chars: number

@@ -814,6 +814,90 @@ def test_the_react_log_survives_a_turn_that_never_reached_an_answer(client):
     assert view["react"]["steps"][0]["calls"] == ["c1"]
 
 
+# ---- finish_reason（厂商说的）与 outcome（我们判的）分开记 ----
+
+def test_each_step_carries_the_finish_reason_the_provider_returned(client):
+    """厂商返回的 finish_reason 原来只进了 SSE 的 turn_completed，没进 trace，
+    开发者模式看不到任何一轮是怎么收的。判据走 HTTP，接线漏一处就红。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [
+        [ChatToolCalls((ToolCallRequest("c1", "search_materials", '{"query": "护航效应"}'),),
+                       provider_finish_reason="tool_calls")],
+        [ChatDelta("长作业挡在前面。[1]"),
+         ChatFinal("长作业挡在前面。[1]", "stop", "example", "m", "provider", provider_finish_reason="stop")],
+    ]
+    view = _react_turn(client, session_id, script)
+
+    steps = view["react"]["steps"]
+    assert [step["finish_reason"] for step in steps] == ["tool_calls", "stop"], steps
+
+
+def test_a_provider_that_said_nothing_leaves_finish_reason_null(client):
+    """取不到就是 null。兜底填成 stop 会把「厂商没说」伪装成「厂商说正常收尾」。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [[ChatDelta("好了。"), ChatFinal("好了。", "stop", "example", "m", "provider")]]
+    view = _react_turn(client, session_id, script)
+
+    assert view["react"]["steps"][0]["finish_reason"] is None
+
+
+def test_a_server_added_round_keeps_the_providers_own_stop(client):
+    """补救轮是服务端补的，厂商无从知道——它那次调用照样正常收尾。
+    两个字段合并成一个就会把 stop 覆盖成 remediation，看不出厂商说了什么。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    plan = "我把计划排好了：周一到周五各一章。"
+    script = [
+        [ChatDelta(plan), ChatFinal(plan, "stop", "example", "m", "provider", provider_finish_reason="stop")],
+        [ChatDelta("已写入。"),
+         ChatFinal("已写入。", "stop", "example", "m", "provider", provider_finish_reason="stop")],
+    ]
+    view = _react_turn(client, session_id, script, message="帮我排一下复习计划，周末也要学")
+
+    steps = view["react"]["steps"]
+    assert steps[0]["outcome"] == "remediation", steps
+    assert steps[0]["finish_reason"] == "stop", steps
+    assert steps[1]["injected"] == "plan_reminder", steps
+
+
+def test_a_round_that_ran_out_of_tool_budget_still_shows_the_providers_tool_calls(client):
+    """额度用满是我们的判断，厂商那次返回的是 tool_calls。
+    上报给客户端的 finish_reason 是我们编的 tool_budget_exhausted，别把它写进步骤。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+
+    class AlwaysCallsTools(Scripted):
+        """额度用完那一轮工具定义已经不下发了，它照样在调——这才走到服务端收尾那条分支。"""
+
+        def chat(self, *, messages, tools=()):
+            yield ChatDelta("我再查一下。")
+            yield ChatToolCalls((ToolCallRequest("x", "list_materials", "{}"),),
+                                provider_finish_reason="tool_calls")
+
+    space = _space(client)
+    space.turns._responder = AlwaysCallsTools([])
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "b-1", "message": "有哪些资料"})
+
+    steps = _fetch(client, session_id).json()["turns"][-1]["react"]["steps"]
+    exhausted = [step for step in steps if step["outcome"] == "budget_exhausted"]
+    assert exhausted, steps
+    assert exhausted[-1]["finish_reason"] == "tool_calls", exhausted
+
+
+def test_the_reasoning_field_name_reaches_the_panel(client):
+    """思考内容的字段名不统一（reasoning_content / reasoning），面板要显示实际收到的那个。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [[ChatReasoning("先看看教材。", field="reasoning"), ChatDelta("好了。"),
+               ChatFinal("好了。", "stop", "example", "m", "provider", provider_finish_reason="stop")]]
+    view = _react_turn(client, session_id, script)
+
+    assert view["react"]["steps"][0]["reasoning_field"] == "reasoning"
+
+
 # ---- 工具正文改成按需取 ----
 
 def test_the_trace_listing_carries_no_tool_text_at_all(client):
