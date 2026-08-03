@@ -26,7 +26,7 @@ from .compact import COMPACT_PROMPT_VERSION, KEEP_RATIO, CompactionInput, summar
 from .context import PROMPT_VERSION, SEED_CALL_ID, ContextSegment, TrimReport, assemble_general_messages, assemble_messages, clip_to_tokens, enforce_context_limit, estimate_tokens, message_tokens, tool_schema_tokens
 from .skills import SkillRegistry
 from .tools import DELEGATE_TOOLS, MAIN, MAIN_PROFILE, MCP_PROPOSE_TOOLS, NETWORK, SEARCH_LIMIT, SUBAGENT_CAPABILITIES, SUBAGENT_TOOLS, WIKI_TOOLS, CitationRegistry, ToolExecutor, ToolOutcome, budget_key, cited_only, external_specs, is_repeatable, persisted_tool_body, profile_for_skill, specs_for, with_external_budget, without_tools
-from .trace import TraceWriter
+from .trace import ReactLog, TraceWriter
 
 logger = logging.getLogger(__name__)
 
@@ -577,7 +577,7 @@ class TurnService:
         self, *, scope: ResolvedKnowledgeScope, session_id: str, responder: AgentChatPort,
         registry: CitationRegistry, capabilities: frozenset[str], budget: dict[str, int],
         used: dict[str, int], beat: Callable[[], None], usage: dict[str, int],
-        parsed: dict, today: str,
+        parsed: dict, today: str, sub_steps: list[dict],
     ) -> ToolOutcome:
         """子任务：带一套只读工具自己跑几轮，把最后一次回复当成交回父轮的成果。
 
@@ -627,6 +627,12 @@ class TurnService:
             rounds += 1
             if outcome is not None:
                 self._merge_usage(usage, outcome.usage)
+            # 子任务只在父轮的时序里留一层骨架：几轮、每轮说了多少、调了哪些工具。
+            # 正文不记——它已经以 sub: 前缀落进消息表，父轮 trace 再存一份是白花 payload。
+            sub_calls = list(outcome.calls) if isinstance(outcome, ChatToolCalls) and allow_tools else []
+            thought = (outcome.reasoning if isinstance(outcome, ChatToolCalls) else "") or reasoning
+            sub_steps.append({"round": rounds, "reasoning_chars": len(thought),
+                              "text_chars": len("".join(parts)), "calls": [call.name for call in sub_calls]})
             if isinstance(outcome, ChatToolCalls) and allow_tools:
                 messages.append(ChatMessage(role="assistant", content="".join(parts), tool_calls=outcome.calls,
                                             reasoning=outcome.reasoning or reasoning))
@@ -695,6 +701,13 @@ class TurnService:
             logger.exception("子任务发现落 artifact 失败 session=%s", session_id)
 
     @staticmethod
+    def _new_subagent_log(react: ReactLog, call_id: str, parsed: dict) -> list[dict]:
+        """给这一次 delegate 开一栏子时序，返回让子循环往里追加的那个列表。"""
+        steps: list[dict] = []
+        react.add_subagent(call_id=call_id, task=str(parsed.get("task") or ""), steps=steps)
+        return steps
+
+    @staticmethod
     def _display_args(raw: str) -> dict:
         try:
             parsed = json.loads(raw) if raw.strip() else {}
@@ -712,6 +725,8 @@ class TurnService:
         started_monotonic = time.monotonic()
         trace_record: dict[str, object] = {"kind": "turn", "started_at": utc_now(), "session_id": session_id, "scope_mode": session.scope_mode, "prompt_version": PROMPT_VERSION}
         trace_tools: list[dict[str, object]] = []
+        react = ReactLog()
+        final_answer = ""
         # 面向用户的工具活动，与消息一同持久化，刷新后仍能看到本轮查了什么。
         activity: list[dict[str, object]] = []
         last_heartbeat = time.monotonic()
@@ -796,15 +811,20 @@ class TurnService:
                     responder = self._responder
                     if self._select_responder and (model_key is not None or thinking is not None):
                         responder = self._select_responder(model_key, thinking)
+                    reasoning = ""
                     for item in responder.chat(messages=messages, tools=()):
                         if isinstance(item, ChatDelta):
                             answer_parts.append(item.text)
                             seq += 1
                             yield self._event("text_delta", seq=seq, text=item.text)
                             last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
+                        elif isinstance(item, ChatReasoning):
+                            reasoning += item.text
                         elif isinstance(item, ChatFinal):
                             response = item
                             self._merge_usage(usage_total, item.usage)
+                    react.record(round_index=1, injected=None, reasoning=reasoning,
+                                 text="".join(answer_parts), calls=(), outcome="final")
                     answer = "".join(answer_parts) or (response.text if response else "")
                     finish_reason = response.finish_reason if response else "stop"
                     responder_mode = response.mode if response else "unknown"
@@ -828,7 +848,8 @@ class TurnService:
                     yield self._event("citation", **citation)
                 yield self._event("tool_result", call_id=SEED_CALL_ID, name="search_materials", ok=seed.ok, **_summary_fields(seed))
                 activity.append({"call_id": SEED_CALL_ID, "name": "search_materials", "origin": "seed", "ok": seed.ok, **_summary_fields(seed)})
-                trace_tools.append({"call_id": SEED_CALL_ID, "origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, **_summary_fields(seed), "duration_ms": int((time.monotonic() - seed_started) * 1000)})
+                # round=0：种子检索与自动加载 skill 都发生在模型开口之前，不属于任何一次模型调用。
+                trace_tools.append({"call_id": SEED_CALL_ID, "round": 0, "origin": "seed", "name": "search_materials", "arguments": {"query": message[:200]}, "ok": seed.ok, **_summary_fields(seed), "duration_ms": int((time.monotonic() - seed_started) * 1000)})
                 self._persist_tool_body(session_id=session_id, turn_id=turn.id, call_id=SEED_CALL_ID,
                                         name="search_materials", result=seed)
                 # 没明说要做一件成规模的调研，就整体不下发 delegate（照 wiki_off 的先例摘在
@@ -922,7 +943,7 @@ class TurnService:
                     activity.append({"call_id": call_id, "name": "use_skill", "origin": "auto", "ok": True,
                                      "summary": f"自动加载 {auto_skill.name}", "summary_key": "summary.skill_auto_loaded_short",
                                      "summary_args": {"name": auto_skill.name}})
-                    trace_tools.append({"call_id": call_id, "origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载",
+                    trace_tools.append({"call_id": call_id, "round": 0, "origin": "auto", "name": "use_skill", "arguments": arguments, "ok": True, "summary": "自动加载",
                                         "summary_key": "summary.skill_auto_loaded_short", "summary_args": {"name": auto_skill.name},
                                         "decision": "allowed", "reason": None, "duration_ms": 0})
                     skill_body = clip_to_tokens(auto_skill.body, self._limits.skill, _SKILL_BODY_CLIP)
@@ -936,6 +957,10 @@ class TurnService:
                     capabilities = skill_profile.capabilities - self._offline
                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)
                     trace_record["skill"] = {"name": auto_skill.name, "content_hash": auto_skill.content_hash, "activation": "auto"}
+                # 服务端往下一次模型调用里塞了什么。补救轮不是模型自己要跑的，
+                # 时序上看不出这一点，用户会以为它自己想起来要写计划。
+                injected: str | None = None
+                react_round = 0
                 try:
                     while response is None:
                         allow_tools = tool_rounds < max_rounds
@@ -943,6 +968,7 @@ class TurnService:
                             # 只是不下发 tools 的话模型并不知道，它会继续尝试调用、把调用写成正文
                             # （见 _PROVIDER_MARKUP）。明确说一句，让它用手上的资料收尾。
                             budget_notified = True
+                            injected = injected or "tool_budget"
                             messages.append(ChatMessage(
                                 role="user",
                                 content="工具调用次数已用完。现在只用上面已经取得的资料作答，不要再尝试调用任何工具；"
@@ -982,6 +1008,17 @@ class TurnService:
                             else:
                                 outcome = item
                                 break
+                        react_round += 1
+                        step = react.record(
+                            round_index=react_round, injected=injected,
+                            reasoning=(outcome.reasoning if isinstance(outcome, ChatToolCalls) else "") or reasoning,
+                            text="".join(segment_parts),
+                            calls=[call.id for call in outcome.calls] if isinstance(outcome, ChatToolCalls) else (),
+                            # 供应商流完了却没有终态时下面会抛错，那一步不能记成 final
+                            outcome=("tool_calls" if isinstance(outcome, ChatToolCalls)
+                                     else "final" if isinstance(outcome, ChatFinal) else "no_response"),
+                        )
+                        injected = None
                         if isinstance(outcome, ChatFinal):
                             answer_segments.append("".join(segment_parts))
                             missing_steps = []
@@ -1001,6 +1038,7 @@ class TurnService:
                                     content=_PLAN_REMINDER_EN if _typed_in_latin(message) else _PLAN_REMINDER_ZH,
                                 ))
                                 trace_record["plan_reminder"] = True
+                                step["outcome"], injected = "remediation", "plan_reminder"
                                 continue
                             if not missing_steps and wants_memory and not memory_written and not memory_reminded and tool_rounds < max_rounds:
                                 # 用户明确要求记住，但这一轮没有一次成功的 memory_patch：
@@ -1010,6 +1048,7 @@ class TurnService:
                                 messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
                                 messages.append(ChatMessage(role="user", content="用户要求记住的内容你还没有写进长期记忆。现在只调用 memory_patch 补上，不要重复输出正文。"))
                                 trace_record["memory_reminder"] = True
+                                step["outcome"], injected = "remediation", "memory_reminder"
                                 continue
                             # 判据要看所有段落：题目常常出在某个工具轮之前，只看最后一段会漏掉。
                             # 不能用 join_answer——它带着展示用的过滤，会把没有引用的短段丢掉。
@@ -1022,6 +1061,7 @@ class TurnService:
                                 messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
                                 messages.append(ChatMessage(role="user", content="这道选择题的选项还没有变成可点的按钮。现在只调用 ask_user（question 放题干，options 放 A、B、C、D 四个短标签），不要重复输出正文。"))
                                 trace_record["choices_reminder"] = True
+                                step["outcome"], injected = "remediation", "choices_reminder"
                                 continue
                             if missing_steps:
                                 # 规程有步骤没做完就补一轮，只补一次。
@@ -1030,12 +1070,14 @@ class TurnService:
                                 messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
                                 messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, practice.question_count, practice.evidence_count)))
                                 trace_record["practice_reminder"] = missing_steps
+                                step["outcome"], injected = "remediation", "practice_reminder"
                                 continue
                             response = outcome
                             self._merge_usage(usage_total, outcome.usage)
                         elif isinstance(outcome, ChatToolCalls) and not allow_tools:
                             # 已达工具轮次上限仍尝试调用：以现有内容收尾，保证循环终止。
                             self._merge_usage(usage_total, outcome.usage)
+                            step["outcome"] = "budget_exhausted"
                             response = ChatFinal(
                                 text="".join(segment_parts) or "（未能在限定步数内完成检索，请换个问法或稍后重试。）",
                                 finish_reason="tool_budget_exhausted", provider=responder.provider,
@@ -1073,6 +1115,7 @@ class TurnService:
                                             registry=registry, capabilities=SUBAGENT_CAPABILITIES - self._offline,
                                             budget=tool_budget, used=tool_used, beat=beat,
                                             usage=usage_total, parsed=params, today=date.today().isoformat(),
+                                            sub_steps=self._new_subagent_log(react, call.id, params),
                                         ),
                                     )
                                     if result.reason is None:
@@ -1107,7 +1150,7 @@ class TurnService:
                                 shown = _summary_fields(result, reused=cached is not None)
                                 yield self._event("tool_result", call_id=call.id, name=call.name, ok=result.ok, **shown)
                                 activity.append({"call_id": call.id, "name": call.name, "origin": "model", "ok": result.ok, **_summary_fields(result, reused=cached is not None)})
-                                trace_tools.append({"call_id": call.id, "origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, **_summary_fields(result, reused=cached is not None), "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
+                                trace_tools.append({"call_id": call.id, "round": react_round, "origin": "model", "name": call.name, "arguments": self._display_args(call.arguments), "ok": result.ok, **_summary_fields(result, reused=cached is not None), "decision": "denied" if result.reason else "allowed", "reason": result.reason, "duration_ms": int((time.monotonic() - call_started) * 1000)})
                                 messages.append(ChatMessage(role="tool", content=result.text, tool_call_id=call.id))
                                 if cached is None:
                                     # 复用那次的正文已经在库里了，别存第二份。
@@ -1119,7 +1162,7 @@ class TurnService:
                     if answer_parts:
                         # 已输出增量：保留部分内容并如实标记中断，不静默换供应商重放。
                         yield self._event("stream_interrupted", error_code=error.code, retryable=error.retryable)
-                        partial = "".join(answer_parts)
+                        partial = final_answer = "".join(answer_parts)
                         assistant = self._sessions.append_message(
                             session_id=session_id, turn_id=turn.id, role="assistant",
                             content=partial, citations=cited_only(partial, registry.citations), status="interrupted", activity=activity,
@@ -1138,15 +1181,20 @@ class TurnService:
                         error_code=error.code,
                         retryable=error.retryable,
                     )
+                    fallback_parts: list[str] = []
                     for item in self._fallback_responder.chat(messages=messages, tools=()):
                         if isinstance(item, ChatDelta):
                             answer_parts.append(item.text)
+                            fallback_parts.append(item.text)
                             seq += 1
                             yield self._event("text_delta", seq=seq, text=item.text)
                         elif isinstance(item, ChatFinal):
                             response = item
                             self._merge_usage(usage_total, item.usage)
                             break
+                    react_round += 1
+                    react.record(round_index=react_round, injected="provider_fallback", reasoning="",
+                                 text="".join(fallback_parts), calls=(), outcome="final")
                     if response is None:
                         raise LLMProviderError("invalid_response", "本地 responder 没有给出终态响应", retryable=False)
                 # 三层各覆盖一条路径，都不是冗余：主路按轮次收段落进 answer_segments；
@@ -1167,6 +1215,7 @@ class TurnService:
                 yield self._event("turn_failed", error_code="turn_superseded", retryable=False)
                 return
             practice.close(session_id=session_id, course_id=context.course_id or "")
+            final_answer = answer
             citations = cited_only(answer, registry.citations)
             assistant = self._sessions.append_message(session_id=session_id, turn_id=turn.id, role="assistant", content=answer, citations=citations, activity=activity, choices=choices)
             self._sessions.complete_turn(turn.id, status="completed")
@@ -1210,5 +1259,7 @@ class TurnService:
                     # 未走到终态多半是客户端断连；排查时要能看出失败原因而不是只有 failed。
                     trace_record.setdefault("error_code", "client_disconnected")
                 trace_record["tools"] = trace_tools
+                # 这一轮没走到回答（中断、抢占、异常）时已经跑过的几步仍然是排查线索。
+                trace_record["react"] = react.as_record(final_answer)
                 trace_record["duration_ms"] = int((time.monotonic() - started_monotonic) * 1000)
                 self._trace.write(trace_record)

@@ -16,11 +16,13 @@ import pytest
 from conftest import workspace
 from fastapi.testclient import TestClient
 
-from app.http.devtools import (MAX_BODY_CHARS, MAX_DAY_FILES, MAX_PAYLOAD_BYTES,
-                               MAX_PAYLOAD_TOTAL_BYTES, MAX_SCAN_LINES, MAX_TURNS)
+from app.http.devtools import (MAX_DAY_FILES, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_TOTAL_BYTES,
+                               MAX_SCAN_LINES, MAX_TURNS)
 from app.main import create_app
-from contracts.llm import ChatDelta, ChatFinal, ChatToolCalls, ToolCallRequest
+from contracts.llm import (ChatDelta, ChatFinal, ChatReasoning, ChatToolCalls, LLMProviderError,
+                           ToolCallRequest)
 from core.settings import Settings
+from modules.agent.context import SEED_CALL_ID
 
 MATERIAL_TEXT = "FIFO 调度下长作业会拖住后面的短作业，这就是护航效应。SJF 优先跑最短的作业。"
 ALICE = {"X-CoursePilot-User": "alice"}
@@ -114,6 +116,12 @@ def _turn_ids(payload) -> list[str]:
     return [item["turn_id"] for item in payload["turns"]]
 
 
+def _body_text(client, session_id, turn_id, call_id, headers=None) -> str | None:
+    """正文不随列表下发，点开哪一步才取哪一条。"""
+    return client.get(f"/api/v2/sessions/{session_id}/trace/body",
+                      params={"turn_id": turn_id, "call_id": call_id}, headers=headers).json()["text"]
+
+
 # ---- 正常路径：trace 给时序，messages 给正文 ----
 
 def test_a_completed_turn_carries_both_the_trace_span_and_the_tool_body(client):
@@ -135,8 +143,10 @@ def test_a_completed_turn_carries_both_the_trace_span_and_the_tool_body(client):
     assert seed["name"] == "search_materials"
     assert seed["arguments"] == {"query": "FIFO 为什么有护航效应"}
     assert seed["body"] is not None, "trace 有这一步，messages 里的正文没接上来"
-    assert "护航效应" in seed["body"]["text"] and "os.md" in seed["body"]["text"]
-    assert seed["body"]["chars"] == len(seed["body"]["text"])
+    assert seed["body_state"] == "stored"
+    text = _body_text(client, session_id, view["turn_id"], seed["body"]["call_id"])
+    assert "护航效应" in text and "os.md" in text
+    assert seed["body"]["chars"] == len(text)
 
 
 def test_without_a_turn_id_the_newest_turn_is_the_one_in_focus(client):
@@ -194,7 +204,9 @@ def test_a_turn_with_no_trace_record_says_so_instead_of_failing(client):
     view = next(item for item in payload["turns"] if item["turn_id"] == turn_id)
     assert view["trace_record"] is False
     assert view["started_at"] is None and view["tools"] == []
-    assert any(body["text"] and "护航效应" in body["text"] for body in view["unmatched_bodies"])
+    assert view["unmatched_bodies"], "trace 没了，库里还留着的正文也要列出来"
+    texts = [_body_text(client, session_id, turn_id, body["call_id"]) for body in view["unmatched_bodies"]]
+    assert any(text and "护航效应" in text for text in texts)
 
 
 def test_a_session_with_neither_trace_nor_bodies_comes_back_empty_not_broken(client):
@@ -364,7 +376,9 @@ def test_another_session_in_the_same_day_file_never_leaks_in(client):
     other_ids = {item["turn_id"] for item in _fetch(client, other).json()["turns"]}
     assert other_ids.isdisjoint(set(_turn_ids(payload)))
     for view in payload["turns"]:
-        assert all("SJF" not in (body.get("text") or "") for body in view["unmatched_bodies"])
+        texts = [_body_text(client, mine, view["turn_id"], body["call_id"])
+                 for body in view["unmatched_bodies"]]
+        assert all("SJF" not in (text or "") for text in texts)
 
 
 def test_a_line_that_merely_mentions_the_session_id_is_still_another_session(client):
@@ -427,7 +441,9 @@ def test_a_subagent_body_is_labelled_instead_of_glued_onto_a_parent_span(client)
 
     view = _fetch(client, session_id).json()["turns"][-1]
     assert [body["call_id"] for body in view["subagent_bodies"]] == ["sub:c9"]
-    assert all(tool["body"] is None or "子任务" not in tool["body"]["text"] for tool in view["tools"])
+    attached = [_body_text(client, session_id, turn_id, tool["body"]["call_id"])
+                for tool in view["tools"] if tool["body"]]
+    assert all("子任务" not in (text or "") for text in attached)
 
 
 def test_two_calls_of_the_same_tool_keep_their_own_text(client):
@@ -477,45 +493,28 @@ def test_a_reused_call_has_no_text_and_does_not_steal_the_next_ones(client):
     assert view["unmatched_bodies"] == []
 
 
-def test_bodies_beyond_the_char_budget_are_marked_not_silently_dropped(client):
-    """一个会话几十轮检索，正文加起来能有几兆。裁掉可以，装作没有不行。"""
+def test_many_long_bodies_cost_the_listing_almost_nothing(client):
+    """一个会话几十轮检索，正文加起来能有几兆。列表只报每段多长，
+    所以正文再多，打开侧栏的那一次响应也不会跟着涨。"""
     course_id = _indexed_course(client)
     session_id = _session(client, course_id)
     _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
     turn_id = _fetch(client, session_id).json()["turns"][-1]["turn_id"]
+    lean = len(_fetch(client, session_id).content)
 
     space = _space(client)
-    for index in range(MAX_BODY_CHARS // 4_000 + 3):
+    count = 25
+    for index in range(count):
         space.sessions.append_message(session_id=session_id, turn_id=turn_id, role="tool",
                                       content="长" * 4_000, activity=[{"call_id": f"sub:x{index}", "name": "web_fetch"}])
 
-    view = _fetch(client, session_id).json()["turns"][-1]
-    kept = sum(len(body["text"]) for body in view["subagent_bodies"] if body["text"] is not None)
-    assert kept <= MAX_BODY_CHARS
-    assert view["bodies_omitted"] > 0
-    omitted = [body for body in view["subagent_bodies"] if body["text"] is None]
-    assert omitted and all(body["chars"] > 0 for body in omitted), "裁掉的那些连原本多长都没说"
-
-
-def test_the_focused_turn_gets_its_bodies_before_the_others(client):
-    """预算填满时先填用户点的那一轮，否则点旧轮次永远看不到正文。"""
-    course_id = _indexed_course(client)
-    session_id = _session(client, course_id)
-    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
-    _turn(client, session_id, request_id="t-2", message="那 SJF 呢")
-    ids = _turn_ids(_fetch(client, session_id).json())
-
-    space = _space(client)
-    for turn_id in ids:
-        for index in range(MAX_BODY_CHARS // 4_000 + 2):
-            space.sessions.append_message(session_id=session_id, turn_id=turn_id, role="tool",
-                                          content="长" * 4_000, activity=[{"call_id": f"sub:{turn_id}-{index}", "name": "web_fetch"}])
-
-    payload = _fetch(client, session_id, turn_id=ids[0]).json()
-    first = next(item for item in payload["turns"] if item["turn_id"] == ids[0])
-    second = next(item for item in payload["turns"] if item["turn_id"] == ids[1])
-    assert any(body["text"] for body in first["subagent_bodies"]), "点中的那一轮反而没有正文"
-    assert second["bodies_omitted"] > first["bodies_omitted"]
+    response = _fetch(client, session_id)
+    view = response.json()["turns"][-1]
+    assert len(view["subagent_bodies"]) == count
+    assert all(body["chars"] == 4_000 for body in view["subagent_bodies"]), "连原本多长都没说"
+    # 25 段 4000 字符的正文是 10 万字符；列表只多出这些段落的元数据
+    assert len(response.content) - lean < 4_000, "正文跟着列表一起下来了"
+    assert _body_text(client, session_id, turn_id, "sub:x0") == "长" * 4_000
 
 
 def test_fields_the_reader_does_not_know_about_still_reach_the_response(client):
@@ -620,6 +619,32 @@ def test_a_payload_ref_pointing_outside_the_payload_directory_is_refused(client)
     assert view["tools"][0]["arguments"] is None
 
 
+def test_the_endpoint_pairs_by_call_id_too_not_just_the_helper(client):
+    """span 记了 call_id，但视图得把它带出来才用得上。带不出来时精确配对整条静默失效，
+    退回按工具名先来先接——落库顺序和 span 顺序一错位就接反。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
+    turn_id = _fetch(client, session_id).json()["turns"][-1]["turn_id"]
+
+    directory = _trace_dir(client)
+    day = str(_fetch(client, session_id).json()["turns"][-1]["started_at"])[:10]
+    _write_records(directory, day, [_record(
+        session_id=session_id, turn_id="pairing", started_at=f"{day}T11:00:00Z",
+        tools=[{"call_id": "c1", "round": 1, "origin": "model", "name": "search_materials", "ok": True},
+               {"call_id": "c2", "round": 1, "origin": "model", "name": "search_materials", "ok": True}])])
+
+    # 落库顺序和 span 顺序相反：重试、并发写都会这样
+    space = _space(client)
+    for call_id in ("c2", "c1"):
+        space.sessions.append_message(session_id=session_id, turn_id="pairing", role="tool",
+                                      content=f"{call_id} 的正文", activity=[{"call_id": call_id, "name": "search_materials"}])
+
+    view = next(item for item in _fetch(client, session_id).json()["turns"] if item["turn_id"] == "pairing")
+    assert [tool["body"]["call_id"] for tool in view["tools"]] == ["c1", "c2"], "视图把 call_id 丢了，接反了"
+    assert view["tools"][0]["call_id"] == "c1"
+
+
 def test_bodies_pair_by_call_id_even_when_they_arrive_out_of_order():
     """按工具名先来先接只在「正文与 span 同序」时才对。span 现在记了 call_id，
     乱序也认得出来——同名工具连调几次时，接错一位就是「查 A 拿回了 B 的结果」。"""
@@ -634,10 +659,282 @@ def test_bodies_pair_by_call_id_even_when_they_arrive_out_of_order():
         "subagent_bodies": [],
     }
     # 落库顺序与 span 顺序不一致（重试、并发写都会这样）
-    bodies = [{"call_id": "c3", "name": "search_materials", "text": "第三次"},
-              {"call_id": "c1", "name": "search_materials", "text": "第一次"},
-              {"call_id": "c2", "name": "search_materials", "text": "第二次"}]
+    bodies = [{"call_id": "c3", "name": "search_materials", "chars": 3},
+              {"call_id": "c1", "name": "search_materials", "chars": 1},
+              {"call_id": "c2", "name": "search_materials", "chars": 2}]
     _attach_bodies(view, bodies)
 
-    assert [tool["body"]["text"] for tool in view["tools"]] == ["第一次", "第二次", "第三次"]
+    assert [tool["body"]["call_id"] for tool in view["tools"]] == ["c1", "c2", "c3"]
     assert view["unmatched_bodies"] == []
+
+
+# ---- ReAct 执行流程：思考 → 调工具 → 又说了什么 → 最终回答 ----
+
+def _react_turn(client, session_id, script, *, request_id="r-1", message="护航效应是怎么回事"):
+    space = _space(client)
+    space.turns._responder = Scripted(script)
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": request_id, "message": message})
+    return _fetch(client, session_id).json()["turns"][-1]
+
+
+def test_each_model_round_leaves_its_thinking_its_text_and_the_calls_it_made(client):
+    """侧栏第一眼要看到的是这条链：第 1 轮想了什么、说了什么、调了哪几个工具，
+    第 2 轮又是什么，最后给了什么答案。trace 里只有 answer_chars 时这条链重建不出来。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [
+        [ChatReasoning("先看看教材里护航效应在哪一节。"), ChatDelta("我先查一下教材。"),
+         ChatToolCalls((ToolCallRequest("c1", "search_materials", '{"query": "护航效应"}'),))],
+        [ChatReasoning("材料够了，可以下结论。"), ChatDelta("再看看 SJF。"),
+         ChatToolCalls((ToolCallRequest("c2", "search_materials", '{"query": "SJF"}'),))],
+        [ChatDelta("长作业挡在前面。[1]"), ChatFinal("长作业挡在前面。[1]", "stop", "example", "m", "provider")],
+    ]
+    view = _react_turn(client, session_id, script)
+
+    react = view["react"]
+    steps = react["steps"]
+    assert [step["round"] for step in steps] == [1, 2, 3], steps
+    assert steps[0]["reasoning"] == "先看看教材里护航效应在哪一节。"
+    assert steps[0]["text"] == "我先查一下教材。"
+    assert steps[0]["calls"] == ["c1"] and steps[0]["outcome"] == "tool_calls"
+    assert steps[1]["reasoning"] == "材料够了，可以下结论。"
+    assert steps[1]["calls"] == ["c2"]
+    assert steps[2]["calls"] == [] and steps[2]["outcome"] == "final"
+    assert react["answer"] == "长作业挡在前面。[1]"
+    assert react["answer_chars"] == len("长作业挡在前面。[1]")
+
+
+def test_a_round_without_thinking_leaves_no_thinking_field(client):
+    """不带思考的档位跑一轮，那一块要整个不出现，而不是显示成空——空看起来像出了错。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [[ChatDelta("长作业挡在前面。[1]"),
+               ChatFinal("长作业挡在前面。[1]", "stop", "example", "m", "provider")]]
+    view = _react_turn(client, session_id, script)
+
+    step = view["react"]["steps"][0]
+    assert step["reasoning"] is None and step["reasoning_chars"] == 0
+
+
+def test_a_tool_span_says_which_round_issued_it(client):
+    """时序要能把调用挂回它所属的那一轮：种子检索在模型开口之前，算第 0 轮。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [
+        [ChatToolCalls((ToolCallRequest("c1", "search_materials", '{"query": "护航效应"}'),))],
+        [ChatDelta("好了。"), ChatFinal("好了。", "stop", "example", "m", "provider")],
+    ]
+    view = _react_turn(client, session_id, script)
+
+    rounds = {tool["call_id"]: tool["round"] for tool in view["tools"]}
+    assert rounds[SEED_CALL_ID] == 0, rounds
+    assert rounds["c1"] == 1, rounds
+
+
+def test_a_server_injected_round_is_marked_as_such(client):
+    """补救轮是服务端补的，不是模型自己要的。看不出这一点，用户会以为模型自己想起来要写计划。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [
+        [ChatDelta("我把计划排好了：周一到周五各一章。"),
+         ChatFinal("我把计划排好了：周一到周五各一章。", "stop", "example", "m", "provider")],
+        [ChatDelta("已写入。"), ChatFinal("已写入。", "stop", "example", "m", "provider")],
+    ]
+    view = _react_turn(client, session_id, script, message="帮我排一下复习计划，周末也要学")
+
+    steps = view["react"]["steps"]
+    assert len(steps) == 2, steps
+    assert steps[0]["injected"] is None
+    assert steps[0]["outcome"] == "remediation"
+    assert steps[1]["injected"] == "plan_reminder", steps
+
+
+def test_long_thinking_is_clipped_and_says_how_long_it_really_was(client):
+    """max 档一轮能吐两千 token 的思考。截断可以，装作它本来就这么短不行。"""
+    from modules.agent.trace import REACT_FIELD_MAX_CHARS
+
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    huge = "想" * (REACT_FIELD_MAX_CHARS * 2)
+    script = [[ChatReasoning(huge), ChatDelta("好了。"),
+               ChatFinal("好了。", "stop", "example", "m", "provider")]]
+    view = _react_turn(client, session_id, script)
+
+    step = view["react"]["steps"][0]
+    assert step["reasoning_chars"] == len(huge), "原文多长没说出来"
+    assert len(step["reasoning"]) <= REACT_FIELD_MAX_CHARS + 64
+    assert step["reasoning"].startswith("想想想")
+
+
+def test_the_react_text_of_one_turn_has_a_ceiling(client):
+    """一轮可以有十几次模型调用。逐轮全存进 payload 文件，一轮就能顶爆单文件上限。"""
+    from modules.agent.trace import REACT_FIELD_MAX_CHARS, REACT_TURN_MAX_CHARS
+
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    chunk = "思" * REACT_FIELD_MAX_CHARS
+    rounds = REACT_TURN_MAX_CHARS // REACT_FIELD_MAX_CHARS + 2
+    script = [[ChatReasoning(chunk),
+               ChatToolCalls((ToolCallRequest(f"c{index}", "search_materials", '{"query": "护航效应"}'),))]
+              for index in range(rounds)]
+    script.append([ChatDelta("好了。"), ChatFinal("好了。", "stop", "example", "m", "provider")])
+    view = _react_turn(client, session_id, script)
+
+    react = view["react"]
+    kept = sum(len(step["reasoning"]) for step in react["steps"] if step["reasoning"])
+    assert kept <= REACT_TURN_MAX_CHARS
+    assert react["dropped_chars"] > 0, "撞到上限却没说"
+    dropped = [step for step in react["steps"] if step["reasoning"] is None and step["reasoning_chars"] > 0]
+    assert dropped, "被丢掉的那几段连原本多长都没留下"
+
+
+def test_the_react_log_survives_a_turn_that_never_reached_an_answer(client):
+    """流被打断时这一轮没有回答，但已经走过的几步仍然是排查线索。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [[ChatReasoning("先查教材。"),
+               ChatToolCalls((ToolCallRequest("c1", "search_materials", '{"query": "护航效应"}'),))]]
+
+    class Broken(Scripted):
+        def chat(self, *, messages, tools=()):
+            if self._script:
+                yield from self._script.pop(0)
+                return
+            raise LLMProviderError("upstream_error", "断了", retryable=True)
+
+    space = _space(client)
+    space.turns._responder = Broken(script)
+    space.turns._fallback_responder = Broken([])
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "b-1", "message": "护航效应"})
+
+    view = _fetch(client, session_id).json()["turns"][-1]
+    assert view["react"]["steps"], "中断的那一轮一步都没记下来"
+    assert view["react"]["steps"][0]["calls"] == ["c1"]
+
+
+# ---- 工具正文改成按需取 ----
+
+def test_the_trace_listing_carries_no_tool_text_at_all(client):
+    """打开侧栏是第一眼，不该把几十段检索原文一起拖下来。判据打在响应本身：
+    整个 JSON 里不许出现教材原文，每一步只报它有多长。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
+
+    raw = _fetch(client, session_id).text
+    assert "护航效应。SJF" not in raw, "工具正文跟着列表一起下来了"
+    view = _fetch(client, session_id).json()["turns"][-1]
+    seed = next(tool for tool in view["tools"] if tool["origin"] == "seed")
+    assert seed["body"] is not None and seed["body"]["chars"] > 0
+    assert "text" not in seed["body"], "列表里还带着正文"
+
+
+def test_a_tool_body_is_fetched_on_demand_by_call_id(client):
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
+    view = _fetch(client, session_id).json()["turns"][-1]
+
+    response = client.get(f"/api/v2/sessions/{session_id}/trace/body",
+                          params={"turn_id": view["turn_id"], "call_id": SEED_CALL_ID})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["found"] is True and "护航效应" in body["text"]
+    assert body["chars"] == len(body["text"]) and body["name"] == "search_materials"
+
+
+def test_fetching_two_calls_of_the_same_tool_never_swaps_their_text(client):
+    """同名工具连调几次，按需取那一条也要按 call_id 精确配对。接错一位，
+    界面上就是「查 A 拿回了 B 的结果」。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
+    turn_id = _fetch(client, session_id).json()["turns"][-1]["turn_id"]
+
+    space = _space(client)
+    for call_id, text in (("c1", "第一次查回来的"), ("c2", "第二次查回来的")):
+        space.sessions.append_message(session_id=session_id, turn_id=turn_id, role="tool",
+                                      content=text, activity=[{"call_id": call_id, "name": "search_materials"}])
+
+    assert _body_text(client, session_id, turn_id, "c1") == "第一次查回来的"
+    assert _body_text(client, session_id, turn_id, "c2") == "第二次查回来的"
+
+
+def test_a_tool_that_never_stores_its_output_says_so_instead_of_looking_empty(client):
+    """artifact_read、MCP 工具这些按设计不落库。显示成空看起来像出了错，要明说。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    script = [
+        [ChatToolCalls((ToolCallRequest("c1", "get_plan", "{}"),))],
+        [ChatDelta("看过了。"), ChatFinal("看过了。", "stop", "example", "m", "provider")],
+    ]
+    view = _react_turn(client, session_id, script, message="我的复习计划到哪了")
+
+    span = next(tool for tool in view["tools"] if tool["name"] == "get_plan")
+    assert span["body"] is None
+    assert span["body_state"] == "not_persisted", span
+
+    response = client.get(f"/api/v2/sessions/{session_id}/trace/body",
+                          params={"turn_id": view["turn_id"], "call_id": "c1"})
+    assert response.status_code == 200 and response.json()["found"] is False
+
+
+def test_the_body_endpoint_cannot_reach_another_users_session(client):
+    alice_course = _indexed_course(client, name="甲的操作系统", headers=ALICE)
+    alice_session = _session(client, alice_course, headers=ALICE)
+    _turn(client, alice_session, request_id="a-1", message="FIFO 为什么有护航效应", headers=ALICE)
+    turn_id = _fetch(client, alice_session, headers=ALICE).json()["turns"][-1]["turn_id"]
+
+    params = {"turn_id": turn_id, "call_id": SEED_CALL_ID}
+    mine = client.get(f"/api/v2/sessions/{alice_session}/trace/body", params=params, headers=ALICE)
+    assert mine.status_code == 200 and mine.json()["found"] is True
+    denied = client.get(f"/api/v2/sessions/{alice_session}/trace/body", params=params, headers=BOB)
+    assert denied.status_code == 404
+
+
+def test_the_body_endpoint_will_not_hand_over_another_turns_text(client):
+    """turn_id 与 call_id 要一起配对。只按 call_id 找，同一个会话里别的轮次会串过来。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
+    _turn(client, session_id, request_id="t-2", message="那 SJF 呢")
+    ids = _turn_ids(_fetch(client, session_id).json())
+
+    # 两轮里各有一次 call_id 相同的调用：模型自己生成 id，跨轮撞上是常态
+    space = _space(client)
+    for turn_id, text in zip(ids, ("第一轮的正文", "第二轮的正文")):
+        space.sessions.append_message(session_id=session_id, turn_id=turn_id, role="tool",
+                                      content=text, activity=[{"call_id": "same", "name": "search_materials"}])
+
+    assert _body_text(client, session_id, ids[0], "same") == "第一轮的正文"
+    assert _body_text(client, session_id, ids[1], "same") == "第二轮的正文"
+
+
+def test_the_focused_turns_payload_is_resolved_before_the_others(client):
+    """回读 payload 有总量上限。按文件顺序填会让最新的那几轮全落到 skipped，
+    而用户点的多半就是最新那一轮。"""
+    course_id = _indexed_course(client)
+    session_id = _session(client, course_id)
+    _turn(client, session_id, request_id="t-1", message="FIFO 为什么有护航效应")
+    directory = _trace_dir(client)
+    day = str(_fetch(client, session_id).json()["turns"][-1]["started_at"])[:10]
+    (directory / "payloads").mkdir(parents=True, exist_ok=True)
+
+    chunk = MAX_PAYLOAD_BYTES // 2
+    count = MAX_PAYLOAD_TOTAL_BYTES // chunk + 3
+    for index in range(count):
+        (directory / "payloads" / f"q{index}.json").write_text(
+            json.dumps({"tools": {"0.arguments": {"query": "x" * chunk}}}), encoding="utf-8")
+    _write_records(directory, day, [_record(
+        session_id=session_id, turn_id=f"pay-{index:03d}", started_at=f"{day}T10:{index:02d}:00Z",
+        payload_ref=f"payloads/q{index}.json",
+        tools=[{"origin": "model", "name": "search_materials", "ok": True,
+                "arguments": {"payload_ref": "tools.0.arguments", "chars": chunk}}])
+        for index in range(count)])
+
+    last = f"pay-{count - 1:03d}"
+    payload = _fetch(client, session_id, turn_id=last).json()
+    view = next(item for item in payload["turns"] if item["turn_id"] == last)
+    assert view["payload_state"] == "resolved", "点中的那一轮反而被总量闸挡掉了"

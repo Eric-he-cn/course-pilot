@@ -13,7 +13,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.bootstrap import Application
 from app.http.deps import current_workspace, model_choice
-from app.http.devtools import build_trace_view
+from app.http.devtools import build_trace_view, tool_body
 from contracts.llm import LLMProviderError
 from modules.sessions.api import VisionFeatureDisabledError
 
@@ -139,6 +139,22 @@ def create_core_router() -> APIRouter:
             raise _not_found(exc) from exc
         return build_trace_view(session=session, messages=messages,
                                 data_dir=application.settings.data_dir, focus_turn_id=turn_id)
+
+    @router.get("/sessions/{session_id}/trace/body")
+    def session_trace_body(session_id: str, turn_id: str, call_id: str,
+                           application: Application = Depends(current_workspace)):
+        """某一步取回的正文，点开那一步才来取。
+
+        单独一个端点是为了让侧栏打开时不必把几十段检索原文一起拖下来。
+        按设计不落库的工具（artifact_read、MCP 等）在这里返回 found=false。
+        """
+        try:
+            if application.sessions.get_session(session_id) is None:
+                raise LookupError("会话不存在")
+            messages = application.sessions.list_messages(session_id)
+        except LookupError as exc:
+            raise _not_found(exc) from exc
+        return tool_body(messages=messages, turn_id=turn_id, call_id=call_id)
 
     @router.post("/sessions/{session_id}/attachments", status_code=201)
     async def upload_attachment(session_id: str, file: UploadFile = File(...), application: Application = Depends(current_workspace)):

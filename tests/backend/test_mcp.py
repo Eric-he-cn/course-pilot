@@ -412,8 +412,10 @@ def test_the_credential_reaches_the_server_but_never_comes_back_out(tmp_path, cl
     assert "北京今天晴" in body, "外部工具没跑通，泄漏判据就落空了"
     assert SECRET not in body, "凭据出现在 SSE 流里"
     assert SECRET not in caplog.text, "凭据进了日志"
+    # 索引与 payload 都要扫：ReAct 的正文（思考、每轮说的话）落在 payloads/ 那一侧
     traces = "".join(path.read_text(encoding="utf-8")
-                     for path in (application.settings.data_dir / "traces").rglob("*"))
+                     for path in (application.settings.data_dir / "traces").rglob("*")
+                     if path.is_file())
     assert traces and SECRET not in traces, "凭据进了 trace"
     listed = client.get("/api/v2/mcp/servers")
     assert SECRET not in listed.text, "凭据出现在管理接口的响应里"

@@ -386,6 +386,21 @@ button:disabled { cursor:not-allowed; opacity:.5 }
 .trace-args>summary,.trace-body>summary { color:var(--muted); font-family:var(--mono); font-size:11px; cursor:pointer; margin:6px 0 }
 .trace-body pre { overflow:auto; max-height:280px; margin:0 0 8px; padding:10px; border:1px solid var(--border); border-radius:7px; background:var(--panel); font-size:12px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere }
 .trace-loose-body { margin-bottom:10px; padding-left:10px; border-left:2px dashed var(--border) }
+.trace-steps { list-style:none; margin:0; padding:0 }
+.trace-step { margin-bottom:14px; padding:8px 0 0 11px; border-left:2px solid var(--accent) }
+.trace-step-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:6px; font-family:var(--mono); font-size:11.5px }
+.trace-step-head b { font-weight:650 }
+.trace-thinking>summary,.trace-answer>summary,.trace-stats>summary { color:var(--muted); font-family:var(--mono); font-size:11px; cursor:pointer; margin:6px 0 }
+.trace-thinking pre,.trace-answer pre,.trace-step-text pre { overflow:auto; max-height:260px; margin:0 0 8px; padding:10px; border:1px solid var(--border); border-radius:7px; background:var(--panel); font-size:12px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere }
+.trace-thinking pre { color:var(--muted); font-style:italic }
+.trace-step-text h4 { margin:6px 0 4px; color:var(--muted); font-family:var(--mono); font-size:10px; font-weight:600; letter-spacing:.1em; text-transform:uppercase }
+.trace-answer { margin:10px 11px 0 }
+.trace-answer pre { border-color:var(--accent) }
+.trace-substeps { list-style:none; margin:0 0 8px; padding:0 }
+.trace-substeps>li { display:flex; flex-wrap:wrap; gap:8px; font-family:var(--mono); font-size:11px; color:var(--muted) }
+.trace-substeps b { color:var(--text); font-weight:600 }
+.trace-stats { margin:14px 11px 12px; border-top:1px solid var(--border) }
+.trace-turn.focused .trace-stats section { padding:0 }
 .dev-toggle { display:flex; align-items:center; gap:9px; margin:12px 0 4px; font-size:13px }
 .dev-toggle input { width:15px; height:15px }
 /* help-note 是 small，行内元素带边框换行会碎成几段 */

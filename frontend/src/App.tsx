@@ -6,7 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { api, clearCurrentUser, currentDevMode, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentDevMode, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, McpServer, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceTurn, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, McpServer, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceStep, TraceSubagent, TraceTool, TraceTurn, WikiEstimate, WikiPageSummary } from './types'
 
 /** 开发者模式。关掉时 openTrace 为 null——入口靠这一个判断决定要不要渲染成可点的元素，
  *  免得出现「按钮还在、只是点了没反应」这种状态。 */
@@ -1744,17 +1744,137 @@ function TraceJson({ value }: { value: unknown }) {
   return <pre className="trace-json">{JSON.stringify(value, null, 2)}</pre>
 }
 
-function TraceBodyBlock({ body }: { body: TraceBody }) {
-  if (body.text === null) return <p className="trace-note trace-warn">{t('trace.body_omitted', { n: body.chars })}</p>
-  return <details className="trace-body"><summary>{t('trace.tool_body', { n: body.chars })}</summary><pre>{body.text}</pre></details>
+/** 工具正文：点开这一块才去取那一条，打开侧栏时不下载任何正文。 */
+function TraceBodyBlock({ sessionId, turnId, body }: { sessionId: string; turnId: string; body: TraceBody }) {
+  const [text, setText] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const load = () => {
+    if (text !== null || loading) return
+    setLoading(true); setError('')
+    api.traceBody(sessionId, turnId, body.call_id)
+      .then(payload => setText(payload.text ?? ''))
+      .catch(problem => setError(errorText(problem)))
+      .finally(() => setLoading(false))
+  }
+  return <details className="trace-body" onToggle={event => { if (event.currentTarget.open) load() }}>
+    <summary>{t('trace.tool_body', { n: body.chars })}</summary>
+    {loading && <p className="trace-note">{t('trace.body_loading')}</p>}
+    {error && <p className="trace-note trace-warn">{error}</p>}
+    {text !== null && <pre>{text}</pre>}
+  </details>
 }
 
-function TraceBodyList({ title, bodies }: { title: string; bodies: TraceBody[] }) {
+const BODY_STATE_NOTE: Record<string, string> = {
+  not_persisted: 'trace.body_not_persisted', reused: 'trace.body_reused',
+  denied: 'trace.body_denied', failed: 'trace.body_failed', missing: 'trace.body_missing',
+}
+
+function TraceBodyList({ title, bodies, sessionId, turnId }: {
+  title: string; bodies: TraceBody[]; sessionId: string; turnId: string
+}) {
   if (bodies.length === 0) return null
   return <section><h3>{title}</h3>{bodies.map(body => <div className="trace-loose-body" key={body.call_id}>
     <div className="trace-tool-head"><b>{tOr(`tool.${body.name}`, body.name)}</b><span className="trace-origin">{body.call_id}</span></div>
-    <TraceBodyBlock body={body} />
+    <TraceBodyBlock sessionId={sessionId} turnId={turnId} body={body} />
   </div>)}</section>
+}
+
+/** 时序里的一次调用：摘要、参数、以及按需展开的正文。 */
+function TraceCall({ tool, sessionId, turnId, subagent }: {
+  tool: TraceTool; sessionId: string; turnId: string; subagent?: TraceSubagent
+}) {
+  const summary = tool.summary_key ? tOr(tool.summary_key, tool.summary ?? '', tool.summary_args ?? undefined) : tool.summary
+  const note = BODY_STATE_NOTE[tool.body_state]
+  return <li>
+    <div className="trace-tool-head">
+      <b>{tOr(`tool.${tool.name}`, tool.name ?? '—')}</b>
+      <span className="trace-origin">{tool.origin ?? '—'}</span>
+      <span>{traceMs(tool.duration_ms)}</span>
+      {tool.reused && <i className="trace-badge">{t('trace.reused')}</i>}
+      {tool.decision === 'denied' && <i className="trace-bad">{t('trace.denied')}</i>}
+      {tool.ok === false && <i className="trace-bad">✕</i>}
+    </div>
+    {summary && <p className="trace-summary">{summary}</p>}
+    {tool.reason && <p className="trace-note trace-warn">{tool.reason}</p>}
+    {tool.arguments_ref
+      ? <p className="trace-note trace-warn">{t('trace.tool_args_dropped', { n: tool.arguments_ref.chars ?? 0 })}</p>
+      : <details className="trace-args"><summary>{t('trace.tool_args')}</summary><TraceJson value={tool.arguments ?? {}} /></details>}
+    {subagent && <TraceSubagentSteps subagent={subagent} />}
+    {tool.body
+      ? <TraceBodyBlock sessionId={sessionId} turnId={turnId} body={tool.body} />
+      : <p className="trace-note">{tOr(note ?? 'trace.body_missing', '')}</p>}
+  </li>
+}
+
+/** 子任务在父轮里只有骨架：几轮、每轮多长、调了哪些工具。它查到的正文单列在下面那一栏。 */
+function TraceSubagentSteps({ subagent }: { subagent: TraceSubagent }) {
+  return <details className="trace-args">
+    <summary>{t('trace.subagent_steps', { n: subagent.steps.length })}</summary>
+    <ol className="trace-substeps">{subagent.steps.map(step => <li key={step.round}>
+      <span>{t('trace.subagent_step', { n: step.round, r: step.reasoning_chars, t: step.text_chars })}</span>
+      <b>{step.calls.length > 0 ? step.calls.map(name => tOr(`tool.${name}`, name)).join(t('common.list_sep')) : t('trace.subagent_no_calls')}</b>
+    </li>)}</ol>
+  </details>
+}
+
+/** 模型的一次调用：想了什么 → 说了什么 → 调了哪几个工具。思考很长，默认收起。 */
+function TraceStepCard({ step, calls, sessionId, turnId, subagents }: {
+  step: TraceStep; calls: TraceTool[]; sessionId: string; turnId: string; subagents: TraceSubagent[]
+}) {
+  return <li className="trace-step">
+    <div className="trace-step-head">
+      <b>{t('trace.flow_step', { n: step.round })}</b>
+      {step.injected && <i className="trace-badge">{tOr(`trace.injected_${step.injected}`, step.injected)}</i>}
+      {step.outcome === 'budget_exhausted' && <i className="trace-bad">{t('trace.outcome_budget_exhausted')}</i>}
+    </div>
+    {step.reasoning !== null
+      ? <details className="trace-thinking"><summary>{t('trace.thinking', { n: step.reasoning_chars })}</summary><pre>{step.reasoning}</pre></details>
+      : step.reasoning_chars > 0 && <p className="trace-note trace-warn">{t('trace.thinking_missing', { n: step.reasoning_chars })}</p>}
+    {step.text !== null && <div className="trace-step-text"><h4>{t('trace.step_text')}</h4><pre>{step.text}</pre></div>}
+    {step.text === null && step.text_chars > 0 && <p className="trace-note trace-warn">{t('trace.step_text_missing', { n: step.text_chars })}</p>}
+    {step.text === null && step.text_chars === 0 && calls.length > 0 && <p className="trace-note">{t('trace.step_silent')}</p>}
+    {calls.length > 0 && <ol className="trace-tools">{calls.map(tool => (
+      <TraceCall key={tool.index} tool={tool} sessionId={sessionId} turnId={turnId}
+        subagent={subagents.find(item => item.call_id === tool.call_id)} />
+    ))}</ol>}
+  </li>
+}
+
+/** 执行流程：开场的系统动作 → 每一次模型调用 → 最终回答。侧栏第一眼看的就是这一段。 */
+function TraceFlow({ turn, sessionId }: { turn: TraceTurn; sessionId: string }) {
+  const react = turn.react
+  const claimed = new Set(react.steps.flatMap(step => step.calls))
+  const prelude = turn.tools.filter(tool => tool.round === 0)
+  // 老 trace 的 span 没有 round，模型那几次也归不到某一步：单列在时序末尾，别把它们藏掉
+  const loose = turn.tools.filter(tool => tool.round !== 0 && !claimed.has(tool.call_id))
+  const byCallId = new Map(turn.tools.map(tool => [tool.call_id, tool]))
+  const render = (tool: TraceTool) => <TraceCall key={tool.index} tool={tool} sessionId={sessionId}
+    turnId={turn.turn_id} subagent={react.subagents.find(item => item.call_id === tool.call_id)} />
+
+  if (react.steps.length === 0 && turn.tools.length === 0) {
+    return <section><h3>{t('trace.section_flow')}</h3><p className="trace-note">{t('trace.flow_empty')}</p></section>
+  }
+  return <section><h3>{t('trace.section_flow')}</h3>
+    {react.dropped_chars > 0 && <p className="trace-note trace-warn">{t('trace.flow_dropped', { n: react.dropped_chars })}</p>}
+    <ol className="trace-steps">
+      {prelude.length > 0 && <li className="trace-step">
+        <div className="trace-step-head"><b>{t('trace.flow_prelude')}</b></div>
+        <ol className="trace-tools">{prelude.map(render)}</ol>
+      </li>}
+      {react.steps.map(step => <TraceStepCard key={step.round} step={step} sessionId={sessionId} turnId={turn.turn_id}
+        subagents={react.subagents}
+        calls={step.calls.map(id => byCallId.get(id)).filter((tool): tool is TraceTool => Boolean(tool))} />)}
+      {loose.length > 0 && <li className="trace-step">
+        <div className="trace-step-head"><b>{t('trace.section_tools')}</b></div>
+        <ol className="trace-tools">{loose.map(render)}</ol>
+      </li>}
+    </ol>
+    {react.answer !== null && <details className="trace-answer" open>
+      <summary>{t('trace.flow_answer', { n: react.answer_chars })}</summary><pre>{react.answer}</pre>
+    </details>}
+    {react.answer === null && react.answer_chars > 0 && <p className="trace-note trace-warn">{t('trace.flow_answer_missing', { n: react.answer_chars })}</p>}
+  </section>
 }
 
 const PAYLOAD_NOTE: Record<string, string> = {
@@ -1762,7 +1882,10 @@ const PAYLOAD_NOTE: Record<string, string> = {
   oversized: 'trace.payload_oversized', skipped: 'trace.payload_skipped',
 }
 
-function TraceTurnCard({ turn, ordinal, focused, onFocus }: { turn: TraceTurn; ordinal: number; focused: boolean; onFocus: () => void }) {
+/** 一轮的卡片。执行流程在最上面，课程判定、用量这些统计折到最后并默认收起。 */
+function TraceTurnCard({ turn, ordinal, focused, sessionId, onFocus }: {
+  turn: TraceTurn; ordinal: number; focused: boolean; sessionId: string; onFocus: () => void
+}) {
   const head = <button type="button" className="trace-turn-head" onClick={onFocus}>
     <b>{t('trace.turn_label', { n: ordinal })}</b>
     <span>{turn.started_at ? timeLabel(turn.started_at) : '—'}</span>
@@ -1775,49 +1898,28 @@ function TraceTurnCard({ turn, ordinal, focused, onFocus }: { turn: TraceTurn; o
   return <div className="trace-turn focused">{head}
     {!turn.trace_record && <p className="trace-note trace-warn">{t('trace.no_record')}</p>}
     {payloadNote && <p className="trace-note trace-warn">{tOr(payloadNote, '')}</p>}
-    {turn.bodies_omitted > 0 && <p className="trace-note trace-warn">{t('trace.bodies_omitted_count', { n: turn.bodies_omitted })}</p>}
-    {turn.trace_record && <section><h3>{t('trace.section_basics')}</h3><TraceFacts rows={[
-      [t('trace.field_turn'), <code key="id">{turn.turn_id}</code>],
-      [t('trace.field_started'), turn.started_at ?? '—'],
-      [t('trace.field_status'), turn.error_code ? `${turn.status ?? '—'} · ${turn.error_code}` : turn.status ?? '—'],
-      [t('trace.field_duration'), traceMs(turn.duration_ms)],
-      [t('trace.field_prompt'), turn.prompt_version ?? '—'],
-      [t('trace.field_scope'), turn.scope_mode ?? '—'],
-      [t('trace.field_answer_chars'), turn.answer_chars ?? '—'],
-      [t('trace.field_citations'), `${turn.citations ?? '—'} / ${turn.citations_retrieved ?? '—'}`],
-      [t('trace.field_tool_rounds'), turn.tool_rounds ?? '—'],
-    ]} /></section>}
-    {turn.resolution && <section><h3>{t('trace.section_resolution')}</h3><TraceJson value={turn.resolution} /></section>}
-    {(turn.responder || turn.usage) && <section><h3>{t('trace.section_model')}</h3>
-      {turn.responder && <TraceJson value={turn.responder} />}
-      {turn.usage && <TraceJson value={turn.usage} />}
-    </section>}
-    <section><h3>{t('trace.section_tools')}</h3>
-      {turn.tools.length === 0 ? <p className="trace-note">{t('trace.no_tools')}</p> : <ol className="trace-tools">
-        {turn.tools.map(tool => {
-          const summary = tool.summary_key ? tOr(tool.summary_key, tool.summary ?? '', tool.summary_args ?? undefined) : tool.summary
-          return <li key={tool.index}>
-            <div className="trace-tool-head">
-              <b>{tOr(`tool.${tool.name}`, tool.name ?? '—')}</b>
-              <span className="trace-origin">{tool.origin ?? '—'}</span>
-              <span>{traceMs(tool.duration_ms)}</span>
-              {tool.reused && <i className="trace-badge">{t('trace.reused')}</i>}
-              {tool.decision === 'denied' && <i className="trace-bad">{t('trace.denied')}</i>}
-              {tool.ok === false && <i className="trace-bad">✕</i>}
-            </div>
-            {summary && <p className="trace-summary">{summary}</p>}
-            {tool.reason && <p className="trace-note trace-warn">{tool.reason}</p>}
-            {tool.arguments_ref
-              ? <p className="trace-note trace-warn">{t('trace.tool_args_dropped', { n: tool.arguments_ref.chars ?? 0 })}</p>
-              : <details className="trace-args"><summary>{t('trace.tool_args')}</summary><TraceJson value={tool.arguments ?? {}} /></details>}
-            {tool.body ? <TraceBodyBlock body={tool.body} /> : <p className="trace-note">{t('trace.tool_body_none')}</p>}
-          </li>
-        })}
-      </ol>}
-    </section>
-    <TraceBodyList title={t('trace.section_subagent')} bodies={turn.subagent_bodies} />
-    <TraceBodyList title={t('trace.section_unmatched')} bodies={turn.unmatched_bodies} />
-    {Object.keys(turn.extras).length > 0 && <section><h3>{t('trace.section_extras')}</h3><TraceJson value={turn.extras} /></section>}
+    <TraceFlow turn={turn} sessionId={sessionId} />
+    <TraceBodyList title={t('trace.section_subagent')} bodies={turn.subagent_bodies} sessionId={sessionId} turnId={turn.turn_id} />
+    <TraceBodyList title={t('trace.section_unmatched')} bodies={turn.unmatched_bodies} sessionId={sessionId} turnId={turn.turn_id} />
+    {turn.trace_record && <details className="trace-stats"><summary>{t('trace.section_stats')}</summary>
+      <section><h3>{t('trace.section_basics')}</h3><TraceFacts rows={[
+        [t('trace.field_turn'), <code key="id">{turn.turn_id}</code>],
+        [t('trace.field_started'), turn.started_at ?? '—'],
+        [t('trace.field_status'), turn.error_code ? `${turn.status ?? '—'} · ${turn.error_code}` : turn.status ?? '—'],
+        [t('trace.field_duration'), traceMs(turn.duration_ms)],
+        [t('trace.field_prompt'), turn.prompt_version ?? '—'],
+        [t('trace.field_scope'), turn.scope_mode ?? '—'],
+        [t('trace.field_answer_chars'), turn.answer_chars ?? '—'],
+        [t('trace.field_citations'), `${turn.citations ?? '—'} / ${turn.citations_retrieved ?? '—'}`],
+        [t('trace.field_tool_rounds'), turn.tool_rounds ?? '—'],
+      ]} /></section>
+      {turn.resolution && <section><h3>{t('trace.section_resolution')}</h3><TraceJson value={turn.resolution} /></section>}
+      {(turn.responder || turn.usage) && <section><h3>{t('trace.section_model')}</h3>
+        {turn.responder && <TraceJson value={turn.responder} />}
+        {turn.usage && <TraceJson value={turn.usage} />}
+      </section>}
+      {Object.keys(turn.extras).length > 0 && <section><h3>{t('trace.section_extras')}</h3><TraceJson value={turn.extras} /></section>}
+    </details>}
   </div>
 }
 
@@ -1847,15 +1949,16 @@ function TraceDrawer({ sessionId, turnId, onFocus, onClose }: {
     {loading && <p className="trace-note">{t('trace.loading')}</p>}
     {error && <p className="trace-note trace-warn">{error}</p>}
     {data && <>
-      <p className="trace-note">{t('trace.scan_note', { files: data.scan.files.length, lines: data.scan.scanned_lines })}</p>
+      {/* 覆盖不全与点不到那一轮是数据缺失，留在最上面；纯统计的扫描量折到最后 */}
       {data.scan.truncated && <p className="trace-note trace-warn">{t('trace.truncated', { turns: data.limits.max_turns, lines: data.limits.max_scan_lines, files: data.limits.max_day_files })}</p>}
       {!data.focus_found && data.turns.length > 0 && <p className="trace-note trace-warn">{t('trace.focus_missing')}</p>}
       {data.turns.length === 0 && <p className="trace-empty">{t('trace.empty')}</p>}
       {/* key 带上序号：同一份 JSONL 里出现两条相同 turn_id 时 turn_id 单独做 key 会撞 */}
       <ol className="trace-turns">{data.turns.map((turn, index) => <li key={`${index}:${turn.turn_id}`}>
         <TraceTurnCard turn={turn} ordinal={index + 1} focused={turn.turn_id === data.focus_turn_id}
-          onFocus={() => onFocus(turn.turn_id)} />
+          sessionId={sessionId} onFocus={() => onFocus(turn.turn_id)} />
       </li>)}</ol>
+      <p className="trace-note">{t('trace.scan_note', { files: data.scan.files.length, lines: data.scan.scanned_lines })}</p>
     </>}
   </aside>
 }

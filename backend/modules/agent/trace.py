@@ -5,6 +5,7 @@ import json
 import re
 import threading
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -16,6 +17,16 @@ logger = logging.getLogger(__name__)
 # 超过这个长度的字段搬进 payload 文件，主 JSONL 只留 ref（架构 §16.1）。
 _INLINE_MAX_CHARS = 200
 _PAYLOAD_FIELDS = ("arguments",)
+# ReAct 时序里的正文（思考、每轮说的话、最终回答）也走 payload 文件。
+_REACT_FIELDS = ("reasoning", "text")
+
+# 单段正文进 trace 的上限。思考在 max 档一轮能有两千 token，全存下来索引和回读都扛不住；
+# 截断后仍然报原文长度，界面上说得出「这里少了多少」。
+REACT_FIELD_MAX_CHARS = 4_000
+# 一轮的 ReAct 正文合计上限。skill 激活后一轮可以有十几次模型调用，
+# 逐段封顶挡不住总量——单个 payload 文件有 512 KiB 的硬上限。
+REACT_TURN_MAX_CHARS = 32_000
+REACT_CLIP = "…（超出 trace 记录上限，末尾已截断）"
 
 # 回读上限。trace 按天分文件、一天可以有几万行，所以三个维度都要有闸：
 # 翻几个文件、扫多少行、返回多少轮。限制了覆盖就要在响应里说出来。
@@ -82,9 +93,85 @@ class TraceWriter:
                         span_copy[field] = {"payload_ref": f"tools.{position}.{field}", "chars": len(encoded)}
                 trimmed.append(span_copy)
             index["tools"] = trimmed
+        TraceWriter._split_react(index, payload)
         if payload:
             payload["turn_id"] = turn_id
         return index, payload
+
+    @staticmethod
+    def _split_react(index: dict, payload: dict) -> None:
+        """ReAct 的正文一律搬进 payload：思考与每轮的话都是整段文本，留在索引里
+        会让一行 JSONL 涨到几十 KB，而扫描要逐行 json.loads。"""
+        react = index.get("react")
+        if not isinstance(react, dict):
+            return
+        moved = dict(react)
+        steps = []
+        for position, step in enumerate(moved.get("steps") or []):
+            if not isinstance(step, dict):
+                steps.append(step)
+                continue
+            copy = dict(step)
+            for field in _REACT_FIELDS:
+                text = copy.get(field)
+                if isinstance(text, str) and text:
+                    payload.setdefault("react", {})[f"{position}.{field}"] = text
+                    copy[field] = {"payload_ref": f"react.{position}.{field}"}
+            steps.append(copy)
+        moved["steps"] = steps
+        answer = moved.get("answer")
+        if isinstance(answer, str) and answer:
+            payload.setdefault("react", {})["answer"] = answer
+            moved["answer"] = {"payload_ref": "react.answer"}
+        index["react"] = moved
+
+
+class ReactLog:
+    """一轮的 ReAct 时序：每次模型调用的思考、它说出来的话、它发起的调用。
+
+    纯观测——这里不抛异常也不参与任何业务判断，记岔了最多让侧栏少一段。
+    """
+
+    def __init__(self) -> None:
+        self.steps: list[dict] = []
+        self.subagents: list[dict] = []
+        self._room = REACT_TURN_MAX_CHARS
+        self._dropped = 0
+
+    def record(self, *, round_index: int, injected: str | None, reasoning: str, text: str,
+               calls: Sequence[str], outcome: str) -> dict:
+        """记下刚跑完的这一次模型调用。返回这一步，调用方后续可以改写 outcome。"""
+        step: dict = {"round": round_index, "injected": injected, "outcome": outcome,
+                      "calls": list(calls)}
+        for name, value in (("reasoning", reasoning), ("text", text)):
+            step[name], step[f"{name}_chars"] = self._fit(value, self._room)
+        self.steps.append(step)
+        return step
+
+    def add_subagent(self, *, call_id: str, task: str, steps: list[dict]) -> None:
+        """子任务只记轮次骨架（每轮的思考/正文长度与调了哪些工具），不记正文。"""
+        self.subagents.append({"call_id": call_id, "task": task[:200], "steps": steps})
+
+    def as_record(self, answer: str) -> dict:
+        # 最终回答单独给一份额度：它是这条链的落点，不能被前面的思考挤掉。
+        stored, chars = self._fit(answer, REACT_FIELD_MAX_CHARS)
+        return {"steps": self.steps, "answer": stored, "answer_chars": chars,
+                "subagents": self.subagents, "dropped_chars": self._dropped}
+
+    def _fit(self, value: str, room: int) -> tuple[str | None, int]:
+        """按剩余额度收下这一段，返回 (存下来的文本, 原文长度)。
+        存不下就整段不存，长度照报——界面据此说得出这里少了多少。"""
+        chars = len(value)
+        budget = min(REACT_FIELD_MAX_CHARS, room)
+        if not chars:
+            return None, 0
+        if budget <= len(REACT_CLIP):
+            self._dropped += chars
+            return None, chars
+        kept = value if chars <= budget else value[:budget - len(REACT_CLIP)] + REACT_CLIP
+        self._dropped += max(0, chars - len(kept))
+        self._room -= len(kept)
+        return kept, chars
 
 
 def _shift_day(day: str, days: int) -> str:
@@ -194,11 +281,14 @@ class TraceReader:
             return "missing"
         except (json.JSONDecodeError, ValueError):
             return "invalid"
-        slots = payload.get("tools") if isinstance(payload, dict) else None
-        if not isinstance(slots, dict):
+        if not isinstance(payload, dict):
+            return "invalid"
+        slots = payload.get("tools")
+        react_slots = payload.get("react")
+        if not isinstance(slots, dict) and not isinstance(react_slots, dict):
             return "invalid"
         tools = record.get("tools")
-        if isinstance(tools, list):
+        if isinstance(tools, list) and isinstance(slots, dict):
             for position, span in enumerate(tools):
                 if not isinstance(span, dict):
                     continue
@@ -206,7 +296,23 @@ class TraceReader:
                     key = f"{position}.{name}"
                     if key in slots and isinstance(span.get(name), dict) and "payload_ref" in span[name]:
                         span[name] = slots[key]
+        if isinstance(react_slots, dict):
+            self._restore_react(record.get("react"), react_slots)
         return "resolved"
+
+    @staticmethod
+    def _restore_react(react: object, slots: dict) -> None:
+        if not isinstance(react, dict):
+            return
+        for position, step in enumerate(react.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            for name in _REACT_FIELDS:
+                key = f"{position}.{name}"
+                if key in slots and isinstance(step.get(name), dict):
+                    step[name] = slots[key]
+        if "answer" in slots and isinstance(react.get("answer"), dict):
+            react["answer"] = slots["answer"]
 
     def _day_files(self, since: str | None, until: str | None) -> tuple[list[Path], bool]:
         if not self._directory.is_dir():

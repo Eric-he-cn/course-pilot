@@ -1,5 +1,5 @@
 import { t } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, McpOverview, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, McpOverview, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TraceBodyText, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
@@ -107,10 +107,15 @@ export const api = {
     // 这里再滤一次：多一道拦截比事后发现检索原文被画成气泡便宜。
     return payload.messages.filter(message => message.role !== 'tool').map(message => ({ ...message, citations: message.citations?.map(citation => ({ ...citation, id: citation.id ?? citation.citation_id, material_name: citation.material_name ?? citation.document, text: citation.text ?? citation.snippet })) }))
   },
-  /** 开发者模式侧栏：整个会话的轮次，turnId 指出高亮哪一轮（它的工具正文优先返回）。 */
+  /** 开发者模式侧栏：整个会话的轮次，turnId 指出高亮哪一轮。只有时序与长度，不含工具正文。 */
   sessionTrace: (sessionId: string, turnId?: string) => {
     const query = turnId ? `?${new URLSearchParams({ turn_id: turnId })}` : ''
     return request<SessionTrace>(`/sessions/${sessionId}/trace${query}`)
+  },
+  /** 某一步取回的正文，点开那一步才来取。 */
+  traceBody: (sessionId: string, turnId: string, callId: string) => {
+    const query = new URLSearchParams({ turn_id: turnId, call_id: callId })
+    return request<TraceBodyText>(`/sessions/${sessionId}/trace/body?${query}`)
   },
   materials: (courseId: string) => request<Material[]>(`/courses/${courseId}/materials`),
   uploadMaterial: (courseId: string, file: File) => {

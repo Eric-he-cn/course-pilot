@@ -190,16 +190,31 @@ export interface Message {
 
 // —— 开发者模式的 trace 侧栏。观测用，读不到就是读不到，别拿它当业务数据 ——
 
-/** 工具取回的正文。text 为 null 表示超出本次响应的字符预算，chars 仍是它原本的长度。 */
+/** 工具正文在列表里的存根：只报它有多长，正文点开那一步才去取。 */
 export interface TraceBody {
   call_id: string
   name: string
   chars: number
-  text: string | null
 }
+
+/** 按需取回的一条正文。found 为 false 表示这一步按设计不落库。 */
+export interface TraceBodyText {
+  turn_id: string
+  call_id: string
+  name: string
+  chars: number
+  text: string | null
+  found: boolean
+}
+
+/** 这一步为什么没有正文。空着看起来像出了错，四种原因各有各的说法。 */
+export type TraceBodyState = 'stored' | 'not_persisted' | 'reused' | 'denied' | 'failed' | 'missing'
 
 export interface TraceTool {
   index: number
+  call_id: string
+  // 哪一次模型调用发起的；0 是模型开口之前的系统动作（种子检索、自动加载 skill）
+  round?: number | null
   origin?: string | null
   name?: string | null
   ok?: boolean | null
@@ -214,12 +229,43 @@ export interface TraceTool {
   // 长参数搬进了 payload 文件而这次没取到：参数不是空的，只是没读到
   arguments_ref?: { chars?: number | null } | null
   body: TraceBody | null
+  body_state: TraceBodyState
+}
+
+/** 一次模型调用：想了什么、说了什么、发起了哪几个调用。
+ *  正文为 null 而字数大于 0，表示这一段超出 trace 的记录上限没有留下来。 */
+export interface TraceStep {
+  round: number
+  // 服务端往这一轮塞了什么：四种补救轮、工具额度用尽的通知、降级到兜底模型
+  injected: string | null
+  outcome: string | null
+  calls: string[]
+  reasoning: string | null
+  reasoning_chars: number
+  text: string | null
+  text_chars: number
+}
+
+export interface TraceSubagent {
+  call_id: string
+  task: string
+  steps: Array<{ round: number; reasoning_chars: number; text_chars: number; calls: string[] }>
+}
+
+export interface TraceReact {
+  steps: TraceStep[]
+  answer: string | null
+  answer_chars: number
+  subagents: TraceSubagent[]
+  dropped_chars: number
 }
 
 export interface TraceTurn {
   turn_id: string
   // false 表示这一轮的 trace 记录已经不在了（目录被清理），正文还在库里
   trace_record: boolean
+  // 执行流程，侧栏第一眼看的东西
+  react: TraceReact
   started_at?: string | null
   status?: string | null
   error_code?: string | null
@@ -238,7 +284,6 @@ export interface TraceTurn {
   // 子任务查到的正文：父轮的 trace 里没有对应的调用，所以单列
   subagent_bodies: TraceBody[]
   unmatched_bodies: TraceBody[]
-  bodies_omitted: number
   extras: Record<string, unknown>
 }
 
@@ -247,7 +292,7 @@ export interface SessionTrace {
   focus_turn_id: string | null
   focus_found: boolean
   turns: TraceTurn[]
-  limits: { max_turns: number; max_scan_lines: number; max_day_files: number; max_body_chars: number; max_payload_bytes: number; max_payload_total_bytes: number }
+  limits: { max_turns: number; max_scan_lines: number; max_day_files: number; max_payload_bytes: number; max_payload_total_bytes: number; react_field_max_chars: number; react_turn_max_chars: number }
   scan: { files: string[]; scanned_lines: number; scan_capped: boolean; turns_capped: boolean; files_capped: boolean; truncated: boolean }
 }
 
