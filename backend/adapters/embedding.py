@@ -69,6 +69,30 @@ class BgeEmbedder:
         order = np.argsort(-scores)[: max(1, top_k)]
         return [(int(index), float(scores[index])) for index in order]
 
+    def pairwise(self, vectors: list[bytes]) -> list[list[float]] | None:
+        return cosine_matrix(vectors)
+
     def _needs_query_prefix(self) -> bool:
         name = self._model_name.lower()
         return "bge" in name and "m3" not in name and ("zh" in name or "chinese" in name)
+
+
+def cosine_matrix(vectors: list[bytes]) -> list[list[float]] | None:
+    """存好的文档向量两两求余弦。不加载模型：向量已经在库里，这一步只是解字节串做点积。
+
+    维度对不上（换过嵌入模型又没重建索引）返回 None，让调用方降级，别给出错的相似度。
+    """
+    if not vectors:
+        return []
+    if len({len(vector) for vector in vectors}) != 1:
+        return None
+    import numpy as np
+
+    try:
+        matrix = np.frombuffer(b"".join(vectors), dtype=np.float32).reshape(len(vectors), -1)
+    except ValueError:  # 字节数不是 float32 的整数倍：库里那几行坏了
+        return None
+    # 服务端可能不做归一化，这里自己归一，保证分数是余弦
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return ((matrix / norms) @ (matrix / norms).T).tolist()

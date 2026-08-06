@@ -22,7 +22,11 @@ class ToolSpec:
     parameters: dict[str, object]
 
     def wire(self) -> dict[str, object]:
-        """OpenAI 兼容接口上工具定义的形状。发送与用量估算共用这一份，免得两处各写各的。"""
+        """Chat Completions 上工具定义的形状；用量估算也用它。
+
+        Responses 协议发的是平铺形状（见 adapters/llm/responses_api.py），比这份短，
+        所以那条协议下估算是保守高估（22 个工具全量实测 2.2%），方向安全，不另算一份。
+        """
         return {"type": "function",
                 "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}
 
@@ -37,6 +41,24 @@ class ToolCallRequest:
 
 
 @dataclass(frozen=True)
+class ServerToolCall:
+    """厂商在自己那边执行的一次工具调用（目前只有 server-side 联网搜索）。
+
+    本地没有执行回环：我们既看不到搜索结果，也无从产出可点开的引用，
+    拿到的只是「它做了什么」。只用于可观测与回传，不参与任何判断。
+    """
+
+    id: str
+    kind: str            # web_search
+    action: str          # search | open_page | find_in_page
+    detail: str          # 查询词或网址，已压成一行
+    ok: bool = True
+    duration_ms: int = 0
+    # 厂商原样的那条记录，回传时照发。只有产生它的适配器认得，别处不要读它的内部结构。
+    echo: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ChatMessage:
     role: str  # system | user | assistant | tool
     content: str
@@ -44,6 +66,8 @@ class ChatMessage:
     tool_call_id: str | None = None
     # 思考模式下厂商要求把上一轮的思考内容随 assistant 消息回传，不带会被拒。
     reasoning: str = ""
+    # 厂商端工具调用要原样回传，它据此恢复自己那边的搜索结果；不回传等于这一轮白搜。
+    server_calls: tuple[ServerToolCall, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +98,8 @@ class ChatToolCalls:
     reasoning: str = ""
     # 厂商原样返回的 finish_reason，没返回就是 None。纯观测，不参与任何判断。
     provider_finish_reason: str | None = None
+    # 这一轮厂商在自己那边跑过的工具调用，见 ServerToolCall。
+    server_calls: tuple[ServerToolCall, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,6 +114,8 @@ class ChatFinal:
     usage: dict[str, int] = field(default_factory=dict)
     # 厂商原样返回的 finish_reason，没返回就是 None。纯观测，不参与任何判断。
     provider_finish_reason: str | None = None
+    # 这一轮厂商在自己那边跑过的工具调用，见 ServerToolCall。
+    server_calls: tuple[ServerToolCall, ...] = ()
 
 
 @dataclass(frozen=True)

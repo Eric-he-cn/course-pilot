@@ -37,6 +37,21 @@ def _parse_extra_body(raw: str, name: str = "TEXT_EXTRA_BODY") -> dict[str, obje
 
 _CN_DIGITS = "一二三四五六七八九"
 
+# 模型接入协议：chat 打 /chat/completions，responses 打 /responses。语义等价，选哪条看服务支持哪条。
+PROTOCOLS = ("chat", "responses")
+
+
+def _parse_protocol(raw: str, name: str = "TEXT_PROTOCOL") -> str:
+    """配错了在启动时说清楚，别留到第一次对话才发现请求打在了不存在的端点上。"""
+    protocol = raw.strip().lower() or "chat"
+    if protocol not in PROTOCOLS:
+        raise ValueError(f"{name} 只能是 {' 或 '.join(PROTOCOLS)}，收到：{raw.strip()}")
+    return protocol
+
+
+def _flag(raw: str) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes"}
+
 # 软窗口各分区占的比例，对应架构 §5.5 那张表。合计 92.2%，余下留给模型输出与估算误差。
 # 换一个窗口更小的模型只改 AGENT_MODEL_CONTEXT_WINDOW，各分区按同样比例一起缩。
 CONTEXT_PARTITION_RATIOS: dict[str, float] = {
@@ -77,6 +92,10 @@ class ModelChoice:
     api_key: str
     model: str
     extra_body: dict[str, object] = field(default_factory=dict)
+    # 走哪条协议，见 PROTOCOLS。
+    protocol: str = "chat"
+    # 是否让厂商在它那边联网搜索（只有 responses 协议有这个能力），默认关。
+    server_search: bool = False
 
     @property
     def configured(self) -> bool:
@@ -84,10 +103,16 @@ class ModelChoice:
 
     @property
     def thinking_tier(self) -> str:
-        """从配置里的 extra_body 推出默认档位；档位名与 bootstrap.THINKING_TIERS 对应。"""
+        """从配置里的 extra_body 推出默认档位；档位名与 bootstrap 的档位表对应。
+        没配就别替用户拍一个深度：adaptive 是「让模型自己决定这轮要不要想」。"""
+        if self.protocol == "responses":
+            # Responses 协议下思考深度走 reasoning.effort。界面只有四档，厂商的 low/medium/xhigh
+            # 都落到 high——与 chat 那套一致（那边非 max 的 effort 同样归 high）。
+            effort = (self.extra_body.get("reasoning") or {}).get("effort") \
+                if isinstance(self.extra_body.get("reasoning"), dict) else None
+            return {"none": "off", "minimal": "off", "max": "max"}.get(str(effort), "high") if effort else "adaptive"
         thinking = self.extra_body.get("thinking")
         if not isinstance(thinking, dict):
-            # 没配就别替用户拍一个深度：adaptive 是「让模型自己决定这轮要不要想」。
             return "adaptive"
         kind, effort = thinking.get("type"), thinking.get("effort")
         if kind == "disabled":
@@ -127,6 +152,8 @@ def _read_models(value) -> tuple[ModelChoice, ...]:
         provider=value("TEXT_PROVIDER", "openai_compatible"), base_url=value("TEXT_BASE_URL"),
         api_key=value("TEXT_API_KEY"), model=value("TEXT_MODEL"),
         extra_body=_parse_extra_body(value("TEXT_EXTRA_BODY")),
+        protocol=_parse_protocol(value("TEXT_PROTOCOL")),
+        server_search=_flag(value("TEXT_SERVER_SEARCH")),
     )
     models = [first]
     for index in range(2, 10):
@@ -134,6 +161,8 @@ def _read_models(value) -> tuple[ModelChoice, ...]:
         if not model:
             break
         raw_extra = value(f"TEXT_EXTRA_BODY_{index}").strip()
+        raw_protocol = value(f"TEXT_PROTOCOL_{index}").strip()
+        raw_search = value(f"TEXT_SERVER_SEARCH_{index}").strip()
         models.append(ModelChoice(
             key=str(index), label=f"模型{_CN_DIGITS[index - 1]}",
             provider=value(f"TEXT_PROVIDER_{index}") or first.provider,
@@ -141,6 +170,8 @@ def _read_models(value) -> tuple[ModelChoice, ...]:
             api_key=value(f"TEXT_API_KEY_{index}") or first.api_key,
             model=model,
             extra_body=_parse_extra_body(raw_extra, f"TEXT_EXTRA_BODY_{index}") if raw_extra else dict(first.extra_body),
+            protocol=_parse_protocol(raw_protocol, f"TEXT_PROTOCOL_{index}") if raw_protocol else first.protocol,
+            server_search=_flag(raw_search) if raw_search else first.server_search,
         ))
     return tuple(models)
 
@@ -212,8 +243,13 @@ class Settings:
     mcp_allow_loopback: bool = False
     mcp_connect_timeout_seconds: float = 10
     mcp_timeout_seconds: float = 30
-    # 厂商私有的请求字段（如关闭思考模式），原样并入 chat/completions 请求体。
+    # 厂商私有的请求字段（如关闭思考模式），原样并入请求体。
     text_extra_body: dict[str, object] = field(default_factory=dict)
+    # 模型接入协议，见 PROTOCOLS。默认 chat，与加这个字段之前的行为一致。
+    text_protocol: str = "chat"
+    # 厂商端联网搜索，默认关。搜索由厂商执行，结果直接进模型上下文，不经过本地的
+    # 不可信内容前缀，也产不出可点开的引用；开它是一次明确的安全取舍。
+    text_server_search: bool = False
     # 可选的对话模型。第一项等同上面那组 text_* 字段，界面按它们的顺序给用户切换。
     text_models: tuple[ModelChoice, ...] = ()
     # 本机探测结果。配置写 auto 时按它选模型；写死模型名时它只用于健康上报。
@@ -251,6 +287,7 @@ class Settings:
         return (ModelChoice(
             key="1", label="模型一", provider=self.text_provider, base_url=self.text_base_url,
             api_key=self.text_api_key, model=self.text_model, extra_body=dict(self.text_extra_body),
+            protocol=self.text_protocol, server_search=self.text_server_search,
         ),)
 
     @property
@@ -329,6 +366,8 @@ class Settings:
             mcp_connect_timeout_seconds=max(0.1, float(value("MCP_CONNECT_TIMEOUT_SECONDS", "10"))),
             mcp_timeout_seconds=max(1.0, float(value("MCP_TIMEOUT_SECONDS", "30"))),
             text_extra_body=_parse_extra_body(value("TEXT_EXTRA_BODY")),
+            text_protocol=_parse_protocol(value("TEXT_PROTOCOL")),
+            text_server_search=_flag(value("TEXT_SERVER_SEARCH")),
             text_models=_read_models(value),
             hardware=machine.as_dict(),
             rag_cloud_base_url=value("RAG_CLOUD_BASE_URL"),

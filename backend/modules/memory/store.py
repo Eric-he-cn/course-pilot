@@ -5,6 +5,8 @@ import shutil
 import threading
 from pathlib import Path
 
+from core.common import write_text_atomic
+
 # 受管区块：只有 marker 之间的内容会被 Agent 覆盖，用户手写的段落不动（架构 §8）。
 _BLOCK = "<!-- agent:managed:{section} -->\n{content}\n<!-- /agent:managed:{section} -->"
 _BLOCK_PATTERN = "<!-- agent:managed:{section} -->.*?<!-- /agent:managed:{section} -->"
@@ -67,7 +69,7 @@ class MemoryStore:
         path = self._user_path() if scope == "user" else self._course_path(course_id or "")
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content.strip() + "\n" if content.strip() else "", encoding="utf-8")
+            write_text_atomic(path, content.strip() + "\n" if content.strip() else "")
 
     def patch(self, *, scope: str, section: str, content: str, course_id: str | None = None) -> str:
         """整块替换某个受管区块；区块不存在就追加。返回一句写入结果说明。"""
@@ -99,5 +101,5 @@ class MemoryStore:
             if len(body) > _MAX_FILE_CHARS:
                 raise ValueError("记忆文件超过上限，请先精简既有内容")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body.strip() + "\n", encoding="utf-8")
+            write_text_atomic(path, body.strip() + "\n")
         return f"已{'更新' if replaced else '新增'}{'用户画像' if scope == 'user' else '课程记忆'}的 {section} 区块"

@@ -254,12 +254,13 @@ def judge(chat, prompt: str, case: str) -> dict:
 
 
 def build_chat():
-    from adapters.llm.openai_compatible import OpenAICompatibleChat
+    from adapters.llm import OpenAICompatibleChat, ResponsesApiChat
     from core.settings import Settings
     settings = Settings.from_environment()
     if not settings.remote_llm_configured:
         raise SystemExit("judge 需要配置 TEXT_API_KEY / TEXT_BASE_URL / TEXT_MODEL，或加 --no-judge")
-    return OpenAICompatibleChat(
+    adapter = ResponsesApiChat if settings.text_protocol == "responses" else OpenAICompatibleChat
+    return adapter(
         api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
         provider=settings.text_provider, extra_body=settings.text_extra_body,
         total_timeout_seconds=settings.llm_total_timeout_seconds,

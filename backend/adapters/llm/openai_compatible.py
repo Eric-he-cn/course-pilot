@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 
 import httpx
 
@@ -18,86 +17,23 @@ from contracts.llm import (
     ToolSpec,
 )
 
-
-_PROTOCOL_FIELDS = frozenset({"model", "messages", "stream", "tools", "max_tokens"})
-
-
-def _detail(response: httpx.Response, secret: str) -> str:
-    """带上服务端对错误的说明：4xx 只有状态码根本没法查——模型名错了、参数不被接受、
-    还是缺了某个必传字段，全靠这句话。只取结构化的 error.message，不回显整个响应体；
-    密钥就算被服务端回显也在这里抹掉。这条消息只进本地 trace，不随事件发给前端。"""
-    try:
-        response.read()
-        body = response.json()
-        # vLLM / FastAPI 系的错误说明在顶层 detail 或 message，不在 error.message 里。
-        message = (body.get("error") or {}).get("message") or body.get("message") \
-            or (body.get("detail") if isinstance(body.get("detail"), str) else None)
-    except Exception:
-        return ""
-    if not isinstance(message, str):
-        return ""
-    text = " ".join(message.split())[:200]
-    if secret:
-        text = text.replace(secret, "***")
-    return f"：{text}" if text else ""
+from .http_chat import HttpChatBase
 
 
-class OpenAICompatibleChat:
+class OpenAICompatibleChat(HttpChatBase):
     """OpenAI Chat Completions 兼容适配器：多轮 messages + function calling，流式输出。
 
     只用标准字段，任何兼容该协议的服务都能接。厂商私有参数走 extra_body 传入。
     """
 
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        base_url: str,
-        model: str,
-        provider: str = "openai_compatible",
-        extra_body: Mapping[str, object] | None = None,
-        connect_timeout_seconds: float = 10,
-        total_timeout_seconds: float = 180,
-        max_output_tokens: int = 8192,
-        max_retries: int = 2,
-        client: httpx.Client | None = None,
-    ) -> None:
-        if not api_key or not base_url or not model:
-            raise ValueError("适配器需要 api_key、base_url 和 model")
-        self._model = model
-        self._provider = provider or "openai_compatible"
-        self._extra_body = dict(extra_body or {})
-        # 覆盖这些字段会直接改坏协议本身，宁可启动就报错也不要留个难查的运行时故障。
-        clashing = sorted(self._extra_body.keys() & _PROTOCOL_FIELDS)
-        if clashing:
-            raise ValueError(f"extra_body 不能覆盖协议字段：{'、'.join(clashing)}")
-        self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
-        self._api_key = api_key
-        self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        self._max_output_tokens = max(256, max_output_tokens)
-        self._max_retries = max(0, max_retries)
-        self._owns_client = client is None
-        timeout = httpx.Timeout(total_timeout_seconds, connect=connect_timeout_seconds)
-        self._client = client or httpx.Client(timeout=timeout)
-        self._state_lock = threading.Lock()
-        self._last_call_ok: bool | None = None
-        self._last_error_code: str | None = None
-        # 撞过一次「必须回传 reasoning_content」之后就一直带上这个字段。
-        self._echo_reasoning = False
+    endpoint_path = "/chat/completions"
+    protocol_fields = {name: "它是协议字段，覆盖了流式解析会崩在运行时"
+                       for name in ("model", "messages", "stream", "tools", "max_tokens")}
+    default_provider = "openai_compatible"
+    # 撞过一次「必须回传 reasoning_content」之后，这个实例就一直带上该字段。
+    _echo_reasoning = False
 
-    @property
-    def mode(self) -> str:
-        return "provider"
-
-    @property
-    def provider(self) -> str:
-        return self._provider
-
-    @property
-    def model(self) -> str:
-        return self._model
-
-    def chat(self, *, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> Iterator[ChatDelta | ChatToolCalls | ChatFinal]:
+    def chat(self, *, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> Iterator[ChatDelta | ChatReasoning | ChatToolCalls | ChatFinal]:
         payload: dict[str, object] = {
             "model": self._model,
             "messages": self._to_wire(messages),
@@ -194,7 +130,7 @@ class OpenAICompatibleChat:
                     attempt += 1
                     time.sleep(0.2 * (2 ** (attempt - 1)))
                     continue
-                detail = _detail(error.response, self._api_key)
+                detail = self._detail(error.response)
                 # 思考模式要求 assistant 消息回传 reasoning_content，只校验字段在不在，空串就行。
                 # 不预先发这个字段：它是厂商扩展，对不认识它的服务发过去可能被拒。撞上一次就记住。
                 if status == 400 and not self._echo_reasoning and "reasoning_content" in detail:
@@ -219,24 +155,6 @@ class OpenAICompatibleChat:
                 code = "stream_interrupted" if emitted else "invalid_response"
                 self._record_failure(code)
                 raise LLMProviderError(code, f"{self._provider} 返回了无法解析的流式数据", retryable=False) from error
-
-    def health(self) -> dict[str, object]:
-        with self._state_lock:
-            last_call_ok, last_error_code = self._last_call_ok, self._last_error_code
-        return {
-            "configured": True,
-            "enabled": True,
-            "mode": self.mode,
-            "adapter_available": True,
-            "provider": self.provider,
-            "model": self.model,
-            "last_call_ok": last_call_ok,
-            "last_error_code": last_error_code,
-        }
-
-    def close(self) -> None:
-        if self._owns_client:
-            self._client.close()
 
     @staticmethod
     def _accumulate_tool_call(acc: dict[int, dict[str, str]], raw_call: dict) -> None:
@@ -299,13 +217,3 @@ class OpenAICompatibleChat:
             if isinstance(details, dict) and isinstance(details.get(key), int):
                 result[key] = details[key]
         return result
-
-    def _record_success(self) -> None:
-        with self._state_lock:
-            self._last_call_ok = True
-            self._last_error_code = None
-
-    def _record_failure(self, code: str) -> None:
-        with self._state_lock:
-            self._last_call_ok = False
-            self._last_error_code = code

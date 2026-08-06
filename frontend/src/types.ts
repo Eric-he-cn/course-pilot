@@ -25,6 +25,8 @@ export interface CitationSource {
   page?: number | null
   chunk_id?: string
   snippet?: string
+  // 归属教材。文件名可以重名，分组与歧义判定按它；旧数据没有这个字段时退回按文件名。
+  material_id?: string
 }
 
 export interface Citation {
@@ -352,6 +354,7 @@ export interface ConceptNode {
 }
 
 // Wiki 知识页：一个概念一页。层级来自页面 frontmatter，没有层级的教材三个字段都是默认值。
+// material_id 是归属教材，document 是服务端解析好的文件名；教材已删或页里没记归属时是空串。
 export interface WikiPageSummary {
   concept_id: string
   concept_name: string
@@ -360,6 +363,33 @@ export interface WikiPageSummary {
   parent_id?: string
   level?: number
   order?: number
+  material_id?: string
+  document?: string
+}
+
+// 两个来源在讲同一件事。服务端读时现算，两端必然分属不同教材；
+// 页名与教材文件名一并给出，界面不必二次查。
+export interface WikiEdge {
+  a: string
+  b: string
+  a_name: string
+  b_name: string
+  a_document: string
+  b_document: string
+  score: number
+}
+
+// 知识页体检的一条发现。code 决定文案，其余字段是文案的插值参数。
+// pages/documents 可能被服务端截断，真正的条数看 n。
+export interface WikiIssue {
+  concept_id: string
+  concept_name: string
+  level: 'error' | 'warn'
+  code: string
+  n?: number
+  pages?: number[]
+  documents?: string[]
+  parent?: string
 }
 
 // 一份教材的目录结构状态，从概念表推导，没有对应的状态列。
@@ -399,6 +429,8 @@ export interface WikiEstimate {
   candidates: number
   merged: number
   has_levels: boolean
+  // 目录是从教材现算的（material）还是退回了概念表（concepts）
+  outline?: string
 }
 
 export interface Job {

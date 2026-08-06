@@ -1,5 +1,5 @@
 import { t } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, ConceptNode, Course, Job, Material, MaterialStructure, McpOverview, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TraceBodyText, TurnEvent, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, Course, Job, Material, MaterialStructure, McpOverview, Message, OcrEstimate, Plan, SearchResult, SessionTrace, SessionSummary, ScopeMode, NoteSummary, SkillInfo, StructurePreview, TraceBodyText, TurnEvent, WikiEdge, WikiEstimate, WikiIssue, WikiPageSummary } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? '/api/v2'
 const USER_KEY = 'cp-username'
@@ -149,12 +149,27 @@ export const api = {
   job: (jobId: string) => request<Job>(`/jobs/${jobId}`),
   buildWiki: (materialId: string) => request<Job>(`/materials/${materialId}/wiki`, json('POST')),
   estimateWiki: (materialId: string) => request<WikiEstimate>(`/materials/${materialId}/wiki/estimate`),
+  /** 最近一次构建完成时的覆盖率报告。刷新后内存里没有任务记录，靠它把那一行找回来。 */
+  wikiReport: (materialId: string) => request<{ job: Job | null }>(`/materials/${materialId}/wiki/report`),
   concepts: (courseId: string) => request<{ concepts: ConceptNode[] }>(`/courses/${courseId}/concepts`),
   structure: (courseId: string) => request<{ materials: MaterialStructure[] }>(`/courses/${courseId}/structure`),
   previewStructure: (materialId: string) => request<StructurePreview>(`/materials/${materialId}/structure/preview`, json('POST')),
   parseStructure: (materialId: string) => request<StructurePreview & MaterialStructure>(`/materials/${materialId}/structure`, json('POST')),
   wikiPages: (courseId: string) => request<{ pages: WikiPageSummary[] }>(`/courses/${courseId}/wiki`),
-  wikiPage: (courseId: string, conceptId: string) => request<{ concept_id: string; content: string }>(`/courses/${courseId}/wiki/${conceptId}`),
+  /** 知识页体检，按需现算：出处越界、编造出处、孤儿页这类确定性缺陷，只报不改。 */
+  wikiLint: (courseId: string) => request<{ issues: WikiIssue[] }>(`/courses/${courseId}/wiki/lint`),
+  /** 哪几页在讲同一件事。没配嵌入模型时是空表，界面据此不显示这一行。 */
+  wikiGraph: (courseId: string) => request<{ edges: WikiEdge[] }>(`/courses/${courseId}/wiki/graph`),
+  /** 一页知识页。body 是系统生成的那半，handwritten 是用户自己写的补充；
+   *  content 是落盘原样，只在旧服务端还没给出分段字段时兜底。 */
+  wikiPage: (courseId: string, conceptId: string) =>
+    request<{ concept_id: string; content: string; body?: string; handwritten?: string }>(`/courses/${courseId}/wiki/${conceptId}`),
+  /** 写手写区。生成区与页面元数据由服务端保住，这里只送用户写的那一段。 */
+  saveWikiHandwritten: (courseId: string, conceptId: string, text: string) =>
+    request<{ concept_id: string; body: string; handwritten: string }>(`/courses/${courseId}/wiki/${conceptId}/handwritten`, json('PUT', { text })),
+  /** 这一页转述时依据的教材页。正文里的 [p.N] 靠它接到原文上；anchors 可能被服务端截断。 */
+  // limit=200：正文里的 [p.N] 要逐个接上锚点，取全量；抽屉的出处列表走引用数据，不经这里。
+  wikiPageSources: (courseId: string, conceptId: string) => request<{ anchors: CitationSource[]; pages: number }>(`/courses/${courseId}/wiki/${conceptId}/sources?limit=200`),
   search: (courseId: string, query: string) => request<SearchResult[]>(`/courses/${courseId}/knowledge/search`, json('POST', { query })),
   plan: (courseId: string) => request<{ plan: Plan | null }>(`/courses/${courseId}/plan`),
   archive: (courseId: string) => request<ArchiveSummary>(`/courses/${courseId}/archive`),

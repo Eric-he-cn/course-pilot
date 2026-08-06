@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "check:cjk": "node scripts/check-cjk-emphasis.mjs"
   },
   "dependencies": {
     "katex": "^0.18.1",
@@ -15,6 +16,7 @@
     "react-dom": "19.1.1",
     "react-markdown": "^10.1.0",
     "rehype-katex": "^7.0.1",
+    "remark-cjk-friendly": "^2.3.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0"
   },

@@ -6,7 +6,9 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from contracts.knowledge import KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope, WikiSources
+from contracts.knowledge import (
+    HANDWRITTEN_LABEL, KnowledgeHit, KnowledgeSearchPort, ResolvedKnowledgeScope, WikiSources,
+)
 from contracts.llm import ToolSpec
 from modules.learning.api import GRADUATE_STREAK, ArchiveReaderPort, EvidenceWriterPort
 from modules.mcp.api import ExternalTool, McpToolProviderPort, is_external_tool
@@ -18,7 +20,7 @@ from contracts.web import WebAccessError, WebSearchPort
 from modules.notes.api import NoteStorePort
 
 from .calculator import CalculationError, evaluate
-from .context import tool_schema_tokens
+from .context import WIKI_ATTRIBUTION_NOTE, tool_schema_tokens
 from .skills import SkillRegistry
 
 logger = logging.getLogger(__name__)
@@ -140,15 +142,15 @@ _WIKI_INDEX_HEADER = (
 # 模型读完长正文就只记得内容，转头把它当成有页码的教材证据。
 _WIKI_PAGE_HEADER = (
     "（以下是知识页，系统按教材整理的转述稿，不是教材原文，也没有页码。用到它的结论"
-    "照下面的编号标 [n]，引用列表里会标成知识页。要给出教材页码就用 search_materials"
-    "回教材查原文，用那一次返回的编号。）\n"
+    f"照下面的编号标 [n]，引用列表里会标成知识页。{WIKI_ATTRIBUTION_NOTE}）\n"
 )
-# 检索结果里知识页那一段的段头，和教材原文分开摆。
+# 检索结果里知识页那一段的段头，和教材原文分开摆，口径与读页时那段一致。
 _WIKI_HITS_HEADER = (
     "以下是同一次检索命中的知识页（系统按教材整理的转述稿，不是教材原文，也没有页码。"
-    "用到它的结论照编号标 [n]，引用列表里会标成知识页）：\n"
+    f"用到它的结论照编号标 [n]，引用列表里会标成知识页。{WIKI_ATTRIBUTION_NOTE}）：\n"
 )
-_WIKI_HANDWRITTEN_HEADER = "以下是用户自己在这一页写的补充（不是教材内容）："
+# 手写区在渲染时独立留位的字符上限。够放下一段纠偏，又不至于让一页的批注挤掉别的证据。
+WIKI_NOTE_MAX_CHARS = 200
 
 
 def _wiki_limit_note(dropped: int) -> str:
@@ -304,8 +306,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=(
             "读一页知识页的正文，concept_id 取自系统提示里的知识页目录（或 wiki_index）。"
             "知识页是对教材的转述，不是教材原文，也没有页码：用到它的结论照返回的编号"
-            "标 [n]，引用列表里会标成知识页。需要给出教材页码时用 search_materials "
-            "回教材查到原文，用那一次返回的编号。"
+            f"标 [n]，引用列表里会标成知识页。{WIKI_ATTRIBUTION_NOTE}"
         ),
         parameters={
             "type": "object",
@@ -764,8 +765,8 @@ class CitationRegistry:
         return self._add(f"wiki:{concept_id}", {
             "kind": "wiki", "concept_id": concept_id, "concept_name": concept_name,
             "page": None, "snippet": snippet, "score": score,
-            "sources": [{"document": item.document, "page": item.page,
-                         "chunk_id": item.chunk_id, "snippet": item.snippet} for item in sources.anchors],
+            "sources": [{"document": item.document, "page": item.page, "chunk_id": item.chunk_id,
+                         "snippet": item.snippet, "material_id": item.material_id} for item in sources.anchors],
             "source_pages": sources.pages,
         })
 
@@ -1245,13 +1246,15 @@ class ToolExecutor:
             concept_id=concept_id, concept_name=page.concept_name, snippet=page.body[:280],
             sources=self._knowledge.wiki_sources(scope=scope, concept_id=concept_id),
         )
-        parts = [f"{_WIKI_PAGE_HEADER}\n[{number}] 知识页\n\n# {page.concept_name}\n\n{page.body}"]
-        if page.handwritten:
-            parts.append(f"{_WIKI_HANDWRITTEN_HEADER}\n{page.handwritten}")
-        text = "\n\n".join(parts)
-        dropped = len(text) - (WIKI_PAGE_MAX_CHARS - _WIKI_NOTE_RESERVE)
-        if dropped > 0:
-            text = _clip(text, WIKI_PAGE_MAX_CHARS - _WIKI_NOTE_RESERVE) + _wiki_limit_note(dropped)
+        # 手写区先占好位再截生成区：整段一起截，长页的用户补充会被整块丢掉。
+        # 生成区里出现的同款标注要摘掉，全文只留一处，手写区从哪里开始才没有歧义。
+        note = (f"\n\n{HANDWRITTEN_LABEL}\n{_clip(page.handwritten, WIKI_NOTE_MAX_CHARS)}"
+                if page.handwritten else "")
+        body = page.body.replace(HANDWRITTEN_LABEL, "")
+        head = f"{_WIKI_PAGE_HEADER}\n[{number}] 知识页\n\n# {page.concept_name}\n\n{body}"
+        limit = WIKI_PAGE_MAX_CHARS - _WIKI_NOTE_RESERVE - len(note)
+        dropped = len(head) - limit
+        text = (_clip(head, limit) + _wiki_limit_note(dropped) if dropped > 0 else head) + note
         return ToolOutcome(
             text=text, ok=True, summary=f"读知识页「{_plain_line(page.concept_name, 20)}」",
             summary_key="summary.wiki_read", summary_args={"name": _plain_line(page.concept_name, 20)},
@@ -1343,7 +1346,8 @@ class ToolExecutor:
             )
             if is_new:
                 new_citations.append(registry.citations[number - 1])
-            lines.append(f"[{number}] 知识页：{hit.citation.concept_name}\n{_clip(hit.content, WIKI_HIT_MAX_CHARS)}")
+            lines.append(f"[{number}] 知识页：{hit.citation.concept_name}\n"
+                         f"{_clip_wiki_content(hit.content, WIKI_HIT_MAX_CHARS)}")
         return "\n\n" + _WIKI_HITS_HEADER + "\n\n".join(lines)
 
     def _web_search(self, parsed: dict, registry: CitationRegistry) -> ToolOutcome:
@@ -1528,3 +1532,14 @@ class ToolExecutor:
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _clip_wiki_content(content: str, limit: int) -> str:
+    """知识页正文按身份标注拆两段各自截断：生成区通常就顶到上限，整段截会把用户的补充丢掉。
+
+    写这一行的一端保证全文只有一处标注，所以第一处就是手写区的起点。
+    """
+    body, marker, note = content.partition(HANDWRITTEN_LABEL)
+    if not marker or not note.strip():
+        return _clip(content, limit)
+    return f"{_clip(body.rstrip(), limit)}\n\n{HANDWRITTEN_LABEL}\n{_clip(note.strip(), WIKI_NOTE_MAX_CHARS)}"

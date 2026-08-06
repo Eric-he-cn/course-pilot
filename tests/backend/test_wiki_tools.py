@@ -13,7 +13,9 @@ from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from contracts.knowledge import ConceptRef, ResolvedKnowledgeScope, WikiDocument, WikiEntry, WikiSources
+from contracts.knowledge import (
+    HANDWRITTEN_LABEL, ConceptRef, ResolvedKnowledgeScope, WikiDocument, WikiEntry, WikiSources,
+)
 from contracts.llm import ChatDelta, ChatFinal, ChatToolCalls, ToolCallRequest
 from core.settings import Settings
 from core.store import SQLiteStore
@@ -211,12 +213,23 @@ def test_read_returns_the_page_body_with_its_concept_name():
 
 
 def test_read_labels_the_handwritten_area_as_the_users_own_words():
-    """手写区是用户自己写的，不是教材内容，也不是系统生成的——归属要说清。"""
+    """手写区是用户自己写的，不是教材内容，也不是系统生成的——归属要说清。
+    标注用检索行那一份常量：两边措辞错开，按标注拆段的渲染就找不到手写区了。"""
     knowledge = FakeKnowledge(pages={"cpt_1": _page(handwritten="我自己的记法：先来先服务=排队买票。")})
     result = _run(knowledge, "wiki_read", '{"concept_id": "cpt_1"}')
 
-    assert "用户自己在这一页写的补充" in result.text
+    assert HANDWRITTEN_LABEL in result.text
     assert "排队买票" in result.text
+
+
+def test_read_keeps_one_label_when_the_generated_half_also_carries_one():
+    """读的一端按第一处标注认手写区的起点。生成区里再冒出一处，边界就说不清了。"""
+    page = _page(body=f"一句话定义。{HANDWRITTEN_LABEL}模型抄的", handwritten="我自己的记法：排队买票。")
+    result = _run(FakeKnowledge(pages={"cpt_1": page}), "wiki_read", '{"concept_id": "cpt_1"}')
+
+    assert result.text.count(HANDWRITTEN_LABEL) == 1
+    assert result.text.partition(HANDWRITTEN_LABEL)[2].strip() == "我自己的记法：排队买票。"
+    assert "模型抄的" in result.text, "只摘标注，生成区的字一个不少"
 
 
 def test_read_reports_a_missing_page_instead_of_failing_silently():

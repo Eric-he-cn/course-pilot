@@ -1,12 +1,13 @@
-import { ChangeEvent, createContext, FormEvent, ReactElement, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, Children, ComponentProps, createContext, FormEvent, ReactElement, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
+import remarkCjkFriendly from 'remark-cjk-friendly'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import { api, clearCurrentUser, currentDevMode, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentDevMode, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
+import { api, ApiError, clearCurrentUser, currentDevMode, currentModel, currentThinking, currentUser, onConnectionLost, setCurrentDevMode, setCurrentModel, setCurrentThinking, setCurrentUser } from './api'
 import { getLang, LangContext, LANGS, locale, nameParts, setLang, t, tOr, useI18n, type Lang } from './i18n'
-import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, McpServer, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceStep, TraceSubagent, TraceTool, TraceTurn, WikiEstimate, WikiPageSummary } from './types'
+import type { ArchiveSummary, Attachment, Citation, CitationSource, ConceptNode, ContextUsage, Course, Job, Material, MaterialStructure, McpServer, Message, MistakeRecord, Plan, ScopeMode, SearchResult, NoteSummary, OcrEstimate, SessionTrace, SessionSummary, SkillInfo, StructurePreview, ToolActivity, TraceBody, TraceStep, TraceSubagent, TraceTool, TraceTurn, WikiEdge, WikiEstimate, WikiIssue, WikiPageSummary } from './types'
 
 /** 开发者模式。关掉时 openTrace 为 null——入口靠这一个判断决定要不要渲染成可点的元素，
  *  免得出现「按钮还在、只是点了没反应」这种状态。 */
@@ -19,9 +20,25 @@ type Workspace = { scope: ScopeMode; courseId?: string }
 type TurnResolution = { sessionId: string; status: string; courseId: string | null; courseName: string | null }
 
 function viewName(view: View) { return t(`nav.${view}`) }
-const nav: { id: View; num: string }[] = [
-  { id: 'chat', num: '01' }, { id: 'library', num: '02' }, { id: 'plan', num: '03' }, { id: 'archive', num: '04' },
+// 原来是 01–04 的编号。这四个页面不是一个序列，编号不编码任何真实信息，
+// 纯装饰还占掉标识槽的宽度，换成线性图标。
+const nav: { id: View; icon: IconName }[] = [
+  { id: 'chat', icon: 'chat' }, { id: 'library', icon: 'shelf' }, { id: 'plan', icon: 'calendar' }, { id: 'archive', icon: 'flag' },
 ]
+
+type IconName = 'compass' | 'chat' | 'shelf' | 'calendar' | 'flag'
+/** 侧栏图标。统一 16px、round 端点，和方块标记的笔画语言一致。 */
+function NavIcon({ name }: { name: IconName }) {
+  const paths: Record<IconName, ReactElement> = {
+    compass: <><circle cx="9" cy="9" r="6.8" /><path d="M11.8 6.2 7.9 7.9 6.2 11.8l3.9-1.7z" fill="currentColor" stroke="none" /></>,
+    chat: <path d="M2.5 3.5h13v8H6l-3.5 3z" />,
+    shelf: <path d="M2.5 3.5h4v11h-4zM8 3.5h3.5v11H8zM13 4.6l2.2.5-2 10.4-2.2-.5z" />,
+    calendar: <><rect x="2.5" y="3.5" width="13" height="11.5" rx="1.6" /><path d="M2.5 7h13M6 2v3M12 2v3" /></>,
+    flag: <path d="M3.5 2.5v13M3.5 3.5h10l-2 3.5 2 3.5h-10" />,
+  }
+  return <svg width="16" height="16" viewBox="0 0 18 18" fill="none" stroke="currentColor"
+    strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden focusable="false">{paths[name]}</svg>
+}
 const MAX_MATERIAL_BYTES = 100 * 1024 * 1024
 // 会用到本地嵌入/重排模型的工具：只有这几个会因为模型加载而变慢。
 const RETRIEVAL_TOOLS = ['search_materials', 'concept_search']
@@ -39,6 +56,56 @@ const TOOL_CAPABILITY_HINT: Record<string, string> = {
   delegate: 'delegate',
 }
 
+/** 浮层的关闭手势：Esc，以及在浮层外面点一下。返回的 ref 要挂到浮层根节点上。
+ *
+ *  不用全屏遮罩：抽屉是非模态的，开着的时候正文要能继续滚动、选中，SOURCES 那排
+ *  引用 chip 也要能一次点击就换到下一条。
+ *  拖选正文时鼠标也落在浮层外面，所以按下不立即关，等松开时确认没拖动、也没新产生选中。
+ *  已知边界：双击/三击选词仍会关——第一次 click 松手时词还没选上，那一刻和普通点击无法区分。
+ *  要挡住得把关闭延后 ~250ms 等后续点击，代价是每次关浮层都变迟钝，不值。 */
+function useDismiss(onClose: () => void) {
+  const latest = useRef(onClose)
+  useEffect(() => { latest.current = onClose })
+  const box = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    let waiting: ((event: MouseEvent) => void) | null = null
+    function outside(target: EventTarget | null) {
+      return box.current !== null && target instanceof Node && !box.current.contains(target)
+    }
+    // 输入法里 Esc 是收候选框，不该连带关掉浮层（composer 挡 Enter 用的是同一个判断）
+    function onKey(event: KeyboardEvent) { if (event.key === 'Escape' && !event.isComposing) latest.current() }
+    function onDown(event: MouseEvent) {
+      // 只认左键：右键唤出的是上下文菜单，不是「点了外面」。右键点空白或图片时
+      // 下面那个选中比较挡不住（选中没变化），所以这个守卫是承重的。
+      if (event.button !== 0 || !outside(event.target)) return
+      // 上一次手势的 mouseup 可能被 dragstart 吞掉（拖链接、拖图片），监听器会留在
+      // document 上。不在这里清掉的话，它会用当初的坐标把后面每一次点击都算成拖动，
+      // 「点外面关闭」从此彻底失效。
+      if (waiting) { document.removeEventListener('mouseup', waiting); waiting = null }
+      const { clientX, clientY } = event
+      // 只在这一次手势「新产生」选中时才不关。不能比「选中变没变」——点在可选中区域上
+      // 会清掉旧选中，那也算变了，于是残留选中时点正文要点两次才关得掉。
+      const before = String(window.getSelection() ?? '')
+      const settle = (up: MouseEvent) => {
+        waiting = null
+        const dragged = Math.abs(up.clientX - clientX) > 4 || Math.abs(up.clientY - clientY) > 4
+        const now = String(window.getSelection() ?? '')
+        if (!dragged && !(now && now !== before)) latest.current()
+      }
+      waiting = settle
+      document.addEventListener('mouseup', settle, { once: true })
+    }
+    document.addEventListener('keydown', onKey)
+    document.addEventListener('mousedown', onDown)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.removeEventListener('mousedown', onDown)
+      if (waiting) document.removeEventListener('mouseup', waiting)
+    }
+  }, [])
+  return box
+}
+
 function errorText(error: unknown) { return error instanceof Error ? error.message : t('error.unknown') }
 function timeLabel(value?: string) { return value ? new Intl.DateTimeFormat(locale(), { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' }).format(new Date(value)) : t('time.just_now') }
 
@@ -49,6 +116,22 @@ function randomNames(count = 5): string[] {
     picked.add(adjectives[Math.floor(Math.random() * adjectives.length)] + creatures[Math.floor(Math.random() * creatures.length)])
   }
   return [...picked]
+}
+
+/** 方块标记 + 字标。两处用（登录页与侧栏），所以抽出来。
+ *  字标只做两处排版微调：字距收到 -0.022em、Course 450 / Pilot 680 的双字重。
+ *  字形仍是系统字体——手绘 SVG 字形那版作者判「太花哨」，收回了。 */
+function Brand({ size = 28 }: { size?: number }) {
+  return <div className="brand">
+    <svg className="brandmark" width={size} height={size} viewBox="0 0 60 60" aria-hidden focusable="false">
+      <rect width="60" height="60" rx="14" fill="var(--text)" />
+      <path d="M20 20h13l7 7v13" fill="none" stroke="var(--bg)" strokeWidth="4.2" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="20" y="36.2" width="13" height="4.4" rx="2.2" fill="var(--accent)" />
+    </svg>
+    <div className="brand-copy">
+      <strong><span>Course</span><b>Pilot</b></strong>
+    </div>
+  </div>
 }
 
 /** 登录：只输用户名，没有密码。用途是把不同人的资料分开存，不是访问控制。 */
@@ -67,7 +150,7 @@ function LoginView({ onLogin }: { onLogin: (name: string) => void }) {
   }
   return <div className="login-screen">
     <form className="login-card" onSubmit={submit}>
-      <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
+      <Brand />
       <h1>{t('login.title')}</h1>
       <p>{t('login.intro.before')}<strong>{t('login.intro.strong')}</strong>{t('login.intro.after')}</p>
       <input value={name} autoFocus aria-label={t('a11y.username')} placeholder={t('login.placeholder')}
@@ -97,6 +180,8 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [view, setView] = useState<View>('chat')
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  // 每个会话最后一次被看过的时间，只落在本地——未读是本机的阅读状态，不是服务端数据
+  const [seen, setSeen] = useState<Record<string, string>>(() => readSeen())
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('cp-sidebar-collapsed') === 'true')
   // 生成回答与新建课程/会话分开：一次回答要跑一分钟，这一分钟里不该连侧栏都点不动。
   const [streaming, setStreaming] = useState(false)
@@ -111,6 +196,15 @@ export default function App() {
   const [turnResolution, setTurnResolution] = useState<TurnResolution | null>(null)
   // 上下文构成来自服务端实际组装结果；换会话就清空，避免显示上一会话的数字。
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
+  // 屏幕上正在显示的那个会话就算看过了——包括启动时自动选中的那个。不记的话，
+  // 切走再切回它又变成未读。等 streaming 收尾再记：那一轮把 updated_at 推到了
+  // 上次记录之后，而用户是看着它跑完的。
+  const activeId = activeSession?.id
+  useEffect(() => {
+    if (!activeId || streaming) return
+    markSeen(activeId)
+    setSeen(readSeen())
+  }, [activeId, streaming])
   // 帮助页点例句后带进对话输入框
   const [draftSeed, setDraftSeed] = useState('')
   // 停止生成：中断 SSE 读取，服务端 finally 会把这一轮落成终态，已生成的内容仍在库里
@@ -199,6 +293,7 @@ export default function App() {
     try {
       await api.deleteSession(session.id)
       setSessions(current => current.filter(item => item.id !== session.id))
+      forgetSeen(session.id); setSeen(readSeen())
       // 删的是当前打开的那个就退回空白，否则界面还停在已经不存在的会话上。
       if (activeSession?.id === session.id) { setActiveSession(null); setMessages([]) }
     } catch (error) { setNotice(errorText(error)) }
@@ -216,7 +311,7 @@ export default function App() {
   const healthLlm = (health?.llm ?? null) as Record<string, unknown> | null
   const healthRag = (health?.rag ?? null) as Record<string, unknown> | null
   // 冷启动时首次检索要等模型加载（实测嵌入 36s、重排 60s）。不说清楚，用户只看到
-  // 「正在检索教材」干等一分钟，会当成检索本身慢。配了但还没加载好的才算。
+  // 「正在检索知识库」干等一分钟，会当成检索本身慢。配了但还没加载好的才算。
   const modelNote = (['embedding', 'reranker'] as const)
     .filter(key => {
       const slot = healthRag?.[key] as { model?: string; loaded?: boolean; error?: string | null } | undefined
@@ -224,38 +319,66 @@ export default function App() {
     })
     .map(key => (key === 'embedding' ? t('model.embedding') : t('model.reranker')))
     .join(t('common.list_sep'))
+  // 折叠态只剩 16px 的标识槽，而槽是 aria-hidden——文字一收，这些按钮就全没名字了；
+  // 鼠标用户也只看到几条 2.5px 色条。展开态不加，可见文字本身就是名字。
+  // 返回类型要显式写：JSX 展开不做多余属性检查，带连字符的属性名 tsc 也一律不查，
+  // 不标注的话 title 拼错会静默通过。
+  const slotOnly = (name: string): { 'aria-label'?: string; title?: string } =>
+    sidebarCollapsed ? { 'aria-label': name, title: name } : {}
   return <LangContext.Provider value={i18n}><DevModeContext.Provider value={dev}><div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
     {sidebarOpen && <button className="sidebar-backdrop" aria-label={t('a11y.close_nav')} onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label={t('a11y.sidebar')}>
-      <div className="brand"><div className="brandmark">{'>_'}</div><div className="brand-copy"><strong>CoursePilot</strong><span className="ver">v2.0</span></div></div>
-      <div className="side-label">WORKSPACE</div>
-      <button className={`workspace-card ${workspace.scope === 'general' ? 'selected' : ''}`} onClick={() => switchWorkspace({ scope: 'general' })}>
-        <span className="general-icon" aria-hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9" /><path d="M12 3v18M3 12h18" opacity=".35" /></svg></span>
-        <span className="workspace-copy"><b>{t('workspace.general')}</b><small>{t('workspace.general_hint')}</small></span>
-      </button>
-      <div className="course-switcher">
-        {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id} onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
-          <i style={{ backgroundColor: item.color }} /><span>{item.name}</span>{item.wiki_enabled && <em>Wiki</em>}
+      <Brand />
+      <div className="side-label" id="workspace-group">{t('sidebar.workspaces')}</div>
+      {/* role=group 把这几行标成一组、名字取自可见的小标题；「当前是哪个」由 aria-current 说 */}
+      <div className="course-switcher" role="group" aria-labelledby="workspace-group">
+        {/* 通用模式和课程互斥单选、写的是同一份 workspace 状态，所以并排放在这一组里。
+            它不是一门课，这件事靠罗盘图标与副标题表达。
+            aria-current 让选中态不只靠颜色和投影，读屏器也拿得到。 */}
+        <button className={`course-choice general-choice ${workspace.scope === 'general' ? 'selected' : ''}`}
+          aria-current={workspace.scope === 'general' ? 'true' : undefined} {...slotOnly(t('workspace.general'))}
+          onClick={() => switchWorkspace({ scope: 'general' })}>
+          <span className="slot" aria-hidden><NavIcon name="compass" /></span>
+          <span className="cx"><b>{t('workspace.general')}</b><small>{t('workspace.general_hint')}</small></span>
+        </button>
+        {courses.map(item => <button className={`course-choice ${item.id === workspace.courseId ? 'selected' : ''}`} key={item.id}
+          aria-current={item.id === workspace.courseId ? 'true' : undefined} {...slotOnly(item.name)}
+          onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
+          {/* 竖色条而不是实心圆：7px 实心圆是整个界面里唯一的实心饱和色块，
+              而分区靠细边框不靠填充；竖条和 tab 那条 2px 主色下划线是同一个手势。
+              Wiki 标记去掉了——它对切课程没有帮助，知识仓库页顶部有完整状态。 */}
+          <span className="slot" aria-hidden><i className="course-bar" style={{ backgroundColor: item.color }} /></span>
+          <span className="lb">{item.name}</span>
         </button>)}
-        <button className="text-button add-course" onClick={createCourse} disabled={creating}>{t('course.new')}</button>
+        <button className="course-choice add-course" onClick={createCourse} disabled={creating} {...slotOnly(t('course.new'))}>
+          <span className="slot" aria-hidden>+</span><span className="lb">{t('course.new')}</span>
+        </button>
       </div>
-      <div className="side-label">NAV</div>
+      <div className="side-divider" />
+
       <nav className="main-nav" aria-label={t('a11y.main_nav')}>
-        {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false) }}><span aria-hidden>{item.num}</span><b>{viewName(item.id)}</b></button>)}
+        {/* 可见的「页面」小标题删掉了，当前项靠 aria-current 而不是那个标题被读出来 */}
+        {nav.map(item => <button className={view === item.id ? 'active' : ''} key={item.id}
+          aria-current={view === item.id ? 'page' : undefined} {...slotOnly(viewName(item.id))}
+          onClick={() => { setView(item.id); setSidebarOpen(false) }}>
+          <span className="slot" aria-hidden><NavIcon name={item.icon} /></span><b>{viewName(item.id)}</b>
+        </button>)}
       </nav>
-      <div className="sessions-head"><span>SESSIONS</span></div>
-      <div className="session-list">
+      <div className="sessions-head" id="session-group"><span>{t('sidebar.sessions')}</span></div>
+      <div className="session-list" role="group" aria-labelledby="session-group">
         {sessions.length ? sessions.map(session => <SessionRow key={session.id} session={session}
           active={session.id === activeSession?.id}
-          onOpen={() => { setActiveSession(session); setView('chat'); setSidebarOpen(false) }}
-          onRename={async title => { await renameSession(title, session.id) }}
+          unread={session.id !== activeSession?.id && (!seen[session.id] || session.updated_at > seen[session.id])}
+          onOpen={() => { markSeen(session.id); setSeen(readSeen()); setActiveSession(session); setView('chat'); setSidebarOpen(false) }}
+          onRename={async title => { await renameSession(title, session.id); markSeen(session.id); setSeen(readSeen()) }}
           onDelete={async () => { await deleteSession(session) }} />) : <p className="mini-empty">{t('session.empty')}</p>}
       </div>
       <button className="new-session" onClick={newSession} disabled={creating}>{t('session.new', { scope: workspace.scope === 'general' ? t('session.scope_general') : t('session.scope_course') })}</button>
+      {/* 折叠态把标签 span 收起，只剩那个字形——不给名字的话按钮就叫「问号」「齿轮」 */}
       <div className="sidebar-foot">
-        <button onClick={() => { setView('help'); setSidebarOpen(false) }}>? <span>{t('nav.help')}</span></button>
-        <button onClick={() => { clearCurrentUser(); window.location.reload() }} title={t('a11y.current_user', { name: username })}>⇄ <span>{t('user.switch', { name: username })}</span></button>
-        <button onClick={() => { setView('settings'); setSidebarOpen(false) }}>⚙ <span>{t('nav.settings')}</span></button>
+        <button onClick={() => { setView('help'); setSidebarOpen(false) }} {...slotOnly(t('nav.help'))}>? <span>{t('nav.help')}</span></button>
+        <button onClick={() => { clearCurrentUser(); window.location.reload() }} {...slotOnly(t('user.switch', { name: username }))}>⇄ <span>{t('user.switch', { name: username })}</span></button>
+        <button onClick={() => { setView('settings'); setSidebarOpen(false) }} {...slotOnly(t('nav.settings'))}>⚙ <span>{t('nav.settings')}</span></button>
       </div>
     </aside>
     <main className="main">
@@ -373,18 +496,16 @@ export default function App() {
         finally { setStreaming(false); abortRef.current = null }
       }} busy={streaming} onStop={() => { stoppedRef.current = true; abortRef.current?.abort() }} />}
       {!['chat', 'settings', 'help'].includes(view) && !course && <CoursePickerState view={view} courses={courses} onPick={courseId => switchWorkspace({ scope: 'course', courseId }, { keepView: true })} onCreate={createCourse} />}
-      {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} />}
+      {view === 'library' && course && <LibraryView course={course} onCourseChange={updated => setCourses(current => current.map(item => item.id === updated.id ? updated : item))} onError={setNotice} onCitation={setCitation} />}
       {view === 'plan' && course && <PlanView course={course} onError={setNotice} />}
       {view === 'archive' && course && <ArchiveView course={course} onError={setNotice} />}
       {view === 'settings' && <SettingsView courses={courses} onError={setNotice} onCourseDeleted={courseDeleted} />}
       {view === 'help' && <HelpView courses={courses} health={health} onError={setNotice} onTry={text => { setView('chat'); setDraftSeed(text) }} />}
       <footer className="statusbar">
-        <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? 'connected' : 'offline'}</span>
+        <span className={apiOnline ? 'ok' : 'bad'}>● {apiOnline ? t('status.connected') : t('status.offline')}</span>
         {/* 掉线时这些都是缓存的旧值，留着会让人以为服务还在 */}
         {apiOnline !== false && healthLlm && <ModelPicker llm={healthLlm} />}
         <LangPicker />
-        {apiOnline !== false && healthRag && <span className="statusbar-detail">{retrievalLabel(healthRag.backend as string | undefined, true)}</span>}
-        {apiOnline !== false && view === 'chat' && <span className="statusbar-detail">{t('status.retrieval_note')}</span>}
         <span className="right">CoursePilot v2.0</span>
       </footer>
     </main>
@@ -517,6 +638,11 @@ function Mermaid({ code }: { code: string }) {
     </figcaption>
   </figure>
 }
+
+// 三处渲染共用一份插件表，加插件时不会漏改其中一处。
+// cjk-friendly 治的是 `**术语（英文）**中文` 这种写法——CommonMark 的 flanking 规则会把 ** 原样吐出来。
+const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkCjkFriendly]
+const REHYPE_PLUGINS = [rehypeKatex]
 
 const markdownComponents = {
   code(props: { className?: string; children?: unknown }) {
@@ -663,8 +789,38 @@ function DangerConfirm({ what, consequences, onConfirm, onCancel }: {
   </div>
 }
 
-function SessionRow({ session, active, onOpen, onRename, onDelete }: {
-  session: SessionSummary; active: boolean
+/** 未读：哪些会话在你不在场的时候有了新内容。
+ *
+ *  纯前端，不动接口：后端每插一条消息都会顺手更新 sessions.updated_at，
+ *  所以它就是「最后一条消息的时间」，和本地记的「最后看过的时间」一比就是未读。
+ *  已知误报一处：改名也会更新 updated_at，所以改名成功后要顺手记一次已读。 */
+const SEEN_KEY = 'cp-seen-sessions'
+function readSeen(): Record<string, string> {
+  try { return { ...seenFallback, ...JSON.parse(localStorage.getItem(SEEN_KEY) ?? '{}') } } catch { return { ...seenFallback } }
+}
+// localStorage 写不进时（隐私模式、配额满）退到内存：不兜的话 seen 永远是空的，
+// 每个非活动会话都会永久显示未读——比不显示未读更糟。
+const seenFallback: Record<string, string> = {}
+/** 会话真被删除时才清它的已读记录，不按「当前工作区看到的列表」猜哪些已经不在了——
+ *  会话列表是按工作区过滤的，那样会把切走的课程的已读记录当成「已删除」一并清掉，
+ *  切回来又变成未读。 */
+function forgetSeen(sessionId: string) {
+  const seen = readSeen()
+  if (!(sessionId in seen)) return
+  delete seen[sessionId]
+  delete seenFallback[sessionId]
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)) } catch { /* 内存那份上面已经删了 */ }
+}
+
+function markSeen(sessionId: string) {
+  const seen = readSeen()
+  seen[sessionId] = new Date().toISOString()
+  seenFallback[sessionId] = seen[sessionId]
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)) } catch { /* 用内存那份兜住 */ }
+}
+
+function SessionRow({ session, active, unread, onOpen, onRename, onDelete }: {
+  session: SessionSummary; active: boolean; unread: boolean
   onOpen: () => void; onRename: (title: string) => Promise<void>; onDelete: () => Promise<void>
 }) {
   const [mode, setMode] = useState<'idle' | 'rename' | 'confirm'>('idle')
@@ -691,9 +847,18 @@ function SessionRow({ session, active, onOpen, onRename, onDelete }: {
     <button onClick={() => setMode('idle')}>{t('common.cancel')}</button>
   </div>
 
-  return <div className={`session-row ${active ? 'active' : ''}`}>
-    <button className="session" onClick={onOpen}>
-      <i title={session.scope_mode === 'general' ? t('session.general') : t('session.course')} style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /><span className="session-text"><b>{session.title || t('session.untitled')}</b><small>{timeLabel(session.updated_at)}</small></span>
+  // 未读只在通用模式下需要课程色（那时会话可能跨课程）：颜色管归属、形状管状态。
+  // 课程工作区里所有会话必然同色，一列同色的点信息量是零。
+  const showCourseColor = session.scope_mode === 'general'
+  return <div className={`session-row ${active ? 'active' : ''} ${unread ? 'unread' : ''}`}>
+    <button className="session" onClick={onOpen}
+      aria-label={`${session.title || t('session.untitled')}${unread ? ` · ${t('session.unread')}` : ''} · ${session.scope_mode === 'general' ? t('session.general') : t('session.course')}`}>
+      <span className="slot" aria-hidden>
+        {unread
+          ? <i className="st-dot" style={showCourseColor ? { background: session.course_color ?? undefined } : undefined} />
+          : showCourseColor ? <i className="course-bar" style={{ backgroundColor: session.course_color ?? '#D4D4D8' }} /> : null}
+      </span>
+      <span className="session-text"><b>{session.title || t('session.untitled')}</b><small>{timeLabel(session.updated_at)}</small></span>
     </button>
     <span className="session-actions">
       <button aria-label={t('a11y.rename_session')} title={t('common.rename')} onClick={() => setMode('rename')}>✎</button>
@@ -766,7 +931,7 @@ function ThinkingHint({ activity, modelNote }: { activity?: ToolActivity[]; mode
 }
 
 /** 种子检索是服务端每轮自动做的，只有命中才值得占一行——它解释了引用从哪来。
- *  进行中由「正在检索教材」那句兜着，未命中和停止占位都不上屏。
+ *  进行中由「正在检索知识库」那句兜着，未命中和停止占位都不上屏。
  *  模型自己发起的检索照常显示，失败的那一步也是它的决策过程。 */
 function seedChipHidden(entry: ToolActivity): boolean {
   if (entry.origin !== 'seed') return false
@@ -825,13 +990,14 @@ function NotesPanel({ course, onError }: { course: Course; onError: (message: st
         </div>)}
     {open && <div className="note-viewer">
       <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label={t('a11y.close_note')}>×</button></div>
-      <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{open.content}</ReactMarkdown></div>
+      <div className="message-content"><ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={markdownComponents}>{open.content}</ReactMarkdown></div>
     </div>}
   </article>
 }
 
-/** 可折叠树的一个节点。概念目录与知识页共用，各自把自己的行映射成这个形状。 */
-interface TreeItem { id: string; parentId: string; label: string; meta: string; onOpen?: () => void }
+/** 可折叠树的一个节点。概念目录与知识页共用，各自把自己的行映射成这个形状。
+ *  group 标出「这一行是分组而不是内容」，只影响行的视觉。 */
+interface TreeItem { id: string; parentId: string; label: string; meta: string; group?: boolean; onOpen?: () => void }
 
 /** 按 parent_id 分组。父节点不在列表里的当作根节点，不硬造一层假的根。
  *  知识页的 frontmatter 用户可以手改，改成父子互指时环里的节点从根走不到，
@@ -869,12 +1035,13 @@ function treeRows(children: Map<string, TreeItem[]>, collapsed: Set<string>, tog
     const kids = children.get(item.id) ?? []
     const shut = collapsed.has(item.id)
     return [
-      <div className="concept-row" key={item.id} style={{ paddingLeft: `${depth * 18}px` }}>
+      <div className={item.group ? 'concept-row tree-group' : 'concept-row'} key={item.id} style={{ paddingLeft: `${depth * 18}px` }}>
         {kids.length > 0
           ? <button type="button" className={shut ? 'concept-toggle' : 'concept-toggle open'} aria-expanded={!shut} aria-label={item.label} onClick={() => toggle(item.id)}>›</button>
           : <span className="concept-bullet" aria-hidden />}
         {item.onOpen ? <button type="button" className="tree-open" onClick={item.onOpen}>{item.label}</button> : <b>{item.label}</b>}
-        <small>{item.meta}{kids.length > 0 && ` · ${t('library.concepts_children', { n: kids.length })}`}</small>
+        {/* 分组行不拼子项数：它的 meta 已经是「共 N 页」，两个含义不同的数字并排容易读混 */}
+        <small>{item.meta}{!item.group && kids.length > 0 && ` · ${t('library.concepts_children', { n: kids.length })}`}</small>
       </div>,
       ...(shut ? [] : treeRows(children, collapsed, toggle, item.id, depth + 1)),
     ]
@@ -1013,31 +1180,297 @@ function stripFrontmatter(raw: string): string {
   return match ? raw.slice(match[0].length).trimStart() : raw
 }
 
+/** 正文里的出处标注怎么对上出处。三条路依次试：先按（文档、页）严格对；对不上时按
+ *  归一化的文档名再对一次（小写、去扩展名、并空格），救回扩展名抄丢这类走样；标注本身
+ *  没写文档名时才按页对。按页那一路要自己判歧义——同一页有多条出处（这一页引了多份教材）
+ *  时一条都不给，点开哪一条都可能不是这句话的依据。
+ *
+ *  文档名写了却对不上任何出处时不退到按页：那种标注指的是别的文档，拿本页同页码的出处
+ *  顶上去等于把另一份教材当成依据摆给用户看。没有页码的出处按文档名单独收，对应文档级标注。 */
+function anchorLookup(anchors: CitationSource[]): (document: string, page: number | null) => CitationSource | undefined {
+  const key = (document: string, page: number | null) => `${document}|${page ?? ''}`
+  // 真实页面里文档级标注写成 [p.笔记.docx] 的居多（模型把页码前缀也抄了进来），
+  // 所以归一化时把开头的 p. 一并去掉。
+  const loose = (document: string) => document.toLowerCase().replace(/\s+/g, ' ').trim().replace(/^p\./, '').replace(/\.[a-z0-9]+$/, '')
+  // 歧义按归属教材判：文件名可以重名，同名教材的同一页是两条不同的出处，谁都不能接。
+  // 一旦判成歧义（null）就保持住，后来的条目不能把它翻回去。
+  const owner = (item: CitationSource) => item.material_id || item.document
+  const put = (map: Map<string, CitationSource | null>, mapKey: string, item: CitationSource) => {
+    if (!map.has(mapKey)) map.set(mapKey, item)
+    else if (map.get(mapKey) !== null && owner(map.get(mapKey)!) !== owner(item)) map.set(mapKey, null)
+  }
+  const byDocument = new Map<string, CitationSource | null>()
+  const byLoose = new Map<string, CitationSource | null>()
+  const byPage = new Map<number, CitationSource | null>()
+  for (const item of anchors) {
+    const page = typeof item.page === 'number' ? item.page : null
+    put(byDocument, key(item.document, page), item)
+    put(byLoose, key(loose(item.document), page), item)
+    if (page !== null) byPage.set(page, byPage.has(page) ? null : item)
+  }
+  return (document, page) => {
+    if (document) return byDocument.get(key(document, page)) ?? byLoose.get(key(loose(document), page)) ?? undefined
+    return page === null ? undefined : byPage.get(page) ?? undefined
+  }
+}
+
+// 三种形态都要认：[文档 p.12] 占多数（模型抄的是原文段落自带的标签）、[p.12]、[笔记.docx]。
+// 裸形态在引了多份教材的页面上一样会出现，那种歧义由 anchorLookup 的按页那一路判掉。
+const CITE_MARK = /(\[(?:[^\]\n]+ )?p\.\d+\]|\[[^\]\n]+\.(?:pdf|docx?|pptx?|txt|md)\])/i
+const CITE_PAGE = /^\[(?:(.+) )?p\.(\d+)\]$/i
+const CITE_DOCUMENT = /^\[([^\]\n]+\.(?:pdf|docx?|pptx?|txt|md))\]$/i
+/** 知识页正文里的出处标注：对得上出处的换成可点开原文的小按钮，其余保持原样。
+ *  只处理直接文本，代码、公式、强调里的写法不动。 */
+function citeMarks(children: ReactNode, anchorAt: (document: string, page: number | null) => CitationSource | undefined, onOpen: (anchor: CitationSource) => void): ReactNode {
+  return Children.map(children, child => {
+    if (typeof child !== 'string' || !CITE_MARK.test(child)) return child
+    return child.split(CITE_MARK).map((part, index) => {
+      const paged = CITE_PAGE.exec(part)
+      const whole = paged ? null : CITE_DOCUMENT.exec(part)
+      const named = paged ? paged[1] ?? '' : whole?.[1]
+      if (named === undefined) return part
+      const page = paged ? Number(paged[2]) : null
+      const anchor = anchorAt(named, page)
+      if (!anchor) return part
+      const label = page === null ? t('citation.open_document', { document: anchor.document })
+        : t('citation.open_source', { document: anchor.document, n: page })
+      return <button type="button" className="wiki-cite" key={index} title={label} aria-label={label}
+        onClick={() => onOpen(anchor)}>{part}</button>
+    })
+  })
+}
+
+/** 一条体检发现的说明。code 决定文案，其余字段是插值参数；服务端只列前几个页码或文件名，
+ *  真正的条数由 n 说明，列表短于 n 时补一个省略号。 */
+function lintText(issue: WikiIssue): string {
+  const listed: (string | number)[] = issue.pages ?? issue.documents ?? []
+  const total = issue.n ?? 0
+  return tOr(`library.lint_${issue.code}`, issue.code, {
+    n: total, parent: issue.parent ?? '',
+    items: listed.join(t('common.list_sep')) + (listed.length < total ? '…' : ''),
+  })
+}
+
+/** 知识页体检的结论。没发现问题也说一句：不然「没跑过」和「没问题」在界面上是同一个样子。
+ *  取不到结果时整块不显示——报告本身是接口，宁可缺席也不能给出一个假的「通过」。 */
+function WikiLintNote({ issues }: { issues: WikiIssue[] | null }) {
+  const [open, setOpen] = useState(false)
+  if (issues === null) return null
+  const errors = issues.filter(issue => issue.level === 'error').length
+  const summary = [errors > 0 ? t('library.wiki_lint_errors', { n: errors }) : '',
+    issues.length > errors ? t('library.wiki_lint_warnings', { n: issues.length - errors }) : ''].filter(Boolean)
+  return <div className="wiki-lint">
+    <p>{issues.length === 0 ? t('library.wiki_lint_ok')
+      : t('library.wiki_lint_found', { summary: summary.join(t('common.list_sep')) })}
+      {issues.length > 0 && <button className="text-button" aria-expanded={open} onClick={() => setOpen(!open)}>
+        {t(open ? 'library.wiki_lint_hide' : 'library.wiki_lint_show')}</button>}</p>
+    {open && <ul>{issues.map((issue, index) => <li className={issue.level} key={`${issue.concept_id}:${issue.code}:${index}`}>
+      <b title={issue.concept_name}>{issue.concept_name}</b><span>{lintText(issue)}</span></li>)}</ul>}
+  </div>
+}
+
+/** 「其他来源也讲了这个」：别的教材里在讲同一件事的页，点一下就翻过去。
+ *  边一律跨教材，所以这句话对每一条都成立。服务端读时现算，没有边时整行不显示。 */
+function WikiPairRow({ edges, conceptId, onOpen }: { edges: WikiEdge[]; conceptId: string; onOpen: (conceptId: string) => void }) {
+  // 服务端已按分数从高到低给出，这里照原序摆。
+  const related = useMemo(() => edges
+    .filter(edge => edge.a === conceptId || edge.b === conceptId)
+    .map(edge => edge.a === conceptId
+      ? { id: edge.b, name: edge.b_name, document: edge.b_document }
+      : { id: edge.a, name: edge.a_name, document: edge.a_document }), [edges, conceptId])
+  if (related.length === 0) return null
+  return <div className="wiki-pairs" role="group" aria-labelledby="wiki-pairs-label">
+    <span id="wiki-pairs-label">{t('library.wiki_pairs_label')}</span>
+    {related.map(item => <button type="button" className="pair-chip" key={item.id} onClick={() => onOpen(item.id)}>
+      {item.name}{item.document && <i>{item.document}</i>}
+    </button>)}
+  </div>
+}
+
+/** 保存手写区时的错误。构建中与超限有专门的文案，其余照后端消息显示。 */
+function handwrittenError(error: unknown): string {
+  const status = error instanceof ApiError ? error.status : undefined
+  if (status === 409) return t('library.wiki_hand_busy')
+  if (status === 413) return t('library.wiki_hand_too_large')
+  return errorText(error)
+}
+
+/** 知识页的手写区：分隔线以下归用户，重新生成不覆盖。这里是它唯一的编辑入口。
+ *  没写过内容时只留一个低调的入口，不给一段空内容占位。 */
+function WikiHandwritten({ courseId, conceptId, text, onSaved }: {
+  courseId: string; conceptId: string; text: string; onSaved: (next: string) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(text)
+  const [saving, setSaving] = useState(false)
+  const [failure, setFailure] = useState('')
+  // 换页与保存成功都要收起编辑器，否则上一页的草稿会留在下一页的输入框里。
+  useEffect(() => { setEditing(false); setDraft(text); setFailure('') }, [courseId, conceptId, text])
+  function start() { setDraft(text); setFailure(''); setEditing(true) }
+  async function save() {
+    setSaving(true)
+    try {
+      onSaved((await api.saveWikiHandwritten(courseId, conceptId, draft)).handwritten)
+      setEditing(false); setFailure('')
+    } catch (error) { setFailure(handwrittenError(error)) } finally { setSaving(false) }
+  }
+  if (!editing && !text) return <div className="wiki-hand empty">
+    <button type="button" className="text-button" onClick={start}>{t('library.wiki_hand_add')}</button>
+    {failure && <p className="danger-text" role="alert">{failure}</p>}
+  </div>
+  return <section className="wiki-hand">
+    <div className="wiki-hand-head"><h3>{t('library.wiki_hand_title')}</h3>
+      {!editing && <button type="button" className="text-button" onClick={start}>{t('common.edit')}</button>}</div>
+    {editing
+      ? <>
+          <textarea className="wiki-hand-editor" value={draft} onChange={event => setDraft(event.target.value)}
+            placeholder={t('library.wiki_hand_placeholder')} spellCheck={false}
+            aria-label={t('a11y.wiki_handwritten')} />
+          <div className="wiki-hand-actions">
+            <button className="ghost-button" disabled={saving} onClick={() => void save()}>
+              {saving ? t('library.wiki_hand_saving') : t('common.save')}</button>
+            <button className="ghost-button" disabled={saving} onClick={() => { setEditing(false); setDraft(text); setFailure('') }}>
+              {t('common.cancel')}</button>
+            <span>{t('library.wiki_hand_hint')}</span>
+          </div>
+        </>
+      : <div className="message-content"><ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}
+          components={markdownComponents}>{text}</ReactMarkdown></div>}
+    {failure && <p className="danger-text" role="alert">{failure}</p>}
+  </section>
+}
+
+/** 教材分组行的 id 前缀。知识页 id 是 index / section_ / concept_ 这几种，加前缀不会撞上。 */
+const WIKI_GROUP = 'material:'
+
+/** 教材已删、只剩 id 时显示名里带哪一段。id 形如 material_<32hex>，
+ *  前缀每份都一样，剥掉才看得出这是两本不同的书。 */
+function shortMaterialId(id: string): string {
+  return (id.startsWith('material_') ? id.slice(9) : id).slice(0, 8)
+}
+
+/** 知识页树的行。多教材课程在树根加一层教材分组，一本书一个可折叠节点；
+ *  单教材课程不加这层。没记归属的页（课程总览、旧格式页）留在根层，不并进任何一组。 */
+function wikiTreeItems(pages: WikiPageSummary[], onOpen: (page: WikiPageSummary) => void): TreeItem[] {
+  const row = (page: WikiPageSummary, parentId: string): TreeItem => ({
+    id: page.concept_id, parentId, label: page.concept_name,
+    meta: t('library.updated_at', { time: page.updated_at.slice(0, 16).replace('T', ' ') }),
+    onOpen: () => onOpen(page),
+  })
+  const flat = () => pages.map(page => row(page, page.parent_id ?? ''))
+  const owners = new Set(pages.map(page => page.material_id || '').filter(Boolean))
+  if (owners.size < 2) return flat()
+  // 手改 frontmatter 能让页 id 撞上分组行的 id，两者合成一个指向自己的节点，
+  // treeRows 顺着递归下去爆栈、整页白屏。撞上就整棵树不分组。
+  const taken = new Set(pages.map(page => page.concept_id))
+  if ([...owners].some(owner => taken.has(WIKI_GROUP + owner))) return flat()
+
+  const byId = new Map(pages.map(page => [page.concept_id, page] as const))
+  const groupOf = (page: WikiPageSummary) => page.material_id ? WIKI_GROUP + page.material_id : ''
+  const sameBook = (page: WikiPageSummary) => {
+    const parent = page.parent_id ? byId.get(page.parent_id) : undefined
+    return parent && (parent.material_id || '') === (page.material_id || '') ? parent : undefined
+  }
+  // 挂父页的前提：整条链都在同一本书里、而且走得到顶。跨教材的父页与手改出的环
+  // 一律挂回自己那本书——分组里只出现这本书的页，「共 N 页」才和画出来的行数对得上。
+  const parentOf = (page: WikiPageSummary): string => {
+    const parent = sameBook(page)
+    if (!parent) return groupOf(page)
+    const seen = new Set([page.concept_id])
+    for (let up: WikiPageSummary | undefined = parent; up; up = sameBook(up)) {
+      if (seen.has(up.concept_id)) return groupOf(page)
+      seen.add(up.concept_id)
+    }
+    return parent.concept_id
+  }
+  const counts = new Map<string, number>()
+  const names = new Map<string, string>()
+  for (const page of pages) {
+    const owner = page.material_id || ''
+    if (!owner) continue
+    counts.set(owner, (counts.get(owner) ?? 0) + 1)
+    if (page.document) names.set(owner, page.document)
+  }
+  // 同名教材，以及两份已删教材 id 前几位相同时，两行会显示成同一个名字。
+  // 按分组出现的先后加序号，先出现的那本保留原名。
+  const used = new Map<string, number>()
+  const distinct = (label: string) => {
+    const nth = (used.get(label) ?? 0) + 1
+    used.set(label, nth)
+    return nth > 1 ? t('library.wiki_group_dup', { name: label, n: nth }) : label
+  }
+  const rows = pages.map(page => row(page, parentOf(page)))
+  const groups: TreeItem[] = [...counts].map(([owner, n]) => ({
+    id: WIKI_GROUP + owner, parentId: '', group: true,
+    label: distinct(names.get(owner) ?? t('library.wiki_group_gone', { id: shortMaterialId(owner) })),
+    meta: t('library.wiki_group_pages', { n }),
+  }))
+  // 根层的先后：没记归属的页在前（课程总览排最上），教材分组跟在后面。
+  return [...rows.filter(item => !item.parentId), ...groups, ...rows.filter(item => item.parentId)]
+}
+
 /** 已生成的 Wiki 页，按教材目录嵌成一棵可折叠的树。没有层级的教材照旧平铺。
- *  正文里的 [p.N] 与 frontmatter 的 source_refs 对得上。 */
-function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refreshKey: number; onError: (message: string) => void }) {
+ *  正文里的出处标注与 frontmatter 的 source_refs 对得上，点开的是那一页教材原文。 */
+function WikiPagesPanel({ course, refreshKey, onError, onCitation }: { course: Course; refreshKey: number; onError: (message: string) => void; onCitation: (citation: Citation) => void }) {
   const [pages, setPages] = useState<WikiPageSummary[] | null>(null)
-  const [open, setOpen] = useState<{ title: string; content: string } | null>(null)
+  const [issues, setIssues] = useState<WikiIssue[] | null>(null)
+  const [edges, setEdges] = useState<WikiEdge[]>([])
+  // body 是系统生成的那半，handwritten 是用户自己写的，两段分开渲染，分隔标记不上屏。
+  const [open, setOpen] = useState<{ course: string; id: string; title: string; body: string; handwritten: string; anchors: CitationSource[] } | null>(null)
+  // 连点两页时慢的那个响应会后到。只认最后一次点击的编号，别让它盖掉现在显示的页。
+  const latest = useRef(0)
+  // 正文的滚动容器换页时是复用的同一个节点，不主动滚回顶部，新页会停在上一页的位置。
+  const viewer = useRef<HTMLDivElement>(null)
+  // 切课时同理：上一门课的体检结果可能后到，落到新课的面板上。
+  const loaded = useRef(0)
   const { collapsed, toggle, toggleAll } = useCollapse(`${course.id}:${refreshKey}`)
   const { lang } = useI18n()
   useEffect(() => {
-    setPages(null); setOpen(null)
-    api.wikiPages(course.id).then(payload => setPages(payload.pages)).catch(error => { setPages([]); onError(errorText(error)) })
+    const ticket = ++loaded.current
+    setPages(null); setOpen(null); setIssues(null); setEdges([])
+    api.wikiPages(course.id).then(payload => { if (loaded.current === ticket) setPages(payload.pages) })
+      .catch(error => { if (loaded.current === ticket) { setPages([]); onError(errorText(error)) } })
+    // 体检取不到就不显示那一行，页面本身照读。
+    api.wikiLint(course.id).then(payload => { if (loaded.current === ticket) setIssues(payload.issues) }).catch(() => {})
+    // 配对同理：取不到就当这门课没有边，读页不受影响。
+    api.wikiGraph(course.id).then(payload => { if (loaded.current === ticket) setEdges(payload.edges) }).catch(() => {})
   }, [course.id, refreshKey])
   async function read(page: WikiPageSummary) {
+    const ticket = ++latest.current
     try {
-      const raw = (await api.wikiPage(course.id, page.concept_id)).content
-      setOpen({ title: page.concept_name, content: stripFrontmatter(raw) })
-    } catch (error) { onError(errorText(error)) }
+      const payload = await api.wikiPage(course.id, page.concept_id)
+      if (latest.current !== ticket) return
+      setOpen({ course: course.id, id: page.concept_id, title: page.concept_name,
+        // 分段字段缺席只可能是服务端还没跟上，那时整页照旧剥掉 frontmatter 渲染。
+        body: payload.body ?? stripFrontmatter(payload.content), handwritten: payload.handwritten ?? '', anchors: [] })
+    } catch (error) { if (latest.current === ticket) onError(errorText(error)); return }
+    // 出处单独取：拿不到就让出处标注留成纯文本，正文照样读得了。
+    try {
+      const { anchors } = await api.wikiPageSources(course.id, page.concept_id)
+      if (latest.current !== ticket) return
+      setOpen(current => current && current.id === page.concept_id && current.course === course.id ? { ...current, anchors } : current)
+    } catch { /* 出处取不到不影响正文 */ }
   }
+  useEffect(() => { viewer.current?.scrollTo({ top: 0 }) }, [open?.id])
+  // 出处表只在换页或取回出处时重算一次。memo 里调了 t()，lang 要进依赖。
+  const components = useMemo(() => {
+    const anchorAt = anchorLookup(open?.anchors ?? [])
+    const mark = (children: ReactNode) => citeMarks(children, anchorAt, anchor => onCitation(asMaterial(anchor)))
+    // node 之外的 props 全部透传：className 与 style 由 GFM 给出（任务列表、表格对齐），
+    // 挑着透传的话，remark 换个方式表达对齐时这里会静默丢掉它。
+    return {
+      ...markdownComponents,
+      p: ({ children, node, ...rest }: ComponentProps<'p'> & { node?: unknown }) => <p {...rest}>{mark(children)}</p>,
+      li: ({ children, node, ...rest }: ComponentProps<'li'> & { node?: unknown }) => <li {...rest}>{mark(children)}</li>,
+      td: ({ children, node, ...rest }: ComponentProps<'td'> & { node?: unknown }) => <td {...rest}>{mark(children)}</td>,
+    }
+  }, [open?.anchors, onCitation, lang])
   // lang 要进依赖：memo 里调了 t()，换语言时数据没变，缓存的旧译文会和现算的部分混排。
-  const items = useMemo(() => (pages ?? []).map(page => ({
-    id: page.concept_id, parentId: page.parent_id ?? '', label: page.concept_name,
-    meta: t('library.updated_at', { time: page.updated_at.slice(0, 16).replace('T', ' ') }),
-    onOpen: () => void read(page),
-  })), [pages, lang])
+  const items = useMemo(() => wikiTreeItems(pages ?? [], page => void read(page)), [pages, lang])
   const children = useMemo(() => groupByParent(items), [items])
   const branches = useMemo(() => items.filter(item => (children.get(item.id) ?? []).length > 0), [items, children])
+  // 层级说的是页与页之间，教材分组这一层不算：平铺的多教材课照旧要给出那句说明。
+  const nested = useMemo(() => branches.some(item => !item.group), [branches])
   if (pages !== null && pages.length === 0) return null
   return <article className="card">
     <div className="card-heading">
@@ -1046,14 +1479,21 @@ function WikiPagesPanel({ course, refreshKey, onError }: { course: Course; refre
       {branches.length > 0 && <button className="text-button" onClick={() => toggleAll(branches)}>
         {collapsed.size ? t('library.concepts_expand_all') : t('library.concepts_collapse_all')}</button>}
     </div>
+    <WikiLintNote issues={issues} />
     {pages === null ? <p className="mini-empty">{t('common.loading')}</p>
       : <div className="concept-tree">
-          {branches.length === 0 && <p className="wiki-note">{t('library.wiki_pages_flat_note')}</p>}
+          {!nested && <p className="wiki-note">{t('library.wiki_pages_flat_note')}</p>}
           {treeRows(children, collapsed, toggle)}
         </div>}
     {open && <div className="note-viewer">
       <div className="note-viewer-head"><b>{open.title}</b><button onClick={() => setOpen(null)} aria-label={t('a11y.close_wiki')}>×</button></div>
-      <div className="message-content"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{open.content}</ReactMarkdown></div>
+      <div className="message-content" ref={viewer}><ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={components}>{open.body}</ReactMarkdown></div>
+      <WikiHandwritten courseId={course.id} conceptId={open.id} text={open.handwritten}
+        onSaved={handwritten => setOpen(current => current && current.id === open.id ? { ...current, handwritten } : current)} />
+      <WikiPairRow edges={edges} conceptId={open.id} onOpen={conceptId => {
+        const page = (pages ?? []).find(item => item.concept_id === conceptId)
+        if (page) void read(page)
+      }} />
     </div>}
   </article>
 }
@@ -1097,21 +1537,64 @@ function SessionTitle({ session, onRename }: { session: SessionSummary; onRename
   </button>
 }
 
+/** 上下文占比环。r=7、周长 2πr≈43.98，用 dashoffset 表示已用比例，起点转到 12 点。 */
+function UsageRing({ percent, warn, size = 14 }: { percent: number; warn?: boolean; size?: number }) {
+  const circumference = 2 * Math.PI * 7
+  return <svg width={size} height={size} viewBox="0 0 20 20" aria-hidden focusable="false">
+    <circle className="ring-track" cx="10" cy="10" r="7" fill="none" strokeWidth="3" />
+    <circle className={warn ? 'ring-fill warn' : 'ring-fill'} cx="10" cy="10" r="7" fill="none" strokeWidth="3"
+      strokeDasharray={circumference.toFixed(2)}
+      strokeDashoffset={(circumference * (1 - Math.min(1, percent / 100))).toFixed(2)}
+      transform="rotate(-90 10 10)" />
+  </svg>
+}
+
+// 占比小于这个数的分区折进「其余 n 项」：原来 11 行里有三行不到 0.5%，
+// 各占一整行，把真正的大头夹在中间。
+const CONTEXT_MINOR_SHARE = 2
+
 function ContextMeter({ usage }: { usage: ContextUsage }) {
   const [open, setOpen] = useState(false)
+  const [showMinor, setShowMinor] = useState(false)
   const k = (tokens: number) => tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}K` : String(tokens)
   const percent = Math.min(100, Math.round((usage.total_tokens / usage.limit_tokens) * 100))
-  const filled = Math.max(1, Math.round(percent / 12.5))
   const gated = usage.gate_tools_cleared > 0 || usage.gate_history_dropped > 0 || usage.gate_evidence_clipped
   const notice = usage.dropped_history > 0 || usage.clipped_history > 0 || usage.clipped_segments.length > 0 || gated
+  // 要回答的问题是「哪块吃掉了上下文」，所以按占比降序，而不是按服务端给的顺序
+  const sum = usage.segments.reduce((total, segment) => total + segment.tokens, 0) || 1
+  const ranked = [...usage.segments]
+    .map(segment => ({ ...segment, share: segment.tokens / sum * 100, name: segment.label_key ? tOr(segment.label_key, segment.label) : segment.label }))
+    .sort((a, b) => b.tokens - a.tokens)
+  const major = ranked.filter(segment => segment.share >= CONTEXT_MINOR_SHARE)
+  const minor = ranked.filter(segment => segment.share < CONTEXT_MINOR_SHARE)
+  const minorTokens = minor.reduce((total, segment) => total + segment.tokens, 0)
   return <div className="context-chip">
     <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} aria-label={t('a11y.context')} className={notice ? 'warn' : undefined}>
-      <span aria-hidden>{'▓'.repeat(filled)}{'░'.repeat(8 - filled)}</span>
+      <UsageRing percent={percent} warn={notice} />
       <b>{percent}%</b>
     </button>
     {open && <div className="context-popover">
-      <div className="popover-head"><b>{t('context.title')}</b><span>{k(usage.total_tokens)} / {k(usage.limit_tokens)}</span></div>
-      {usage.segments.map(segment => <div className="popover-row" key={segment.label}><span>{segment.label_key ? tOr(segment.label_key, segment.label) : segment.label}</span><b>{k(segment.tokens)}</b></div>)}
+      <div className="popover-head">
+        <span className="popover-title"><b>{t('context.title')}</b><small>{k(usage.total_tokens)} / {k(usage.limit_tokens)}</small></span>
+        <span className="popover-ring"><UsageRing percent={percent} warn={notice} size={40} /><i>{percent}%</i></span>
+      </div>
+      <div className="usage-stack" role="img" aria-label={t('a11y.context')}>
+        {ranked.map((segment, index) => <i key={segment.label} style={{ width: `${segment.share}%`, background: `var(--stack-${Math.min(index, 6)})` }} />)}
+      </div>
+      {major.map((segment, index) => <div className="usage-row" key={segment.label}>
+        <i style={{ background: `var(--stack-${Math.min(index, 6)})` }} />
+        <span>{segment.name}</span>
+        <b>{k(segment.tokens)} · {Math.round(segment.share)}%</b>
+      </div>)}
+      {minor.length > 0 && (showMinor
+        ? minor.map((segment, index) => <div className="usage-row" key={segment.label}>
+            <i style={{ background: `var(--stack-${Math.min(major.length + index, 6)})` }} />
+            <span>{segment.name}</span>
+            <b>{k(segment.tokens)} · &lt;{CONTEXT_MINOR_SHARE}%</b>
+          </div>)
+        : <button type="button" className="usage-more" onClick={() => setShowMinor(true)}>
+            {t('context.minor_more', { n: minor.length, tokens: k(minorTokens) })}
+          </button>)}
       <p>{t('context.note')}</p>
       {usage.compacted_messages > 0 && <p className="popover-note">{t('context.compacted', { n: usage.compacted_messages })}</p>}
       {usage.dropped_history > 0 && <p className="popover-warn">{t('context.dropped', { n: usage.dropped_history })}</p>}
@@ -1126,30 +1609,63 @@ function ContextMeter({ usage }: { usage: ContextUsage }) {
   </div>
 }
 
-function PlanGantt({ items }: { items: Plan['items'] }) {
-  const today = new Date().toLocaleDateString('sv')
-  const sorted = [...items].sort((a, b) => a.due_date.localeCompare(b.due_date))
-  const start = sorted.length ? Date.parse(sorted[0].due_date) : 0
-  const rows: string[] = []
-  let week = -1
-  for (const item of sorted) {
-    // 三十多条一路铺下来读不动，按周切段
-    const index = Math.floor((Date.parse(item.due_date) - start) / 604800000)
-    if (index !== week) { week = index; rows.push(`    section ${t('plan.gantt_section', { n: index + 1 })}`) }
-    // mermaid 用冒号和逗号分隔字段，而计划标题里这两样都很常见——不换掉整张图都画不出来。
-    const label = item.title.replace(/[:：,，#;]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 16) || t('plan.untitled_item')
-    const state = item.status === 'done' ? 'done'
-      : item.due_date === today ? 'active'
-      : item.due_date < today ? 'crit' : ''
-    rows.push(`    ${label} :${state}${state ? ', ' : ''}${item.due_date}, 1d`)
+/** 周网格。取代原来的 mermaid 甘特图，顺带修掉它三个毛病：
+ *  任务名 slice(0,16) 硬截断不加省略号（看着像渲染坏了）、每条都是 1d 让日期轴刻度重复、
+ *  状态色只在「今天/过期/完成」三档有颜色——新排的计划全是未来日期，整张图一片同色。
+ *
+ *  选型上甘特也不合适：它表达跨度与依赖，而这里每条都是「某一天读某几页」，两者都没有。 */
+function PlanWeeks({ items }: { items: Plan['items'] }) {
+  const today = new Date().toLocaleDateString('sv')   // sv locale 就是 YYYY-MM-DD
+  if (!items.length) return null
+
+  // 按 setDate 走而不是加毫秒：在午夜切换夏令时的时区（Santiago、Cairo、Beirut）
+  // 加 86400000 会丢一天或重复一天，那天的条目就从网格里消失了。
+  const shift = (date: string, days: number) => {
+    const at = new Date(`${date}T00:00:00`)
+    at.setDate(at.getDate() + days)
+    return at.toLocaleDateString('sv')
   }
-  if (!rows.length) return null
-  // useWidth 让 mermaid 按这个宽度自己排版。不设的话它按内容算出一个很窄的尺寸，
-  // 任务名会挤成一团；而用 CSS 去拉宽会连文字一起放大。
-  const code = ['%%{init: {"gantt": {"useWidth": 900, "leftPadding": 96, "barHeight": 18, "fontSize": 12}}}%%',
-                'gantt', '    dateFormat YYYY-MM-DD', '    axisFormat %m/%d',
-                '    todayMarker stroke:#059669,stroke-width:2px', ...rows].join('\n')
-  return <div className="plan-gantt"><Mermaid code={code} /></div>
+  const mondayOf = (date: string) => {
+    const weekday = (new Date(`${date}T00:00:00`).getDay() + 6) % 7   // 周一为 0
+    return shift(date, -weekday)
+  }
+  const byDay = new Map<string, Plan['items']>()
+  for (const item of items) byDay.set(item.due_date, [...(byDay.get(item.due_date) ?? []), item])
+
+  // 有条目的那几周都列出来，不做翻页——翻页会藏掉信息，而甘特图原来是能一眼看全的
+  const weeks = [...new Set([...byDay.keys()].map(mondayOf))].sort()
+  const label = (date: string) => date.slice(5).replace('-', '/')
+
+  return <div className="plan-weeks">
+    {weeks.map(monday => {
+      const days = Array.from({ length: 7 }, (_, offset) => shift(monday, offset))
+      const count = days.reduce((total, day) => total + (byDay.get(day)?.length ?? 0), 0)
+      return <section className="week" key={monday}>
+        <header><b>{t('plan.week_range', { from: label(days[0]), to: label(days[6]) })}</b><span>{t('plan.item_count', { n: count })}</span></header>
+        <div className="week-head">{t('plan.weekday_short').split(',').map((name, index) => <span key={index}>{name}</span>)}</div>
+        <div className="week-body">
+          {days.map(day => {
+            const state = day === today ? 'today' : day < today ? 'past' : ''
+            return <div className={`day ${state}`} key={day}>
+              <time dateTime={day}>{label(day)}{day === today && <em>{t('plan.today')}</em>}</time>
+              {(byDay.get(day) ?? []).map(item => {
+                const mark = item.status === 'done' ? 'done' : day < today ? 'late' : ''
+                return <div className={`task ${mark}`} key={item.id}>
+                  <b>{item.title}</b>
+                  {item.concept_name && <small>{item.concept_name}</small>}
+                </div>
+              })}
+            </div>
+          })}
+        </div>
+      </section>
+    })}
+    <div className="week-legend">
+      <span><i className="todo" />{t('plan.legend_todo')}</span>
+      <span><i className="done" />{t('plan.legend_done')}</span>
+      <span><i className="late" />{t('plan.legend_late')}</span>
+    </div>
+  </div>
 }
 
 function PlanDays({ items }: { items: Plan['items'] }) {
@@ -1188,12 +1704,45 @@ function citationLabel(item: Citation): string {
   return `${item.material_name ?? t('citation.material_fallback')}${item.page ? `:${item.page}` : ''}`
 }
 
-function CitationChip({ item, fallbackNumber, onOpen }: { item: Citation; fallbackNumber: number; onOpen: (citation: Citation) => void }) {
-  const label = <><i>[{item.number ?? fallbackNumber}]</i>{citationLabel(item)}</>
+/** 来源名与出处分成两列：出处右对齐成列，才扫得出「一共引了哪几页」。 */
+function citationParts(item: Citation): { who: string; at: string } {
+  if (item.kind === 'web') return { who: item.title || item.url || t('citation.web'), at: t('citation.at_web') }
+  if (item.kind === 'wiki') return {
+    who: t('citation.wiki_chip', { name: item.concept_name || item.concept_id || t('citation.wiki_fallback') }),
+    at: t('citation.at_wiki'),
+  }
+  return {
+    who: item.material_name ?? t('citation.material_fallback'),
+    at: item.page ? t('citation.at_page', { n: item.page }) : t('citation.at_unknown'),
+  }
+}
+
+function CitationRow({ item, fallbackNumber, onOpen }: { item: Citation; fallbackNumber: number; onOpen: (citation: Citation) => void }) {
+  const { who, at } = citationParts(item)
+  const kind = item.kind === 'wiki' ? 'wiki' : item.kind === 'web' ? 'web' : 'mat'
+  const body = <>
+    <span className="cite-no">{item.number ?? fallbackNumber}</span>
+    <span className="cite-who">{who}</span>
+    <span className="cite-at">{at}</span>
+  </>
   const href = item.kind === 'web' ? safeHref(item.url) : null
-  if (item.kind === 'wiki') return <button className="citation-wiki" onClick={() => onOpen(item)}>{label}</button>
-  if (href) return <a className="citation-web" href={href} target="_blank" rel="noopener noreferrer nofollow" title={item.url}>{label}</a>
-  return <button onClick={() => onOpen(item)}>{label}</button>
+  if (href) return <a className={`cite-row ${kind}`} href={href} target="_blank" rel="noopener noreferrer nofollow" title={item.url}>{body}</a>
+  return <button type="button" className={`cite-row ${kind}`} onClick={() => onOpen(item)}>{body}</button>
+}
+
+/** 依据面板。三类来源用左侧色条 + 出处成列区分，不再靠颜色深浅。 */
+function CitationPanel({ items, onOpen }: { items: Citation[]; onOpen: (citation: Citation) => void }) {
+  const counts = { mat: 0, wiki: 0, web: 0 }
+  for (const item of items) counts[item.kind === 'wiki' ? 'wiki' : item.kind === 'web' ? 'web' : 'mat'] += 1
+  const summary = [
+    counts.mat ? t('citation.count_material', { n: counts.mat }) : '',
+    counts.wiki ? t('citation.count_wiki', { n: counts.wiki }) : '',
+    counts.web ? t('citation.count_web', { n: counts.web }) : '',
+  ].filter(Boolean).join(' · ')
+  return <div className="citations">
+    <div className="citations-head"><b>{t('citation.panel_title')}</b><span>{summary}</span></div>
+    {items.map((item, index) => <CitationRow key={item.id ?? item.chunk_id ?? item.url ?? index} item={item} fallbackNumber={index + 1} onOpen={onOpen} />)}
+  </div>
 }
 
 function MessageCard({ message, onCitation, showResolution, onRetry, modelNote, onChoose }: { message: Message; onCitation: (citation: Citation) => void; showResolution: boolean; onRetry?: () => void; modelNote?: string; onChoose?: (text: string) => void }) {
@@ -1203,15 +1752,17 @@ function MessageCard({ message, onCitation, showResolution, onRetry, modelNote, 
   const resolution = !showResolution ? null : message.resolution_status === 'resolved' ? t('message.resolved', { course: message.resolved_course_name ?? message.resolved_course_id ?? t('message.course_fallback') }) : message.resolution_status ? t('message.unresolved') : null
   return <article className="message assistant-message"><AgentLabel turnId={message.turn_id ?? null} />{message.activity && message.activity.length > 0 && <ToolActivityRow activity={message.activity} />}
     {message.status === 'stopped' && <div className="degraded-notice"><span>{t('message.stopped_note')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}
-    {message.degraded && <div className="degraded-notice">{t('message.degraded_note', { note: message.degraded })}</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>{t('message.interrupted')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}{message.citations && message.citations.length > 0 && <div className="citations"><span className="refs-label">SOURCES · {message.citations.length}</span>{message.citations.map((item, index) => <CitationChip key={`${item.id ?? item.chunk_id ?? item.url ?? index}`} item={item} fallbackNumber={index + 1} onOpen={onCitation} />)}</div>}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>{t('message.artifact_public')}</b><span>{message.artifact.kind}</span></div>}{message.choices && message.choices.length > 0 && onChoose && <div className="choices">{message.choices.map(option => <button type="button" className="choice" key={option} onClick={() => onChoose(option)}>{option}</button>)}</div>}</article>
+    {message.degraded && <div className="degraded-notice">{t('message.degraded_note', { note: message.degraded })}</div>}<div className={message.status === 'streaming' ? 'message-content streaming' : 'message-content'}>{message.content ? <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={markdownComponents}>{message.content}</ReactMarkdown> : <ThinkingHint activity={message.activity} modelNote={modelNote} />}</div>{resolution && <span className={`message-resolution ${message.resolution_status === 'resolved' ? 'resolved' : ''}`}>{resolution}</span>}{isInterrupted && <div className="interrupted"><span>{t('message.interrupted')}</span>{onRetry && <button type="button" className="ghost-button" onClick={onRetry}>{t('message.retry')}</button>}</div>}{message.citations && message.citations.length > 0 && <CitationPanel items={message.citations} onOpen={onCitation} />}{message.artifact && message.artifact.visibility !== 'model_private' && message.artifact.kind !== 'interrupted' && <div className="artifact-card"><b>{t('message.artifact_public')}</b><span>{message.artifact.kind}</span></div>}{message.choices && message.choices.length > 0 && onChoose && <div className="choices">{message.choices.map(option => <button type="button" className="choice" key={option} onClick={() => onChoose(option)}>{option}</button>)}</div>}</article>
 }
 
-function LibraryView({ course, onCourseChange, onError }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void }) {
+function LibraryView({ course, onCourseChange, onError, onCitation }: { course: Course; onCourseChange: (course: Course) => void; onError: (message: string) => void; onCitation: (citation: Citation) => void }) {
   const [tab, setTab] = useState<'rag' | 'concepts' | 'wiki' | 'notes'>('rag'); const [materials, setMaterials] = useState<Material[]>([]); const [jobs, setJobs] = useState<Record<string, Job>>({}); const [searchQuery, setSearchQuery] = useState(''); const [results, setResults] = useState<SearchResult[]>([]); const [searched, setSearched] = useState(''); const [loading, setLoading] = useState(false); const fileInput = useRef<HTMLInputElement>(null)
   const [ragBackend, setRagBackend] = useState<string>('')
   const polling = useRef(false)
   const [ocrTarget, setOcrTarget] = useState<string>(''); const [ocrEstimate, setOcrEstimate] = useState<OcrEstimate | null>(null); const [ocrRunning, setOcrRunning] = useState(false)
   const [wikiEstimates, setWikiEstimates] = useState<Record<string, WikiEstimate>>({})
+  // 构建收尾的覆盖率报告存在任务记录里；刷新后内存里的 jobs 是空的，按教材回读最近一次。
+  const [wikiReports, setWikiReports] = useState<Record<string, Job>>({})
   // 单独重算过目录结构：概念目录与结构面板都要跟着刷新
   const [structureRuns, setStructureRuns] = useState(0)
   const reload = async () => { try { setMaterials(await api.materials(course.id)) } catch (error) { onError(errorText(error)) } }
@@ -1284,6 +1835,19 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
     })()
     return () => { cancelled = true }
   }, [tab, course.id, course.wiki_enabled, indexedIds, wikiEstimates])
+  // 每次整表替换：换课程时旧课的报告不能留在屏幕上。轮询那边合并是因为期间可能有新任务，
+  // 这边是一次性回读一门课的全部教材，合并只会把上一门课的留下。没有报告的教材不占位。
+  useEffect(() => {
+    if (tab !== 'wiki' || !course.wiki_enabled) return
+    let cancelled = false
+    void (async () => {
+      const pairs = await Promise.all(indexedMaterials.map(async item => {
+        try { const { job } = await api.wikiReport(item.id); return job ? [item.id, job] as const : null } catch { return null }
+      }))
+      if (!cancelled) setWikiReports(Object.fromEntries(pairs.filter(Boolean) as [string, Job][]))
+    })()
+    return () => { cancelled = true }
+  }, [tab, course.id, course.wiki_enabled, indexedIds, wikiDone])
   async function search(event: FormEvent) { event.preventDefault(); if (!searchQuery.trim()) return; setLoading(true); try { setResults(await api.search(course.id, searchQuery)); setSearched(searchQuery) } catch (error) { onError(errorText(error)); setResults([]); setSearched('') } finally { setLoading(false) } }
   const backendLabel = retrievalLabel(ragBackend, true)
   return <section className="page"><div className="page-inner"><div className="hero"><div><p className="eyebrow">{t('nav.library')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('library.hero')}{backendLabel && <span className="backend-badge">{backendLabel}</span>}</p></div><div className="hero-actions"><button className="ghost-button" onClick={() => void reload()}>{t('library.refresh_status')}</button></div></div><div className="tabs"><button className={tab === 'rag' ? 'active' : ''} onClick={() => setTab('rag')}>{t('library.tab_rag')}</button><button className={tab === 'concepts' ? 'active' : ''} onClick={() => setTab('concepts')}>{t('library.tab_concepts')}</button><button className={tab === 'wiki' ? 'active' : ''} onClick={() => setTab('wiki')}>{t('library.tab_wiki')} {course.wiki_enabled ? '' : t('library.tab_wiki_off')}</button><button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>{t('library.notes_title')}</button></div>
@@ -1296,8 +1860,10 @@ function LibraryView({ course, onCourseChange, onError }: { course: Course; onCo
       // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
       const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
-      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? stageLabel(wikiJob.stage ?? wikiJob.status, String(wikiJob.status)) : t('library.wiki_ready')}</small>{!running && <WikiEstimateNote estimate={wikiEstimates[material.id]} />}{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{wikiJob?.error && <WikiBuildNote job={wikiJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
-    }) : <div className="empty-inline">{t('library.wiki_needs_material')}</div>}</> : <div className="empty-inline"><b>{t('library.wiki_off_title')}</b><p>{t('library.wiki_off_body')}</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} />}</>}</div></section>
+      // 本次构建的任务记录更新，没有才退回落库的那份报告。
+      const noteJob = wikiJob ?? wikiReports[material.id]
+      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? stageLabel(wikiJob.stage ?? wikiJob.status, String(wikiJob.status)) : t('library.wiki_ready')}</small>{!running && <WikiEstimateNote estimate={wikiEstimates[material.id]} />}{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{noteJob?.error && <WikiBuildNote job={noteJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
+    }) : <div className="empty-inline">{t('library.wiki_needs_material')}</div>}</> : <div className="empty-inline"><b>{t('library.wiki_off_title')}</b><p>{t('library.wiki_off_body')}</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} onCitation={onCitation} />}</>}</div></section>
 }
 
 /** 构建前的账单。页数与调用次数是离线算的，分钟数按每页约 5 秒外推。 */
@@ -1307,6 +1873,7 @@ function WikiEstimateNote({ estimate }: { estimate?: WikiEstimate }) {
     {t('library.wiki_estimate', { pages: estimate.pages, calls: estimate.calls, minutes: estimate.minutes })}
     {estimate.merged > 0 && ` ${t('library.wiki_estimate_merged', { n: estimate.merged })}`}
     {!estimate.has_levels && ` ${t('library.wiki_estimate_flat')}`}
+    {estimate.outline === 'concepts' && ` ${t('library.wiki_outline_fallback')}`}
   </small>
 }
 
@@ -1314,15 +1881,19 @@ function WikiEstimateNote({ estimate }: { estimate?: WikiEstimate }) {
 function WikiBuildNote({ job }: { job: Job }) {
   const raw = job.error ?? ''
   if (!raw.startsWith('wiki_coverage ')) return <small className="danger-text">{raw}</small>
-  const fields: Record<string, number> = {}
+  const fields: Record<string, string> = {}
   for (const item of raw.split(' ').slice(1)) {
     const [key, value] = item.split('=')
-    fields[key] = Number(value) || 0
+    fields[key] = value ?? ''
   }
+  const count = (key: string) => Number(fields[key]) || 0
   return <small className="wiki-coverage">
-    {t('library.wiki_coverage', { concepts: fields.concepts, pages: fields.pages })}
-    {fields.merged > 0 && ` ${t('library.wiki_coverage_merged', { merged: fields.merged })}`}
-    {' '}{t('library.wiki_coverage_detail', { written: fields.written, skipped: fields.skipped })}
+    {t('library.wiki_coverage', { concepts: count('concepts'), pages: count('pages') })}
+    {count('merged') > 0 && ` ${t('library.wiki_coverage_merged', { merged: count('merged') })}`}
+    {' '}{t('library.wiki_coverage_detail', { written: count('written'), skipped: count('skipped') })}
+    {fields.outline === 'concepts' && ` ${t('library.wiki_outline_fallback')}`}
+    {count('oversized') > 0 && ` ${t('library.wiki_coverage_oversized', { n: count('oversized') })}`}
+    {count('issues') > 0 && ` ${t('library.wiki_coverage_issues', { n: count('issues') })}`}
   </small>
 }
 
@@ -1424,7 +1995,7 @@ function PlanView({ course, onError }: { course: Course; onError: (message: stri
   }, [course.id, attempt])
   return <section className="page"><div className="page-inner">
     <div className="hero"><div><p className="eyebrow">{t('nav.plan')}</p><h1 className="course-heading"><i style={{ backgroundColor: course.color }} />{course.name}</h1><p>{t('plan.hero')}</p></div></div>
-    {!loaded ? <p className="mini-empty">{t('plan.loading')}</p> : error ? <RetryCard title={t('plan.error_title')} message={error} onRetry={() => setAttempt(n => n + 1)} /> : plan ? <article className="card"><div className="card-heading"><div><h2>{t('plan.current_title')}</h2><p>{t('plan.meta', { version: plan.version, n: plan.items.length, time: plan.updated_at.slice(0, 16).replace('T', ' ') })}</p></div></div><PlanGantt items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>{t('plan.empty_title')}</h2><p>{t('plan.empty_body')}</p></article>}
+    {!loaded ? <p className="mini-empty">{t('plan.loading')}</p> : error ? <RetryCard title={t('plan.error_title')} message={error} onRetry={() => setAttempt(n => n + 1)} /> : plan ? <article className="card"><div className="card-heading"><div><h2>{t('plan.current_title')}</h2><p>{t('plan.meta', { version: plan.version, n: plan.items.length, time: plan.updated_at.slice(0, 16).replace('T', ' ') })}</p></div></div><PlanWeeks items={plan.items} /><PlanDays items={plan.items} /></article> : <article className="card"><h2>{t('plan.empty_title')}</h2><p>{t('plan.empty_body')}</p></article>}
   </div></section>
 }
 function ArchiveView({ course, onError }: { course: Course; onError: (message: string) => void }) {
@@ -1685,14 +2256,18 @@ function CoursePickerState({ view, courses, onPick, onCreate }: { view: View; co
 }
 /** 一页知识页依据的教材页，按文档归一成「文档 第 9–11 页」。列出的页可能被截断，
  *  所以两端由服务端保证准确，中间少几页只影响能点开哪几页。 */
-function sourceSpans(sources: CitationSource[]): { document: string; pages: string; items: CitationSource[] }[] {
-  const byDocument = new Map<string, CitationSource[]>()
-  for (const item of sources) byDocument.set(item.document, [...(byDocument.get(item.document) ?? []), item])
-  return [...byDocument].map(([document, items]) => {
+function sourceSpans(sources: CitationSource[]): { key: string; document: string; pages: string; items: CitationSource[] }[] {
+  // 按归属教材分组：两本同名书各成一组，不能并成一条页码区间。显示名仍是文件名。
+  const grouped = new Map<string, CitationSource[]>()
+  for (const item of sources) {
+    const key = `${item.material_id ?? ''}|${item.document}`
+    grouped.set(key, [...(grouped.get(key) ?? []), item])
+  }
+  return [...grouped].map(([key, items]) => {
     const numbers = items.map(item => item.page).filter((page): page is number => typeof page === 'number')
     const range = numbers.length === 0 ? '' : numbers[0] === numbers[numbers.length - 1]
       ? String(numbers[0]) : `${numbers[0]}–${numbers[numbers.length - 1]}`
-    return { document, pages: range, items }
+    return { key, document: items[0].document, pages: range, items }
   })
 }
 
@@ -1707,9 +2282,10 @@ function WikiSources({ citation, onOpen }: { citation: Citation; onOpen: (citati
   const total = citation.source_pages ?? sources.length
   return <div className="citation-sources">
     <p className="citation-location">{t('citation.wiki_sources')}</p>
-    {sourceSpans(sources).map(span => <div className="citation-span" key={span.document}>
+    {sourceSpans(sources).map(span => <div className="citation-span" key={span.key}>
       <b>{span.pages ? t('citation.wiki_source_span', { document: span.document, pages: span.pages }) : span.document}</b>
-      <div>{span.items.map(item => <button type="button" key={`${item.document}:${item.page}`} onClick={() => onOpen(asMaterial(item))}>{t('citation.page_short', { n: item.page ?? 0 })}</button>)}</div>
+      {/* txt/md/docx 教材的分片没有页码，那种出处按整份文档标，不写成 p.0。 */}
+      <div>{span.items.map(item => <button type="button" key={`${item.material_id ?? ''}:${item.document}:${item.page}`} onClick={() => onOpen(asMaterial(item))}>{typeof item.page === 'number' ? t('citation.page_short', { n: item.page }) : t('citation.whole_document')}</button>)}</div>
     </div>)}
     {total > sources.length && <p className="citation-location">{t('citation.wiki_sources_more', { n: total, m: sources.length })}</p>}
   </div>
@@ -1944,6 +2520,7 @@ function TraceTurnCard({ turn, ordinal, focused, sessionId, onFocus }: {
 function TraceDrawer({ sessionId, turnId, onFocus, onClose }: {
   sessionId: string; turnId: string; onFocus: (turnId: string) => void; onClose: () => void
 }) {
+  const box = useDismiss(onClose)
   const [data, setData] = useState<SessionTrace | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
@@ -1957,7 +2534,7 @@ function TraceDrawer({ sessionId, turnId, onFocus, onClose }: {
     return () => { alive = false }
   }, [sessionId, turnId])
 
-  return <aside className="trace-drawer" role="dialog" aria-label={t('a11y.trace_drawer')}>
+  return <aside ref={box} className="trace-drawer" role="dialog" aria-label={t('a11y.trace_drawer')}>
     <header>
       <div><p>{t('trace.title')}</p><h2>{t('trace.subtitle')}</h2></div>
       <button aria-label={t('a11y.close_trace')} onClick={onClose}>×</button>
@@ -1983,8 +2560,13 @@ function CitationDrawer({ citation, onClose, onOpen }: { citation: Citation; onC
   const isWiki = citation.kind === 'wiki'
   // 抽屉头部就要说清这是转述稿：正文没有页码，用户不该以为自己在看教材原文。
   const heading = isWiki ? (citation.concept_name || citation.concept_id || t('citation.wiki_fallback')) : (citation.material_name ?? t('citation.fallback_name'))
+  // 没有页码的教材（txt/md/docx）按整份文档说，和出处列表上那颗按钮口径一致；
+  // 连文档名都没有时才退回分片 id，那是唯一还剩的定位。
   const location = isWiki ? t('citation.wiki_location')
     : citation.page ? t('citation.page', { n: citation.page })
+    : citation.material_name ? t('citation.whole_document')
     : citation.chunk_id ? t('citation.chunk', { id: citation.chunk_id }) : t('citation.location_unknown')
-  return <aside className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{isWiki ? t('citation.wiki_title') : t('citation.title')}</p><h2>{heading}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{location}</p><blockquote>{citation.text ?? t('citation.no_text')}</blockquote>{isWiki && <WikiSources citation={citation} onOpen={onOpen} />}{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside>
+  const box = useDismiss(onClose)
+  // 原文片段可能是空串（分片被重建索引换掉时服务端就返回空），空串按没有原文处理。
+  return <aside ref={box} className="citation-drawer" role="dialog" aria-label={t('a11y.citation_drawer')}><header><div><p>{isWiki ? t('citation.wiki_title') : t('citation.title')}</p><h2>{heading}</h2></div><button aria-label={t('a11y.close_citation')} onClick={onClose}>×</button></header><p className="citation-location">{location}</p><blockquote>{citation.text || t('citation.no_text')}</blockquote>{isWiki && <WikiSources citation={citation} onOpen={onOpen} />}{citation.score !== undefined && <p>{t('citation.score', { score: citation.score.toFixed(4) })}</p>}</aside>
 }

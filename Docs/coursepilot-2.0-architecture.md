@@ -182,13 +182,20 @@ class LLMClient(Protocol):
 
 完整字段与默认值见仓库根目录的 `.env.example`，那里是唯一来源；这里只写约束。
 
-模型接入认协议不认厂商：任何兼容 OpenAI Chat Completions 的服务都能配，包括自建的。
-要求支持流式与 function calling，否则工具循环跑不起来。`TEXT_PROVIDER` 只是显示用的名字，
-不参与任何分支判断——写死厂商名做判断会让别家的配置静默退回本地兜底。
+模型接入认协议不认厂商：任何说 OpenAI Chat Completions 或 Responses 协议的服务都能配，
+包括自建的。`TEXT_PROTOCOL` 选哪一条（`chat` 默认打 `/chat/completions`，`responses` 打
+`/responses`），多槽位按 `TEXT_PROTOCOL_N` 逐个指定，不填就继承第一个。两条协议在本项目里
+语义等价——消息、流式增量、function 工具调用、思考内容、用量，产出的内部事件完全一致，
+上层不知道自己接的是哪一条。要求支持流式与 function calling，否则工具循环跑不起来。
+`TEXT_PROVIDER` 只是显示用的名字，不参与任何分支判断——写死厂商名做判断会让别家的配置
+静默退回本地兜底。
 
 厂商私有的请求字段统一走 `TEXT_EXTRA_BODY`（JSON 对象，原样并入请求体），
-适配器本身只发标准字段。覆盖 `messages` / `stream` 这类协议字段会在构造期报错。
-兼容性上有三个已经吸收掉的实际差异：
+适配器本身只发标准字段。覆盖 `messages` / `input` / `stream` 这类协议字段会在构造期报错；
+Responses 那条还拦 `instructions`，因为服务端会把它静默插成第一条 system 消息，
+顶在每一次请求（含学科分类器）的规则前面。
+
+Chat Completions 那条吸收掉的三个实际差异：
 
 - 输出上限字段名不统一：默认发 `max_tokens`；`TEXT_EXTRA_BODY` 里给了
   `max_completion_tokens`（OpenAI 推理系模型的要求）就不再发 `max_tokens`，两者互斥。
@@ -197,8 +204,14 @@ class LLMClient(Protocol):
 - 思考内容的字段名（`reasoning_content` / `reasoning`）都认，归一成同一个内部事件；
   usage 里嵌套的缓存与思考明细（如 `prompt_tokens_details.cached_tokens`）有则拍平记录。
 
+Responses 那条的对应处置：输出上限是 `max_output_tokens`；不发 `stream_options`（这条协议
+没有这个字段，用量随收尾事件 `response.completed` 一起给）；用量字段名（`input_tokens` /
+`output_tokens` 及其 details）在适配器里换成与另一条协议同一套内部键名；收尾状态
+（`status` + `incomplete_details.reason`）映射成同一套 finish_reason 说法；固定发 `store: false`，
+不在厂商侧留会话记录。思考深度这条协议下走 `reasoning.effort`，档位表在 `bootstrap.py` 里另有一张。
+
 已知边界：经代理接 Anthropic 思考模型并同时用工具调用时，思考内容的跨轮回传载体
-（带签名的 thinking block）超出 Chat Completions 协议的表达能力，这类链路不承诺兼容。
+（带签名的 thinking block）超出这两条协议的表达能力，这类链路不承诺兼容。
 
 - `TEXT_*` 四项配齐并把 `COURSEPILOT_ENABLE_REMOTE_LLM` 打到 1 才会调远端，否则走本地兜底 responder。
 - `VISION_*` 四项决定图片提问是否可用，未配置时附件上传返回 `feature_disabled`。
@@ -215,7 +228,7 @@ token 数是估算的：中日韩文字按 1 字 1 token，其余按 3.5 字符 
 
 算进去的不只是 `messages`。**工具定义**走 `tools=` 参数，每轮照发、一样吃上游窗口，所以它计进系统提示分区的配额，总闸也把它算进总量——它裁不掉，漏算就会以为还有余量。主 Agent 全套 19 个工具估 3561 token，比系统提示本身还大（撤掉 `delegate` 回到 3114，实测口径同样偏高约 1.2 倍），skill 激活或撤掉 `wiki_*` / `web_*` 都会改变它，因此只按这一轮实际下发的那份算。**思考内容**（`reasoning`）在思考模式下要随消息回传，也一起计；厂商收不收它的钱各家不同，宁可高估。界面把工具定义单开一段展示：它比系统提示还大，混进那一行用户就看不出有多少是自己改不动的固定开销。
 
-`contracts/llm.py` 定义供应商无关的增量流协议（deltas + 终态摘要），`adapters/llm/openai_compatible.py` 实现流式 Chat Completions（重试仅发生在首个增量之前），`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
+`contracts/llm.py` 定义供应商无关的增量流协议（deltas + 终态摘要），`adapters/llm/openai_compatible.py` 与 `adapters/llm/responses_api.py` 各实现一条线上协议、产出同一套事件（重试仅发生在首个增量之前），公共部分在 `adapters/llm/http_chat.py`，`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
 
 软窗口按固定比例切给各分区（`core/settings.py` 的 `CONTEXT_PARTITION_RATIOS`），组装时逐段核对：超出的只裁本段，不借用别的分区，也不动 output/reserve。下表的 token 数是默认软窗口 512,000 下的取值，换窗口时按同样比例缩放。每一次裁剪都随 `context_usage` 事件报到界面上，正文里也留一句说明——静默截断读起来像“资料就这些”。
 
@@ -245,7 +258,7 @@ token 数是估算的：中日韩文字按 1 字 1 token，其余按 3.5 字符 
 
 ### 5.6 参考配置：一个双槽位的例子
 
-接入层认 OpenAI Chat Completions 协议。text 与 vision 是两个独立槽位：主模型自带图片能力就把两个槽位配成同一个服务；主模型是纯文本的，vision 槽位另配一个视觉模型即可，业务代码感知不到差别。
+接入层认 OpenAI Chat Completions 与 Responses 两条协议（vision 槽位只走前者）。text 与 vision 是两个独立槽位：主模型自带图片能力就把两个槽位配成同一个服务；主模型是纯文本的，vision 槽位另配一个视觉模型即可，业务代码感知不到差别。
 
 作者自用的配置可作参考：text 槽位接 DeepSeek（支持 Tool Calls 与 JSON Output，满足工具循环的要求，但 text-only），vision 槽位接同样暴露 OpenAI 兼容协议的 Qwen-OCR（`qwen-vl-ocr`，支持公式 LaTeX 与表格识别；需要锁定行为可换成日期快照版本）。接 OpenAI 或其他多模态服务的部署不需要这层拆分，两个槽位填同一份配置就行。
 
@@ -320,7 +333,37 @@ OCR 不与讲解合并成一次黑盒调用：
 
 RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿用 1.0 baseline，2.0 首轮不同时改检索算法和 Agent 架构；只有回归评测证明收益后才调整。
 
-### 5.10 接入层验收
+### 5.10 厂商端联网搜索（`TEXT_SERVER_SEARCH`，默认关）
+
+Responses 协议上，厂商可以在自己那边执行联网搜索：请求的 `tools` 里多一条
+`{"type": "web_search"}`，搜索由服务端跑完、结果直接进模型上下文，我们只在事件流里
+看到「它搜了什么」。开关默认关，`chat` 协议下这一项被忽略并在启动时报一句；
+学科分类器永远不开它。
+
+**为什么默认关（安全取舍）**：本机的 `web_search` / `web_fetch` 走 executor，网页正文
+带不可信内容前缀进上下文、URL 进引用表、次数吃工具预算；厂商端这条三样都没有——
+网页内容不经过本地防线，次数也闸不住（真机实测厂商忽略 `max_tool_calls`，也忽略工具体上的
+`max_uses`；一个问题搜了 12 次、input 34k token）。所以它是一次明确的取舍，不是默认能力。
+开着时本地那两个工具照常在册，模型自己选用哪条路。
+
+**引用能力：没有。** 真机实测厂商在 `output_text` 上给的 `annotations` 恒为空数组，
+搜索结果也不经过 executor，因此产不出可点开的引用——开着它时，来自网络的结论在回答里
+没有编号可查，只有模型自己写进正文的网址。这条是当前结论，厂商哪天给了来源明细再接。
+
+**可观测**：`response.web_search_call.*` 三个状态事件只带 id（用来记这一步跑了多久），
+做了什么与成没成在 `response.output_item.done` 的 `web_search_call` 条目上（`action.type` 是
+`search` / `open_page` / `find_in_page`）。适配器把它们归一成 `ServerToolCall`，随本轮的
+`ChatToolCalls` / `ChatFinal` 一起交给上层，上层按 `origin="provider"` 报成活动与 trace 里的一步，
+与我们自己执行的那些分得开。它不占工具预算——预算闸的是本地执行次数，这里没有本地执行。
+子任务（`delegate`）那段循环发不出 SSE，它的厂商端调用收集后交回父轮上报，call_id 带 `sub:`
+前缀——父子两边的 id 都由厂商生成，不加前缀撞号就会合成一条。
+
+**回传**：厂商端调用要原样发回下一轮的 `input`，服务端据此恢复自己那边的搜索结果；
+不回传的话模型在下一轮只剩自己那句「我来搜一下」，会重搜一遍。位置有约束（真机实测）：
+它排在这一轮的思考内容之后、正文之前。摆到思考前面，服务端会当成这一轮没回传思考内容而拒收；
+摆到 `function_call` 与它的结果之间则配不上对。工具循环、补救轮与子任务三条路都回传。
+
+### 5.11 接入层验收
 
 1. 每个 adapter 都通过同一套 contract tests：普通文本、SSE 分块、工具调用、JSON Schema、usage、取消与错误分类。
 2. vision adapter 额外使用固定的印刷文字、手写公式、模糊图片和表格样本集。
@@ -438,7 +481,7 @@ trace 的每个 skill span 记录 SKILL.md 的 git hash → judge 抽检评分�
 
 工具轮次上限在 skill 激活后放宽（主 Agent 6 轮 → skill 12 轮）：一次完整评分要读产物、查概念目录、逐题归因，6 轮不够；预算耗尽时供应商可能把 tool call 当普通文本吐出，因此最终回答还要清洗 provider 内部标记。
 
-这些保障的必要性有实测支撑：只靠提示词时冒烟用例通过率约 2/3，逐层补齐后到 8/9。剩余不稳定项（变式题落 artifact）在不同运行间摆动，作为已知的可靠性上限记录在案，不做第四层侵入式兜底。
+这些保障的必要性有实测支撑：只靠提示词时 9 条冒烟用例通过 6 条，逐层补齐后到 8/9。剩余不稳定项（变式题落 artifact）在不同运行间摆动，作为已知的可靠性上限记录在案，不做第四层侵入式兜底。
 
 ## 8. 记忆与知识页体系
 
@@ -514,7 +557,35 @@ data/users/<user_id>/
 
 其余三条硬约束：**只用教材原文**（写不出来就少写一条，不许拿通用知识补）、**增量刷新**（证据指纹 `source_hash` 没变就跳过，省 token 也省得每次生成一个不一样的版本）、**手写区不动**（`HANDWRITTEN_MARKER` 以下归用户，重新生成只换上半部分）。页面 frontmatter 记 `concept_id / material_id / parent_id / level / order / source_hash / prompt_version / source_refs`；掌握度不写进文件，读页时现算才不会过期。
 
-构建前后都要把覆盖率说出来：`GET /materials/{id}/wiki/estimate` 离线跑一次切段，报预计页数、模型调用次数和耗时（实测约 5 秒一页）；作业结束时回一行 `wiki_coverage concepts=… pages=… written=… skipped=… merged=… dropped=… empty=… pruned=…`，界面按字段渲染。静默截断读起来像"这本书就这些"。
+构建前后都要把覆盖率说出来：`GET /materials/{id}/wiki/estimate` 离线跑一次切段，报预计页数、模型调用次数和耗时（实测约 5 秒一页）；作业结束时回一行 `wiki_coverage concepts=… pages=… written=… skipped=… merged=… empty=… pruned=… issues=… outline=…`，界面按字段渲染。静默截断读起来像"这本书就这些"。
+`issues` 是体检发现的条数，体检没跑成时这个字段整个不出现——0 是"查过、没问题"的结论，不能拿来顶替。
+这一行落在作业记录里，`GET /materials/{id}/wiki/report` 回读最近一次跑完的那份，刷新页面不丢。
+
+**体检**（`GET /courses/{id}/wiki/lint`）是零模型调用的确定性检查，只报不改：报告是接口，改不改由用户决定。
+判据分两级，error 是该重建或该修的（正文标的页码不在这页出处里、总览页标了教材页码、带页码的编造出处、
+叶子页零出处、出处指向教材里不存在的页），warn 是提示（无页码的文档级标注对不上出处、引了这一页没读过的教材、
+没人读的页、空正文、孤儿页、缺证据指纹）。
+只查正文不查手写区——用户自己写 `[p.99]` 不是缺陷。规则全在一个纯函数里，页数据与对账用的页集合由服务层查库喂进去。
+
+**配对**（`GET /courses/{id}/wiki/graph`）回答「哪几个来源在讲同一件事」，服务的是多份教材讲同一节的场景。
+读时现算，不落盘：证据没变的页不重写，边写进 frontmatter 就再也回填不进去。
+
+**只连跨教材的两页。** 一门课只有一本书时本来就没有「几个来源」，同一本书里的相邻小节是「相关」不是
+「同一件事」，它们的关系中间页也已经用自然语言写过。同章的两页必然同教材，这一条把同章的边一并挡在外面。
+判据是知识页向量的余弦：互为 6 近邻才算候选，门槛取这门课直系兄弟页相似度的中位数（余弦的绝对值不跨库
+可比，每门课自标定；顶层页不算兄弟组，没有兄弟对时退回全部页对的中位数），每页最多 3 条。门槛是相对量，
+页彼此都不像时它会降到 0，所以余弦不为正的页对一律不连——那是它下面唯一的绝对线。
+一页什么都没连上时保留它分数最高的那个来源：另一本书讲同一节时措辞不同，未必够得着按同章标定的线，
+而「几本书都讲了这一节」正是这件功能要兑付的东西。
+
+**只给界面，模型侧一个字都不下发**——把这样一张关系表摆到模型眼前，它会顺着链接把整门课读一遍。
+没配嵌入模型时是空表，不做词面兜底：两套排序会给出两种结论。
+
+**手写区编辑**是「用户纠偏」这一环的入口。读一页时 `body` 与 `handwritten` 分成两个字段下发，
+界面各自渲染，落盘格式（frontmatter、分隔标记）不上屏；`PUT /courses/{id}/wiki/{concept_id}/handwritten`
+只收分隔线以下那一段，生成区与 frontmatter 一个字节都不动，读改写整段落在 store 的锁里。
+这门课有排队中或正在跑的构建作业时拒绝写入（409）——构建会把整页重写一遍，交错保存必然丢更新；
+整页超过 `MAX_PAGE_BYTES` 返回 413，盘上的内容原样留着。手写区仍然不进体检，模型读到它时带归属标注。
 
 ### 8.3 知识页是第三类可引用来源
 
@@ -766,7 +837,12 @@ class Channel(Protocol):
 | `GET` | `/courses/{course_id}/concepts` | 概念目录，按教材目录顺序，层级用 `parent_id` 表示 |
 | `GET` | `/materials/{material_id}/wiki/estimate` | 知识页构建前的账单：预计页数、模型调用次数与耗时。离线算，不调模型 |
 | `POST` | `/materials/{material_id}/wiki` | 把指定教材构建成知识页；Wiki 未开启或教材未索引时返回 `feature_disabled` / `material_not_indexed` |
-| `GET` | `/courses/{course_id}/wiki` · `/wiki/{concept_id}` | 列出知识页（带 `parent_id / level / order`）与读取单页原文 |
+| `GET` | `/materials/{material_id}/wiki/report` | 最近一次构建完成时的覆盖率报告，界面刷新后靠它回读；没构建过是 `{"job": null}`，没跑完的那次不算 |
+| `GET` | `/courses/{course_id}/wiki` · `/wiki/{concept_id}` | 列出知识页（带 `parent_id / level / order`，以及归属教材 `material_id` 与服务端解析好的文件名 `document`，供界面按教材分组；课程总览、旧格式页与已删教材的 `document` 是空串）与读取单页；单页给 `content` 整页原样，外加拆好的 `body` 与 `handwritten` |
+| `PUT` | `/courses/{course_id}/wiki/{concept_id}/handwritten` | 写手写区，只动分隔线以下那一段。构建中 409，整页超上限 413 |
+| `GET` | `/courses/{course_id}/wiki/{concept_id}/sources` | 这一页转述时依据的教材页；`limit` 是每份教材列出的页数上限。未知 concept 返回空表而不是 404 |
+| `GET` | `/courses/{course_id}/wiki/lint` | 知识页体检，按需现算、零模型调用；路由排在 `/wiki/{concept_id}` 之前 |
+| `GET` | `/courses/{course_id}/wiki/graph` | 知识页之间的跨教材配对（哪几个来源在讲同一件事），读时现算；同样排在 `/wiki/{concept_id}` 之前 |
 | `GET` | `/jobs/{job_id}` | 查询索引或知识页构建任务的状态、阶段与错误摘要 |
 | `POST` | `/sessions` | 创建 `{scope_mode: general}` 或 `{scope_mode: course, course_id}` 会话；默认 general |
 | `GET` | `/sessions` | 按 `workspace=general|course:<id>` 可选过滤，返回课程色点与最近解析投影 |
@@ -830,7 +906,7 @@ turn_failed       {error_code, retryable, partial_message_id?}
 
 React SPA 的视觉系统、组件状态和响应式规范独立维护在 [coursepilot-2.0-frontend-design.md](./coursepilot-2.0-frontend-design.md)。本章只保留后端对前端的产品合约：
 
-1. **对话**：默认通用模式，左栏可进入课程工作区；切换工作区不修改旧会话。会话列表始终可见并以课程稳定色点标记，通用会话顶部区分“本轮解析课程”和永久绑定。
+1. **对话**：默认通用模式，左栏「工作区」组里通用模式与各门课平级单选；切换工作区不修改旧会话。会话列表始终可见，通用模式下用课程稳定色表达归属、形状表达未读状态，通用会话顶部区分“本轮解析课程”和永久绑定。
 2. **知识仓库**：全局导航名称，进入后必须明确选择课程。默认打开资料库，完整展示上传、解析、切块、嵌入、索引和检索验证；同级还有「目录结构」（概念数、有无层级、重建入口与影响预告）、「概念目录」（按教材目录画的可折叠树）、「课程笔记」，以及默认关闭的「知识页」tab。
 3. **计划**：日历视图 + 完成情况 + 手动调整入口。
 4. **管理**：课程/教材上传、检索索引、目录结构重建、知识页构建、未归因队列、用户 Skill 导入/预览/启停、模型槽位能力检查、trace 查看器。OCR 未配置时显示“未启用”，不影响文本学习。

@@ -14,6 +14,8 @@ import threading
 
 import httpx
 
+from adapters.embedding import cosine_matrix
+
 # 一次请求塞多少条。太大容易撞上服务端的单请求上限，索引本来就是后台任务，不急。
 _EMBED_BATCH = 16
 # 单条文档送去重排前的截断长度：云端接口对单条有长度上限，600 字符的 chunk 留足余量。
@@ -85,6 +87,10 @@ class CloudEmbedder:
         scores = (matrix / norms) @ (query_vector / (np.linalg.norm(query_vector) or 1.0))
         order = np.argsort(-scores)[: max(1, top_k)]
         return [(int(index), float(scores[index])) for index in order]
+
+    def pairwise(self, vectors: list[bytes]) -> list[list[float]] | None:
+        # 两端都是库里的向量，不用出网，和本地版共用同一段点积。
+        return cosine_matrix(vectors)
 
     def close(self) -> None:
         self._client.close()

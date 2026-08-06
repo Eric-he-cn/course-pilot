@@ -16,7 +16,7 @@ from contracts.knowledge import (
 from contracts.llm import ChatFinal
 from contracts.reranker import RerankerPort
 
-from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
+from .api import KnowledgeFeatureDisabledError, MaterialNotIndexedError, WikiBuildInProgressError
 from .concepts import extract_candidates, from_outline
 from . import scanned, wiki
 from .extract import SUPPORTED_SUFFIXES, extract_pages, pdf_outline
@@ -121,6 +121,12 @@ class KnowledgeService:
     def get_job(self, *, job_id: str) -> Job | None:
         return self._repository.get_job(job_id)
 
+    def latest_wiki_report(self, *, material_id: str) -> Job | None:
+        """这份教材最近一次跑完的知识页构建。覆盖率报告写在它的 error_message 里，
+        界面刷新后内存里没有任务记录，靠这里把那一行找回来。"""
+        self._material_or_error(material_id)
+        return self._repository.latest_job(material_id=material_id, type="wiki", status="completed")
+
     def enqueue_wiki_build(self, *, material_id: str) -> Job:
         material = self._material_or_error(material_id)
         if not self._wiki_is_enabled(material.course_id):
@@ -196,15 +202,42 @@ class KnowledgeService:
                         if row["material_id"] == material.id), {})
         return {**applied, **current, "material_id": material.id}
 
-    def _structure_candidates(self, material: Material) -> list[dict]:
+    def _structure_candidates(self, material: Material, *, unique_names: bool = True) -> list[dict]:
         """目录结构只吃文本准备的产物：有书签的 PDF 读文件，没书签的读已落库的 chunk 正文。"""
         chunks = self._repository.list_material_chunks(material_id=material.id)
         if not chunks:
             raise MaterialNotIndexedError("这份教材还没有可读的正文，先重建索引")
         return self._concepts_for(
             self._repository.material_storage_path(material.id), material.filename,
-            [(row["page"], row["content"]) for row in chunks],
+            [(row["page"], row["content"]) for row in chunks], unique_names=unique_names,
         )
+
+    def _wiki_outline(self, material: Material) -> tuple[list[dict], str]:
+        """知识页的目录，以及它是从哪儿来的。
+
+        直接用文本准备的产物，不走 concepts 表：那张表按「课程 + 名字」给 id 并在同名时并成
+        一行，同一门课两份教材有同名节时第二份那几节整节查不到。教材文件丢了取不到书签，
+        这时退回概念表并把数据源报进覆盖率汇总，不静默降成刮正文。
+        两条路的 id 命名空间不同（section_* 与 concept_*），所以来回切一次要付两次全量重建，
+        界面上要说明白——这不是「层级粗一点」那种量级的差别。
+        """
+        path = self._repository.material_storage_path(material.id)
+        if Path(material.filename).suffix.lower() == ".pdf" and (path is None or not path.is_file()):
+            return self._repository.list_material_concept_tree(material_id=material.id), "concepts"
+        candidates = self._structure_candidates(material, unique_names=False)
+        return wiki.outline_rows(material_id=material.id, candidates=candidates), "material"
+
+    def _wiki_folder(self, material: Material) -> str:
+        """这份教材在库里的目录名。同课重名的教材各占一个目录——两棵树混进同一章下面，
+        按目录树排版这件事就不成立了。名次按上传先后定，先传的那份保留原名。"""
+        def base_of(item: Material) -> str:
+            return wiki.folder_name(item.filename, fallback=item.id)
+
+        peers = sorted((other for other in self._repository.list_materials(course_id=material.course_id)
+                        if base_of(other) == base_of(material)),
+                       key=lambda other: (other.created_at, other.id))
+        rank = next((index for index, other in enumerate(peers, start=1) if other.id == material.id), 1)
+        return wiki.folder_name(material.filename, rank=rank, fallback=material.id)
 
     def _parse_structure_quietly(self, material: Material) -> None:
         """结构解析失败不该把检索索引一起拖垮。它随时可以单独重算，检索却要重跑向量化。"""
@@ -223,12 +256,13 @@ class KnowledgeService:
         chunks = self._repository.list_material_chunks(material_id=material.id)
         if not chunks:
             raise MaterialNotIndexedError("这份教材还没有可读的正文，先重建索引")
-        concepts = self._repository.list_material_concept_tree(material_id=material.id)
+        concepts, outline = self._wiki_outline(material)
         sections, stats = wiki.plan_sections(material_id=material.id, chunks=chunks, concepts=concepts)
         pages = len(sections) + 1  # 课程首页
         seconds = pages * wiki.SECONDS_PER_PAGE
         return {"pages": pages, "calls": pages, "seconds": seconds, "minutes": round(seconds / 60, 1),
                 "sections": len(sections), "candidates": stats["candidates"], "merged": stats["capped"],
+                "outline": outline,
                 "has_levels": any(row.get("level") is not None for row in concepts)}
 
     def _run_wiki(self, job: Job, material: Material) -> Job:
@@ -243,10 +277,8 @@ class KnowledgeService:
             chunks = self._repository.list_material_chunks(material_id=material.id)
             if not chunks:
                 raise ValueError("这份教材还没有可读的正文，先重建索引")
-            sections, stats = wiki.plan_sections(
-                material_id=material.id, chunks=chunks,
-                concepts=self._repository.list_material_concept_tree(material_id=material.id),
-            )
+            concepts, outline = self._wiki_outline(material)
+            sections, stats = wiki.plan_sections(material_id=material.id, chunks=chunks, concepts=concepts)
             if not sections:
                 raise ValueError("这份教材切不出可写的小节，先重建索引")
 
@@ -263,9 +295,15 @@ class KnowledgeService:
             counts = wiki.build_pages(
                 course_id=material.course_id, material_id=material.id, document=material.filename,
                 sections=sections, store=self._wiki, now=utc_now(), ask=self._ask_once, on_progress=progress,
+                folder=self._wiki_folder(material),
             )
             self.reindex_wiki_pages(course_id=material.course_id, material_id=material.id)
-            summary = wiki.coverage_summary({**counts, **stats, "pruned": len(orphans)})
+            extra: dict[str, object] = {"pruned": len(orphans), "outline": outline}
+            try:
+                extra["issues"] = len(self.wiki_lint(course_id=material.course_id))
+            except Exception as error:  # 体检是旁路诊断，它出问题不该把已经写完的页报成构建失败
+                _LOG.warning("知识页体检失败，构建结果不受影响：%s", error)
+            summary = wiki.coverage_summary({**counts, **stats, **extra})
             return self._repository.update_job(job.id, status="completed", stage="wiki_completed", progress=100, error_message=summary)
         except Exception as error:
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error))
@@ -280,41 +318,89 @@ class KnowledgeService:
             raise ValueError("模型没有返回完整结果")
         return final
 
-    def reindex_wiki_pages(self, *, course_id: str, material_id: str) -> int:
-        """把这门课落盘的每一页知识页正文写成一行可检索记录，整课替换。
+    def _wiki_chunk_row(self, *, course_id: str, page, known: set[str], fallback: str) -> dict | None:
+        """一页知识页的检索行；这一页不该进检索时返回 None。整课刷新与单页刷新共用。
 
-        知识页也要能被引用，前提是它得先在检索库里。归属教材照页里记的来，
-        记不到的（课程首页）挂在触发这次构建的那份上，删教材时才有人收走它。
+        归属只有一条规则：页里记的教材还在就用它；教材已删就不进检索（文件留着是为了保
+        用户手写，不是让它继续当证据）；页里没记归属（课程首页、旧格式页）才用兜底。
         """
-        if self._wiki is None:
-            return 0
-        known = self._repository.material_ids(course_id=course_id)
-        pages = []
-        for page in self._wiki.list_pages(course_id=course_id):
+        if page.material_id and page.material_id not in known:
+            return None
+        owner = page.material_id or fallback
+        if not owner:  # 页里没记归属，课程也一份教材都不剩，检索行挂不上归属
+            return None
+        try:
             document = wiki.split_page(
                 concept_id=page.concept_id,
                 document=self._wiki.read(course_id=course_id, concept_id=page.concept_id),
             )
-            body = document.body.strip()
-            if not body:
-                continue
-            owner = page.material_id if page.material_id in known else material_id
-            pages.append({"concept_id": page.concept_id, "concept_name": document.concept_name,
-                          "material_id": owner, "content": f"{document.concept_name}\n\n{body}"})
+        except (LookupError, ValueError, OSError) as error:
+            # 读不到就跳过这一页（按 GBK 存过的页、读到一半被搬走的页）：一页坏文件
+            # 不该让整门课的检索行刷不成，它本身会被知识页体检报出来。
+            _LOG.warning("知识页 %s 读不出来，这一页不进检索：%s", page.concept_id, error)
+            return None
+        if not document.body.strip():
+            return None
+        return {"concept_id": page.concept_id, "concept_name": document.concept_name,
+                "material_id": owner, "content": wiki.retrieval_content(document)}
+
+    def _embed_one(self, content: str) -> bytes | None:
+        if self._embedder is None:
+            return None
+        vectors = self._embedder.embed_documents([content])
+        return vectors[0] if vectors else None
+
+    def reindex_wiki_pages(self, *, course_id: str, material_id: str = "") -> int:
+        """把这门课落盘的每一页知识页正文写成一行可检索记录，整课替换。
+
+        知识页也要能被引用，前提是它得先在检索库里。归属规则见 _wiki_chunk_row；
+        没记归属的页用兜底教材，构建传了触发的那份就用它，没传的取本课程任意一份。
+        兜底那份被删时这一页的检索行会跟着没（删教材连带删分片，不分 source_kind），
+        下一次刷新会照当时还活着的教材重新挂上——既有形状，这里不修。
+        """
+        if self._wiki is None:
+            return 0
+        known = self._repository.material_ids(course_id=course_id)
+        fallback = material_id if material_id in known else (min(known) if known else "")
+        pages = [row for page in self._wiki.list_pages(course_id=course_id)
+                 if (row := self._wiki_chunk_row(course_id=course_id, page=page,
+                                                 known=known, fallback=fallback)) is not None]
         embeddings = None
         if self._embedder is not None and pages:
             embeddings = self._embedder.embed_documents([page["content"] for page in pages])
         self._repository.replace_wiki_chunks(course_id=course_id, pages=pages, embeddings=embeddings)
         return len(pages)
 
+    def reindex_wiki_page(self, *, course_id: str, concept_id: str) -> bool:
+        """只刷这一页的检索行。保存手写区走这里：整课刷新要把每页读一遍再整批嵌入，
+        页数上百时用户按一次保存要等好几秒，而改的只有这一页。
+        """
+        if self._wiki is None:
+            return False
+        known = self._repository.material_ids(course_id=course_id)
+        page = next((item for item in self._wiki.list_pages(course_id=course_id)
+                     if item.concept_id == concept_id), None)
+        row = None if page is None else self._wiki_chunk_row(
+            course_id=course_id, page=page, known=known, fallback=min(known) if known else "")
+        self._repository.replace_wiki_chunk(
+            course_id=course_id, concept_id=concept_id, page=row,
+            embedding=self._embed_one(row["content"]) if row else None)
+        return row is not None
+
     def wiki_pages(self, *, course_id: str) -> list[dict[str, object]]:
-        """层级一并下发：页面 frontmatter 里本来就记着，丢在服务层界面就画不出树。"""
+        """层级一并下发：页面 frontmatter 里本来就记着，丢在服务层界面就画不出树。
+
+        教材名在这里一次解析好，界面按教材分组时不必再查一趟清单。教材已删除、
+        或页里没记归属（课程总览、旧格式页）时 document 是空串，由界面决定怎么显示。
+        """
         if self._wiki is None:
             return []
+        filenames = {item.id: item.filename for item in self.list_materials(course_id=course_id)}
         return [
             {"concept_id": page.concept_id, "concept_name": page.concept_name,
              "updated_at": page.updated_at, "chars": page.chars,
-             "parent_id": page.parent_id, "level": page.level, "order": page.order}
+             "parent_id": page.parent_id, "level": page.level, "order": page.order,
+             "material_id": page.material_id, "document": filenames.get(page.material_id, "")}
             for page in self._wiki.list_pages(course_id=course_id)
         ]
 
@@ -322,6 +408,90 @@ class KnowledgeService:
         if self._wiki is None:
             raise LookupError(concept_id)
         return self._wiki.read(course_id=course_id, concept_id=concept_id)
+
+    def wiki_page_view(self, *, course_id: str, concept_id: str) -> tuple[str, WikiDocument]:
+        """一次读盘给出两种口径：整页原文，以及拆好的正文与手写区。
+
+        界面按后者分区渲染，分隔标记这类落盘格式不必上屏。
+        """
+        raw = self.wiki_page(course_id=course_id, concept_id=concept_id)
+        return raw, wiki.split_page(concept_id=concept_id, document=raw)
+
+    def write_wiki_handwritten(self, *, course_id: str, concept_id: str, text: str) -> WikiDocument:
+        """写这一页的手写区，生成区与 frontmatter 不动。构建期间拒绝写入。
+
+        构建会把整页重写一遍，两边交错会让刚保存的补充被生成结果盖掉。
+        """
+        if self._wiki is None:
+            raise LookupError(concept_id)
+        if self._repository.has_active_wiki_job(course_id=course_id):
+            raise WikiBuildInProgressError("知识页正在构建，稍后再保存")
+        raw = self._wiki.write_handwritten(course_id=course_id, concept_id=concept_id, text=text)
+        # 刚写的补充要马上能被检索到，否则用户的纠偏得等下一次构建才对模型可见。
+        # 只刷这一页，和检索读并发只是一次 SQLite 写事务。
+        try:
+            self.reindex_wiki_page(course_id=course_id, concept_id=concept_id)
+        except Exception as error:  # 内容已经落盘了，刷新出问题别把这次保存报成失败
+            _LOG.warning("知识页检索行刷新失败，手写区已保存：%s", error)
+        return wiki.split_page(concept_id=concept_id, document=raw)
+
+    def wiki_lint(self, *, course_id: str) -> list[dict[str, object]]:
+        """这门课知识页的体检结果，按需现算，一次模型调用都不发。
+
+        报告是接口：这里只负责把落盘的页与检索库的页码摆到一起，判据全在 wiki.lint_pages 里，
+        发现的问题一律交给用户决定怎么办，不自动改任何一页。
+        """
+        if self._wiki is None:
+            return []
+        pages = []
+        for page in self._wiki.list_pages(course_id=course_id):
+            try:
+                raw = self._wiki.read(course_id=course_id, concept_id=page.concept_id)
+            except (LookupError, ValueError, OSError):
+                # 读不到就按空正文体检（按 GBK 存过的页、读到一半被搬走的页）：一页坏文件
+                # 不该让整门课的报告拿不出来，而它本身会被「正文是空的」那条报出来。
+                raw = ""
+            document = wiki.split_page(concept_id=page.concept_id, document=raw)
+            pages.append(wiki.LintPage(
+                concept_id=page.concept_id, concept_name=page.concept_name or document.concept_name,
+                body=document.body, refs=tuple(wiki.refs_in(raw)), parent_id=page.parent_id,
+                material_id=page.material_id, source_hash=page.source_hash))
+        return wiki.lint_pages(
+            pages, material_pages=self._repository.material_page_numbers(course_id=course_id),
+            material_names={item.id: item.filename for item in self.list_materials(course_id=course_id)})
+
+    def wiki_pairs(self, *, course_id: str) -> list[dict[str, object]]:
+        """哪几个来源在讲同一件事：知识页之间的语义配对，按需现算，一次模型调用都不发。
+
+        不落盘：证据没变的页不重写，边落进 frontmatter 就再也回填不进去。
+        只给界面看，模型侧一个字都不下发——目录一摆出来它就想顺着读完整门课（wiki_index 那次）。
+        没有向量（demo、没配嵌入模型）时返回空表，不做词面兜底：两套排序会给出两种结论。
+        """
+        if self._wiki is None or self._embedder is None:
+            return []
+        # 首页在检索库里也有一行，配对时摘掉：它转述的是整门课，和谁都像。
+        pages = {page.concept_id: page for page in self._wiki.list_pages(course_id=course_id)
+                 if page.concept_id != wiki.INDEX_ID}
+        rows = [row for row in self._repository.wiki_embeddings(course_id=course_id) if row[0] in pages]
+        nodes = [wiki.PairNode(concept_id=concept_id, material_id=material_id,
+                               parent_id=pages[concept_id].parent_id)
+                 for concept_id, material_id, _vector in rows]
+        try:
+            similarity = self._embedder.pairwise([vector for _concept, _material, vector in rows])
+        except Exception as error:  # 端口实现不全：配对是旁注，不该让整份页面清单打不开
+            _LOG.warning("知识页配对算不出来，界面按没有边显示：%s", error)
+            similarity = None
+        if not similarity:
+            return []
+        owners = {concept_id: material_id for concept_id, material_id, _vector in rows}
+        filenames = {item.id: item.filename for item in self.list_materials(course_id=course_id)}
+        # 名字在这里一次解析好：界面拿到边就能画，不必为每条边再查一趟页和教材。
+        # 边一律跨教材，所以两端的教材名必然不同，界面直接摆出来就是「另一本书也讲了」。
+        return [{**edge,
+                 "a_name": pages[str(edge["a"])].concept_name, "b_name": pages[str(edge["b"])].concept_name,
+                 "a_document": filenames.get(owners[str(edge["a"])], ""),
+                 "b_document": filenames.get(owners[str(edge["b"])], "")}
+                for edge in wiki.pair_pages(nodes, similarity)]
 
     def search(self, *, scope: ResolvedKnowledgeScope, query: str, limit: int = 6) -> list[KnowledgeHit]:
         """Agent-only search: the course is a server-issued resolver result."""
@@ -339,11 +509,11 @@ class KnowledgeService:
         lexical = self._repository.search_wiki(course_id=scope.course_id, query=query, limit=limit * 3)
         dense = self._dense_wiki(course_id=scope.course_id, query=query, limit=limit * 3)
         if not dense:
-            return lexical[:limit]
+            return _diverse_by_material(lexical, limit)
         reranked = self._rerank(query=query, candidates=self._candidates(dense, lexical, limit=limit * 3))
         if reranked is not None:
-            return reranked[:limit]
-        return self._fuse_rrf(dense, lexical, limit=limit)
+            return _diverse_by_material(reranked, limit)
+        return _diverse_by_material(self._fuse_rrf(dense, lexical, limit=limit * 3), limit)
 
     def _dense_wiki(self, *, course_id: str, query: str, limit: int) -> list[KnowledgeHit]:
         if self._embedder is None:
@@ -389,30 +559,47 @@ class KnowledgeService:
             return WikiSources((), 0)
         return self.wiki_page_sources(course_id=scope.course_id, concept_id=concept_id)
 
-    def wiki_page_sources(self, *, course_id: str, concept_id: str) -> WikiSources:
-        """总览页自己不读原文，出处顺着子页递归收上来；按（文档、页）去重后每份教材各截几页。"""
+    def wiki_page_sources(self, *, course_id: str, concept_id: str, cap: int | None = None) -> WikiSources:
+        """总览页自己不读原文，出处顺着子页递归收上来；按（教材、页）去重后每份教材各截几页。
+
+        cap 是每份教材列出的页数上限，引用抽屉用默认值防止淹掉列表，正文接线传大值取全。
+        """
         if self._wiki is None:
             return WikiSources((), 0)
-        chunk_by_page: dict[tuple[str, int | None], str] = {}
-        for page_id in self._wiki_family(course_id=course_id, concept_id=concept_id):
+        cap = cap or wiki.WIKI_SOURCE_MAX_PAGES
+        chunk_by_page: dict[tuple[str, str, int | None], str] = {}
+        for page_id, owner in self._wiki_family(course_id=course_id, concept_id=concept_id):
             refs = self._wiki.source_refs(course_id=course_id, concept_id=page_id)
             for document, page, chunk_id in wiki.parse_source_refs(refs):
-                chunk_by_page.setdefault((document, page), chunk_id)
-        ordered = sorted(chunk_by_page, key=lambda key: (key[0], key[1] or 0))
-        kept = _cap_per_document(ordered, wiki.WIKI_SOURCE_MAX_PAGES)
+                chunk_by_page.setdefault((owner, document, page), chunk_id)
+        ordered = sorted(chunk_by_page, key=lambda key: (key[1], key[2] or 0))
+        kept = _cap_per_document(ordered, cap)
         snippets = self._repository.chunk_snippets(
             course_id=course_id, ids=[chunk_by_page[key] for key in kept], limit=wiki.WIKI_SOURCE_SNIPPET)
-        anchors = tuple(
-            WikiSource(document=document, page=page, chunk_id=chunk_by_page[(document, page)],
-                       snippet=snippets.get(chunk_by_page[(document, page)], ""))
-            for document, page in kept
-        )
-        return WikiSources(anchors, len(ordered))
+        # 教材重建索引会把分片 id 整表换掉。记录的 id 已经不在时按（教材, 页码）解析回
+        # 当前分片，出处不因一次重建索引整批变空；id 还活着就照记录的用，它更精确。
+        # 页所属教材未知（旧格式页）或位置本来就没有页码时不解析——没有位置就不假装解析到了。
+        stale = [key for key in kept
+                 if chunk_by_page[key] not in snippets and key[0] and key[2] is not None]
+        relocated = self._repository.chunks_at_pages(
+            course_id=course_id, keys=stale, limit=wiki.WIKI_SOURCE_SNIPPET)
+        anchors: list[WikiSource] = []
+        for key in kept:
+            chunk_id = chunk_by_page[key]
+            snippet = snippets.get(chunk_id, "")
+            if not snippet and key in relocated:
+                chunk_id, snippet = relocated[key]
+            anchors.append(WikiSource(document=key[1], page=key[2], chunk_id=chunk_id,
+                                      snippet=snippet, material_id=key[0]))
+        return WikiSources(tuple(anchors), len(ordered))
 
-    def _wiki_family(self, *, course_id: str, concept_id: str) -> list[str]:
-        """这一页与它的全部子孙。首页是课程根，顶层页没记父节点，挂到它下面才收得齐。"""
+    def _wiki_family(self, *, course_id: str, concept_id: str) -> list[tuple[str, str]]:
+        """这一页与它的全部子孙，各自带教材归属。首页是课程根，顶层页没记父节点，
+        挂到它下面才收得齐。"""
         children: dict[str, list[str]] = {}
+        owner: dict[str, str] = {}
         for page in self._wiki.list_pages(course_id=course_id):
+            owner[page.concept_id] = page.material_id
             if page.concept_id == wiki.INDEX_ID:
                 continue
             children.setdefault(page.parent_id or wiki.INDEX_ID, []).append(page.concept_id)
@@ -424,7 +611,7 @@ class KnowledgeService:
             seen.add(node)
             family.append(node)
             queue += children.get(node, [])
-        return family
+        return [(node, owner.get(node, "")) for node in family]
 
     def concept_exists(self, course_id: str, concept_id: str) -> bool:
         """按 id 精确判断，不受概念清单的展示上限影响。"""
@@ -578,14 +765,15 @@ class KnowledgeService:
             self._repository.set_material_status(material.id, "failed")
             return self._repository.update_job(job.id, status="failed", stage="failed", progress=100, error_message=str(error), retrieval_backend="sqlite_fts")
 
-    def _concepts_for(self, path: Path | None, filename: str, chunks: list[tuple[int | None, str]]) -> list[dict]:
+    def _concepts_for(self, path: Path | None, filename: str, chunks: list[tuple[int | None, str]],
+                      *, unique_names: bool = True) -> list[dict]:
         """有目录书签就用它，没有才从正文刮标题。
 
         刮标题在代码和表格多的教材上假阳性很高——markdown 标题正则会命中 Python 注释，
         编号标题正则会命中表格行，页码还常常指到目录页。书签是作者写的，这些问题都没有。
         """
         if path is not None and path.is_file() and Path(filename).suffix.lower() == ".pdf":
-            candidates = from_outline(pdf_outline(path))
+            candidates = from_outline(pdf_outline(path), unique_names=unique_names)
             if candidates:
                 return candidates
         return extract_candidates([(page, content) for page, content in chunks])
@@ -636,13 +824,30 @@ class KnowledgeService:
         return material
 
 
-def _cap_per_document(keys: list[tuple[str, int | None]], limit: int) -> list[tuple[str, int | None]]:
+def _diverse_by_material(hits: list[KnowledgeHit], limit: int) -> list[KnowledgeHit]:
+    """知识页席位先保来源多样：每份教材先各取一条，有剩再按原序补满。
+
+    几本教材讲同一主题时按分数硬排，席位常被一本书占满，另几本的讲法永远到不了场——
+    而「几个来源怎么讲同一件事」正是知识页相对教材原文的增量。单教材课程不受影响。
+    """
+    picked, backfill, seen = [], [], set()
+    for hit in hits:
+        owner = hit.citation.material_id
+        if owner and owner in seen:
+            backfill.append(hit)
+        else:
+            seen.add(owner)
+            picked.append(hit)
+    return (picked + backfill)[:limit]
+
+
+def _cap_per_document(keys: list[tuple[str, str, int | None]], limit: int) -> list[tuple[str, str, int | None]]:
     """每份教材最多留几页。超了留最前面几页加最后一页，页码区间的两端不会因此说小。"""
-    grouped: dict[str, list[tuple[str, int | None]]] = {}
+    grouped: dict[tuple[str, str], list[tuple[str, str, int | None]]] = {}
     for key in keys:
-        grouped.setdefault(key[0], []).append(key)
-    out: list[tuple[str, int | None]] = []
-    for document in sorted(grouped):
-        group = grouped[document]
+        grouped.setdefault(key[:2], []).append(key)
+    out: list[tuple[str, str, int | None]] = []
+    for owner in sorted(grouped):
+        group = grouped[owner]
         out += group if len(group) <= limit else group[: limit - 1] + group[-1:]
     return out

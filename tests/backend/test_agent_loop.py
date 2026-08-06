@@ -295,6 +295,20 @@ def test_filler_segments_are_dropped_but_substance_is_kept():
     assert join_answer(["只有一段最终回答"]) == "只有一段最终回答"
 
 
+def test_a_segment_repeated_across_tool_rounds_is_kept_once():
+    """真机实测：模型在出题轮写一遍题、调 ask_user 的那轮又原样重写一遍，
+    只是选项加了粗体。归一化（去粗体与空白）后整段在前文出现过的不再收。"""
+    from modules.agent.service import join_answer
+
+    question = "题目：RR 时间片怎么选？\n- A. 越短越好\n- B. 越长越好\n- C. 权衡切换成本\n- D. 无所谓"
+    bolded = "题目：RR 时间片怎么选？\n- **A.** 越短越好\n- **B.** 越长越好\n- **C.** 权衡切换成本\n- **D.** 无所谓"
+    joined = join_answer([f"教材讲得很清楚 [1]。\n\n{question}", bolded, "点上面的按钮作答。"])
+    assert joined.count("RR 时间片怎么选") == 1, joined
+    # 内容不同的实质段落照常保留，不能被查重误伤。
+    two = join_answer(["第一部分：FIFO 的定义 [1]。", "第二部分：RR 的定义 [2]。", "总结完毕。"])
+    assert "第一部分" in two and "第二部分" in two
+
+
 def test_provider_tool_call_markup_never_reaches_the_answer():
     from modules.agent.service import _strip_provider_markup
 
@@ -713,6 +727,134 @@ def test_no_reminder_when_the_turn_ends_on_ask_user(client):
     assert responder.nudges() == 0, f"模型在等用户选，不该逼它写：{responder.prompts}"
 
 
+def test_adding_one_item_to_the_plan_is_a_plan_change(client):
+    """真机实测：「把明天的学习计划里加一条」没被认成改计划请求——判据只认改/调整/更新
+    这类动词，增删条目一个都不在里面。模型正文里说加好了，库里一个字没动，兜底也没触发。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class ClaimsWithoutWriting(_RecordsPrompts):
+        def script(self):
+            if self.calls == 1:
+                prose = "好的，我在明天的计划里加了一条背诵任务。"
+                yield ChatDelta(prose)
+                yield ChatFinal(prose, "stop", self.provider, self.model, self.mode)
+            elif self.calls == 2:
+                yield ChatToolCalls((ToolCallRequest("g1", "get_plan", "{}"),))
+            elif self.calls == 3:
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                yield ChatFinal("加好了。", "stop", self.provider, self.model, self.mode)
+
+    responder = ClaimsWithoutWriting()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-add", "message": "帮我把明天的学习计划里加一条背诵任务"})
+
+    assert responder.nudges() == 1, f"加一条也是改计划，该补一轮：{responder.prompts}"
+    plan = client.get(f"/api/v2/courses/{course}/plan").json()["plan"]
+    assert plan and plan["items"], "补的那一轮没把计划写进库"
+
+
+def test_plan_tools_survive_practice_skill_activation(client):
+    """真机实测最严重的一条：「出练习题 + 计划里加一条」先命中 practice，skill 的 profile
+    是整体替换，模型手里没有 plan_update，只能在正文里声称计划已更新——库里一个字没动。
+    明确要改计划的这一轮，计划工具要跟基座工具一样保留。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+    stash = ('{"kind": "practice", "visibility": "model_private", '
+             '"payload": {"questions": [{"answer": "A"}]}}')
+
+    class PracticeThenPlan(_RecordsPrompts):
+        def __init__(self):
+            super().__init__()
+            self.toolsets: list[tuple[str, ...]] = []
+
+        def chat(self, *, messages, tools=()):
+            self.toolsets.append(tuple(spec.name for spec in tools))
+            yield from super().chat(messages=messages, tools=tools)
+
+        def script(self):
+            if self.calls == 1:
+                prose = ("题目：请解释 FIFO 调度的护航效应，并说明它对短作业周转时间的影响。\n"
+                         "1. 提示：考虑一长两短三个作业先后到达的情形。\n"
+                         "答完这道题，我会把做题任务排进明天的计划。")
+                yield ChatDelta(prose)
+                yield ChatFinal(prose, "stop", self.provider, self.model, self.mode)
+            elif self.calls == 2:
+                # practice 补救轮：模型无视「不要重复输出正文」又把题目讲了一遍。
+                # 这段要够“有实质内容”，否则本来就会被 filler 过滤丢掉，测不出封板。
+                repeat = ("先把练习存档，再重复一遍题目：\n"
+                          "- 请解释 FIFO 调度的护航效应\n"
+                          "- 存档后我会把做题任务排进明天的计划，保持进度与练习对齐")
+                yield ChatDelta(repeat)
+                yield ChatToolCalls((ToolCallRequest("t1", "artifact_append", stash),))
+            elif self.calls == 3:
+                yield ChatFinal("", "stop", self.provider, self.model, self.mode)
+            elif self.calls == 4:  # 计划补救轮
+                yield ChatToolCalls((ToolCallRequest("g1", "get_plan", "{}"),))
+            elif self.calls == 5:
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                confirm = "计划已更新，明天加了一条做题任务。"
+                yield ChatDelta(confirm)
+                yield ChatFinal(confirm, "stop", self.provider, self.model, self.mode)
+
+    responder = PracticeThenPlan()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-skill", "message": "出一套练习题，另外把明天的学习计划里加一条做题任务"})
+
+    assert any("plan_update" in names for names in responder.toolsets), \
+        f"practice 激活后计划工具被收掉了：{responder.toolsets[-1]}"
+    assert responder.nudges() == 1, f"计划兜底该补一轮：{responder.prompts}"
+    plan = client.get(f"/api/v2/courses/{course}/plan").json()["plan"]
+    assert plan and plan["items"], "补的那一轮没把计划写进库"
+    content = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"][-1]["content"]
+    assert "护航效应" in content and "计划已更新" in content, f"正文缺了该有的段落：{content!r}"
+    assert "保持进度与练习对齐" not in content, f"补救轮重复的正文没被封板挡住：{content!r}"
+
+
+def test_plan_tools_survive_a_model_activated_skill(client):
+    """skill 有两个激活点：预路由和模型自己调 use_skill。上一条测试只钉住了前者，
+    这里走后者——只改后一处的回归不该是静默的。"""
+    course, session_id = _plan_course_session(client)
+    items = _plan_items()
+
+    class ActivatesThenClaims(_RecordsPrompts):
+        def __init__(self):
+            super().__init__()
+            self.toolsets: list[tuple[str, ...]] = []
+
+        def chat(self, *, messages, tools=()):
+            self.toolsets.append(tuple(spec.name for spec in tools))
+            yield from super().chat(messages=messages, tools=tools)
+
+        def script(self):
+            if self.calls == 1:
+                yield ChatToolCalls((ToolCallRequest("u1", "use_skill", '{"name": "practice"}'),))
+            elif self.calls == 2:
+                prose = "好的，我在明天的计划里加了一条背诵任务。"
+                yield ChatDelta(prose)
+                yield ChatFinal(prose, "stop", self.provider, self.model, self.mode)
+            elif self.calls == 3:
+                yield ChatToolCalls((ToolCallRequest("g1", "get_plan", "{}"),))
+            elif self.calls == 4:
+                yield ChatToolCalls((ToolCallRequest("p1", "plan_update", f'{{"expected_version": 0, "items": {items}}}'),))
+            else:
+                yield ChatFinal("加好了。", "stop", self.provider, self.model, self.mode)
+
+    responder = ActivatesThenClaims()
+    workspace(client).turns._responder = responder
+    client.post(f"/api/v2/sessions/{session_id}/turns",
+                json={"client_request_id": "plan-use-skill", "message": "帮我把明天的学习计划里加一条背诵任务"})
+
+    assert "plan_update" in responder.toolsets[-1], \
+        f"模型激活 skill 后计划工具被收掉了：{responder.toolsets[-1]}"
+    plan = client.get(f"/api/v2/courses/{course}/plan").json()["plan"]
+    assert plan and plan["items"], "补的那一轮没把计划写进库"
+
+
 PLAN_EXIT_ZH = "就按默认排计划，之后我再调"
 PLAN_EXIT_EN = "Just create the study plan with defaults"
 
@@ -1073,6 +1215,54 @@ def test_a_plain_answer_does_not_get_the_choice_reminder(client):
     client.post(f"/api/v2/sessions/{session_id}/turns", json={"client_request_id": "quiz-2", "message": "为什么除以根号d"})
     assert not [m for call in scripted.calls for m in call["messages"]
                 if m.role == "user" and "可点的按钮" in m.content], "普通回答被误判成选择题"
+
+
+def test_the_choice_reminder_round_does_not_duplicate_the_question(client):
+    """真机实测：补救轮要求「只调 ask_user，不要重复输出正文」，模型照样把整道题
+    重写一遍，最终回答里同一道题连着出现两次。补救轮开始后正文封板，重复的那份不进回答。"""
+    session_id = _indexed_course_session(client, name="大模型", text="注意力得分要除以缩放因子。")
+    stash = ('{"kind": "practice", "visibility": "model_private", '
+             '"payload": {"questions": [{"answer": "A"}]}}')
+    scripted = ScriptedChat([
+        [ChatDelta(QUIZ), ChatToolCalls((ToolCallRequest("t1", "artifact_append", stash),))],
+        [ChatDelta("点选项作答就行。"), ChatFinal("点选项作答就行。", "stop", "example", "example-model", "provider")],
+        # 补救轮：模型先把题目重写一遍才调 ask_user
+        [ChatDelta(QUIZ), ChatToolCalls((ToolCallRequest("a1", "ask_user",
+                                        '{"question": "自注意力为什么要除以 √d", "options": ["A", "B", "C", "D"]}'),))],
+        [ChatDelta(""), ChatFinal("", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "quiz-3", "message": "出一道选择题"}).text)
+    assert [data["options"] for name, data in events if name == "choices"] == [["A", "B", "C", "D"]], \
+        "封板不该影响选项按钮"
+    streamed = "".join(data["text"] for name, data in events if name == "text_delta")
+    assert streamed.count("自注意力为什么要除以") == 1, f"重复的题目被流式下发了：{streamed!r}"
+    content = client.get(f"/api/v2/sessions/{session_id}/messages").json()["messages"][-1]["content"]
+    assert content.count("自注意力为什么要除以") == 1, f"最终回答里题目出现了两次：{content!r}"
+
+
+def test_a_rewritten_question_still_gets_the_choice_reminder(client):
+    """真机实测：模型出题后又换措辞重写了一遍，两组 A-D 拼在一起。判据要是整体判，
+    这会被当成多道题而不补 ask_user——按钮出不来，还叠着题目两遍。逐段判就能认出来。"""
+    session_id = _indexed_course_session(client, name="大模型", text="注意力得分要除以缩放因子。")
+    stash = ('{"kind": "practice", "visibility": "model_private", '
+             '"payload": {"questions": [{"answer": "A"}]}}')
+    rewritten = QUIZ.replace("题目：", "**题目**（单选）：")
+    scripted = ScriptedChat([
+        [ChatDelta(QUIZ), ChatToolCalls((ToolCallRequest("t1", "artifact_append", stash),))],
+        [ChatDelta(rewritten), ChatFinal(rewritten, "stop", "example", "example-model", "provider")],
+        [ChatToolCalls((ToolCallRequest("a1", "ask_user",
+                                        '{"question": "自注意力为什么要除以 √d", "options": ["A", "B", "C", "D"]}'),))],
+        [ChatDelta(""), ChatFinal("", "stop", "example", "example-model", "provider")],
+    ])
+    workspace(client).turns._responder = scripted
+
+    events = _events(client.post(f"/api/v2/sessions/{session_id}/turns",
+                                 json={"client_request_id": "quiz-4", "message": "出一道选择题"}).text)
+    assert [data["options"] for name, data in events if name == "choices"] == [["A", "B", "C", "D"]], \
+        "重写过的题目没被认成单道选择题，按钮没补出来"
 
 
 def test_ask_user_rejects_options_that_are_questions(client):

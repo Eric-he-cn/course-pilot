@@ -10,6 +10,7 @@ specifiers:
   react-dom: 19.1.1
   react-markdown: ^10.1.0
   rehype-katex: ^7.0.1
+  remark-cjk-friendly: ^2.3.1
   remark-gfm: ^4.0.1
   remark-math: ^6.0.0
   typescript: 5.9.3
@@ -22,6 +23,7 @@ dependencies:
   react-dom: 19.1.1_react@19.1.1
   react-markdown: 10.1.0_hkmopinwlnbcc44pkwhq7zhare
   rehype-katex: 7.0.1
+  remark-cjk-friendly: 2.3.1
   remark-gfm: 4.0.1
   remark-math: 6.0.0
 
@@ -1527,6 +1529,11 @@ packages:
     engines: {node: '>=6.9.0'}
     dev: true
 
+  /get-east-asian-width/1.6.0:
+    resolution: {integrity: sha512-QRbvDIbx6YklUe6RxeTeleMR0yv3cYH6PsPZHcnVn7xv7zO1BHN8r0XETu8n6Ye3Q+ahtSarc3WgtNWmehIBfA==}
+    engines: {node: '>=18'}
+    dev: false
+
   /hachure-fill/0.5.2:
     resolution: {integrity: sha512-3GKBOn+m2LX9iq+JC1064cSFprJY4jL1jCXTcpnfER5HYE2l/4EfWSGzkPa/ZDBmYI0ZOEj5VHV/eKnPGkHuOg==}
     dev: false
@@ -1926,6 +1933,22 @@ packages:
       vfile: 6.0.3
     dev: false
 
+  /mdast-util-to-markdown-cjk-friendly/1.0.0:
+    resolution: {integrity: sha512-BoaAm8mlJ+LAYz0Qs532Y3ciTuQYgBUPZcSFbvC/ZKmEMAKgulw84YvQK1gI34t/vL2euSfuaWlqczkTBgamkw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      '@types/mdast': '*'
+    peerDependenciesMeta:
+      '@types/mdast':
+        optional: true
+    dependencies:
+      mdast-util-to-markdown: 2.1.2
+      micromark-extension-cjk-friendly-util: 3.0.1
+      micromark-util-symbol: 2.0.1
+    transitivePeerDependencies:
+      - micromark-util-types
+    dev: false
+
   /mdast-util-to-markdown/2.1.2:
     resolution: {integrity: sha512-xj68wMTvGXVOKonmog6LwyJKrYXZPvlwabaryTjLh9LuvovB/KAH+kvi8Gjj+7rJjsFi23nkUxRQv1KqSroMqA==}
     dependencies:
@@ -1991,6 +2014,37 @@ packages:
       micromark-util-subtokenize: 2.1.0
       micromark-util-symbol: 2.0.1
       micromark-util-types: 2.0.2
+    dev: false
+
+  /micromark-extension-cjk-friendly-util/3.0.1:
+    resolution: {integrity: sha512-GcbXqTTHOsiZHyF753oIddP/J2eH8j9zpyQPhkof6B2JNxfEJabnQqxbCgzJNuNes0Y2jTNJ3LiYPSXr6eJA8w==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      micromark-util-types: '*'
+    peerDependenciesMeta:
+      micromark-util-types:
+        optional: true
+    dependencies:
+      get-east-asian-width: 1.6.0
+      micromark-util-character: 2.1.1
+      micromark-util-symbol: 2.0.1
+    dev: false
+
+  /micromark-extension-cjk-friendly/2.0.1:
+    resolution: {integrity: sha512-OkzoYVTL1ChbvQ8Cc1ayTIz7paFQz8iS9oIYmewncweUSwmWR+hkJF9spJ1lxB90XldJl26A1F4IkPOKS3bDXw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      micromark: ^4.0.0
+      micromark-util-types: ^2.0.0
+    peerDependenciesMeta:
+      micromark-util-types:
+        optional: true
+    dependencies:
+      devlop: 1.1.0
+      micromark-extension-cjk-friendly-util: 3.0.1
+      micromark-util-chunked: 2.0.1
+      micromark-util-resolve-all: 2.0.1
+      micromark-util-symbol: 2.0.1
     dev: false
 
   /micromark-extension-gfm-autolink-literal/2.1.0:
@@ -2356,6 +2410,23 @@ packages:
       katex: 0.16.47
       unist-util-visit-parents: 6.0.2
       vfile: 6.0.3
+    dev: false
+
+  /remark-cjk-friendly/2.3.1:
+    resolution: {integrity: sha512-f+pKZRxCRwNEGFBKNRAZAqU91GIK1SAo3ZyFHWRUgC9zcxRR0BXKd6YwqgSsxtW0rNpUDtONj7H5nje2WL3fcA==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      '@types/mdast': ^4.0.0
+      unified: ^11.0.0
+    peerDependenciesMeta:
+      '@types/mdast':
+        optional: true
+    dependencies:
+      mdast-util-to-markdown-cjk-friendly: 1.0.0
+      micromark-extension-cjk-friendly: 2.0.1
+    transitivePeerDependencies:
+      - micromark
+      - micromark-util-types
     dev: false
 
   /remark-gfm/4.0.1:

@@ -37,7 +37,9 @@ sys.exit(1 if bad else 0)
 PY
 
 "${python_bin}" scripts/check_i18n_keys.py
+"${python_bin}" scripts/check_css_vars.py
 
 cd "${project_dir}/frontend"
 pnpm run typecheck
+pnpm run check:cjk
 pnpm run build

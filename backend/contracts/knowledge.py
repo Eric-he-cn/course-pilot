@@ -31,10 +31,14 @@ class WikiDocument:
     """一页知识页，按落盘格式拆好：body 是系统按教材生成的，handwritten 是用户自己写的。
     拆分放在 knowledge 模块，页面格式（frontmatter、分隔标记）不外泄给调用方。"""
     concept_id: str; concept_name: str; body: str; handwritten: str
+# 手写区的身份标注。写检索行的一端与渲染给模型的一端都用它：知识页要按它拆出手写区
+# 单独留位，两边各写一份措辞就会在某一天错开，拆分点随之失效。
+HANDWRITTEN_LABEL = "【以下是用户自己写的补充，不是教材内容】"
 @dataclass(frozen=True)
 class WikiSource:
-    """知识页转述时依据的一个教材位置。给的是整页的来源，不是「这句话在第几页」。"""
-    document: str; page: int | None; chunk_id: str; snippet: str
+    """知识页转述时依据的一个教材位置。给的是整页的来源，不是「这句话在第几页」。
+    material_id 是归属教材：文件名可以重名，分组与匹配要按它，不然两本同名书会并成一条。"""
+    document: str; page: int | None; chunk_id: str; snippet: str; material_id: str = ""
 @dataclass(frozen=True)
 class WikiSources:
     """一页知识页的教材出处：anchors 是可点开的那几页，pages 是去重后的总页数。

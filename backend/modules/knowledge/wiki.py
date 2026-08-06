@@ -16,12 +16,18 @@ import hashlib
 import os
 import re
 import shutil
+import threading
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
+from statistics import median
 from typing import Callable
 
-from contracts.knowledge import WikiDocument
+from contracts.knowledge import HANDWRITTEN_LABEL, WikiDocument
 from contracts.llm import ChatFinal, ChatMessage
+from core.common import write_text_atomic
+
+from .api import WikiPageTooLargeError
 
 PROMPT_VERSION = "wiki-v2"
 # 分隔线以下归用户。重新生成只替换上半部分，手写内容不会被冲掉。
@@ -40,6 +46,11 @@ SECONDS_PER_PAGE = 5
 # 一页最多读多少字原文。超过就按分片顺序再切一层，不截断——截断就是漏。
 MAX_EVIDENCE_CHARS = 6000
 MAX_PAGE_BYTES = 128 * 1024
+# 手写区要给下一次重建留出余量：生成区实测 1.2–1.9 KB，但换个提示词版本、换个模型都会让它变长。
+# 手写区顶到 MAX_PAGE_BYTES 时下一次重写这一页必然超限，而那时用户已经花过模型的钱了。
+REBUILD_HEADROOM = 8 * 1024
+# 读一页的记账信息只需要开头这么多字符，整份读进来在整目录扫描时是白花的 IO。
+FRONTMATTER_CHARS = 1024
 # 一页知识页最多摆出每份教材的几页出处。总览页依据整本书，全列出来只会淹掉抽屉。
 WIKI_SOURCE_MAX_PAGES = 8
 # 出处那几页各带多长的原文，够看出「这页在讲什么」即可。
@@ -113,21 +124,81 @@ def _safe(component: str) -> str:
     return _ALLOWED.sub("", component).strip()[:120]
 
 
+@dataclass(frozen=True)
+class PageSlot:
+    """一页在库里的落点：祖先页对应的目录，加上它在树里的位次编号。
+
+    文件名要等页名定下来才拼得出——没有目录的教材，段名是模型读完原文才起的。
+    """
+    folders: tuple[str, ...]
+    number: str
+
+    def location(self, name: str) -> tuple[str, ...]:
+        return (*self.folders, f"{self.number}-{_safe(name)}")
+
+
+def folder_name(filename: str, *, rank: int = 1, fallback: str = "") -> str:
+    """教材在库里的目录名，取掉扩展名。同课重名的教材按名次错开，两棵树不合并进一个目录。"""
+    base = _safe(Path(filename).stem) or _safe(fallback)
+    return base if rank <= 1 else f"{base}-{rank}"
+
+
+def page_slots(sections: list[Section], *, folder: str = "") -> dict[str, PageSlot]:
+    """磁盘布局：目录层级照树层级，编号取树内位次，零填充按同级数量定宽。
+
+    中间页的文件与它的子目录同名（Obsidian 的 folder note 惯例），整个库直接当笔记库打开就能读。
+    `folder` 是这份教材自己的目录：位次是每份教材各从 1 数起的，同课几份教材摊在一层会撞号。
+    """
+    known = {section.id for section in sections}
+    children: dict[str | None, list[Section]] = {}
+    for section in sections:
+        children.setdefault(section.parent_id if section.parent_id in known else None, []).append(section)
+    slots: dict[str, PageSlot] = {}
+    root = (folder,) if folder else ()
+    queue: list[tuple[str | None, tuple[str, ...], str]] = [(None, root, "")]
+    while queue:
+        parent_id, folders, prefix = queue.pop(0)
+        siblings = children.get(parent_id, [])
+        width = len(str(len(siblings)))
+        for position, section in enumerate(siblings, start=1):
+            number = f"{prefix}.{position:0{width}d}" if prefix else f"{position:0{width}d}"
+            slots[section.id] = PageSlot(folders, number)
+            if section.children:
+                queue.append((section.id, (*folders, f"{number}-{_safe(section.name)}"), number))
+    return slots
+
+
 class WikiStore:
-    """按课程隔离的 markdown 落盘，落点校验照 NoteStore 的口径。"""
+    """按课程隔离的 markdown 落盘，落点校验照 NoteStore 的口径。
+
+    磁盘上按目录树排版（`01-章名/01.1-节名.md`），当笔记库打开就能读。页的身份只认
+    frontmatter 里的 concept_id，路径怎么排都不影响引用、增量刷新与手写区。
+    """
 
     def __init__(self, data_dir: Path) -> None:
         self._root = data_dir / "wiki"
+        # concept_id → 落点，以及哪几门课已经扫过。路径可读之后按 id 找页要扫目录，
+        # 扫过的结果留着，写页与搬页同步维护，所以找不到就是真没有，不必再扫一遍。
+        self._located: dict[str, dict[str, Path]] = {}
+        self._scanned: set[str] = set()
+        # 构建在后台线程里跑，界面同时在读页：整目录扫描的「遍历 + 发布」必须和写页互斥，
+        # 否则扫描会用开工前的快照盖掉刚写进去的那几页，读页拿到 LookupError。
+        self._lock = threading.RLock()
 
     def _course_dir(self, course_id: str) -> Path:
         return self._root / _safe(course_id)
 
-    def _path(self, *, course_id: str, concept_id: str) -> Path:
+    def _path(self, *, course_id: str, concept_id: str, location: tuple[str, ...] | None = None) -> Path:
+        """落点：给了 location 就按它排目录，没给就平铺成 `<id>.md`（课程首页与老版本的页）。"""
         directory = self._course_dir(course_id)
-        name = _safe(concept_id)
-        if not name:
-            raise ValueError("概念 id 不合法")
-        path = (directory / f"{name}.md").resolve()
+        parts = list(location or (concept_id,))
+        # 目录深度封顶：教材目录 + 树深度正好用到 WIKI_MAX_DEPTH 层，兜的是 location 算错的
+        # 情况（真跑飞了宁可几页挤在上一层，也不让路径无限长）。文件名那一段永远留着。
+        folders = [_safe(part) for part in parts[:-1]][:WIKI_MAX_DEPTH]
+        name = _safe(parts[-1])
+        if not name or not all(folders) or {name, *folders} & {".", ".."}:
+            raise ValueError("Wiki 页落点不合法")
+        path = directory.joinpath(*folders, f"{name}.md").resolve()
         base = directory.resolve()
         if os.path.commonpath([str(base), str(path)]) != str(base):
             raise ValueError("Wiki 页只能写在本课程目录内")
@@ -135,22 +206,58 @@ class WikiStore:
             raise ValueError("Wiki 页是符号链接，已拒绝写入")
         return path
 
+    def _scan(self, course_id: str) -> list[tuple[Path, WikiPage]]:
+        """遍历课程目录，认出这门课的知识页，落点一律用 resolve 后的真路径。
+
+        只认 frontmatter 里真有 concept_id 的文件：用户自己放进库里的 markdown 不是知识页，
+        列不出、也不会被清理碰到。读页与写页守同一条落点线，符号链接和跑出课程目录的都不认。
+        """
+        directory = self._course_dir(course_id)
+        base = directory.resolve()
+        found: list[tuple[Path, WikiPage]] = []
+        with self._lock:
+            for path in sorted(directory.rglob("*.md")) if directory.is_dir() else []:
+                # 目录名也可能以 .md 结尾（小节就叫「README.md」），所以要挑出真正的文件。
+                if path.is_symlink() or not path.is_file():
+                    continue
+                real = path.resolve()
+                if os.path.commonpath([str(base), str(real)]) != str(base):
+                    continue
+                page = _page_of(real)
+                if page.concept_id:
+                    found.append((real, page))
+            self._located[course_id] = {page.concept_id: path for path, page in found}
+            self._scanned.add(course_id)
+        return found
+
+    def _locate(self, *, course_id: str, concept_id: str) -> Path | None:
+        """按 concept_id 找落点。目录由本模块自己写，扫过一遍后靠写页与搬页增量维护，
+        所以扫过之后找不到就当真没有——构建一次上百页，每次未命中都重扫等于扫上百遍。
+
+        自愈是单向的：外部删掉或移走那份能自愈（记下的落点不在了就重扫），外部**新增**的页
+        要等下一次 list_pages 才认得出（列页每次都真扫，界面与构建的每条路都先列页）。
+        """
+        with self._lock:
+            path = self._located.get(course_id, {}).get(concept_id)
+            if path is None and course_id in self._scanned:
+                return None
+            if path is None or not path.is_file():
+                self._scan(course_id)
+                path = self._located.get(course_id, {}).get(concept_id)
+            return path
+
     def read(self, *, course_id: str, concept_id: str) -> str:
-        path = self._path(course_id=course_id, concept_id=concept_id)
-        if not path.is_file():
+        path = self._locate(course_id=course_id, concept_id=concept_id)
+        if path is None or not path.is_file():
             raise LookupError(f"没有 {concept_id} 的 Wiki 页")
         return path.read_text(encoding="utf-8")
 
     def source_refs(self, *, course_id: str, concept_id: str) -> list[str]:
         """读一页 frontmatter 里记的证据出处。读不到就当这页没有出处，不报错。"""
         try:
-            text = self.read(course_id=course_id, concept_id=concept_id)
+            return refs_in(self.read(course_id=course_id, concept_id=concept_id))
         except (LookupError, ValueError, OSError):
             return []
-        match = re.search(r"^source_refs:\n((?:[ \t]+- .*\n)*)", text, re.MULTILINE)
-        if not match:
-            return []
-        return [line.strip()[2:].strip() for line in match.group(1).splitlines() if line.strip().startswith("- ")]
 
     def source_hash(self, *, course_id: str, concept_id: str) -> str:
         """读已有页的证据指纹，用来判断要不要重写。读不到就返回空串。"""
@@ -161,17 +268,81 @@ class WikiStore:
         match = re.search(r"^source_hash:[ \t]*(\S+)$", head, re.MULTILINE)
         return match.group(1) if match else ""
 
+    def _free_path(self, *, concept_id: str, previous: Path | None, path: Path) -> Path:
+        """落点被别的页占着就加后缀。同名教材下同号同名的小节会撞在一处，撞了各自成文件，
+        不能一份盖掉另一份。"""
+        candidate, taken = path, 1
+        while candidate != previous and candidate.is_file() and _page_of(candidate).concept_id != concept_id:
+            taken += 1
+            candidate = path.with_name(f"{path.stem}-{taken}.md")
+        return candidate
+
+    def relocate(self, *, course_id: str, concept_id: str, location: tuple[str, ...]) -> None:
+        """把已有的页搬到它现在该在的落点。证据没变的页不重写，编号却会随目录改动而变，
+        不搬的话换版之后同一目录里会并排摆着两个同号的页。目标已被别的页占着就先放着。"""
+        with self._lock:
+            current = self._locate(course_id=course_id, concept_id=concept_id)
+            target = self._path(course_id=course_id, concept_id=concept_id, location=location)
+            if current is None or current == target or not current.is_file() or target.exists():
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(current, target)
+            self._located.setdefault(course_id, {})[concept_id] = target
+
     def write(self, *, course_id: str, concept_id: str, concept_name: str, body: str,
               source_hash: str, source_refs: list[str], updated_at: str,
               material_id: str = "", parent_id: str | None = None, level: int = 0,
-              order: int = 0) -> WikiPage:
-        path = self._path(course_id=course_id, concept_id=concept_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handwritten = ""
-        if path.is_file():
-            existing = path.read_text(encoding="utf-8")
-            if HANDWRITTEN_MARKER in existing:
-                handwritten = HANDWRITTEN_MARKER + existing.split(HANDWRITTEN_MARKER, 1)[1]
+              order: int = 0, location: tuple[str, ...] | None = None) -> WikiPage:
+        with self._lock:
+            previous = self._locate(course_id=course_id, concept_id=concept_id)
+            path = self._free_path(concept_id=concept_id, previous=previous,
+                                   path=self._path(course_id=course_id, concept_id=concept_id, location=location))
+            document = self._compose(
+                concept_id=concept_id, concept_name=concept_name, body=body, source_hash=source_hash,
+                source_refs=source_refs, updated_at=updated_at, material_id=material_id,
+                parent_id=parent_id, level=level, order=order,
+                # 手写区先看旧落点（改名换号时它在那边），旧落点没有再看新落点，两头都不弄丢。
+                handwritten=_handwritten_of(previous) or (_handwritten_of(path) if path != previous else ""),
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(path, document)
+            # 改名或换编号让落点变了，旧文件要收走，否则同一页在库里留下两份。
+            if previous is not None and previous != path:
+                previous.unlink(missing_ok=True)
+            self._located.setdefault(course_id, {})[concept_id] = path
+        return WikiPage(concept_id, concept_name, source_hash, updated_at, len(document),
+                        material_id, parent_id or "", level, order)
+
+    def write_handwritten(self, *, course_id: str, concept_id: str, text: str) -> str:
+        """替换分隔线以下那一段，生成区与 frontmatter 一个字节都不动。返回落盘后的整页。
+
+        读改写整段放在锁里：构建线程同时在重写这一页时，两边不能各拿一份旧内容互相覆盖。
+        """
+        with self._lock:
+            path = self._locate(course_id=course_id, concept_id=concept_id)
+            if path is None or not path.is_file():
+                raise LookupError(f"没有 {concept_id} 的 Wiki 页")
+            try:
+                existing = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(f"{concept_id} 这一页不是 UTF-8 文本，无法在界面上编辑") from error
+            generated, marker, _old = existing.partition(HANDWRITTEN_MARKER)
+            # 没有分隔线的老页在末尾补一条，原有内容照旧算作生成区。
+            # 用户正文里写出分隔标记会让这一页出现第二条，之后读页会从错的地方切开。
+            # 只删标记不删它后面的字：用户打的内容一个字都不能悄悄吞掉。
+            body = text.replace(HANDWRITTEN_MARKER, "").strip()
+            document = (generated if marker else existing.rstrip() + "\n\n") + HANDWRITTEN_MARKER + "\n"
+            document += f"{body}\n" if body else ""
+            if len(document.encode("utf-8")) > MAX_PAGE_BYTES - REBUILD_HEADROOM:
+                raise WikiPageTooLargeError(
+                    f"{concept_id} 这一页超过 {(MAX_PAGE_BYTES - REBUILD_HEADROOM) // 1024} KiB 上限，这次没有保存")
+            write_text_atomic(path, document)
+        return document
+
+    @staticmethod
+    def _compose(*, concept_id: str, concept_name: str, body: str, source_hash: str,
+                 source_refs: list[str], updated_at: str, material_id: str,
+                 parent_id: str | None, level: int, order: int, handwritten: str) -> str:
         refs = "\n".join(f"  - {ref}" for ref in source_refs) or "  []"
         # 掌握度不写进文件：它随答题变化，读的时候现算才不会过期（架构 §8.2）
         document = (
@@ -183,29 +354,12 @@ class WikiStore:
             f"# {concept_name}\n\n{body.strip()}\n\n{handwritten or HANDWRITTEN_MARKER + chr(10)}"
         )
         if len(document.encode("utf-8")) > MAX_PAGE_BYTES:
-            raise ValueError("Wiki 页超过大小上限")
-        path.write_text(document, encoding="utf-8")
-        return WikiPage(concept_id, concept_name, source_hash, updated_at, len(document),
-                        material_id, parent_id or "", level, order)
+            raise WikiPageTooLargeError(f"Wiki 页 {concept_id} 超过大小上限")
+        return document
 
     def list_pages(self, *, course_id: str) -> list[WikiPage]:
-        """按构建时记下的 order 返回，首页排在最前。文件名是 id，照文件名排等于随机排。"""
-        directory = self._course_dir(course_id)
-        pages: list[WikiPage] = []
-        for path in sorted(directory.glob("*.md")) if directory.is_dir() else []:
-            head = path.read_text(encoding="utf-8")[:800]
-
-            def field_of(key: str, text: str = head) -> str:
-                # 空值那几行不能用 \s*：它会吃掉换行，把下一行整行当成本行的值。
-                match = re.search(rf"^{key}:[ \t]*(.*)$", text, re.MULTILINE)
-                return match.group(1).strip() if match else ""
-
-            pages.append(WikiPage(
-                concept_id=field_of("concept_id") or path.stem, concept_name=field_of("concept_name") or path.stem,
-                source_hash=field_of("source_hash"), updated_at=field_of("updated_at"), chars=path.stat().st_size,
-                material_id=field_of("material_id"), parent_id=field_of("parent_id"),
-                level=int(field_of("level") or 0), order=int(field_of("order") or 0),
-            ))
+        """按构建时记下的 order 返回，首页排在最前。文件名带的编号只是排版，不拿它当顺序。"""
+        pages = [page for _path, page in self._scan(course_id)]
         return sorted(pages, key=lambda page: (page.concept_id != INDEX_ID, page.order, page.concept_id))
 
     def prune(self, *, course_id: str, valid_concept_ids: set[str], material_id: str = "",
@@ -217,30 +371,100 @@ class WikiStore:
         """
         planned = planned_ids or set()
         alive = known_material_ids or set()
-        directory = self._course_dir(course_id)
         removed = []
-        for page in self.list_pages(course_id=course_id):
-            if page.concept_id == INDEX_ID:
-                continue
-            if page.material_id and page.material_id == material_id:
-                keep = page.concept_id in planned
-            elif page.material_id:
-                keep = page.material_id in alive
-            else:
-                keep = page.concept_id in valid_concept_ids
-            if not keep:
-                (directory / f"{_safe(page.concept_id)}.md").unlink(missing_ok=True)
+        with self._lock:
+            for path, page in self._scan(course_id):
+                if page.concept_id == INDEX_ID:
+                    continue
+                if page.material_id and page.material_id == material_id:
+                    keep = page.concept_id in planned
+                elif page.material_id:
+                    keep = page.material_id in alive
+                else:
+                    keep = page.concept_id in valid_concept_ids
+                # 手写区是用户自己写的，没有第二份副本：这样的页留在原位当孤儿，也不删。
+                if keep or _user_wrote_in(path):
+                    continue
+                path.unlink(missing_ok=True)
                 removed.append(page.concept_id)
+            if removed:
+                self.tidy(course_id=course_id)
+                self._scan(course_id)
         return removed
+
+    def tidy(self, *, course_id: str) -> None:
+        """收掉空目录，库里不留只剩名字的空章。深的先删，整条空链一次清完。"""
+        directory = self._course_dir(course_id)
+        if not directory.is_dir():
+            return
+        with self._lock:
+            for path in sorted(directory.rglob("*"), reverse=True):
+                if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+                    path.rmdir()
 
     def delete_course(self, *, course_id: str) -> None:
         """删课程时由组装根调用。目录布局是本模块自己的事，别处不该知道。"""
-        shutil.rmtree(self._course_dir(course_id), ignore_errors=True)
+        with self._lock:
+            shutil.rmtree(self._course_dir(course_id), ignore_errors=True)
+            self._located.pop(course_id, None)
+            self._scanned.discard(course_id)
+
+
+def _page_of(path: Path) -> WikiPage:
+    """按 frontmatter 认一页。concept_id 为空表示这个文件不是知识页，调用方据此放过它。"""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        head = handle.read(FRONTMATTER_CHARS)
+
+    def field_of(key: str) -> str:
+        # 空值那几行不能用 \s*：它会吃掉换行，把下一行整行当成本行的值。
+        match = re.search(rf"^{key}:[ \t]*(.*)$", head, re.MULTILINE)
+        return match.group(1).strip() if match else ""
+
+    def number_of(key: str) -> int:
+        # 手改坏的一行不该让整门课列不出来。能不能当数用交给 int 判，别自己写判据。
+        try:
+            return int(field_of(key))
+        except ValueError:
+            return 0
+
+    concept_id = field_of("concept_id")
+    return WikiPage(
+        concept_id=concept_id, concept_name=field_of("concept_name") or concept_id,
+        source_hash=field_of("source_hash"), updated_at=field_of("updated_at"), chars=path.stat().st_size,
+        material_id=field_of("material_id"), parent_id=field_of("parent_id"),
+        level=number_of("level"), order=number_of("order"),
+    )
+
+
+def _handwritten_of(path: Path | None) -> str:
+    """读一页的手写区。读不到就当没有——这里的判断只用来「别弄丢」，不该反过来阻断写入。"""
+    if path is None or not path.is_file():
+        return ""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):  # 解码错是 ValueError 的子类：按 GBK 存过的页别挂住构建
+        return ""
+    if HANDWRITTEN_MARKER not in existing:
+        return ""
+    return HANDWRITTEN_MARKER + existing.split(HANDWRITTEN_MARKER, 1)[1]
+
+
+def _user_wrote_in(path: Path) -> bool:
+    """分隔线之后真写了东西。每一页都带着那条分隔线，空的手写区不算。"""
+    return bool(_handwritten_of(path).removeprefix(HANDWRITTEN_MARKER).strip())
 
 
 # 叶子页的出处形如「math-gaussian.pdf p.10 #chunk_9a7d…」，见 _raw_evidence。
 # 中间页记的是子页（「子页 X <id>」），对不上这个形状，由调用方顺着子页往下收。
 _SOURCE_REF = re.compile(r"^(?P<document>.+?)(?: p\.(?P<page>\d+))? #(?P<chunk_id>\S+)$")
+
+
+def refs_in(document: str) -> list[str]:
+    """从落盘的一页里取出 frontmatter 记的出处行。"""
+    match = re.search(r"^source_refs:\n((?:[ \t]+- .*\n)*)", document, re.MULTILINE)
+    if not match:
+        return []
+    return [line.strip()[2:].strip() for line in match.group(1).splitlines() if line.strip().startswith("- ")]
 
 
 def parse_source_refs(refs: list[str]) -> list[tuple[str, int | None, str]]:
@@ -268,11 +492,62 @@ def split_page(*, concept_id: str, document: str) -> WikiDocument:
     return WikiDocument(concept_id, concept_name or concept_id, body.strip(), handwritten.strip())
 
 
+def retrieval_content(document: WikiDocument) -> str:
+    """这一页进检索库的正文：概念名 + 生成区，手写区非空时带身份标注一起收进来。
+
+    用户在手写区写的纠偏要能被日常问答检索到，否则只有模型主动读这一页才看得见。
+    生成区里出现的同款标注要摘掉：读的一端按第一处标注拆段，多一处就会切错地方。
+    """
+    parts = [f"{document.concept_name}\n\n{strip_handwritten_label(document.body)}"]
+    if document.handwritten.strip():
+        parts.append(f"{HANDWRITTEN_LABEL}\n{document.handwritten.strip()}")
+    return "\n\n".join(parts)
+
+
+def strip_handwritten_label(body: str) -> str:
+    """摘掉生成区里的身份标注。全文只留一处，手写区的边界才认得准。"""
+    return body.replace(HANDWRITTEN_LABEL, "").strip()
+
+
 # ---- 切段：把一份教材切成一棵 Section 树 ----
 
-def _section_id(material_id: str, ordinal: int) -> str:
-    """按教材加分片序号派生，重建索引后同一段仍是同一个 id，增量刷新才认得出来。"""
-    return "section_" + hashlib.sha1(f"{material_id}\n{ordinal}".encode()).hexdigest()[:16]
+def _section_id(material_id: str, key: object) -> str:
+    """按教材加教材内位置派生，重建索引后同一节仍是同一个 id，增量刷新才认得出来。
+
+    key 是这一节在教材里的位置：有目录时是名字加同名位次，没目录时是首个分片的序号。
+    """
+    return "section_" + hashlib.sha1(f"{material_id}\n{key}".encode()).hexdigest()[:16]
+
+
+def outline_rows(*, material_id: str, candidates: list[dict]) -> list[dict]:
+    """把目录候选整理成 plan_sections 要的目录行，id 按这份教材内的位置派生。
+
+    不走 concepts 表：那张表按「课程 + 名字」给 id 并在同名时并成一行，同一门课两份教材有
+    同名节时第二份那几节整节查不到，原文会被并进邻节、挂在别人的标题下面。
+    id 只认「名字 + 教材内同名位次」，不含祖先路径——改一个章名不该把整棵子树连同手写区
+    一起作废；代价是同名节前面再插进一处同名的，后面几处位次平移、各作废重建一次。
+    与 concepts 表解耦后，掌握度按 concept_id join 到知识页的那条路不再存在（实测命中 0/5，
+    日后按页码区间聚合更稳），历史会话里指向旧 concept_id 的引用点开会 404，属于「已有页
+    作废重建」的一次性代价。
+    """
+    outline = sorted((row for row in candidates if row.get("level") is not None),
+                     key=lambda row: row.get("ordinal") or 0)
+    rows: list[dict] = []
+    stack: list[tuple[int, str]] = []  # 祖先链：(层级, id)
+    seen: dict[str, int] = {}
+    for row in outline:
+        level, name = int(row["level"]), str(row["name"])
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        key = name.casefold()
+        # 重名的几节（每章都有「小结」）按教材内出现位次分开，各自成页。位次与名字之间用
+        # 换行分隔：书签名归一化时空白全被压成空格，换行产不出来，两段拼不出歧义。
+        seen[key] = seen.get(key, 0) + 1
+        page_id = _section_id(material_id, f"{seen[key]}\n{key}")
+        rows.append({"id": page_id, "name": name, "page": row.get("page"), "level": level,
+                     "parent_id": stack[-1][1] if stack else None})
+        stack.append((level, page_id))
+    return rows
 
 
 def _groups_by_size(chunks: list[dict], *, target: int) -> list[list[dict]]:
@@ -507,13 +782,15 @@ def _directory(pages: list[WikiPage]) -> str:
 def build_pages(
     *, course_id: str, material_id: str, document: str, sections: list[Section],
     store: WikiStore, now: str, ask: Callable[[list[ChatMessage]], ChatFinal],
-    on_progress: Callable[[int, int], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None, folder: str = "",
 ) -> dict[str, int]:
     """自底向上写页，最后写课程首页。返回「写入 / 跳过 / 无内容」三个计数。"""
-    counts = {"written": 0, "skipped": 0, "ungrounded": 0}
+    counts = {"written": 0, "skipped": 0, "ungrounded": 0, "oversized": 0}
     bodies: dict[str, str] = {}
     names: dict[str, str] = {}
     positions = {section.id: index for index, section in enumerate(sections)}
+    # 教材各占一个目录。目录名由调用方给（同课重名的教材要错开），没给就照文件名算。
+    slots = page_slots(sections, folder=folder or folder_name(document, fallback=material_id))
     total = len(sections) + 1
     done = 0
 
@@ -537,6 +814,9 @@ def build_pages(
             existing = split_page(concept_id=section.id,
                                   document=store.read(course_id=course_id, concept_id=section.id))
             bodies[section.id], names[section.id] = existing.body, existing.concept_name
+            if slot := slots.get(section.id):
+                store.relocate(course_id=course_id, concept_id=section.id,
+                               location=slot.location(existing.concept_name))
             continue
         heading = section.name or "（这一段还没有名字）"
         final = ask([
@@ -548,16 +828,25 @@ def build_pages(
             counts["ungrounded"] += 1
             continue
         name, body = _titled(section.name, body)
-        store.write(course_id=course_id, concept_id=section.id, concept_name=name, body=body,
-                    source_hash=source_hash, source_refs=refs, updated_at=now,
-                    material_id=material_id, parent_id=section.parent_id, level=section.level,
-                    order=positions[section.id])
+        try:
+            store.write(course_id=course_id, concept_id=section.id, concept_name=name, body=body,
+                        source_hash=source_hash, source_refs=refs, updated_at=now,
+                        material_id=material_id, parent_id=section.parent_id, level=section.level,
+                        order=positions[section.id],
+                        location=slot.location(name) if (slot := slots.get(section.id)) else None)
+        except WikiPageTooLargeError:
+            # 一页落不了盘（手写区把整页撑满了）不该拖垮整次构建：后面的页照写，
+            # 这一页保持盘上的旧版本，条数如实报出来让用户知道有一页没更新。
+            counts["oversized"] += 1
+            continue
         bodies[section.id], names[section.id] = body, name
         counts["written"] += 1
 
     if on_progress is not None:
         on_progress(total, total)
     _write_index(course_id=course_id, store=store, now=now, ask=ask, counts=counts)
+    # 改名换号会把页搬走，原来那一层可能空了。
+    store.tidy(course_id=course_id)
     return counts
 
 
@@ -588,21 +877,281 @@ def _write_index(*, course_id: str, store: WikiStore, now: str,
     if not body:
         counts["ungrounded"] += 1
         return
-    store.write(course_id=course_id, concept_id=INDEX_ID, concept_name="课程总览",
-                body=f"{body}\n\n{directory}", source_hash=source_hash,
-                source_refs=[f"顶层页 {page.concept_name}" for page in pages if page.level == 0],
-                updated_at=now, level=0, order=-1)
+    try:
+        store.write(course_id=course_id, concept_id=INDEX_ID, concept_name="课程总览",
+                    body=f"{body}\n\n{directory}", source_hash=source_hash,
+                    source_refs=[f"顶层页 {page.concept_name}" for page in pages if page.level == 0],
+                    updated_at=now, level=0, order=-1)
+    except WikiPageTooLargeError:
+        counts["oversized"] += 1
+        return
     counts["written"] += 1
 
 
-def coverage_summary(counts: dict[str, int]) -> str:
+# ---- 体检：零模型调用的确定性检查，只报不改 ----
+
+# 正文里的出处标注，三种形态与前端的 CITE_MARK 同一口径：[文档 p.12]、[p.12]、[笔记.docx]。
+_CITE_MARK = re.compile(r"\[(?:([^\]\n]+) )?p\.(\d+)\]|\[([^\]\n]+\.(?:pdf|docx?|pptx?|txt|md))\]", re.I)
+# 文档名那一半得真像个文件名才拿去比对。切歪的（「讲义.pdf p.1,」）与泛指（「第三章」）都判不出结论。
+_HAS_SUFFIX = re.compile(r"\.(?:pdf|docx?|pptx?|txt|md)$", re.I)
+# 代码里的写法不算标注：前端也不给 pre/code 接原文。围栏、行内、四空格缩进三种都要认，
+# 缩进那条放过列表项——缩进的列表在前端渲染成 li，标注照样是可点的。
+_CODE_SPAN = re.compile(r"(?s:```.*?```)|`[^`\n]*`|(?m:^(?: {4}|\t)(?![-*+] |\d+\. ).*$)")
+# 带页码的标注按这个键与本页 refs 配对；文档级标注的页码位是 None。
+_PAGE_CODES = {"page_out_of_range", "overview_cites_pages"}
+# 一条发现里最多列几个页码或文件名。真正的条数由 n 说明，整表摆出来会淹掉界面。
+LINT_SAMPLE_MAX = 12
+
+
+@dataclass(frozen=True)
+class LintPage:
+    """体检要看的一页：正文（不含手写区）、frontmatter 的出处行，加几个记账字段。"""
+    concept_id: str
+    concept_name: str
+    body: str
+    refs: tuple[str, ...] = ()
+    parent_id: str = ""
+    material_id: str = ""
+    source_hash: str = ""
+
+
+def _loose_name(document: str) -> str:
+    """文档名的松匹配口径，与前端 anchorLookup 一致：大小写、空白、开头的 p. 与扩展名都不计。"""
+    name = re.sub(r"\s+", " ", document).strip().casefold().removeprefix("p.")
+    return re.sub(r"\.[a-z0-9]+$", "", name)
+
+
+def _marks_in(body: str) -> list[tuple[str, int | None]]:
+    """正文里的出处标注，逐个拆成（文档名, 页码）。这两半都可能缺，缺的那半是空串或 None。"""
+    text = _CODE_SPAN.sub(" ", body)
+    return [(match.group(1) or match.group(3) or "",
+             int(match.group(2)) if match.group(2) else None)
+            for match in _CITE_MARK.finditer(text)]
+
+
+def _classify_mark(document: str, number: int | None, *, overview: bool, cited: set[tuple[str, int | None]],
+                   cited_pages: set[int], cited_names: set[str], known_names: set[str],
+                   ) -> tuple[str, str, object] | None:
+    """一条出处标注落到哪条规则上，落不到就返回 None。返回（code, level, 报出来的值）。
+
+    `cited` 是本页出处的（文档, 页）对，`cited_pages` 与 `cited_names` 是它的两个投影。
+    """
+    # 中间页与首页读的是子页不是原文，页码无从核对，提示词也禁止标——标了就是编的。
+    if overview and number is not None:
+        return "overview_cites_pages", "error", number
+    if not document:
+        return None if number in cited_pages else ("page_out_of_range", "error", number)
+    if not _HAS_SUFFIX.search(document):
+        return None
+    name = _loose_name(document)
+    # 文档级标注（没有页码）只要这本书读过就算对上，不必逐页配。
+    if (name, number) in cited or (number is None and name in cited_names):
+        return None
+    if name in cited_names:
+        return "page_out_of_range", "error", number
+    # 这门课确实有这份教材，只是这一页没读过它。可能是对的，交给用户看，不当编造。
+    if name in known_names:
+        return "cross_document_mark", "warn", document
+    # 整份文档标注常常只是行文里提了个文件名（「配置写在 README.md 里」），比编造页码轻一档。
+    return "fabricated_document", "error" if number is not None else "warn", document
+
+
+def lint_pages(pages: list[LintPage], *, material_pages: dict[str, set[int]],
+               material_names: dict[str, str]) -> list[dict[str, object]]:
+    """给一门课的知识页做体检，只报不改。error 是该重建或该修的，warn 是提示。
+
+    `material_pages` 是每份教材在检索库里实际存在的页码，`material_names` 是教材 id 到文件名。
+    两者由调用方查库给出，这里不碰 IO——每条规则都要能用手造的页数据钉住。
+
+    每条发现都带 concept_id 与 concept_name；教材级的对账落不到某一页，concept_id 是空串、
+    名字位上是教材文件名。`code` 决定文案，其余键是文案的插值参数。
+    """
+    issues: list[dict[str, object]] = []
+
+    def report(page: LintPage, level: str, code: str, **params: object) -> None:
+        issues.append({"concept_id": page.concept_id, "concept_name": page.concept_name,
+                       "level": level, "code": code, **params})
+
+    known_ids = {page.concept_id for page in pages}
+    parents = {page.parent_id for page in pages if page.parent_id}
+    known_names = {_loose_name(name) for name in material_names.values()}
+    read_pages: dict[str, set[int]] = {}
+
+    for page in pages:
+        located = parse_source_refs(list(page.refs))
+        cited_pages = {number for _document, number, _chunk in located if number is not None}
+        cited = {(_loose_name(document), number) for document, number, _chunk in located}
+        cited_names = {name for name, _number in cited}
+        if page.material_id:
+            read_pages.setdefault(page.material_id, set()).update(cited_pages)
+        overview = page.concept_id == INDEX_ID or page.concept_id in parents
+        # 一条标注只落一条规则，先判最能说明问题的那条：同一处写法报两遍会让报告没人看。
+        buckets: dict[tuple[str, str], list] = {}
+        for document, number in _marks_in(page.body):
+            if verdict := _classify_mark(document, number, overview=overview, cited=cited,
+                                         cited_pages=cited_pages, cited_names=cited_names,
+                                         known_names=known_names):
+                buckets.setdefault(verdict[:2], []).append(verdict[2])
+        for (code, level), values in sorted(buckets.items(), key=lambda item: (item[0][1] != "error", item[0][0])):
+            unique = sorted(set(values))
+            report(page, level, code, n=len(unique),
+                   **{"pages" if code in _PAGE_CODES else "documents": _sample(unique)})
+        if not overview and not located:
+            report(page, "error", "leaf_without_sources")
+        if not page.body.strip():
+            report(page, "warn", "empty_body")
+        if page.parent_id and page.parent_id not in known_ids:
+            report(page, "warn", "orphan_page", parent=page.parent_id)
+        if not page.source_hash:
+            report(page, "warn", "no_source_hash")
+
+    issues += _coverage_issues(read_pages, material_pages, material_names)
+    # error 先摆出来，同级内保持页面顺序。
+    return sorted(issues, key=lambda issue: issue["level"] != "error")
+
+
+def _coverage_issues(read_pages: dict[str, set[int]], material_pages: dict[str, set[int]],
+                     material_names: dict[str, str]) -> list[dict[str, object]]:
+    """出处与检索库的页码对账，两边都来自实际内容，正常构建应当吻合。
+
+    只对账有知识页的教材：没生成过页的教材两边必然对不上，那不是缺陷。
+    「没人读的页」降为 warn——上级页接管区间、空白页不进检索库这些形态都可能让它响。
+    """
+    out: list[dict[str, object]] = []
+    for material_id, seen in sorted(read_pages.items()):
+        indexed = material_pages.get(material_id)
+        if indexed is None:  # 这份教材的正文一页页码都没有，对不出结论
+            continue
+        # 对账是教材级的，落不到某一页上：concept_id 留空，名字位上给教材文件名。
+        row = {"concept_id": "", "concept_name": material_names.get(material_id, material_id)}
+        if dangling := sorted(seen - indexed):
+            out.append({**row, "level": "error", "code": "dangling_page_refs",
+                        "pages": _sample(dangling), "n": len(dangling)})
+        if unread := sorted(indexed - seen):
+            out.append({**row, "level": "warn", "code": "unread_pages",
+                        "pages": _sample(unread), "n": len(unread)})
+    return out
+
+
+def _sample(values: list) -> list:
+    return values[:LINT_SAMPLE_MAX]
+
+
+def coverage_summary(counts: dict[str, object]) -> str:
     """构建结果的机器可读汇总，界面按字段渲染中英两版。
 
     覆盖率必须说出来：节点上限之下写出的仍然是这本书的一部分，静默截断读起来像写全了。
+    `outline` 报目录是从教材现算的还是退回了概念表，降质同样不该静默。
+    体检没跑成时 `issues` 字段不出现，不写 0——0 是「查过、没问题」的结论，不能拿来顶替。
+    `oversized` 是落不了盘的页（手写区把整页撑满了），它们保持旧版本，和 `empty` 不是一回事。
     """
-    return ("wiki_coverage "
-            f"concepts={counts.get('candidates', 0)} "
-            f"pages={counts.get('written', 0) + counts.get('skipped', 0)} "
-            f"written={counts.get('written', 0)} skipped={counts.get('skipped', 0)} "
-            f"merged={counts.get('capped', 0)} "
-            f"empty={counts.get('ungrounded', 0)} pruned={counts.get('pruned', 0)}")
+    def count(key: str) -> int:
+        value = counts.get(key, 0)
+        return value if isinstance(value, int) else 0
+
+    fields = [f"concepts={count('candidates')}",
+              f"pages={count('written') + count('skipped')}",
+              f"written={count('written')}", f"skipped={count('skipped')}",
+              f"merged={count('capped')}",
+              f"empty={count('ungrounded')}", f"oversized={count('oversized')}",
+              f"pruned={count('pruned')}"]
+    if "issues" in counts:
+        fields.append(f"issues={count('issues')}")
+    fields.append(f"outline={counts.get('outline', 'material')}")
+    return "wiki_coverage " + " ".join(fields)
+
+
+# ---- 配对：哪几个来源在讲同一件事。读时现算，不落盘 ----
+
+# 每页取几个最近邻当候选。只连互为近邻的一对，k 再放大也只是让相似的页连成一团。
+WIKI_PAIR_K = 6
+# 一页最多连几条边。这一行是读页时的旁注，不是目录，多了会盖过正文。
+WIKI_PAIR_MAX = 3
+
+
+@dataclass(frozen=True)
+class PairNode:
+    """参与配对的一页：教材归属定连不连，直系父页用来标定门槛。"""
+    concept_id: str
+    material_id: str
+    parent_id: str
+
+
+def pair_pages(nodes: list[PairNode], similarity: list[list[float]]) -> list[dict[str, object]]:
+    """哪几个来源在讲同一件事。输入是页的归属与它们两两的相似度，这里不碰 IO 也不碰向量。
+
+    **只连跨教材的页。** 一门课只有一本书时本来就没有「几个来源」，同一本书里的相邻小节是
+    「相关」不是「同一件事」，它们的关系中间页也已经用自然语言写过。同章的两页必然同教材，
+    所以这一条把同章的边一并挡在外面，不必再看树。
+    连边还要互为近邻、余弦为正、分数过这门课自己标定的门槛；一条都没连上的页留最像的那个来源。
+    """
+    # 矩阵不是 n×n 就是调用方接错了。这里不抛：配对是页面上的旁注，坏数据只该让它不显示。
+    if len(nodes) < 2 or len(similarity) != len(nodes) or any(len(row) != len(nodes) for row in similarity):
+        return []
+    # 余弦不为正的两页，在任何标定口径下都不可能是「在讲同一件事」。门槛是相对量（页对的中位数），
+    # 一门课的页彼此都不像时它会一路降到 0，这条是它下面唯一的绝对线，主路径与保底都受它管。
+    candidates = [pair for pair in _mutual_pairs(similarity)
+                  if pair[2] > 0 and nodes[pair[0]].material_id != nodes[pair[1]].material_id]
+    threshold = _sibling_threshold(nodes, similarity)
+    degree: dict[int, int] = {}
+    edges = _take_edges([pair for pair in candidates if pair[2] >= threshold], degree)
+    edges += _lonely_page_floor(candidates, degree)
+    return [{"a": nodes[left].concept_id, "b": nodes[right].concept_id, "score": round(score, 4)}
+            for left, right, score in sorted(edges, key=lambda edge: (-edge[2], edge[0], edge[1]))]
+
+
+def _mutual_pairs(similarity: list[list[float]]) -> list[tuple[int, int, float]]:
+    """互为 k 近邻的页对。单向不算：写得概括的那一页谁都觉得像，它会挂满整门课。"""
+    count = len(similarity)
+    nearest = [set(sorted((other for other in range(count) if other != index),
+                          key=lambda other: (-similarity[index][other], other))[:WIKI_PAIR_K])
+               for index in range(count)]
+    return [(left, right, similarity[left][right])
+            for left in range(count) for right in sorted(nearest[left])
+            if right > left and left in nearest[right]]
+
+
+def _sibling_threshold(nodes: list[PairNode], similarity: list[list[float]]) -> float:
+    """门槛每门课自己标定：余弦的绝对值不跨库可比（rag_min_similarity 默认关掉正是这个原因）。
+
+    同一个直系父页下的兄弟天生在讲相近的东西，取它们两两相似度的中位数当「讲的是同一件事」的下限。
+    顶层页不算一组：它们分属各本教材，凑在一起标出来的数代表不了「同一章里的两页有多像」。
+    一对兄弟都没有的课（页全在顶层）退回全部页对的中位数。
+    """
+    groups: dict[str, list[int]] = {}
+    for index, node in enumerate(nodes):
+        if node.parent_id:
+            groups.setdefault(node.parent_id, []).append(index)
+    scores = [similarity[left][right] for members in groups.values() for left, right in combinations(members, 2)]
+    if not scores:
+        scores = [similarity[left][right] for left, right in combinations(range(len(nodes)), 2)]
+    return median(scores) if scores else 0.0
+
+
+def _take_edges(pairs: list[tuple[int, int, float]], degree: dict[int, int]) -> list[tuple[int, int, float]]:
+    """分数高的先占位，两端都没到上限才收。同分按下标定序，同一份数据每次给同样的结果。"""
+    kept = []
+    for left, right, score in sorted(pairs, key=lambda pair: (-pair[2], pair[0], pair[1])):
+        if degree.get(left, 0) < WIKI_PAIR_MAX and degree.get(right, 0) < WIKI_PAIR_MAX:
+            degree[left] = degree.get(left, 0) + 1
+            degree[right] = degree.get(right, 0) + 1
+            kept.append((left, right, score))
+    return kept
+
+
+def _lonely_page_floor(candidates: list[tuple[int, int, float]],
+                       degree: dict[int, int]) -> list[tuple[int, int, float]]:
+    """一条边都没连上的页，把它最像的那个来源留下来（候选到这里已经全是跨教材的）。
+
+    门槛按同章兄弟标定，而另一本书讲同一节时用的是另一套措辞，未必够得着那条线；
+    「几本书都讲了这一节」正是这件功能要兑付的东西，不该被它挡掉。
+    """
+    rescued: list[tuple[int, int, float]] = []
+    for index in sorted({end for pair in candidates for end in pair[:2]}):
+        if degree.get(index, 0):
+            continue
+        outside = [pair for pair in candidates if index in pair[:2]
+                   and degree.get(pair[1] if pair[0] == index else pair[0], 0) < WIKI_PAIR_MAX]
+        if outside:
+            rescued += _take_edges([max(outside, key=lambda pair: (pair[2], -pair[0], -pair[1]))], degree)
+    return rescued

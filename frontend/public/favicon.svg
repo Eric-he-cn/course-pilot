@@ -1,0 +1,7 @@
+<!-- 16px 档：折角那条斜线在这个尺寸会糊成一团，只留方框 + 基线，形状仍可辨。
+     颜色写死不走 token——favicon 在文档外，拿不到 CSS 变量。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 60">
+  <rect width="60" height="60" rx="12" fill="#18181B"/>
+  <path d="M19 19h14l8 8v14" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+  <rect x="19" y="35" width="14" height="6" fill="#34D399"/>
+</svg>

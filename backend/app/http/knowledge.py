@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from modules.courses.api import CourseCatalogPort
-from modules.knowledge.api import KnowledgeFeatureDisabledError, MaterialNotIndexedError
+from modules.knowledge.api import (
+    KnowledgeFeatureDisabledError, MaterialNotIndexedError, WikiBuildInProgressError, WikiPageTooLargeError,
+)
 from app.bootstrap import Application
 from app.http.deps import current_workspace
 from modules.knowledge.service import KnowledgeService
@@ -19,6 +21,12 @@ from modules.knowledge.worker import KnowledgeJobWorker
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(default=6, ge=1, le=20)
+
+
+class HandwrittenRequest(BaseModel):
+    """知识页手写区的正文。必填：漏传字段和「用户要清空」是两件事，不能都当成空串。
+    长度由页面的字节上限统一裁决，这里不再设第二道字符门槛。"""
+    text: str
 
 
 def _not_found(message: str) -> HTTPException:
@@ -178,6 +186,15 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
         except ValueError as error:
             raise _not_found(str(error)) from error
 
+    @router.get("/materials/{material_id}/wiki/report")
+    def wiki_report(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """最近一次构建完成时的覆盖率报告。没构建过就是空，不是错误。"""
+        try:
+            job = application.knowledge.latest_wiki_report(material_id=material_id)
+        except ValueError as error:
+            raise _not_found(str(error)) from error
+        return {"job": _job_payload(job) if job is not None else None}
+
     @router.post("/materials/{material_id}/wiki")
     def build_wiki(material_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
         try:
@@ -196,13 +213,63 @@ def build_knowledge_router(*, legacy_data_pending: Callable[[], bool] = lambda: 
         require_course(application, course_id)
         return {"pages": application.knowledge.wiki_pages(course_id=course_id)}
 
+    # lint 与 graph 都要排在 /wiki/{concept_id} 前面，否则会被当成一个概念 id 去找页。
+    @router.get("/courses/{course_id}/wiki/lint")
+    def lint_wiki(course_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """知识页体检：出处越界、编造出处、孤儿页这类确定性缺陷。按需现算，只报不改。"""
+        require_course(application, course_id)
+        return {"issues": application.knowledge.wiki_lint(course_id=course_id)}
+
+    @router.get("/courses/{course_id}/wiki/graph")
+    def wiki_graph(course_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """哪几页在讲同一件事，按需现算。没有向量（demo、没配嵌入模型）时是空表，不是错误。"""
+        require_course(application, course_id)
+        return {"edges": application.knowledge.wiki_pairs(course_id=course_id)}
+
     @router.get("/courses/{course_id}/wiki/{concept_id}")
     def read_wiki_page(course_id: str, concept_id: str, application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """整页与拆好的两段一起给：content 是落盘原样，body 与 handwritten 让界面把
+        系统生成的部分和用户自己写的补充分开渲染，分隔标记不必上屏。"""
         require_course(application, course_id)
         try:
-            return {"concept_id": concept_id, "content": application.knowledge.wiki_page(course_id=course_id, concept_id=concept_id)}
+            content, document = application.knowledge.wiki_page_view(course_id=course_id, concept_id=concept_id)
         except (LookupError, ValueError) as error:
             raise _not_found(str(error)) from error
+        return {"concept_id": concept_id, "content": content,
+                "body": document.body, "handwritten": document.handwritten}
+
+    @router.put("/courses/{course_id}/wiki/{concept_id}/handwritten")
+    def write_wiki_handwritten(course_id: str, concept_id: str, body: HandwrittenRequest,
+                               application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """写手写区。分隔线以下归用户，重新生成不覆盖，这里也只动这一段。"""
+        require_course(application, course_id)
+        try:
+            document = application.knowledge.write_wiki_handwritten(
+                course_id=course_id, concept_id=concept_id, text=body.text)
+        except LookupError as error:
+            raise _not_found(str(error)) from error
+        except WikiBuildInProgressError as error:
+            raise HTTPException(status_code=409, detail={"code": "wiki_build_running", "message": str(error)}) from error
+        except WikiPageTooLargeError as error:
+            raise HTTPException(status_code=413, detail={"code": "wiki_page_too_large", "message": str(error)}) from error
+        except ValueError as error:  # 页面本身坏了（非 UTF-8）：说清楚，别把内容悄悄写没
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"concept_id": concept_id, "body": document.body, "handwritten": document.handwritten}
+
+    @router.get("/courses/{course_id}/wiki/{concept_id}/sources")
+    def read_wiki_page_sources(course_id: str, concept_id: str, limit: int = 0,
+                               application: Application = Depends(current_workspace)) -> dict[str, object]:
+        """这一页转述时依据的教材页。界面把正文里的 [p.N] 接到可点开的原文上。
+
+        limit 是每份教材列出的页数上限，不传用抽屉的默认档；正文接线传大值取全。
+        未知 concept 返回空表而不是 404：出处是页的附属，页不在就是没有出处。
+        """
+        require_course(application, course_id)
+        sources = application.knowledge.wiki_page_sources(
+            course_id=course_id, concept_id=concept_id, cap=min(limit, 200) if limit > 0 else None)
+        return {"anchors": [{"document": item.document, "page": item.page, "chunk_id": item.chunk_id,
+                             "snippet": item.snippet, "material_id": item.material_id}
+                            for item in sources.anchors], "pages": sources.pages}
 
     @router.get("/health")
     def health(application: Application = Depends(current_workspace)) -> dict[str, object]:

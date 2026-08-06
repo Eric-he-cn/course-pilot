@@ -18,8 +18,8 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from core.identity import sole_workspace  # noqa: E402
 
-from adapters.llm.openai_compatible import OpenAICompatibleChat  # noqa: E402
-from contracts.llm import ChatDelta, ChatMessage  # noqa: E402
+from adapters.llm import OpenAICompatibleChat, ResponsesApiChat  # noqa: E402
+from contracts.llm import AgentChatPort, ChatDelta, ChatMessage  # noqa: E402
 from core.settings import Settings  # noqa: E402
 
 _JUDGE_PROMPT = """你是学习助手的离线评审。只依据给出的记录打分，不做补充解释。
@@ -78,7 +78,7 @@ def render_case(record: dict, store_path: Path) -> str:
     )
 
 
-def judge(chat: OpenAICompatibleChat, case: str) -> dict:
+def judge(chat: AgentChatPort, case: str) -> dict:
     messages = [ChatMessage(role="system", content=_JUDGE_PROMPT), ChatMessage(role="user", content=case)]
     parts: list[str] = []
     for item in chat.chat(messages=messages):
@@ -120,7 +120,8 @@ def main() -> None:
     if not records:
         raise SystemExit(f"{traces_dir(data_dir)} 里没有可评测的完成轮次")
 
-    chat = OpenAICompatibleChat(
+    adapter = ResponsesApiChat if settings.text_protocol == "responses" else OpenAICompatibleChat
+    chat = adapter(
         api_key=settings.text_api_key, base_url=settings.text_base_url, model=settings.text_model,
         provider=settings.text_provider, extra_body=settings.text_extra_body,
         total_timeout_seconds=settings.llm_total_timeout_seconds,

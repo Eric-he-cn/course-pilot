@@ -9,7 +9,7 @@ from datetime import date
 from collections.abc import Callable, Iterator, Sequence
 
 from contracts.knowledge import KnowledgeSearchPort, ResolvedKnowledgeScope
-from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ToolCallRequest, ToolSpec
+from contracts.llm import AgentChatPort, ChatDelta, ChatFinal, ChatMessage, ChatReasoning, ChatToolCalls, LLMProviderError, ServerToolCall, ToolCallRequest, ToolSpec
 from core.common import utc_now
 from core.settings import PartitionLimits
 from modules.learning.api import ArchiveReaderPort, EvidenceWriterPort
@@ -188,7 +188,8 @@ def _typed_text(message: str) -> str:
 
 # 一道选择题的特征：A-D 每个字母只出现一次。三道题会出现三个「A.」，
 # 那种情况一次 ask_user 问不了，选项留在正文里是对的。
-_CHOICE_LINE = re.compile(r"^\s*\*{0,2}([A-D])[.、)\s]", re.MULTILINE)
+# 行首允许 - / * 列表前缀：真模型常把选项写成「- **A.** 110」。
+_CHOICE_LINE = re.compile(r"^\s*(?:[-*]\s+)?\*{0,2}([A-D])[.、)\s]", re.MULTILINE)
 
 
 def _single_choice_question(text: str) -> bool:
@@ -205,7 +206,7 @@ def _has_plan_intent(text: str) -> bool:
 # 误命中会把一句纯查询变成一次未经要求的重写，所以必须见到改动动词。
 _PLAN_CHANGE_DIRECT = re.compile(
     r"进系统|(?:排|重排|改|修改|调整|更新|写|存|做|生成)[一二三下份个张点\s]{0,4}(?:复习|学习|备考)?计划"
-    r"|计划[里的上]{0,2}(?:改|调整|更新|重排|重新排)"
+    r"|计划[里的上中]{0,2}(?:改|调整|更新|重排|重新排|(?:加|删|添|补|增|插)(?!的|过|充|长|了吗))"
     r"|(?:update|change|adjust|revise|rewrite|redo|reschedule|rearrange|redistribute)\s+"
     r"(?:the\s+|my\s+|our\s+)?(?:study\s+|review\s+|revision\s+|exam\s+)?(?:plan|schedule|timetable)"
     r"|(?:make|create|build|write|draw|set)\s+(?:me\s+)?(?:up\s+)?(?:a\s+|an\s+|the\s+|my\s+)?"
@@ -257,20 +258,36 @@ _PROVIDER_MARKUP = re.compile(r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}.*", re.DOTALL)
 
 # 多轮工具调用之间模型爱写"我来查一下""证据齐全了"这类过场话，提示词压不住；
 # 短、无引用、无公式、无列表的中间段按过场话丢弃，有实质内容的段落一律保留。
+# 选项行也算实质内容：ask_user 的 question 参数不渲染，题干只存在于正文里，
+# 一道短选择题被当成过场话丢掉，用户就只剩四个没有题目的按钮。
 _SUBSTANCE = re.compile(r"\[\d+\]|\$|^\s*[-*\d]", re.MULTILINE)
 _FILLER_MAX_CHARS = 80
 
 
 def _is_filler(segment: str) -> bool:
     text = segment.strip()
-    return bool(text) and len(text) <= _FILLER_MAX_CHARS and not _SUBSTANCE.search(text)
+    return (bool(text) and len(text) <= _FILLER_MAX_CHARS
+            and not _SUBSTANCE.search(text) and not _single_choice_question(text))
+
+
+# 段落查重前先归一：真模型重写同一道题时常只改动粗体标记和空白。
+_NORMALIZE_STRIP = re.compile(r"[\s*]+")
 
 
 def join_answer(segments: list[str]) -> str:
-    """最后一段是最终回答，之前的中间段只保留有实质内容的。"""
+    """最后一段是最终回答，之前的中间段只保留有实质内容的。
+    整段内容在前文里原样出现过的也不进回答——模型爱在工具轮之间把题目重写一遍。"""
     if not segments:
         return ""
-    kept = [segment for segment in segments[:-1] if segment.strip() and not _is_filler(segment)]
+    kept, seen = [], ""
+    for segment in segments[:-1]:
+        if not segment.strip() or _is_filler(segment):
+            continue
+        normalized = _NORMALIZE_STRIP.sub("", segment)
+        if normalized and normalized in seen:
+            continue
+        kept.append(segment)
+        seen += normalized
     kept.append(segments[-1])
     return "\n\n".join(part.strip() for part in kept if part.strip())
 
@@ -285,6 +302,25 @@ def _summary_fields(result: ToolOutcome, *, reused: bool = False) -> dict[str, o
     if reused:
         fields["reused"] = True
     return fields
+
+
+# 厂商端调用做了什么 → 摘要文案。开厂商端搜索时才会出现，见架构 §5.10。
+_SERVER_ACTIONS = {"search": "厂商端检索", "open_page": "厂商端打开网页", "find_in_page": "厂商端查网页"}
+# key 写成字面量，i18n 对账门才看得见它们；没列出的动作走通用那条，英文界面同样有译文。
+_SERVER_SUMMARY_KEYS = {
+    "search": "summary.server_search", "open_page": "summary.server_open_page",
+    "find_in_page": "summary.server_find_in_page",
+}
+
+
+def _server_call_fields(call: ServerToolCall) -> dict[str, object]:
+    """厂商端调用的展示文案，与本地工具走同一组字段（SSE、activity、trace 共用）。"""
+    action = _SERVER_ACTIONS.get(call.action, "厂商端调用")
+    return {
+        "summary": f"{action}：{call.detail}" if call.detail else action,
+        "summary_key": _SERVER_SUMMARY_KEYS.get(call.action, "summary.server_call"),
+        "summary_args": {"detail": call.detail},
+    }
 
 
 def _args_key(arguments: str) -> str:
@@ -455,6 +491,27 @@ class TurnService:
         for key, value in extra.items():
             total[key] = total.get(key, 0) + value
 
+    def _server_activity(self, calls: Sequence[ServerToolCall], *, round_index: int,
+                         activity: list[dict[str, object]], trace_tools: list[dict[str, object]],
+                         prefix: str = "") -> Iterator[dict[str, object]]:
+        """厂商在它那边跑过的调用（如联网搜索）。本地没有执行回环，也不占工具预算，
+        拿到的只是它做了什么——一步一条报完，不上屏就等于凭空多出一段联网结论。
+
+        prefix 给子任务用：父子两边的 id 都由厂商生成，撞上会让两条记录合成一条。
+        """
+        for served in calls:
+            call_id = f"{prefix}{served.id}"
+            shown = _server_call_fields(served)
+            arguments = {"action": served.action, "detail": served.detail}
+            yield self._event("tool_call", call_id=call_id, name=served.kind,
+                              arguments=arguments, origin="provider")
+            yield self._event("tool_result", call_id=call_id, name=served.kind, ok=served.ok, **shown)
+            activity.append({"call_id": call_id, "name": served.kind, "origin": "provider",
+                             "ok": served.ok, **shown})
+            trace_tools.append({"call_id": call_id, "round": round_index, "origin": "provider",
+                                "name": served.kind, "arguments": arguments, "ok": served.ok, **shown,
+                                "decision": "allowed", "reason": None, "duration_ms": served.duration_ms})
+
     def _context_usage(self, messages: list[ChatMessage], base: list[ContextSegment], assembled, summary,
                        trim: TrimReport | None = None, history_count: int | None = None,
                        tools: Sequence[ToolSpec] = ()) -> dict[str, object]:
@@ -577,13 +634,14 @@ class TurnService:
         self, *, scope: ResolvedKnowledgeScope, session_id: str, responder: AgentChatPort,
         registry: CitationRegistry, capabilities: frozenset[str], budget: dict[str, int],
         used: dict[str, int], beat: Callable[[], None], usage: dict[str, int],
-        parsed: dict, today: str, sub_steps: list[dict],
+        parsed: dict, today: str, sub_steps: list[dict], served: list[ServerToolCall] | None = None,
     ) -> ToolOutcome:
         """子任务：带一套只读工具自己跑几轮，把最后一次回复当成交回父轮的成果。
 
         额度用父轮那两个 dict，子任务花掉的算在父轮头上——子任务不该是绕开预算的口子。
         每一步都续约心跳：父轮在这期间一个 SSE 事件都不发，没有心跳会被下一轮判失活抢占。
         摘要不额外调模型：子 agent 自己的最后一轮就是摘要，为「总结一下」再花一次调用不值。
+        served 收厂商端跑过的调用：这里发不出 SSE（不是生成器），交回父轮由它上报。
         """
         task = str(parsed.get("task") or "").strip()
         if not task:
@@ -627,6 +685,8 @@ class TurnService:
             rounds += 1
             if outcome is not None:
                 self._merge_usage(usage, outcome.usage)
+                if served is not None:
+                    served += outcome.server_calls
             # 子任务只在父轮的时序里留一层骨架：几轮、每轮说了多少、调了哪些工具。
             # 正文不记——它已经以 sub: 前缀落进消息表，父轮 trace 再存一份是白花 payload。
             sub_calls = list(outcome.calls) if isinstance(outcome, ChatToolCalls) and allow_tools else []
@@ -635,7 +695,8 @@ class TurnService:
                               "text_chars": len("".join(parts)), "calls": [call.name for call in sub_calls]})
             if isinstance(outcome, ChatToolCalls) and allow_tools:
                 messages.append(ChatMessage(role="assistant", content="".join(parts), tool_calls=outcome.calls,
-                                            reasoning=outcome.reasoning or reasoning))
+                                            reasoning=outcome.reasoning or reasoning,
+                                            server_calls=outcome.server_calls))
                 for call in outcome.calls:
                     result = self._executor.execute(
                         scope=scope, session_id=session_id, name=call.name, arguments=call.arguments,
@@ -829,6 +890,10 @@ class TurnService:
                                  text="".join(answer_parts), calls=(), outcome="final",
                                  finish_reason=response.provider_finish_reason if response else None,
                                  reasoning_field=reasoning_field)
+                    # 这条路一件本地工具都不发，厂商端搜索反而最可能在这里发生。
+                    yield from self._server_activity(response.server_calls if response else (),
+                                                     round_index=1, activity=activity,
+                                                     trace_tools=trace_tools)
                     answer = "".join(answer_parts) or (response.text if response else "")
                     finish_reason = response.finish_reason if response else "stop"
                     responder_mode = response.mode if response else "unknown"
@@ -910,6 +975,9 @@ class TurnService:
                 # 没权限时补也是白补，plan_update 会被闸门原样挡回来。
                 wants_plan_change = plan_intent and _wants_plan_change(message)
                 plan_written = plan_conflicted = plan_reminded = False
+                # skill 的 profile 是整体替换，会把本轮用户明确授权的计划工具一并收走，
+                # 模型只能在正文里声称已更新。照基座工具的先例保留这两件。
+                plan_tools: tuple[str, ...] = ("get_plan", "plan_update") if wants_plan_change else ()
                 active_skill: str | None = None
                 max_rounds = self._max_tool_rounds
                 # 有尚未批改的练习时直接把 practice 规程注入：纯靠模型自觉加载 skill 会漏，
@@ -954,7 +1022,7 @@ class TurnService:
                     messages.append(ChatMessage(role="assistant", content="", tool_calls=(ToolCallRequest(id=call_id, name="use_skill", arguments=json.dumps(arguments)),)))
                     messages.append(ChatMessage(role="tool", content=f"# Skill: {auto_skill.name}\n\n{skill_body}", tool_call_id=call_id))
                     base_segments = base_segments + [ContextSegment("context.segment.skill", "skill 规程", estimate_tokens(skill_body))]
-                    skill_profile = profile_for_skill(auto_skill.allowed_tools)
+                    skill_profile = profile_for_skill(auto_skill.allowed_tools + plan_tools)
                     # skill 激活后不再摘 delegate：声明它的 skill（research）本来就是被
                     # 意图路由进来的，那一步已经是一道闸门，再摘一次等于永远拿不到。
                     active_skill, allowed_tools = auto_skill.name, without_tools(skill_profile.tools, wiki_off)
@@ -964,6 +1032,10 @@ class TurnService:
                 # 服务端往下一次模型调用里塞了什么。补救轮不是模型自己要跑的，
                 # 时序上看不出这一点，用户会以为它自己想起来要写计划。
                 injected: str | None = None
+                # 首个 ChatFinal 时回答已经完整。之后进「只调工具」的补救轮就把正文封板：
+                # 模型常无视「不要重复输出正文」把答案重写一遍，不封板用户会看到两份。
+                # 写计划的补救例外——它之后那句「计划已更新」要给用户看。
+                answer_sealed = False
                 react_round = 0
                 try:
                     while response is None:
@@ -998,11 +1070,14 @@ class TurnService:
                         outcome: ChatToolCalls | ChatFinal | None = None
                         for item in responder.chat(messages=messages, tools=round_tools):
                             if isinstance(item, ChatDelta):
+                                # 封板期间正文只进 segment_parts（模型要看到自己说过什么），
+                                # 不下发也不进回答。
                                 segment_parts.append(item.text)
-                                answer_parts.append(item.text)
-                                seq += 1
                                 last_heartbeat = self._heartbeat(turn.id, last_heartbeat)
-                                yield self._event("text_delta", seq=seq, text=item.text)
+                                if not answer_sealed:
+                                    answer_parts.append(item.text)
+                                    seq += 1
+                                    yield self._event("text_delta", seq=seq, text=item.text)
                             elif isinstance(item, ChatReasoning):
                                 # 思考期间一个字都不下发，界面会停在上一个动作上；而且没有心跳，
                                 # 长思考会让这一轮被判失活、被下一轮抢占。
@@ -1028,8 +1103,12 @@ class TurnService:
                             reasoning_field=round_reasoning_field,
                         )
                         injected = None
+                        yield from self._server_activity(
+                            outcome.server_calls if outcome is not None else (),
+                            round_index=react_round, activity=activity, trace_tools=trace_tools)
                         if isinstance(outcome, ChatFinal):
-                            answer_segments.append("".join(segment_parts))
+                            if not answer_sealed:
+                                answer_segments.append("".join(segment_parts))
                             missing_steps = []
                             if active_skill == "practice" and not practice.reminded and tool_rounds < max_rounds:
                                 missing_steps = practice.missing_steps()
@@ -1041,45 +1120,51 @@ class TurnService:
                                 # 模型常把新计划写在正文里就收尾，库里一个字没动，用户以为已经改了。
                                 plan_reminded = True
                                 self._merge_usage(usage_total, outcome.usage)
-                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts), server_calls=outcome.server_calls))
                                 messages.append(ChatMessage(
                                     role="user",
                                     content=_PLAN_REMINDER_EN if _typed_in_latin(message) else _PLAN_REMINDER_ZH,
                                 ))
                                 trace_record["plan_reminder"] = True
                                 step["outcome"], injected = "remediation", "plan_reminder"
+                                # 这条补救之后模型要报「计划已更新」，正文不封板。
+                                answer_sealed = False
                                 continue
                             if not missing_steps and wants_memory and not memory_written and not memory_reminded and tool_rounds < max_rounds:
                                 # 用户明确要求记住，但这一轮没有一次成功的 memory_patch：
                                 # 模型会照样说「已记住」，用户下次打开长期记忆却是空的。
                                 memory_reminded = True
                                 self._merge_usage(usage_total, outcome.usage)
-                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts), server_calls=outcome.server_calls))
                                 messages.append(ChatMessage(role="user", content="用户要求记住的内容你还没有写进长期记忆。现在只调用 memory_patch 补上，不要重复输出正文。"))
                                 trace_record["memory_reminder"] = True
                                 step["outcome"], injected = "remediation", "memory_reminder"
+                                answer_sealed = True
                                 continue
-                            # 判据要看所有段落：题目常常出在某个工具轮之前，只看最后一段会漏掉。
-                            # 不能用 join_answer——它带着展示用的过滤，会把没有引用的短段丢掉。
+                            # 判据要看所有段落且逐段判：题目常常出在某个工具轮之前，只看最后
+                            # 一段会漏掉；而重写过的同一道题拼在一起是两组 A-D，整体判会被
+                            # 当成多道题漏掉。不能用 join_answer——它带展示用过滤，会丢短段。
                             if (not missing_steps and not choices and not choices_reminded
-                                    and _single_choice_question("\n".join(answer_segments)) and tool_rounds < max_rounds):
+                                    and any(map(_single_choice_question, answer_segments)) and tool_rounds < max_rounds):
                                 # 出了一道选择题却没走 ask_user：选项只是正文里的文字，
                                 # 用户没得可点。提示词两版都压不住，只能服务端补一轮。
                                 choices_reminded = True
                                 self._merge_usage(usage_total, outcome.usage)
-                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts), server_calls=outcome.server_calls))
                                 messages.append(ChatMessage(role="user", content="这道选择题的选项还没有变成可点的按钮。现在只调用 ask_user（question 放题干，options 放 A、B、C、D 四个短标签），不要重复输出正文。"))
                                 trace_record["choices_reminder"] = True
                                 step["outcome"], injected = "remediation", "choices_reminder"
+                                answer_sealed = True
                                 continue
                             if missing_steps:
                                 # 规程有步骤没做完就补一轮，只补一次。
                                 practice.reminded = True
                                 self._merge_usage(usage_total, outcome.usage)
-                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts)))
+                                messages.append(ChatMessage(role="assistant", content="".join(segment_parts), server_calls=outcome.server_calls))
                                 messages.append(ChatMessage(role="user", content=_practice_reminder(missing_steps, practice.question_count, practice.evidence_count)))
                                 trace_record["practice_reminder"] = missing_steps
                                 step["outcome"], injected = "remediation", "practice_reminder"
+                                answer_sealed = True
                                 continue
                             response = outcome
                             self._merge_usage(usage_total, outcome.usage)
@@ -1095,9 +1180,11 @@ class TurnService:
                         elif isinstance(outcome, ChatToolCalls):
                             self._merge_usage(usage_total, outcome.usage)
                             tool_rounds += 1
-                            answer_segments.append("".join(segment_parts))
+                            if not answer_sealed:
+                                answer_segments.append("".join(segment_parts))
                             # reasoning 必须原样带回去：思考模式下厂商会拒收缺它的 assistant 消息。
-                            messages.append(ChatMessage(role="assistant", content="".join(segment_parts), tool_calls=outcome.calls, reasoning=outcome.reasoning or reasoning))
+                            # 厂商端调用同理，不回传它就恢复不了自己那边的搜索结果，模型只能重搜一遍。
+                            messages.append(ChatMessage(role="assistant", content="".join(segment_parts), tool_calls=outcome.calls, reasoning=outcome.reasoning or reasoning, server_calls=outcome.server_calls))
                             for call in outcome.calls:
                                 yield self._event("tool_call", call_id=call.id, name=call.name, arguments=self._display_args(call.arguments), origin="model")
                                 call_started = time.monotonic()
@@ -1106,6 +1193,8 @@ class TurnService:
                                 # 只对读工具生效——写工具参数相同也是两次不同的事件。
                                 repeat_key = (call.name, _args_key(call.arguments))
                                 cached = tool_results.get(repeat_key) if is_repeatable(call.name) else None
+                                # 子循环里厂商端跑过的调用：那边发不出 SSE，收在这里由父轮报出去。
+                                sub_served: list[ServerToolCall] = []
                                 if cached is not None:
                                     # 沿用被复用那次的 key，只补中文兜底里的后缀；「已复用」靠标记传给前端。
                                     result = replace(
@@ -1125,12 +1214,18 @@ class TurnService:
                                             budget=tool_budget, used=tool_used, beat=beat,
                                             usage=usage_total, parsed=params, today=date.today().isoformat(),
                                             sub_steps=self._new_subagent_log(react, call.id, params),
+                                            served=sub_served,
                                         ),
                                     )
                                     if result.reason is None:
                                         spent = budget_key(call.name)
                                         tool_used[spent] = tool_used.get(spent, 0) + 1
                                         tool_results[repeat_key] = result
+                                # 子任务里的厂商端调用挂 sub: 前缀报出来：父子两边的 id 都由厂商生成，
+                                # 不加前缀撞上就会合成一条。
+                                yield from self._server_activity(sub_served, round_index=react_round,
+                                                                 activity=activity, trace_tools=trace_tools,
+                                                                 prefix="sub:")
                                 if call.name == "memory_patch" and result.ok:
                                     memory_written = True
                                 if call.name == "plan_update":
@@ -1149,7 +1244,7 @@ class TurnService:
                                     active_skill = result.activated_skill
                                     skill = self._skills.get(active_skill)
                                     if skill:
-                                        skill_profile = profile_for_skill(skill.allowed_tools)
+                                        skill_profile = profile_for_skill(skill.allowed_tools + plan_tools)
                                         allowed_tools = without_tools(skill_profile.tools, wiki_off)
                                         capabilities = skill_profile.capabilities - self._offline
                                     max_rounds = max(max_rounds, self.SKILL_TOOL_ROUNDS)

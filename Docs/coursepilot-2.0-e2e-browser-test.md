@@ -1,6 +1,7 @@
 # CoursePilot 2.0 浏览器端到端测试
 
-一次浏览过程覆盖《Demo 交付计划》第 5 节的全部验收项，外加工具循环、跨语言检索和图片提问。
+一次浏览过程覆盖《Demo 交付计划》第 5 节的全部验收项，外加工具循环、跨语言检索、图片提问，
+以及知识页、错题本、界面语言、MCP、开发者模式这几块只有界面上看得见的部分。
 
 教材是真实开源教材的章节切片，断言锚点都是教材里真实存在的事实与页码；回答里出现这些事实，
 才说明证据真的被检索到，而不是模型凭通用知识说出来的。
@@ -10,11 +11,15 @@
 ### 1.1 驱动方式
 
 用内置 Browser pane（`mcp__Claude_Browser__*`）驱动。它没有文件选择器，教材上传靠页面自己
-`fetch` fixture 再注入到隐藏 input——`vite.config.ts` 的 `server.fs.allow` 只放开了
-`testdata/fixtures` 这一个目录，仓库其余文件（含 `.env`）仍返回 403。
+`fetch` fixture 再注入到隐藏 input——`vite.config.ts` 的 `server.fs.allow` 除了前端目录只放开了
+`testdata/fixtures`，仓库其余文件（含根目录的 `.env`）仍返回 403。
 
 两个实测坑：`javascript_tool` 单次调用 30 秒超时；标签页不在前台时 `setTimeout` 被浏览器节流到
 1 秒起。所以不要写长轮询，一次调用里的等待控制在 25 秒内，等不到就再发一次读取调用。
+
+界面文案全部走 i18n，默认中文。**选择器不要认文案**（有一步要切英文）：导航按钮认
+`.main-nav button` 的顺序（0 对话 / 1 知识仓库 / 2 学习计划 / 3 学习档案），
+设置与使用说明认侧栏底部的 `⚙` / `?`，别按「对话」「管理与设置」这些字去找。
 
 ### 1.2 准备与启动
 
@@ -22,14 +27,17 @@
 .venv/bin/python scripts/e2e_fixture.py
 ```
 
-首次执行下载约 68 MB 开源教材，缓存在 `testdata/fixtures/source/`，重跑不再下载；随后切出章节、
-光栅化一页 PNG，并清空 `testdata/e2e`。测试用独立数据目录，不碰开发库 `data/coursepilot.db`。
+首次执行下载约 68 MB 开源教材，缓存在 `testdata/fixtures/source/`，重跑不再下载；随后切出 6 份
+章节切片、光栅化一页 PNG，并清空 `testdata/e2e`。测试用独立数据目录，不碰开发库 `data/coursepilot.db`。
 
-启动被测实例：`preview_start` 选 `coursepilot-e2e`，或
+启动被测实例：`preview_start` 选 `coursepilot-e2e`（后端 8001、前端 5174），或
 
 ```bash
-STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
+CP_PORT_OFFSET=1 STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
 ```
+
+**别用裸 `dev.sh`**：8000 / 5173 通常是开发实例在占，端口撞上脚本会直接失败，而且数据目录
+不换就会写进开发库。
 
 `.env` 里 `COURSEPILOT_ENABLE_REMOTE_LLM=1` 必须开启，否则第 6 步起测的是本地 responder。
 BGE 向量模型需已在本地缓存，否则首次索引会卡在下载模型。后端比前端晚几秒就绪，首屏可能闪一次
@@ -48,10 +56,14 @@ window.__e2eUpload = async (selector, name) => {
   input.files = dt.files
   input.dispatchEvent(new Event('change', { bubbles: true }))
 }
+window.__nav = (i) => document.querySelectorAll('.main-nav button')[i].click()
+  // 0 对话 / 1 知识仓库 / 2 学习计划 / 3 学习档案。按顺序取，切英文那步也不受影响
 window.__ask = async (course, text) => {
-  [...document.querySelectorAll('.course-choice')].find(b => b.textContent.includes(course)).click()
+  // 通用模式行和「新建课程」现在也是 .course-choice，排除掉才不会误命中
+  const rows = '.course-choice:not(.general-choice):not(.add-course)'
+  ;[...document.querySelectorAll(rows)].find(b => b.textContent.includes(course)).click()
   await new Promise(r => setTimeout(r, 400))
-  ;[...document.querySelectorAll('.main-nav button')].find(b => b.textContent.includes('对话')).click()
+  window.__nav(0)
   await new Promise(r => setTimeout(r, 600))
   const ta = document.querySelector('.composer textarea')
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, text)
@@ -65,7 +77,8 @@ window.__read = () => {
     streaming: document.querySelector('.composer textarea')?.disabled,   // 生成中判据，不要看发送按钮
     answer: last?.querySelector('.message-content').textContent.trim(),
     chips: [...last.querySelectorAll('.tool-chip')].map(c => c.textContent.trim()),
-    sources: [...last.querySelectorAll('.citations button')].map(b => b.textContent.trim()),
+    // 网络引用是 <a>，教材与知识页是 <button>，两种都要收
+    sources: [...last.querySelectorAll('.citations button, .citations a')].map(b => b.textContent.trim()),
     notice: document.querySelector('.notice')?.textContent ?? null,
   }
 }
@@ -83,21 +96,29 @@ window.__read = () => {
 | 操作系统 | `os-cpu-scheduling.pdf` | OSTEP 第 7 章（英文） | Round Robin 响应时间好、周转时间差（p6–p7） |
 | 机器学习数学 | `math-gaussian.pdf` | Mathematics for Machine Learning（英文） | 两个高斯密度的乘积仍是高斯，C=(A⁻¹+B⁻¹)⁻¹（p8） |
 
+书签数决定走哪条路，第 23、24 步要用：`深度学习-批量规范化.pdf` 13 条（有层级）、
+`llm-*` 6~7 条、`math-gaussian.pdf` 2 条、`os-cpu-scheduling.pdf` **0 条**（原书零书签，
+走无目录那条主路）。
+
+第六份 `深度学习-多层感知机.pdf`（66 页、99 条书签）是压结构与知识页规模用的大切片，
+只在第 23、24 步按需上传——它会明显拖慢索引，别混进前面的检索断言里。
+
 OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 Figure 7.6/7.7）。
 
 ## 2. 主轮次
 
 每步都给出**期望**，任一期望不成立即记为失败并停下定位，不要跳过继续。
 
-1. **打开首页** `http://127.0.0.1:5173`
-   期望：状态栏 `● connected`、显示你配置的 provider/model、`retrieval: hybrid_bge_rerank`（没配重排模型时是 `hybrid_bge`）；侧栏无课程。
+1. **打开首页**（`coursepilot-e2e` 是 `http://127.0.0.1:5174`）
+   期望：状态栏 `● connected`、显示你配置的 provider/model、检索方式写成「混合检索 + 重排」
+   （没配重排模型时是「语义 + 词面混合检索」，纯词面时是「仅词面检索」）；侧栏无课程。
 
 2. **新建 4 门课程**：`大语言模型`、`深度学习`、`操作系统`、`机器学习数学`
    期望：每门课程带稳定色点；创建后自动切进该课程工作区。
 
 3. **上传教材**：进「知识仓库」，按 1.4 把 5 份切片上传到对应课程（`input[accept*=".pdf"]`）
-   期望：上传后自动起索引 job，流水线依次亮起「解析 → 切块 → 向量 → 索引」；结束后状态为「已索引」，
-   副标题显示 `N 块 · 语义 + 词面检索就绪`。五份合计约 225 块。
+   期望：上传后自动起索引 job，流水线依次亮起「解析 → 切块 → 向量 → 索引 → 目录」；结束后状态为
+   「已索引」，副标题显示 `N 块 · 语义 + 词面检索就绪`。五份合计约 225 块。
 
 4. **检索验证**：在「大语言模型」检索 `QLoRA`，在「操作系统」检索 `turnaround`
    期望：结果给出资料名 + `p.X` + 排序分，页码与 1.4 的锚点页对得上。
@@ -106,8 +127,9 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
    期望：课程、资料、索引状态、会话、消息、引用、每轮解析结果、工具活动 chip 全部还在。
 
 6. **课程会话问锚点事实**：「大语言模型」会话问 *"QLoRA 相比 LoRA 多做了什么来省显存？"*
-   期望：出现工具 chip「✓检索教材 · 命中 N 段」并在本轮结束后仍然可见；回答给出 **NF4 4-bit 量化 /
-   双重量化 / 分页优化器**；`SOURCES` 指向 `llm-微调-LoRA.pdf` 的 p4–p6。
+   期望：出现工具 chip「✓ 检索知识库 · 「…」教材原文 N 条」（有知识页命中时追加「· 知识页 M 条」）
+   并在本轮结束后仍然可见；回答给出
+   **NF4 4-bit 量化 / 双重量化 / 分页优化器**；`SOURCES` 指向 `llm-微调-LoRA.pdf` 的 p4–p6。
 
 7. **点引用**
    期望：右侧抽屉显示页码与教材原文片段，不是空占位。
@@ -132,17 +154,17 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
     开头给通用知识；因为没有引用教材，`SOURCES` 为空。
 
 13. **模型自主多轮工具**：「大语言模型」会话问 *"这门课有哪些资料？其中关于指令数据集的部分讲了什么？"*
-    验证：
+    验证（trace 落在工作区里，路径带 `users/<用户 id>/`）：
 
     ```bash
-    tail -n 3 testdata/e2e/traces/*.jsonl | .venv/bin/python -c "import sys,json;[print(r.get('status'), 'rounds=%s' % r.get('tool_rounds'), [(t['origin'],t['name'],t['ok']) for t in r.get('tools',[])]) for l in sys.stdin if l.strip().startswith('{') for r in [json.loads(l)]]"
+    tail -n 3 testdata/e2e/users/*/traces/*.jsonl | .venv/bin/python -c "import sys,json;[print(r.get('status'), 'rounds=%s' % r.get('tool_rounds'), [(t['origin'],t['name'],t['ok']) for t in r.get('tools',[])]) for l in sys.stdin if l.strip().startswith('{') for r in [json.loads(l)]]"
     ```
 
     期望：`status=completed`、`tool_rounds ≥ 1`，`tools` 里既有 `seed` 也有 `model`。
 
 14. **计划 / 档案工具与骨架页**：问 *"我这门课的学习计划和学习记录现在是什么状态？"*
     期望：chip 出现「学习计划 · 暂无计划」「学习档案 · 档案为空」，回答如实说没有；侧栏
-    `03 学习计划` / `04 学习档案` 显示对应空态。
+    「学习计划」/「学习档案」两页显示对应空态。
 
 15. **图片提问**：「操作系统」会话上传 `教材页-提问.png`，正文写 *"这页在讲哪几种调度算法？"*
     期望：发送前 attach chip 显示 OCR 转录（能看到 SJF / Round Robin）；回答基于转录作答并带
@@ -159,9 +181,9 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
 17. **课程名嵌套**：临时新建 `深度学习进阶`，在新的通用会话问 *"深度学习进阶这门课的重点是什么？"*
     期望：解析到「深度学习进阶」（`reason=explicit_course_name`），不是 ambiguous。
 
-18. **Wiki**：任一课程「知识仓库 → Wiki 知识页」
-    期望：默认「Wiki 尚未启用」；打开开关后列出已索引资料；点「解析到 Wiki」立即显示阶段与进度，
-    完成后显示「Wiki 已生成」，按钮变「重新解析到 Wiki」。
+18. **Wiki 默认关闭**：任一课程「知识仓库 → Wiki 知识页」
+    期望：tab 标题后面带「（已关闭）」，正文是「Wiki 尚未启用」，并说清不开也不影响提问与检索；
+    打开开关后 tab 后缀消失、列出这门课已索引的资料。
 
 19. **输入校验**：依次试四种坏输入
     - 下载被截断的 PDF：索引 job 落 `failed`，错误信息「未能从教材中提取可检索文本」，不产生垃圾索引。
@@ -178,26 +200,117 @@ OCR 提问用 `教材页-提问.png`（OSTEP 第 7 页的真实排版页，含 F
     期望：60 秒内重问返回 `session_busy`（旧一轮心跳还新），超过 60 秒后新一轮正常接管并完成，
     数据库里那条孤儿 turn 落为 `failed`。若一直 `session_busy` 不恢复，说明心跳或抢占被改坏了。
 
-22. **收尾检查**
-    - `read_console_messages`：整轮无 error。
-    - trace 命令：每轮都有记录，没有意外的 `status=failed`。
-    - 「管理与设置 → 检查服务」：provider/model 真实、检索方式「语义 + 词面混合，并做重排」、migration 版本正常。
+22. **知识仓库四个 tab**：把「RAG 资料库 / 概念目录 / Wiki 知识页 / 课程笔记」依次点过
+    期望：每个 tab 要么有内容，要么给出说明去哪儿做的空态，没有一个是空白页；
+    换 tab 不会把已经在跑的索引或知识页进度弄丢（切走再切回来，进度还在往前走）。
 
-## 3. 补充轮次：供应商失败降级（可选，约 2 分钟）
+23. **目录结构与概念目录**（「概念目录」tab）
+    期望：`深度学习-批量规范化.pdf` 报「有目录层级」，概念画成可折叠的树，能一次全部展开/折叠，
+    每个概念带 `p.X`（抽不到页码的显式写「无页码」）；`os-cpu-scheduling.pdf` 报「没有目录层级」，
+    概念平铺，并解释为什么（原书没有目录书签）。
+    上传大切片 `深度学习-多层感知机.pdf` 后：树是多层的，最深那几层也点得开，不是一堆平行条目。
+    点「重新解析」：先出影响预告（新增 / 保留 / 删除各几个，其中几个挂着掌握度或错题会被连带删掉，
+    这次能不能解析出层级），确认后如实报出概念数的变化。
+    **重算前后同一个查询的检索结果逐条一致**——重算只动概念，不该碰检索索引。
+
+24. **知识页构建**：「Wiki 知识页」tab 打开开关后
+    期望：每份已索引资料下面先出账单「预计 N 页 · 约 N 次模型调用 · 约 N 分钟」（估算还没回来时是
+    「正在估算…」），没有目录层级的资料另标一句会按顺序切段；账单是给你自己判断成本的，
+    点「解析到 Wiki」立刻开始，没有二次确认。
+    构建中同一行显示「正在写第 x/N 页」和进度条，按钮按不动；完成后显示覆盖率——共几个小节、
+    生成几页、几个没单独成页（并进上级或与相邻段合并）、本次新写几页、几页内容未变沿用上次，
+    按钮变「重新解析到 Wiki」。
+    **覆盖率要自己核**：报出的小节数应等于「概念目录」tab 里这份教材带层级的概念数（各层都算）；
+    「没单独成页」的那几个，内容必须在上级页或相邻页的正文里找得到，不能有小节既没成页
+    也没被并进去——这个数字唯一的用处就是让你能查出这件事。
+    再点一次「重新解析到 Wiki」：内容没变的页应大部分落到「沿用上次」，不是全部重写。
+    失败态见 §3。
+
+25. **三类引用可分、可点开**：先在知识页列表点开一页
+    期望：正文按 Markdown 渲染，公式排版正常，前置元数据不上屏。
+    再在这门课的会话里问一个要把好几节并起来才答得全的问题（例：*"这门课整体分成哪几部分？"*）
+    期望：`SOURCES` 里教材条目是深色、带 `:页码`；知识页条目是灰色、写成「知识页 · <概念名>」；
+    配了 `RESEARCH_SERPAPI_API_KEY` 时网络条目是蓝色链接，点开走新标签页。三类一眼可分。
+    点知识页那条：抽屉标题写「知识页引用」，位置那一行明说这是按教材整理的转述稿、没有页码，
+    下面列出「这一页依据的教材」；点那里的教材页能跳到教材原文抽屉，看到的是教材原文，
+    带页码，读起来和转述稿明显不是一份东西。
+
+26. **上下文占比**：点开对话框右下角的占比条
+    期望：顶部是「本轮总量 / 上限」，下面逐段列出（系统提示、工具定义、知识页目录、会话历史、
+    当前问题、教材证据、知识页正文…），每段一个 token 数，各段加起来与顶部的总量对得上；
+    条上的百分比与顶部两个数字算出来的比例一致。
+    某段超配额时那一行会警示式地说「已从 A 裁到 B」，整轮超软窗口时会说清移出了几条工具结果
+    或几条历史——**界面上说裁了，就要能在回答里看出对应内容确实没进上下文**。
+
+27. **错题本**：先在某门课出一道选择题并**故意答错**，再进「学习档案」
+    期望：错题本卡片出现该概念一行，标「错 1 次」「连对 0/N」「最近错于…」，带一条进度条；
+    N 是后端下发的毕业阈值（现在是 2），改后端阈值界面跟着变。
+    同一概念连续答对到 N 次：该行从主列表消失，进到「已清掉 N 条」的折叠区，展开还能看到它；
+    主列表空了要说一句「错题本已经清空」，整张卡片不该跟着消失。
+    先错、毕业、再错一次：那一行带「复发」标记。
+    一条也没有过的课程：卡片是「还没有错题」的空态。
+    错题多到一页装不下时，列表底下要显式说「另有 N 条未列出」，不能默默截断。
+
+28. **语言切换**：状态栏语言下拉切 English
+    期望：导航、tab、卡片标题、空态、按钮、抽屉整套换成英文，**页面上找不到残留的中文界面文案**；
+    刷新后仍是英文。历史消息里的工具 chip 与上下文占比条的段名也变英文（这些文案由后端下发 key、
+    前端查字典，最容易漏）。切回中文一样干净。
+    模型回答的语言跟提问走，不跟界面语言走：英文界面下用中文提问，回答仍是中文。
+
+29. **MCP**：「⚙ 管理与设置 → MCP server」填一台 Streamable HTTP 的 server（名称 + 地址，
+    凭据可空）点「连接」
+    期望：这一行显示「已连接」「N 个工具」；填过凭据则显示「已配置凭据」而**不回显原文**，
+    重新加载页面也回显不出来。
+    在对话里问一句需要它的问题：工具 chip 上出现 `mcp__<slug>__<工具名>`。点「停用」后同一个
+    问题不再出现那个 chip。（「外部返回不许标引用编号」是纯提示词约束，偶尔不听不算这一步失败，
+    但要记下来。）
+    坏地址要给可读的原因，不是 500 也不是空白：`http://127.0.0.1:9/mcp` →「这个地址指向本机或
+    内网，已拒绝」；`https://no-such-host.invalid/mcp` →「域名解析不了」；`ftp://x/y` →
+    「只支持 http/https 的地址」。
+    删除前有二次确认，说清会一并删掉地址、凭据与工具快照。
+    模型自己提议的 server 落成「待批准」，必须你点「批准并连接」才生效——未批准时它的工具
+    不该出现在任何一轮的 chip 里。
+
+30. **开发者模式 trace 侧栏**：「⚙ 管理与设置 → 开发者模式」打开开关
+    期望：回到对话，Agent 回复开头的 `❯ CoursePilot` 变成可点；点它先出「查看这一轮的 Trace？」
+    的二次确认，点「打开」右侧滑出侧栏。
+    侧栏里：本次会话每一轮一行（时间、状态、耗时），点中的那一轮展开成 ReAct 循环——每轮列出
+    模型这一轮想了什么、说了什么、发起了哪几个 tool_calls，以及厂商返回的 finish_reason；
+    同一个工具在一轮里调了好几次（换关键词连查几次教材）时，每一次各占一条，展开各自的正文
+    要对上各自的那次参数，不能几条都显示第一次的内容。
+    工具正文默认只报有多少字符，**展开某一步才去取**（展开瞬间先显示「正在取 tool.content…」，
+    随后出正文）；按设计不落库、或本轮复用了上一次结果的那些步骤，展开后说明原因，不给空白。
+    统计与 usage 折在「本轮的原始字段」里，默认不占版面。
+    trace 已被清理的旧轮次要如实说「这一轮没有 trace 记录」，不能拿别的轮次的数据填。
+    **关掉开关后回到对话**：那个名字是普通文本，点不动，也不出确认框。
+
+31. **收尾检查**
+    - `read_console_messages`：整轮无 error。
+    - trace 命令（第 13 步那条）：每轮都有记录，没有意外的 `status=failed`。
+    - 「⚙ 管理与设置 → 检查服务」：模型是真实 provider/model、检索方式「语义 + 词面混合，
+      并做重排」、数据库 migration 版本正常；展开原始 JSON 里没有 key 之类的敏感值。
+
+## 3. 补充轮次：供应商失败降级（可选，约 3 分钟）
 
 停掉实例，用坏 Key 重启，再问一次第 6 步的问题：
 
 ```bash
-TEXT_API_KEY=sk-invalid STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
+TEXT_API_KEY=sk-invalid CP_PORT_OFFSET=1 STORAGE_DATA_DIR=testdata/e2e ./scripts/dev.sh
 ```
 
 期望：出现 `provider_fallback` 后由本地 responder 完成回答，回答带明确的本地标识，会话仍正常持久化；
 状态栏与 health 如实显示降级。
 
+顺带测知识页构建的失败态：这时再点一次「解析到 Wiki」
+期望：job 落 `failed`，同一行显示红色的失败原因原文（不是「Wiki 已生成」也不是无声无息），
+**已有的知识页一页不少**，知识页列表和引用照旧可用。
+
 ## 4. 这条测试不覆盖
 
 `client_request_id` 幂等重放、`stream_interrupted`（需要在流中途切断供应商）、100 MiB 上限校验、
-IM 渠道。这些留给后端测试与手工验证。
+IM 渠道。真并发也测不到：`BACKGROUND_JOB_WORKERS` 默认 1，界面上「连点两次」实际是顺序执行。
+`delegate` 派出去的子任务只在第 30 步的侧栏里看得到痕迹，它让回答更好了没有，这条测试判不出来。
+这些留给后端测试与手工验证。
 
 ## 5. 验收项对照
 
@@ -209,15 +322,22 @@ IM 渠道。这些留给后端测试与手工验证。
 | 4 上传 → 索引 → 检索验证 | 3、4 |
 | 5 通用会话解析 + 引用 | 16 |
 | 6 模糊问题不全库检索 / 课程不越界 | 12、16 |
-| 7 知识仓库先选课程、Wiki 默认关闭 | 3、18 |
+| 7 知识仓库先选课程、Wiki 默认关闭 | 3、18、22 |
 | 8 刷新后状态仍在 | 5 |
-| 9 工具只接受服务端 scope | 12（边界由 `tests/backend/test_module_boundaries.py` 保证） |
+| 9 工具只接受服务端 scope | 12、29（边界由 `tests/backend/test_module_boundaries.py` 保证） |
 | 10 构建与测试 | `./scripts/check.sh`（本测试之外单独跑） |
-| 11 远端模型真实 provider + 同轮完成解析/引用/持久化 | 6、8、22 |
+| 11 远端模型真实 provider + 同轮完成解析/引用/持久化 | 6、8、31 |
 | 工具循环 | 13、14 |
 | 引用与答案一致 | 9、12 |
 | 课程解析健壮性 | 16、17 |
 | 索引与对话并发 | 20 |
 | 公式渲染 | 10 |
 | 断连不锁死会话 | 21 |
-| 坏输入不冒 500 | 19 |
+| 坏输入不冒 500 | 19、29 |
+| 目录结构与概念层级 | 23 |
+| 知识页构建与三类引用 | 24、25 |
+| 上下文预算说得准 | 26 |
+| 错题本 | 27 |
+| 界面中英切换 | 28 |
+| 外部工具接入 | 29 |
+| 开发者模式可观测 | 30 |

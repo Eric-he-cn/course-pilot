@@ -172,6 +172,41 @@ def test_wiki_requires_explicit_course_flag_and_keeps_rag_independent(env):
     assert "source_refs:" in content and "notes.md" in content
 
 
+def test_wiki_pages_report_the_owning_material_and_its_name(env):
+    """界面按教材分组，教材名在服务端解析好：页里只记 material_id。"""
+    first = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode())
+    second = env.service.upload_material(
+        course_id=env.math.id, filename="lecture.md", mime_type="text/markdown",
+        content="# 导数\n\n导数刻画的是变化率。\n".encode())
+    env.wiki_enabled = True
+    for material in (first, second):
+        env.run_job(env.service.enqueue_index(material_id=material.id).id)
+        env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+
+    pages = env.service.wiki_pages(course_id=env.math.id)
+    assert {(page["material_id"], page["document"]) for page in pages if page["material_id"]} \
+        == {(first.id, "notes.md"), (second.id, "lecture.md")}
+    # 课程总览是课程级的，没有归属教材，两个字段都空——界面据此把它留在树根
+    index = next(page for page in pages if page["concept_id"] == "index")
+    assert (index["material_id"], index["document"]) == ("", "")
+
+
+def test_wiki_pages_leave_the_name_empty_when_the_material_is_gone(env):
+    """删教材不动已落盘的页：归属 id 还在，名字解析不出来时留空，由界面降级显示。"""
+    material = env.service.upload_material(
+        course_id=env.math.id, filename="notes.md", mime_type="text/markdown", content=WIKI_MATERIAL.encode())
+    env.wiki_enabled = True
+    env.run_job(env.service.enqueue_index(material_id=material.id).id)
+    env.run_job(env.service.enqueue_wiki_build(material_id=material.id).id)
+    assert any(page["document"] == "notes.md" for page in env.service.wiki_pages(course_id=env.math.id))
+
+    KnowledgeRepository(env.store).delete_material(material.id)
+    orphans = [page for page in env.service.wiki_pages(course_id=env.math.id) if page["material_id"] == material.id]
+    assert orphans, "删教材不清盘上的页，这几页应该还在"
+    assert {page["document"] for page in orphans} == {""}
+
+
 def test_wiki_only_feeds_the_model_retrieved_material(env):
     """写页的证据必须来自检索，不能让模型拿通用知识补。"""
     material = env.service.upload_material(

@@ -60,8 +60,10 @@ def _citation(row: object, score: float) -> Citation:
     而去重、RRF 融合都按这个键，键跟着重建变就等于没去重。"""
     if row["source_kind"] == "wiki":
         # 正文以概念名开头（那一行是给检索用的），摘要里跳过它——抽屉标题已经写着同一个名字。
+        # material_id 是这页的归属教材，检索侧按它保来源多样；界面照 kind 分流不读它。
         body = row["content"].split("\n\n", 1)[-1]
-        return Citation(material_id="", document="", page=None, chunk_id=f"wiki:{row['concept_id']}",
+        return Citation(material_id=row["material_id"] or "", document="", page=None,
+                        chunk_id=f"wiki:{row['concept_id']}",
                         snippet=body[:280], score=round(float(score), 6), kind="wiki",
                         concept_id=row["concept_id"], concept_name=row["concept_name"] or row["concept_id"])
     return Citation(material_id=row["material_id"], document=row["filename"], page=row["page"],
@@ -202,6 +204,26 @@ class KnowledgeRepository:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return _job(row) if row else None
 
+    def latest_job(self, *, material_id: str, type: str, status: str) -> Job | None:
+        """这份教材最近一次到达某个状态的任务。收尾写进任务记录的东西刷新后要回读。
+        同一时刻结束的两条按 id 排，而 id 是随机的——这种情况下取哪条不确定。"""
+        with self._store.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE material_id = ? AND type = ? AND status = ? "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (material_id, type, status),
+            ).fetchone()
+        return _job(row) if row else None
+
+    def has_active_wiki_job(self, *, course_id: str) -> bool:
+        """这门课有没有排队中或正在跑的知识页构建。构建会整页重写，编辑手写区要避开它。"""
+        with self._store.read() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM jobs WHERE course_id = ? AND type = 'wiki' AND status IN ('queued', 'running') LIMIT 1",
+                (course_id,),
+            ).fetchone()
+        return row is not None
+
     def recover_jobs_after_restart(self) -> list[str]:
         """Fail interrupted work and return durable queued jobs for resubmission.
 
@@ -272,6 +294,36 @@ class KnowledgeRepository:
                      embeddings[ordinal] if embeddings else None, page["concept_id"], page["concept_name"]),
                 )
 
+    def replace_wiki_chunk(self, *, course_id: str, concept_id: str, page: dict | None,
+                           embedding: bytes | None = None) -> None:
+        """只重写一页的检索行。page 为 None 表示这一页不该再出现在检索里，删掉即可。
+
+        保存手写区走这里：整课替换要把每页读一遍再整批嵌入，而用户只改了其中一页。
+        排序位置沿用原来那一行，新页排到末尾——ordinal 只用来给检索结果定序。
+        """
+        with self._store.write() as conn:
+            row = conn.execute(
+                "SELECT ordinal FROM chunks WHERE course_id = ? AND source_kind = 'wiki' AND concept_id = ?",
+                (course_id, concept_id)).fetchone()
+            conn.execute(
+                "DELETE FROM chunks WHERE course_id = ? AND source_kind = 'wiki' AND concept_id = ?",
+                (course_id, concept_id))
+            if page is None:
+                return
+            if row is None:
+                tail = conn.execute(
+                    "SELECT max(ordinal) AS last FROM chunks WHERE course_id = ? AND source_kind = 'wiki'",
+                    (course_id,)).fetchone()
+                ordinal = (tail["last"] + 1) if tail and tail["last"] is not None else 0
+            else:
+                ordinal = row["ordinal"]
+            conn.execute(
+                "INSERT INTO chunks(id, material_id, course_id, ordinal, page, content, embedding,"
+                " source_kind, concept_id, concept_name) VALUES (?, ?, ?, ?, NULL, ?, ?, 'wiki', ?, ?)",
+                (new_id("wiki"), page["material_id"], course_id, ordinal, page["content"],
+                 embedding, page["concept_id"], page["concept_name"]),
+            )
+
     def chunk_snippets(self, *, course_id: str, ids: list[str], limit: int) -> dict[str, str]:
         """按分片 id 取本课程的正文开头。重建索引会换 id，取不到的那几个交给调用方降级处理。"""
         if not ids:
@@ -283,6 +335,39 @@ class KnowledgeRepository:
                 f" AND id IN ({placeholders})", (course_id, *ids),
             ).fetchall()
         return {row["id"]: row["content"][:limit] for row in rows}
+
+    def chunks_at_pages(self, *, course_id: str, keys: list[tuple[str, str, int | None]],
+                        limit: int) -> dict[tuple[str, str, int | None], tuple[str, str]]:
+        """按（教材, 页码）取该位置现存的第一个分片。记录的分片 id 在重建索引后会失效，
+        出处按位置重新解析才能一直点得开；按教材 id 找而不按文件名，同名教材不互串。"""
+        out: dict[tuple[str, str, int | None], tuple[str, str]] = {}
+        if not keys:
+            return out
+        with self._store.read() as conn:
+            for material_id, document, page in keys:
+                row = conn.execute(
+                    "SELECT id, content FROM chunks WHERE course_id = ? AND source_kind = 'chunk'"
+                    " AND material_id = ? AND page IS ? ORDER BY ordinal LIMIT 1",
+                    (course_id, material_id, page),
+                ).fetchone()
+                if row is not None:
+                    out[(material_id, document, page)] = (row["id"], row["content"][:limit])
+        return out
+
+    def material_page_numbers(self, *, course_id: str) -> dict[str, set[int]]:
+        """每份教材在检索库里实际有正文的页码。知识页体检拿它当出处对账的基准。
+
+        提取不出页号的教材（md、部分 docx）一页都不进这个表，调用方据此跳过对账。
+        """
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT material_id, page FROM chunks"
+                " WHERE course_id = ? AND source_kind = 'chunk' AND page IS NOT NULL", (course_id,),
+            ).fetchall()
+        out: dict[str, set[int]] = {}
+        for row in rows:
+            out.setdefault(row["material_id"], set()).add(int(row["page"]))
+        return out
 
     def list_wiki_rows(self, *, course_id: str) -> list[dict]:
         with self._store.read() as conn:
@@ -444,6 +529,16 @@ class KnowledgeRepository:
                 (course_id, source_kind),
             ).fetchall()
         return [(row["id"], row["embedding"]) for row in rows]
+
+    def wiki_embeddings(self, *, course_id: str) -> list[tuple[str, str, bytes]]:
+        """知识页的向量，按（概念, 教材）取。行 id 每次构建都会换，跨页配对只能按 concept_id 对齐。"""
+        with self._store.read() as conn:
+            rows = conn.execute(
+                "SELECT concept_id, material_id, embedding FROM chunks WHERE course_id = ?"
+                " AND source_kind = 'wiki' AND embedding IS NOT NULL ORDER BY ordinal",
+                (course_id,),
+            ).fetchall()
+        return [(row["concept_id"] or "", row["material_id"] or "", row["embedding"]) for row in rows]
 
     def hits_by_chunk_ids(self, *, scored: list[tuple[str, float]]) -> list[KnowledgeHit]:
         if not scored:

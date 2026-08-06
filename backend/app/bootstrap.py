@@ -10,7 +10,7 @@ from adapters.embedding import BgeEmbedder
 from adapters.mcp_http import StreamableHttpTransport
 from adapters.reranker import CrossEncoderReranker
 from adapters.web import HttpWebAccess
-from adapters.llm import DemoAgentChat, OpenAICompatibleChat, VisionOcrTranscriber
+from adapters.llm import DemoAgentChat, OpenAICompatibleChat, ResponsesApiChat, VisionOcrTranscriber
 from contracts.llm import AgentChatPort, VisionTranscriberPort
 from contracts.web import WebSearchPort
 from modules.agent.service import TurnService
@@ -112,10 +112,36 @@ THINKING_TIERS: dict[str, dict[str, object]] = {
     "high": {"thinking": {"type": "enabled", "effort": "high"}},
     "max": {"thinking": {"type": "enabled", "effort": "max"}},
 }
-def _with_thinking(extra_body: dict[str, object], tier: str) -> dict[str, object]:
-    """档位覆盖配置里的 thinking 字段，其余私有参数原样保留。
+# Responses 协议下同一档位换 reasoning.effort 表达——上面那个 thinking 字段在这条协议里
+# 会被静默忽略，不换表的话界面上的思考开关就成了摆设。真机实测 DeepSeek 接受的取值是
+# none / minimal / low / medium / high / xhigh / max；adaptive 没有对应值，整个字段不发，
+# 由服务端按自己的默认决定这轮要不要想。
+RESPONSES_THINKING_TIERS: dict[str, dict[str, object]] = {
+    "off": {"reasoning": {"effort": "none"}},
+    "adaptive": {},
+    "high": {"reasoning": {"effort": "high"}},
+    "max": {"reasoning": {"effort": "max"}},
+}
+# 协议 → 适配器与档位表。两条协议语义等价，选哪条看服务支持哪条。
+_ADAPTERS = {"chat": (OpenAICompatibleChat, THINKING_TIERS),
+             "responses": (ResponsesApiChat, RESPONSES_THINKING_TIERS)}
+
+
+def _with_thinking(extra_body: dict[str, object], tier: str, protocol: str = "chat") -> dict[str, object]:
+    """档位覆盖配置里的思考字段，其余私有参数原样保留。
     tier 由调用方保证合法（遍历 THINKING_TIERS 或写死 off），拿不到就该报错而不是静默降档。"""
-    return {**extra_body, **THINKING_TIERS[tier]}
+    merged = {**extra_body, **_ADAPTERS[protocol][1][tier]}
+    if protocol == "responses":
+        # 档位只管 effort 这一个键：配置里 reasoning 下的其他键（如 summary）整块替换会丢掉。
+        # adaptive 是「让服务端自己定」，连 effort 都不发。
+        rest = {key: value for key, value in extra_body["reasoning"].items() if key != "effort"} \
+            if isinstance(extra_body.get("reasoning"), dict) else {}
+        effort = (_ADAPTERS[protocol][1][tier].get("reasoning") or {}).get("effort")
+        reasoning = {**rest, **({"effort": effort} if effort else {})}
+        merged.pop("reasoning", None)
+        if reasoning:
+            merged["reasoning"] = reasoning
+    return merged
 
 
 @dataclass(frozen=True)
@@ -205,22 +231,32 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
         for choice in settings.models:
             if not choice.configured:
                 continue
+            adapter = _ADAPTERS[choice.protocol][0]
+            if choice.protocol == "responses" and "thinking" in choice.extra_body:
+                logger.warning("模型 %s 走 Responses 协议，extra_body 里的 thinking 不会生效；"
+                               "思考深度请改配 reasoning.effort", choice.key)
+            if choice.server_search and choice.protocol != "responses":
+                logger.warning("模型 %s 开了 TEXT_SERVER_SEARCH，但它走 %s 协议——厂商端搜索只在 "
+                               "Responses 协议上有，这一项已忽略", choice.key, choice.protocol)
+            # 厂商端搜索只有 Responses 适配器认得这个参数，另一条协议连传都不能传。
+            server_search = {"server_search": True} if choice.server_search and choice.protocol == "responses" else {}
             for tier in THINKING_TIERS:
-                responders[(choice.key, tier)] = OpenAICompatibleChat(
+                responders[(choice.key, tier)] = adapter(
                     api_key=choice.api_key, base_url=choice.base_url, model=choice.model,
-                    provider=choice.provider, extra_body=_with_thinking(choice.extra_body, tier),
+                    provider=choice.provider, extra_body=_with_thinking(choice.extra_body, tier, choice.protocol),
                     connect_timeout_seconds=settings.llm_connect_timeout_seconds,
                     total_timeout_seconds=settings.llm_total_timeout_seconds,
                     max_output_tokens=settings.agent_max_output_tokens,
                     max_retries=settings.llm_max_retries,
+                    **server_search,
                 )
         first = settings.models[0]
         llm = responders.get((first.key, first.thinking_tier), fallback)
         # 学科分类器：超时更短、不重试，它跑在 turn 锁内、首个增量之前，所以固定用第一个模型
-        # 并关掉思考——它的任务只是从清单里挑一个 id。
-        classifier = OpenAICompatibleChat(
+        # 并关掉思考——它的任务只是从清单里挑一个 id，也不需要联网。
+        classifier = _ADAPTERS[first.protocol][0](
             api_key=first.api_key, base_url=first.base_url, model=first.model,
-            provider=first.provider, extra_body=_with_thinking(first.extra_body, "off"),
+            provider=first.provider, extra_body=_with_thinking(first.extra_body, "off", first.protocol),
             connect_timeout_seconds=settings.llm_connect_timeout_seconds,
             total_timeout_seconds=6, max_output_tokens=256, max_retries=0,
         )

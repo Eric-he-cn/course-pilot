@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 import pytest
+from conftest import workspace
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -117,3 +118,56 @@ def test_course_scoped_material_index_search_wiki_and_health(client):
     assert health.json()["llm"]["mode"] == "demo_fallback"
     assert health.json()["llm"]["enabled"] is False
     assert "api_key" not in health.json()["llm"]
+
+
+def test_the_wiki_report_is_readable_after_the_build_and_ignores_unfinished_ones(client):
+    """覆盖率报告落在任务记录里。界面刷新后内存里没有任务记录，靠这个接口把那一行找回来。"""
+    course = client.post("/api/v2/courses", json={"name": "线性代数"}).json()
+    material = client.post(
+        f"/api/v2/courses/{course['id']}/materials",
+        files={"file": ("linalg.md", "# 特征值\n\n特征值是矩阵作用下方向不变的那个倍数。\n", "text/markdown")},
+    ).json()
+    _poll_job(client, client.post(f"/api/v2/materials/{material['id']}/index").json()["id"])
+
+    assert client.get("/api/v2/materials/mat_nope/wiki/report").status_code == 404
+    empty = client.get(f"/api/v2/materials/{material['id']}/wiki/report")
+    assert empty.status_code == 200 and empty.json() == {"job": None}, empty.text
+
+    assert client.patch(f"/api/v2/courses/{course['id']}", json={"wiki_enabled": True}).status_code == 200
+    build = _poll_job(client, client.post(f"/api/v2/materials/{material['id']}/wiki").json()["id"])
+    assert build["status"] == "completed", build
+
+    report = client.get(f"/api/v2/materials/{material['id']}/wiki/report")
+    assert report.status_code == 200, report.text
+    assert report.json()["job"]["id"] == build["id"]
+    assert str(report.json()["job"]["error"]).startswith("wiki_coverage "), report.text
+
+    # 又发起一次、还没跑完：报的仍是上次那份，半截任务没有报告可给。
+    workspace(client).knowledge._repository.create_job(
+        type="wiki", material_id=material["id"], course_id=course["id"])
+    pending = client.get(f"/api/v2/materials/{material['id']}/wiki/report").json()["job"]
+    assert pending["id"] == build["id"] and pending["status"] == "completed"
+
+
+def test_the_wiki_report_follows_the_newest_finished_build_and_skips_failed_ones(client):
+    """重建过就该报新的那份。排序反了会一直停在第一次构建的数字上，界面看不出来。"""
+    course = client.post("/api/v2/courses", json={"name": "概率论"}).json()
+    material = client.post(
+        f"/api/v2/courses/{course['id']}/materials",
+        files={"file": ("prob.md", "# 全概率公式\n\n把样本空间划分成互斥事件再加权求和。\n", "text/markdown")},
+    ).json()
+    _poll_job(client, client.post(f"/api/v2/materials/{material['id']}/index").json()["id"])
+    client.patch(f"/api/v2/courses/{course['id']}", json={"wiki_enabled": True})
+
+    first = _poll_job(client, client.post(f"/api/v2/materials/{material['id']}/wiki").json()["id"])
+    second = _poll_job(client, client.post(f"/api/v2/materials/{material['id']}/wiki").json()["id"])
+    assert first["id"] != second["id"] and second["status"] == "completed"
+    assert client.get(f"/api/v2/materials/{material['id']}/wiki/report").json()["job"]["id"] == second["id"]
+
+    # 之后失败的一次不能顶替上一次成功的报告——它的 error 是报错文字，不是覆盖率。
+    repository = workspace(client).knowledge._repository
+    broken = repository.create_job(type="wiki", material_id=material["id"], course_id=course["id"])
+    repository.update_job(broken.id, status="failed", stage="failed", progress=100, error_message="构建失败")
+    latest = client.get(f"/api/v2/materials/{material['id']}/wiki/report").json()["job"]
+    assert latest["id"] == second["id"]
+    assert str(latest["error"]).startswith("wiki_coverage ")
