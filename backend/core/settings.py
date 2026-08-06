@@ -250,6 +250,8 @@ class Settings:
     # 厂商端联网搜索，默认关。搜索由厂商执行，结果直接进模型上下文，不经过本地的
     # 不可信内容前缀，也产不出可点开的引用；开它是一次明确的安全取舍。
     text_server_search: bool = False
+    # Responses 协议上，厂商标成 commentary 的过场叙述改走思考流，不进正文。默认开。
+    text_commentary_to_reasoning: bool = True
     # 可选的对话模型。第一项等同上面那组 text_* 字段，界面按它们的顺序给用户切换。
     text_models: tuple[ModelChoice, ...] = ()
     # 本机探测结果。配置写 auto 时按它选模型；写死模型名时它只用于健康上报。
@@ -368,6 +370,7 @@ class Settings:
             text_extra_body=_parse_extra_body(value("TEXT_EXTRA_BODY")),
             text_protocol=_parse_protocol(value("TEXT_PROTOCOL")),
             text_server_search=_flag(value("TEXT_SERVER_SEARCH")),
+            text_commentary_to_reasoning=_flag(value("TEXT_COMMENTARY_TO_REASONING", "1")),
             text_models=_read_models(value),
             hardware=machine.as_dict(),
             rag_cloud_base_url=value("RAG_CLOUD_BASE_URL"),

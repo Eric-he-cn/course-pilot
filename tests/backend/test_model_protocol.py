@@ -110,3 +110,20 @@ def test_the_two_protocols_can_be_mixed_across_slots(tmp_path):
     runtime = build_shared_runtime(settings)
     assert isinstance(runtime.responders[("1", "high")], OpenAICompatibleChat)
     assert isinstance(runtime.responders[("2", "high")], ResponsesApiChat)
+
+
+def test_the_commentary_split_reaches_the_responses_adapters(tmp_path):
+    """开关默认开、配 0 关掉，两头都要真的传到适配器上——接线断了行为静默不变。"""
+    on = build_shared_runtime(_settings(tmp_path, text_protocol="responses"))
+    off = build_shared_runtime(_settings(tmp_path, text_protocol="responses",
+                                         text_commentary_to_reasoning=False))
+    assert all(responder._commentary_to_reasoning for responder in on.responders.values())
+    assert not any(responder._commentary_to_reasoning for responder in off.responders.values())
+
+
+def test_the_commentary_switch_is_read_from_the_environment(monkeypatch, tmp_path):
+    """不配就是开着；配 0 关掉。空目录当 project_root，别读到本机 .env。"""
+    monkeypatch.delenv("TEXT_COMMENTARY_TO_REASONING", raising=False)
+    assert Settings.from_environment(tmp_path).text_commentary_to_reasoning
+    monkeypatch.setenv("TEXT_COMMENTARY_TO_REASONING", "0")
+    assert not Settings.from_environment(tmp_path).text_commentary_to_reasoning

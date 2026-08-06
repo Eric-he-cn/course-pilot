@@ -65,7 +65,7 @@ SHOTS: list[dict] = [
         "name": "library-wiki.png",
         "caption": "知识页：按教材目录自底向上编出来的页面，成树展示，可直接读；未建时先给预算预估",
         # 挑有书签层级的那门课：无目录的教材走顺序切段，知识页会平铺成一列，看不出树
-        "clicks": ["深度学习", "知识仓库"],
+        "clicks": ["深度学习", "知识库"],
         "script": "const t=[...document.querySelectorAll('.tabs button')].find(e=>e.textContent.includes('知识页')); t&&t.click();",
         "wait": 1500,
         # 要的是「层级画出来了」，所以判据落在可折叠节点上，光等 .tree-open 连平铺也算过
@@ -74,7 +74,7 @@ SHOTS: list[dict] = [
     {
         "name": "library-notes.png",
         "caption": "课程笔记：助手整理并存下的学习卡片，可在界面直接查看",
-        "clicks": ["操作系统", "知识仓库"],
+        "clicks": ["操作系统", "知识库"],
         "script": "const t=[...document.querySelectorAll('.tabs button')].find(e=>e.textContent.includes('课程笔记')); t&&t.click();",
         "settle": "const b=[...document.querySelectorAll('.ghost-button')].find(e=>e.textContent==='查看'); b&&b.click();",
         "wait": 1200,

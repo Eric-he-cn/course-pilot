@@ -196,7 +196,7 @@ language you typed the question in.
 ![Model picker](Docs/images/model-picker.png)
 
 **Data can be deleted completely.** Hover a conversation in the sidebar to rename or delete it;
-textbooks are deleted in the knowledge library, courses on the management page. Note that the
+textbooks are deleted in the knowledge base, courses on the management page. Note that the
 knock-on effects are listed before the deletion — deleting a course takes its textbooks, concepts,
 mastery, plan, notes and conversations with it.
 

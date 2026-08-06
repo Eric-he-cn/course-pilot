@@ -238,8 +238,11 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
             if choice.server_search and choice.protocol != "responses":
                 logger.warning("模型 %s 开了 TEXT_SERVER_SEARCH，但它走 %s 协议——厂商端搜索只在 "
                                "Responses 协议上有，这一项已忽略", choice.key, choice.protocol)
-            # 厂商端搜索只有 Responses 适配器认得这个参数，另一条协议连传都不能传。
-            server_search = {"server_search": True} if choice.server_search and choice.protocol == "responses" else {}
+            # 这两个参数只有 Responses 适配器认得，另一条协议连传都不能传。
+            responses_only: dict[str, object] = {}
+            if choice.protocol == "responses":
+                responses_only["commentary_to_reasoning"] = settings.text_commentary_to_reasoning
+                responses_only["server_search"] = choice.server_search
             for tier in THINKING_TIERS:
                 responders[(choice.key, tier)] = adapter(
                     api_key=choice.api_key, base_url=choice.base_url, model=choice.model,
@@ -248,7 +251,7 @@ def build_shared_runtime(settings: Settings) -> SharedRuntime:
                     total_timeout_seconds=settings.llm_total_timeout_seconds,
                     max_output_tokens=settings.agent_max_output_tokens,
                     max_retries=settings.llm_max_retries,
-                    **server_search,
+                    **responses_only,
                 )
         first = settings.models[0]
         llm = responders.get((first.key, first.thinking_tier), fallback)

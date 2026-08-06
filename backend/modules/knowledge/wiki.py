@@ -890,8 +890,9 @@ def _write_index(*, course_id: str, store: WikiStore, now: str,
 
 # ---- 体检：零模型调用的确定性检查，只报不改 ----
 
-# 正文里的出处标注，三种形态与前端的 CITE_MARK 同一口径：[文档 p.12]、[p.12]、[笔记.docx]。
-_CITE_MARK = re.compile(r"\[(?:([^\]\n]+) )?p\.(\d+)\]|\[([^\]\n]+\.(?:pdf|docx?|pptx?|txt|md))\]", re.I)
+# 正文里的出处标注，与前端 App.tsx 的 CITE_MARK 同一口径：[文档 p.12]、[p.12]、[笔记.docx]，
+# 页码位可以是区间（[p.12-14]、[文档 pp.12-14]）。改一处要改两处。
+_CITE_MARK = re.compile(r"\[(?:([^\]\n]+) )?pp?\.(\d+)(?:-(\d+))?\]|\[([^\]\n]+\.(?:pdf|docx?|pptx?|txt|md))\]", re.I)
 # 文档名那一半得真像个文件名才拿去比对。切歪的（「讲义.pdf p.1,」）与泛指（「第三章」）都判不出结论。
 _HAS_SUFFIX = re.compile(r"\.(?:pdf|docx?|pptx?|txt|md)$", re.I)
 # 代码里的写法不算标注：前端也不给 pre/code 接原文。围栏、行内、四空格缩进三种都要认，
@@ -921,31 +922,45 @@ def _loose_name(document: str) -> str:
     return re.sub(r"\.[a-z0-9]+$", "", name)
 
 
-def _marks_in(body: str) -> list[tuple[str, int | None]]:
-    """正文里的出处标注，逐个拆成（文档名, 页码）。这两半都可能缺，缺的那半是空串或 None。"""
+def _marks_in(body: str) -> list[tuple[str, int | None, int | None]]:
+    """正文里的出处标注，逐个拆成（文档名, 起页, 止页）。文档名与页码都可能缺，缺的那半是
+    空串或 None；不是区间时止页与起页相同，写反了按小到大算。"""
     text = _CODE_SPAN.sub(" ", body)
-    return [(match.group(1) or match.group(3) or "",
-             int(match.group(2)) if match.group(2) else None)
-            for match in _CITE_MARK.finditer(text)]
+    marks: list[tuple[str, int | None, int | None]] = []
+    for match in _CITE_MARK.finditer(text):
+        first = int(match.group(2)) if match.group(2) else None
+        last = max(first, int(match.group(3))) if first is not None and match.group(3) else first
+        marks.append((match.group(1) or match.group(4) or "", first, last))
+    return marks
 
 
-def _classify_mark(document: str, number: int | None, *, overview: bool, cited: set[tuple[str, int | None]],
+def _in_span(pages: set[int], first: int, last: int) -> bool:
+    """这一页读过的位置里，有没有落在标注页码（区间取全段）内的。"""
+    return any(first <= page <= last for page in pages)
+
+
+def _classify_mark(document: str, number: int | None, last: int | None, *, overview: bool,
+                   cited: set[tuple[str, int | None]],
                    cited_pages: set[int], cited_names: set[str], known_names: set[str],
                    ) -> tuple[str, str, object] | None:
     """一条出处标注落到哪条规则上，落不到就返回 None。返回（code, level, 报出来的值）。
 
     `cited` 是本页出处的（文档, 页）对，`cited_pages` 与 `cited_names` 是它的两个投影。
+    区间标注只要与读过的页有交集就算对上：区间比读过的范围宽不是幻觉，报出来是误报。
+    报出来的页码取区间首页——与前端「点开第一页」同一个语义。
     """
     # 中间页与首页读的是子页不是原文，页码无从核对，提示词也禁止标——标了就是编的。
     if overview and number is not None:
         return "overview_cites_pages", "error", number
     if not document:
-        return None if number in cited_pages else ("page_out_of_range", "error", number)
+        hit = number is not None and _in_span(cited_pages, number, last or number)
+        return None if hit else ("page_out_of_range", "error", number)
     if not _HAS_SUFFIX.search(document):
         return None
     name = _loose_name(document)
     # 文档级标注（没有页码）只要这本书读过就算对上，不必逐页配。
-    if (name, number) in cited or (number is None and name in cited_names):
+    named_pages = {page for cited_name, page in cited if cited_name == name and page is not None}
+    if (number is None and name in cited_names) or (number is not None and _in_span(named_pages, number, last or number)):
         return None
     if name in cited_names:
         return "page_out_of_range", "error", number
@@ -987,8 +1002,8 @@ def lint_pages(pages: list[LintPage], *, material_pages: dict[str, set[int]],
         overview = page.concept_id == INDEX_ID or page.concept_id in parents
         # 一条标注只落一条规则，先判最能说明问题的那条：同一处写法报两遍会让报告没人看。
         buckets: dict[tuple[str, str], list] = {}
-        for document, number in _marks_in(page.body):
-            if verdict := _classify_mark(document, number, overview=overview, cited=cited,
+        for document, number, last in _marks_in(page.body):
+            if verdict := _classify_mark(document, number, last, overview=overview, cited=cited,
                                          cited_pages=cited_pages, cited_names=cited_names,
                                          known_names=known_names):
                 buckets.setdefault(verdict[:2], []).append(verdict[2])

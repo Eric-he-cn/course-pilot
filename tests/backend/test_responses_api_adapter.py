@@ -780,3 +780,149 @@ def test_the_event_line_names_the_type_when_the_payload_does_not():
 
     assert [item.text for item in items if isinstance(item, ChatDelta)] == ["好"]
     assert isinstance(items[-1], ChatFinal)
+
+
+# ---- 过场叙述（phase=commentary）----
+
+def _message_item(final: bool, phase: str | None, text: str = "") -> dict[str, object]:
+    """真机形状：起始条目上的 phase 一律是 final_answer，收尾条目上的才是准的。"""
+    item: dict[str, object] = {"type": "message", "id": "msg_1", "role": "assistant",
+                               "content": [{"type": "output_text", "text": text}] if text else []}
+    if phase is not None:
+        item["phase"] = phase
+    return {"type": f"response.output_item.{'done' if final else 'added'}", "output_index": 1, "item": item}
+
+
+def test_commentary_goes_to_the_reasoning_stream_not_the_answer():
+    """调工具前的过场叙述（「我来帮您查一下」）不是回答，进正文会让同一条消息里出现两遍开场白。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, "final_answer"),
+            _text("我来帮您"), _text("查询北京天气。"),
+            _message_item(True, "commentary", "我来帮您查询北京天气。"),
+            {"type": "response.output_item.done", "output_index": 2, "item": {
+                "type": "function_call", "call_id": "call_1", "name": "search_materials", "arguments": "{}"}},
+            _completed(),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))
+
+    assert [item.text for item in items if isinstance(item, ChatDelta)] == []
+    assert [item.text for item in items if isinstance(item, ChatReasoning)] == ["我来帮您查询北京天气。"]
+    calls = items[-1]
+    # 回传给厂商与开发者模式看的是同一份，过场叙述在里面。
+    assert isinstance(calls, ChatToolCalls) and calls.reasoning == "我来帮您查询北京天气。"
+
+
+def test_the_final_answer_phase_stays_in_the_answer():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, "final_answer"),
+            _text("链式法则"), _text("是这样用的。"),
+            _message_item(True, "final_answer", "链式法则是这样用的。"),
+            _completed(),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages()))
+
+    assert "".join(item.text for item in items if isinstance(item, ChatDelta)) == "链式法则是这样用的。"
+    assert [item for item in items if isinstance(item, ChatReasoning)] == []
+    assert isinstance(items[-1], ChatFinal) and items[-1].text == "链式法则是这样用的。"
+
+
+def test_a_service_that_does_not_mark_phases_streams_exactly_as_before():
+    """没有 phase 就没有分流的依据：一个字都不攒，逐条增量照旧上屏。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, None), _text("答案"), _text("在这里"),
+            _message_item(True, None, "答案在这里"), _completed(),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages()))
+
+    assert [item.text for item in items if isinstance(item, ChatDelta)] == ["答案", "在这里"]
+
+
+def test_a_long_answer_still_streams_while_the_phase_is_unknown():
+    """攒着等 phase 不能拖住长答案：攒过头就发，后面的增量逐条上屏。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, "final_answer"), *[_text("长" * 40) for _ in range(8)],
+            _message_item(True, "final_answer", "长" * 320), _completed(),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        deltas = [item.text for item in list(_adapter(client).chat(messages=_messages()))
+                  if isinstance(item, ChatDelta)]
+
+    assert len(deltas) > 1 and "".join(deltas) == "长" * 320
+
+
+def test_commentary_stays_in_the_answer_when_the_split_is_switched_off():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, "final_answer"), _text("我来查一下。"),
+            _message_item(True, "commentary", "我来查一下。"), _completed(),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = ResponsesApiChat(api_key="k", base_url="https://api.example.com", model="m",
+                                   commentary_to_reasoning=False, client=client)
+        items = list(adapter.chat(messages=_messages()))
+
+    assert [item.text for item in items if isinstance(item, ChatDelta)] == ["我来查一下。"]
+    assert isinstance(items[-1], ChatFinal) and items[-1].text == "我来查一下。"
+
+
+def test_the_terminal_output_splits_commentary_the_same_way():
+    """只发条目级事件的服务在终态补正文，那条路也要认 phase，否则分流在它那边等于没有。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(_completed(output=[
+            {"type": "message", "role": "assistant", "phase": "commentary",
+             "content": [{"type": "output_text", "text": "我来查一下。"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "search_materials", "arguments": "{}"},
+        ])))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))
+
+    assert [item.text for item in items if isinstance(item, ChatDelta)] == []
+    assert [item.text for item in items if isinstance(item, ChatReasoning)] == ["我来查一下。"]
+    assert isinstance(items[-1], ChatToolCalls)
+
+
+def test_commentary_resolved_while_streaming_is_not_repeated_by_the_terminal_output():
+    """真机的 response.completed 里也带着那条过场叙述，条目事件已经发过就不能再发一遍。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, "final_answer"), _text("我来查一下。"),
+            _message_item(True, "commentary", "我来查一下。"),
+            _completed(output=[{"type": "message", "role": "assistant", "phase": "commentary",
+                                "content": [{"type": "output_text", "text": "我来查一下。"}]},
+                               {"type": "function_call", "call_id": "call_1",
+                                "name": "search_materials", "arguments": "{}"}]),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages(), tools=_TOOLS))
+
+    assert [item.text for item in items if isinstance(item, ChatReasoning)] == ["我来查一下。"]
+    assert [item.text for item in items if isinstance(item, ChatDelta)] == []
+
+
+def test_text_from_an_item_that_never_closed_is_not_dropped():
+    """上一个条目没等到收尾就开了新的：攒着的那段按回答发，不能凭空消失。"""
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(
+            _message_item(False, "final_answer"), _text("前一段"),
+            _message_item(False, "final_answer"), _text("后一段"),
+            _message_item(True, "final_answer", "后一段"), _completed(),
+        ))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        items = list(_adapter(client).chat(messages=_messages()))
+
+    assert "".join(item.text for item in items if isinstance(item, ChatDelta)) == "前一段后一段"

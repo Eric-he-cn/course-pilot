@@ -346,7 +346,7 @@ export default function App() {
           onClick={() => switchWorkspace({ scope: 'course', courseId: item.id })}>
           {/* 竖色条而不是实心圆：7px 实心圆是整个界面里唯一的实心饱和色块，
               而分区靠细边框不靠填充；竖条和 tab 那条 2px 主色下划线是同一个手势。
-              Wiki 标记去掉了——它对切课程没有帮助，知识仓库页顶部有完整状态。 */}
+              Wiki 标记去掉了——它对切课程没有帮助，知识库页顶部有完整状态。 */}
           <span className="slot" aria-hidden><i className="course-bar" style={{ backgroundColor: item.color }} /></span>
           <span className="lb">{item.name}</span>
         </button>)}
@@ -1215,9 +1215,11 @@ function anchorLookup(anchors: CitationSource[]): (document: string, page: numbe
 }
 
 // 三种形态都要认：[文档 p.12] 占多数（模型抄的是原文段落自带的标签）、[p.12]、[笔记.docx]。
+// 页码位可以是区间（[p.12-14]、[文档 pp.12-14]），点开的是区间第一页。
 // 裸形态在引了多份教材的页面上一样会出现，那种歧义由 anchorLookup 的按页那一路判掉。
-const CITE_MARK = /(\[(?:[^\]\n]+ )?p\.\d+\]|\[[^\]\n]+\.(?:pdf|docx?|pptx?|txt|md)\])/i
-const CITE_PAGE = /^\[(?:(.+) )?p\.(\d+)\]$/i
+// 后端体检的 wiki.py:_CITE_MARK 与这里同一口径，改一处要改两处。
+const CITE_MARK = /(\[(?:[^\]\n]+ )?pp?\.\d+(?:-\d+)?\]|\[[^\]\n]+\.(?:pdf|docx?|pptx?|txt|md)\])/i
+const CITE_PAGE = /^\[(?:(.+) )?pp?\.(\d+)(?:-\d+)?\]$/i
 const CITE_DOCUMENT = /^\[([^\]\n]+\.(?:pdf|docx?|pptx?|txt|md))\]$/i
 /** 知识页正文里的出处标注：对得上出处的换成可点开原文的小按钮，其余保持原样。
  *  只处理直接文本，代码、公式、强调里的写法不动。 */
@@ -1860,9 +1862,10 @@ function LibraryView({ course, onCourseChange, onError, onCitation }: { course: 
       // 取最后一个：jobs 只增不删，重建过的话前面那条是上次的 completed。
       const wikiJob = Object.values(jobs).filter(item => item.material_id === material.id && item.type === 'wiki').at(-1)
       const running = wikiJob ? !['completed', 'failed'].includes(wikiJob.status) : false
-      // 本次构建的任务记录更新，没有才退回落库的那份报告。
+      // 状态小字、报告与按钮文案都读它：本次构建的任务记录更新，没有才退回落库的那份报告，
+      // 否则刷新之后建过的教材会显示成没建过。
       const noteJob = wikiJob ?? wikiReports[material.id]
-      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{wikiJob ? stageLabel(wikiJob.stage ?? wikiJob.status, String(wikiJob.status)) : t('library.wiki_ready')}</small>{!running && <WikiEstimateNote estimate={wikiEstimates[material.id]} />}{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{noteJob?.error && <WikiBuildNote job={noteJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{wikiJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
+      return <div className="material-row" key={material.id}><div className="file-mark">{fileKind(material)}</div><div className="material-copy"><b>{material.filename ?? material.name ?? t('library.material_untitled')}</b><small>{noteJob ? stageLabel(noteJob.stage ?? noteJob.status, String(noteJob.status)) : t('library.wiki_ready')}</small>{!running && <WikiEstimateNote estimate={wikiEstimates[material.id]} />}{wikiJob && <div className="job-progress"><i style={{ width: `${wikiJob.progress ?? 15}%` }} /></div>}{noteJob?.error && <WikiBuildNote job={noteJob} />}</div><button className="ghost-button" onClick={() => void buildWiki(material.id)} disabled={running}>{noteJob && !running ? t('library.wiki_rebuild') : t('library.wiki_build')}</button></div>
     }) : <div className="empty-inline">{t('library.wiki_needs_material')}</div>}</> : <div className="empty-inline"><b>{t('library.wiki_off_title')}</b><p>{t('library.wiki_off_body')}</p></div>}</article>{course.wiki_enabled && <WikiPagesPanel course={course} refreshKey={wikiDone} onError={onError} onCitation={onCitation} />}</>}</div></section>
 }
 
@@ -2263,11 +2266,17 @@ function sourceSpans(sources: CitationSource[]): { key: string; document: string
     const key = `${item.material_id ?? ''}|${item.document}`
     grouped.set(key, [...(grouped.get(key) ?? []), item])
   }
+  // 同名教材的两组显示名一模一样，按分组出现的先后加序号，先出现的保留原名（与知识页树同一套写法）。
+  // 出处顺序由服务端给定，同一份数据每次渲染的序号都一样。
+  const used = new Map<string, number>()
   return [...grouped].map(([key, items]) => {
     const numbers = items.map(item => item.page).filter((page): page is number => typeof page === 'number')
     const range = numbers.length === 0 ? '' : numbers[0] === numbers[numbers.length - 1]
       ? String(numbers[0]) : `${numbers[0]}–${numbers[numbers.length - 1]}`
-    return { key, document: items[0].document, pages: range, items }
+    const name = items[0].document
+    const nth = (used.get(name) ?? 0) + 1
+    used.set(name, nth)
+    return { key, document: nth > 1 ? t('library.wiki_group_dup', { name, n: nth }) : name, pages: range, items }
   })
 }
 

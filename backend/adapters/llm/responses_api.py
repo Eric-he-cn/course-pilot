@@ -29,6 +29,13 @@ _SERVER_SEARCH_ITEM = "web_search_call"
 # 思考内容的两路事件。厂商实际用的是哪一路随增量带出去，开发者模式要显示它。
 _REASONING = {"response.reasoning_text.delta": "reasoning_text",
               "response.reasoning_summary_text.delta": "reasoning_summary_text"}
+# 正文条目上的阶段标记：commentary 是调工具前的过场叙述（「我来帮您查一下…」），
+# final_answer 才是回答。不标 phase 的服务照旧全按回答走。
+_COMMENTARY_PHASE = "commentary"
+_COMMENTARY_FIELD = "output_text.commentary"
+# 过场叙述最多攒这么多字。真机实测它在 11~84 字之间，而 phase 只在条目收尾时才给准
+# （起始事件上一律写着 final_answer），所以增量先攒着；攒过头的按回答发，别拖住长答案的首屏。
+_COMMENTARY_HOLD_CHARS = 200
 # 截断原因 → Chat Completions 那套 finish_reason 的说法，界面与统计不必分协议。
 _FINISH_REASONS = {"max_output_tokens": "length", "content_filter": "content_filter"}
 
@@ -119,10 +126,13 @@ class ResponsesApiChat(HttpChatBase):
     # 撞过一次「必须回传思考内容」之后，这个实例就一直带上 reasoning 条目。
     _echo_reasoning = False
 
-    def __init__(self, *, server_search: bool = False, **options: object) -> None:
+    def __init__(self, *, server_search: bool = False, commentary_to_reasoning: bool = True,
+                 **options: object) -> None:
         super().__init__(**options)  # type: ignore[arg-type]
         # 厂商端联网搜索。默认关：它的结果不经过本地的不可信内容前缀，也产不出可点开的引用。
         self._server_search = server_search
+        # 过场叙述改走思考流。默认开：它不是回答，进正文会让同一条消息里出现两遍开场白。
+        self._commentary_to_reasoning = commentary_to_reasoning
 
     def chat(self, *, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec] = ()) -> Iterator[ChatDelta | ChatReasoning | ChatToolCalls | ChatFinal]:
         payload: dict[str, object] = {
@@ -157,6 +167,10 @@ class ResponsesApiChat(HttpChatBase):
                     searches: dict[str, dict[str, object]] = {}
                     usage: dict[str, int] = {}
                     status, reason, failure, event_name = "", "", None, ""
+                    # 当前 message 条目里还没定性的正文；holding 只在服务真标了 phase 时才打开，
+                    # resolved 记「条目事件已经定过性」，终态不再补一遍。
+                    pending: list[str] = []
+                    hold, holding, resolved = self._commentary_to_reasoning, False, False
                     for line in response.iter_lines():
                         if line.startswith("event:"):
                             event_name = line[len("event:"):].strip()
@@ -172,9 +186,13 @@ class ResponsesApiChat(HttpChatBase):
                         if kind == "response.output_text.delta":
                             piece = chunk.get("delta")
                             if isinstance(piece, str) and piece:
-                                emitted = True
-                                parts.append(piece)
-                                yield ChatDelta(piece)
+                                pending.append(piece)
+                                # 攒过头就按回答发，这一条目余下的增量也不再攒（长答案照旧逐字上屏）。
+                                if not holding or sum(map(len, pending)) > _COMMENTARY_HOLD_CHARS:
+                                    piece, pending, holding = "".join(pending), [], False
+                                    emitted = True
+                                    parts.append(piece)
+                                    yield ChatDelta(piece)
                         elif kind in _REASONING:
                             # 思考内容单独走一路：它不进答案，但要回传给厂商。
                             # 刻意不设 emitted——答案还没开始，网络抖动时整轮重试仍然安全。
@@ -194,6 +212,22 @@ class ResponsesApiChat(HttpChatBase):
                             item = chunk.get("item")
                             if isinstance(item, dict) and item.get("type") == _SERVER_SEARCH_ITEM:
                                 self._absorb_search(searches, item, final=kind.endswith(".done"))
+                            elif hold and isinstance(item, dict) and item.get("type") == "message":
+                                # 收尾条目上的 phase 才是准的（起始条目一律写着 final_answer），
+                                # 攒着的那段到这里才定性。不标 phase 的服务照旧直发，一个字都不攒。
+                                final_item = kind.endswith(".done")
+                                # 上一个条目没等到收尾就开了新的，攒着的按回答发，不能丢。
+                                text, pending = "".join(pending), []
+                                holding = not final_item and "phase" in item
+                                resolved = resolved or final_item
+                                if text and final_item and str(item.get("phase") or "") == _COMMENTARY_PHASE:
+                                    # 过场叙述归思考流：正文里不留它，trace 与侧栏照样看得到。
+                                    reasoning_parts.append(text)
+                                    yield ChatReasoning(text, field=_COMMENTARY_FIELD)
+                                elif text:
+                                    emitted = True
+                                    parts.append(text)
+                                    yield ChatDelta(text)
                             else:
                                 self._absorb_item(calls, aliases, chunk, final=kind.endswith(".done"))
                         elif kind.startswith("response.web_search_call."):
@@ -202,6 +236,12 @@ class ResponsesApiChat(HttpChatBase):
                             self._mark_search(searches, str(chunk.get("item_id") or ""),
                                               done=kind.endswith(".completed"))
                         elif kind in _TERMINAL:
+                            # 没等到条目收尾就结束了（截断、服务端不发条目事件）：攒着的按回答发。
+                            if pending:
+                                piece, pending = "".join(pending), []
+                                emitted = True
+                                parts.append(piece)
+                                yield ChatDelta(piece)
                             body = chunk.get("response") or {}
                             usage.update(self._usage(body.get("usage")))
                             status = str(body.get("status") or kind[len("response."):])
@@ -209,7 +249,14 @@ class ResponsesApiChat(HttpChatBase):
                             # 先来的 error 事件说的才是原因，别被收尾那份空的 error 抹掉。
                             failure = failure or body.get("error")
                             # 这一轮失败了就不补正文：半截答案不该当成结果下发。
-                            for piece in ([] if failure else self._recover(body.get("output"), parts, calls, searches)):
+                            late: list[str] = []
+                            recovered = [] if failure else self._recover(body.get("output"), parts, calls, searches,
+                                                                         commentary=late if hold else None)
+                            # 条目事件已经定过性的不再从终态补一遍。
+                            for thought in ([] if resolved else late):
+                                reasoning_parts.append(thought)
+                                yield ChatReasoning(thought, field=_COMMENTARY_FIELD)
+                            for piece in recovered:
                                 emitted = True
                                 parts.append(piece)
                                 yield ChatDelta(piece)
@@ -343,17 +390,25 @@ class ResponsesApiChat(HttpChatBase):
 
     @staticmethod
     def _recover(output: object, parts: list[str], calls: dict[object, dict[str, str]],
-                 searches: dict[str, dict[str, object]] | None = None) -> list[str]:
+                 searches: dict[str, dict[str, object]] | None = None,
+                 commentary: list[str] | None = None) -> list[str]:
         """只在增量缺席时从终态 response.output 里补：有的服务只发条目级事件。
-        补出来的正文照样以增量发出去，上层拼答案的口径不变。"""
+        补出来的正文照样以增量发出去，上层拼答案的口径不变。
+
+        给了 commentary 列表就按 phase 分流，过场叙述收进它，由调用方发成思考流。
+        """
         recovered: list[str] = []
         known = {entry["id"] for entry in calls.values()}
         for index, item in enumerate(output if isinstance(output, list) else []):
             if not isinstance(item, dict):
                 continue
             if item.get("type") == "message" and not parts:
-                recovered += [part["text"] for part in item.get("content") or []
-                              if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]]
+                texts = [part["text"] for part in item.get("content") or []
+                         if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]]
+                if commentary is not None and str(item.get("phase") or "") == _COMMENTARY_PHASE:
+                    commentary += texts
+                else:
+                    recovered += texts
             elif item.get("type") == _SERVER_SEARCH_ITEM and searches is not None:
                 searches.setdefault(str(item.get("id") or index), {"started": time.monotonic()})["item"] = item
             elif item.get("type") == "function_call" and str(item.get("call_id") or "") not in known:

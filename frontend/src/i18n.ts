@@ -12,7 +12,7 @@ const STORAGE_KEY = 'cp-lang'
 const zh = {
   // —— 导航与视图名（也用作各页 hero 的眉标）——
   'nav.chat': '对话',
-  'nav.library': '知识仓库',
+  'nav.library': '知识库',
   'nav.plan': '学习计划',
   'nav.archive': '学习档案',
   'nav.settings': '管理与设置',
@@ -349,7 +349,7 @@ const zh = {
   'help.step1': '新建一门课程',
   'help.step1_hint': '左栏「＋ 新建课程」',
   'help.step2': '上传教材并等索引完成',
-  'help.step2_hint': '知识仓库页上传 PDF、Word、PowerPoint、TXT 或 MD，单个 ≤ 100 MiB',
+  'help.step2_hint': '知识库页上传 PDF、Word、PowerPoint、TXT 或 MD，单个 ≤ 100 MiB',
   'help.step3': '开始提问',
   'help.step3_hint': '回答会带教材文件名与页码，可点开看原文',
   'help.modes_title': '两种会话模式',
@@ -378,7 +378,7 @@ const zh = {
   'help.not_title': '不做什么',
   'help.not_body': '播客音频、通用闪卡产品、泛化每日简报、整卷模拟考试、社交对战、多租户商业化。通用会话不在同一轮里跨多门课读写；解析不出唯一课程时会先问你。',
 
-  // —— 知识仓库 ——
+  // —— 知识库 ——
   'library.hero': '这门课的教材、索引与检索都在这里。换课程用左栏。',
   'library.refresh_status': '刷新状态',
   'library.tab_rag': 'RAG 资料库',
@@ -548,7 +548,7 @@ const zh = {
   'retrieval.hybrid_short': '语义 + 词面混合检索',
   'retrieval.hybrid': '语义 + 词面混合（未启用重排）',
   'retrieval.lexical_short': '仅词面检索',
-  'retrieval.lexical': '仅词面。中文问题命中英文教材效果差，可在知识仓库点一次「重建索引」',
+  'retrieval.lexical': '仅词面。中文问题命中英文教材效果差，可在知识库点一次「重建索引」',
 
   // —— OCR 估算 ——
   'ocr.title': '「{name}」是扫描版',
@@ -821,7 +821,7 @@ type Dictionary = Record<TKey, string> & Partial<Record<`${TKey}.one`, string>>
 
 const en: Dictionary = {
   'nav.chat': 'Chat',
-  'nav.library': 'Library',
+  'nav.library': 'Knowledge base',
   'nav.plan': 'Plan',
   'nav.archive': 'Archive',
   'nav.settings': 'Settings',
@@ -1148,7 +1148,7 @@ const en: Dictionary = {
   'help.step1': 'Create a course',
   'help.step1_hint': '"+ New course" in the sidebar',
   'help.step2': 'Upload a textbook and wait for the index',
-  'help.step2_hint': 'Upload PDF, Word, PowerPoint, TXT or MD on the Library page, up to 100 MiB each',
+  'help.step2_hint': 'Upload PDF, Word, PowerPoint, TXT or MD on the Knowledge base page, up to 100 MiB each',
   'help.step3': 'Start asking',
   'help.step3_hint': 'Answers carry the textbook filename and page, and open to the original text',
   'help.modes_title': 'Two conversation modes',
@@ -1355,7 +1355,7 @@ const en: Dictionary = {
   'retrieval.hybrid_short': 'Semantic + keyword hybrid',
   'retrieval.hybrid': 'Semantic + keyword hybrid (reranking off)',
   'retrieval.lexical_short': 'Keyword only',
-  'retrieval.lexical': 'Keyword only. A Chinese question matches an English textbook poorly; click "Rebuild index" once in the Library',
+  'retrieval.lexical': 'Keyword only. A Chinese question matches an English textbook poorly; click "Rebuild index" once in the knowledge base',
 
   'ocr.title': '"{name}" is a scan',
   'ocr.body': 'This PDF has no text layer, so every page has to be turned into text before it can be retrieved. Transcription spends quota on the OCR model you configured.',

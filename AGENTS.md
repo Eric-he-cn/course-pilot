@@ -36,6 +36,7 @@ TEXT_MODEL=               # 模型 id
 COURSEPILOT_ENABLE_REMOTE_LLM=1
 TEXT_PROTOCOL=            # chat（默认，打 /chat/completions）| responses（打 /responses）
 TEXT_SERVER_SEARCH=0      # 厂商端联网搜索，默认关；只有 responses 协议有，见架构 §5.10
+TEXT_COMMENTARY_TO_REASONING=1  # 调工具前的过场叙述改走思考流，不进正文；见架构 §5.11
 ```
 
 **不要替用户选服务商，也不要猜他的 key。** 任何说 OpenAI Chat Completions 或 Responses
@@ -132,6 +133,7 @@ Claude Code 里可以直接用 `.claude/launch.json` 里的 `coursepilot-dev` �
 | `scripts/e2e_multiturn.py` | 六个场景，每个把同一件事拆到几轮，后一轮依赖前一轮的产物 |
 | `scripts/e2e_library.py` | 资料库那条链路：上传 → 索引 → 目录结构 → 知识页，全程一句话都不问 |
 | `scripts/eval_dataset.py` | `evals/dataset.yaml` 的标注样本；`--no-judge` 只跑不花钱的那两个维度 |
+| `scripts/e2e_wiki/` | 多教材场景下知识页开/关的对比评测：跑臂、离线判据、W 臂前置检查；语料准备见其 README |
 | `evals/wiki_gain.py` | 知识页收益的 A/B，判据是事实锚点（`evals/wiki_anchors.yaml`） |
 
 ```bash
@@ -144,6 +146,8 @@ CP_PORT_OFFSET=1 STORAGE_DATA_DIR=testdata/e2e-fresh ./scripts/dev.sh
 
 界面上的回归清单是人工过的，写在
 [Docs/coursepilot-2.0-e2e-browser-test.md](Docs/coursepilot-2.0-e2e-browser-test.md)。
+知识页那部分有脚本化版本 `scripts/verify_wiki_browser.py`（16 条判据，真 Locator 点击，
+不花模型额度），判据钉在 `scripts/e2e_wiki/` 评测建出的那份数据上，用法见其 docstring。
 
 ## 想要一份能直接玩的示例数据
 

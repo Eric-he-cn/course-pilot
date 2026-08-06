@@ -577,7 +577,7 @@ def _drive_library_ui(page, data_dir: Path, web: str, user: str, course: dict, m
     page.wait_for_timeout(1600)
     click(course["name"])
     page.wait_for_timeout(500)
-    click("知识仓库")
+    click("知识库")
     page.wait_for_selector(".tabs")
 
     # ---- 目录结构：预告 → 确认 ----

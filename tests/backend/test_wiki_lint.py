@@ -79,6 +79,23 @@ def test_a_bare_page_mark_is_checked_the_same_way():
     assert _lint([_page(body="结论 [p.1]。")]) == []
 
 
+def test_a_page_range_that_overlaps_what_was_read_is_legal():
+    """区间标注（真实语料里 7%）与读过的页有交集就算对上：区间比读过的范围宽不是幻觉。
+    `pp.` 是同一件事的另一种写法。"""
+    read_13 = {"m1": {13}}
+    for body in ("结论 [讲义.pdf p.12-14]。", "结论 [p.12-14]。", "结论 [讲义.pdf pp.12-14]。"):
+        page = _page(body=body, refs=("讲义.pdf p.13 #chunk_13",))
+        assert _lint([page], material_pages=read_13) == [], body
+
+
+def test_a_page_range_that_misses_every_page_read_is_an_error():
+    """整段区间都没读过仍是幻觉引用，报出来的是区间首页——与前端「点开第一页」同一个语义。"""
+    issue = _lint([_page(body="结论 [讲义.pdf p.12-14]。")])[0]
+
+    assert issue["code"] == "page_out_of_range" and issue["pages"] == [12]
+    assert _codes(_lint([_page(body="结论 [pp.12-14]。")]), "error") == ["page_out_of_range"]
+
+
 def test_an_overview_page_must_not_cite_textbook_pages_at_all():
     """中间页读的是子页不是原文，页码它无从核对，提示词也明确禁止——标了就是编的。"""
     faulty = [_page("chapter", body="这一章分成三节 [讲义.pdf p.1]。", refs=("子页 甲 <leaf>",)),
