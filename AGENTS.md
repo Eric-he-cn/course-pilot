@@ -71,7 +71,7 @@ TEXT_EXTRA_BODY={"thinking":{"type":"disabled"}}
 （`backend/core/settings.py` 的 `CONTEXT_PARTITION_RATIOS`），没有对应的环境变量。
 
 **MCP。** 接哪台 server 由用户在界面「管理与设置」里填，地址、凭据与工具快照存在这个用户的
-数据目录里，不进 `.env`。`.env` 只管三件事，而且这三项 `.env.example` 里没有列，要用自己加：
+数据目录里，不进 `.env`。`.env` 只管三件事：
 
 ```
 MCP_ALLOW_LOOPBACK=0            # 默认拒绝指向本机与内网的地址；本机自己跑着一台 server 才填 1
@@ -114,11 +114,11 @@ Claude Code 里可以直接用 `.claude/launch.json` 里的 `coursepilot-dev` �
 ./scripts/check.sh
 ```
 
-六道门：后端全部测试、Python 编译检查、界面文案漏走 i18n 的检查、后端产出的 i18n key 与前端
-字典对账、前端类型检查、前端生产构建。全绿说明装对了。
+八道门：后端全部测试、Python 编译检查、界面文案漏走 i18n 的检查、后端产出的 i18n key 与前端
+字典对账、CSS 变量双向对账、前端类型检查、中文加粗渲染门、前端生产构建。全绿说明装对了。
 这个命令不需要配 API key，也不发任何网络请求。
 
-当前基线：`pytest` **784 passed / 1 skipped**——跳过那条要真的向量模型，
+当前基线：`pytest` **1033 passed / 1 skipped**——跳过那条要真的向量模型，
 设 `COURSEPILOT_TEST_EMBEDDINGS=1` 才跑。另外有几条用例按真实教材的目录结构写，
 `testdata/fixtures/` 里没有切片教材时它们也会跳过。
 

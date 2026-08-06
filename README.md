@@ -12,7 +12,7 @@ on; steps that should have happened but did not are caught by the server and fil
 Underneath is a complete agent harness — [the list is here](#whats-in-the-harness).
 
 A personal open-source project. Runs locally. Works with any model service that speaks OpenAI Chat
-Completions.
+Completions or the Responses API.
 
 ![Cited answer](Docs/images/chat-citation.png)
 
@@ -161,8 +161,8 @@ Diagrams are rendered straight to SVG and can be downloaded:
 ![Diagram](Docs/images/chat-diagram.png)
 
 **Study plans.** Ask for a plan in the conversation and the assistant writes it in. Every change
-bumps a version, and past entries are left alone. A Gantt chart at the top shows the rhythm of the
-whole cycle; below it the plan is split by day, with today highlighted.
+bumps a version, and past entries are left alone. A week grid at the top shows whether this week is
+full and what today holds; below it the plan is split by day, with today highlighted.
 
 ![Study plan](Docs/images/plan.png)
 
@@ -259,7 +259,9 @@ separately; a tool's own output lives in the message table and is read back on d
 has several layers: a smoke benchmark, judge sampling, mastery replay, a dataset of fixed samples
 with hard constraints, and three end-to-end scripts — one walks the full journey from an empty
 database, one splits a single task across several turns to check multi-turn behavior, and one drives
-the library chain from upload to wiki build. Assertions look only at structured behavior, never at
+the library chain from upload to wiki build. To measure the difference a feature makes there is also
+a three-arm comparison harness and a browser verification script that costs no model quota.
+Assertions look only at structured behavior, never at
 the wording of an answer; a model phrasing something differently should not make a test fail. Where
 a feature's payoff has to be measured, the judge is a fact anchor that can be decided
 deterministically — "did this specific distant fact make it into the answer" — rather than a model
@@ -301,6 +303,7 @@ TypeScript + Vite. Database changes always add a migration and never touch an ex
 | [Project overview](Docs/overview.md) | The design thinking and trade-offs behind each module |
 | [Product design](Docs/coursepilot-2.0.md) | Positioning, feature modules, phased plan |
 | [Architecture](Docs/coursepilot-2.0-architecture.md) | Module boundaries, the skill system, storage, evaluation layers |
+| [Engineering notes](Docs/工程文档/README.md) | One document per subsystem: agent loop, tools, context, knowledge base, memory, model layer, evaluation, security |
 | [Frontend design](Docs/coursepilot-2.0-frontend-design.md) | Visual design, information architecture, components and state |
 | [In development](Docs/development.md) | Current status, priorities, pitfalls already hit |
 | [End-to-end tests](Docs/coursepilot-2.0-e2e-browser-test.md) | Browser regression checklist |

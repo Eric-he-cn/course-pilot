@@ -610,7 +610,7 @@ DELEGATE_TOOLS: frozenset[str] = frozenset({"delegate"})
 # 摆在那儿模型迟早会拿它当「我来帮你装个插件」用，而它每轮都占 schema 配额。
 MCP_PROPOSE_TOOLS: frozenset[str] = frozenset({"mcp_propose"})
 
-# 外部工具的 schema 一轮能占多少 token。MAIN 全套 19 个工具估 3561 token，而系统分区
+# 外部工具的 schema 一轮能占多少 token。MAIN 全套 20 个工具估 3921 token，而系统分区
 # 在 128K 窗口的模型上只有 8000（软窗口 64000 的 12.5%）——静态提示词自己还要一大块，
 # 留给外部 schema 的余量就是这个量级。超出的按声明顺序丢掉，并把丢了几个说出来。
 EXTERNAL_SCHEMA_TOKEN_BUDGET = 2_000

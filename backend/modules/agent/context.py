@@ -69,8 +69,8 @@ def estimate_tokens(text: str) -> int:
 
 def tool_schema_tokens(tools: Sequence[ToolSpec]) -> int:
     """本轮下发的工具定义要占多少。它走 tools= 参数、不在 messages 里，却每轮都发，一样吃上游窗口。
-    MAIN 全套 20 个工具估 3876 token（估算比 deepseek 实测高约 1.2 倍），比系统提示还大；
-    skill 激活、撤掉 wiki_*/web_*、或没有派子任务意图时摘掉 delegate（回到 3429），
+    MAIN 全套 20 个工具估 3921 token（估算比 deepseek 实测高约 1.2 倍），比系统提示还大；
+    skill 激活、撤掉 wiki_*/web_*、或没有派子任务意图时摘掉 delegate（回到 3474），
     都会改变它，所以只能按这一轮实际下发的那份算。"""
     if not tools:
         return 0

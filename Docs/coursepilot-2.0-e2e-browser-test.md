@@ -310,6 +310,9 @@ TEXT_API_KEY=sk-invalid CP_PORT_OFFSET=1 STORAGE_DATA_DIR=testdata/e2e ./scripts
 `client_request_id` 幂等重放、`stream_interrupted`（需要在流中途切断供应商）、100 MiB 上限校验、
 IM 渠道。真并发也测不到：`BACKGROUND_JOB_WORKERS` 默认 1，界面上「连点两次」实际是顺序执行。
 `delegate` 派出去的子任务只在第 30 步的侧栏里看得到痕迹，它让回答更好了没有，这条测试判不出来。
+知识页的体检行、手写区编辑、跨教材配对 chip 和正文里的 `[p.N]` 按钮也不在这份清单里——它们由
+`scripts/verify_wiki_browser.py`（16 条判据，真 Locator 点击，不花模型额度）钉着，对着
+`scripts/e2e_wiki/` 建出的那份多教材数据跑。
 这些留给后端测试与手工验证。
 
 ## 5. 验收项对照

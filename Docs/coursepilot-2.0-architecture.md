@@ -226,7 +226,7 @@ Responses 那条的对应处置：输出上限是 `max_output_tokens`；不发 `
 
 token 数是估算的：中日韩文字按 1 字 1 token，其余按 3.5 字符 1 token。不接 tokenizer 库——那类库只对某一家的 BPE 准，而这里接的是任意 OpenAI 兼容服务。系数两侧都取偏保守的一端，实测对 deepseek-v4-flash 高估 1.5~1.6 倍：宁可少留几条历史，也不要低估之后顶爆上游窗口。
 
-算进去的不只是 `messages`。**工具定义**走 `tools=` 参数，每轮照发、一样吃上游窗口，所以它计进系统提示分区的配额，总闸也把它算进总量——它裁不掉，漏算就会以为还有余量。主 Agent 全套 19 个工具估 3561 token，比系统提示本身还大（撤掉 `delegate` 回到 3114，实测口径同样偏高约 1.2 倍），skill 激活或撤掉 `wiki_*` / `web_*` 都会改变它，因此只按这一轮实际下发的那份算。**思考内容**（`reasoning`）在思考模式下要随消息回传，也一起计；厂商收不收它的钱各家不同，宁可高估。界面把工具定义单开一段展示：它比系统提示还大，混进那一行用户就看不出有多少是自己改不动的固定开销。
+算进去的不只是 `messages`。**工具定义**走 `tools=` 参数，每轮照发、一样吃上游窗口，所以它计进系统提示分区的配额，总闸也把它算进总量——它裁不掉，漏算就会以为还有余量。主 Agent 全套 20 个工具估 3921 token，比系统提示本身还大（撤掉 `delegate` 回到 3474，实测口径同样偏高约 1.2 倍），skill 激活或撤掉 `wiki_*` / `web_*` 都会改变它，因此只按这一轮实际下发的那份算。**思考内容**（`reasoning`）在思考模式下要随消息回传，也一起计；厂商收不收它的钱各家不同，宁可高估。界面把工具定义单开一段展示：它比系统提示还大，混进那一行用户就看不出有多少是自己改不动的固定开销。
 
 `contracts/llm.py` 定义供应商无关的增量流协议（deltas + 终态摘要），`adapters/llm/openai_compatible.py` 与 `adapters/llm/responses_api.py` 各实现一条线上协议、产出同一套事件（重试仅发生在首个增量之前），公共部分在 `adapters/llm/http_chat.py`，`app/bootstrap.py` 是唯一装配点。主链路仅在服务端解析课程且 RAG 返回证据后调用模型；输出增量前的供应商错误通过类型化错误回到 Demo Adapter 并发出 fallback 事件，已输出增量后的中断发 `stream_interrupted` 并保留部分回答。turn 终态由 finally 兜底并在启动时统一恢复，客户端断连或进程崩溃不会遗留 running turn。健康检查只报告配置状态、provider/model 和脱敏后的最近调用状态。
 
@@ -302,34 +302,25 @@ OCR 不与讲解合并成一次黑盒调用：
 
 ### 5.9 首版运行参数基线
 
-以下值进入 typed settings，启动时校验；代码不得散落魔法数字：
+大写带 `.env` 名字的进 typed settings 并在启动时校验，其余是模块常量；代码不得散落魔法数字：
 
-| 参数 | 首版值 | 说明 |
+| 参数 | 取值 | 说明 |
 | --- | ---: | --- |
-| `AGENT_MAX_LLM_STEPS` | 12 | 单轮最多模型/工具往返次数 |
-| `AGENT_MAX_TOOL_CALLS` | 24 | 包含并发只读调用 |
-| `AGENT_MAX_PARALLEL_READS` | 4 | 写调用永远串行 |
-| `TOOL_RESULT_MAX_BYTES` | 64 KiB | 超出返回摘要和 cursor |
+| `TurnService.max_tool_rounds` | 10 | 单轮最多工具往返次数；skill 激活后放宽到 `SKILL_TOOL_ROUNDS` = 16 |
+| `SUBAGENT_TOOL_ROUNDS` | 4 | `delegate` 派出的子循环自己的轮次上限 |
+| `TOOL_BODY_MAX_CHARS` | 8000 字符 | 工具正文落库的单条上限，超出截断并在正文里说明 |
 | `LLM_CONNECT_TIMEOUT_SECONDS` | 10 | 建连超时 |
-| `LLM_FIRST_TOKEN_TIMEOUT_SECONDS` | 60 | 首 token 超时 |
 | `LLM_TOTAL_TIMEOUT_SECONDS` | 180 | 单次 provider 请求总超时 |
 | `LLM_MAX_RETRIES` | 2 | 仅输出任何 delta 前重试 |
-| `SSE_HEARTBEAT_SECONDS` | 15 | 空闲期间发送注释帧，帮助发现断线 |
-| `SESSION_MAX_ACTIVE_TURNS` | 1 | 用户会话和系统会话分别加锁 |
-| `SQLITE_BUSY_TIMEOUT_MS` | 5000 | 短写事务，超时返回 typed error |
+| `TurnService.HEARTBEAT_SECONDS` | 10 | 心跳写库的最小间隔，长思考期间也照续 |
+| `STALE_TURN_SECONDS` | 60 | 超过这么久没心跳的 running turn 可被下一轮抢占 |
+| `PRAGMA busy_timeout` | 5000 ms | 短写事务，超时返回 typed error |
 | `BACKGROUND_JOB_WORKERS` | 1 | 教材索引与知识页构建的本地后台线程数 |
 | `BACKGROUND_JOB_QUEUE_CAPACITY` | 8 | 持久化任务进入本地执行器的有界容量 |
-| `SCHEDULER_TICK_SECONDS` | 60 | 单 tick 扫描 due items |
-| `APPROVAL_TIMEOUT_SECONDS` | 120 | 超时、断连或进程退出均视为 deny |
-| `SKILL_ARCHIVE_MAX_BYTES` | 2 MiB | 用户上传 Skill 压缩包上限 |
+| `SOURCE_MAX_BYTES` / `BUNDLE_MAX_FILES` / `BUNDLE_MAX_BYTES` | 64 KiB / 40 / 8 MiB | 用户导入 Skill：单文件、包内文件数、包总大小 |
 | `MATERIAL_MAX_BYTES` | 100 MiB | 单本教材上限 |
-| `MATERIAL_MAX_PAGES` | 1500 | 超出要求拆分教材 |
 | `ATTACHMENT_MAX_BYTES` | 10 MiB | 首版图片上限，低于 provider 极限 |
 | `ATTACHMENT_MAX_PIXELS` | 12 MP | 超出先缩放，保留长宽比 |
-| `REPLAN_CONSECUTIVE_INCORRECT` | 2 | 只生成重排建议，不直接写计划 |
-| `REPLAN_PROGRESS_DEVIATION_DAYS` | 2 | 计划落后达到该值时生成建议 |
-| `CHANNEL_DAILY_PUSH_LIMIT` | 3 | 每用户默认上限，可在前端调低 |
-| `CHANNEL_QUIET_HOURS` | `22:00-08:00` | 按用户时区；紧急推送也不越过 |
 
 RAG 的 `RAG_CHUNK_SIZE=600 / RAG_CHUNK_OVERLAP=120 / RAG_TOP_K_RESULTS=6` 沿用 1.0 baseline，2.0 首轮不同时改检索算法和 Agent 架构；只有回归评测证明收益后才调整。
 
@@ -503,7 +494,7 @@ data/users/<user_id>/
 ├─ courses/<course>/memory.md  # 该课程的情景记忆
 ├─ materials/                  # 教材原件，落盘用生成的文件名
 ├─ notes/<course>/*.md         # Agent 用 note_write 整理的课程笔记
-├─ wiki/<course>/*.md          # 课程知识页
+├─ wiki/<course>/<教材>/…      # 课程知识页，按教材目录嵌成可读路径（见 §8.2）
 └─ traces/*.jsonl
 ```
 
@@ -564,7 +555,7 @@ data/users/<user_id>/
 - **节点上限只让页变大，不让内容消失。** `WIKI_MAX_NODES = 300` 是跑飞的兜底，不是目标值：有目录时 BFS 截断砍掉的是最深的那批，它们的页码区间被上级页接过去；无目录时把段合并到刚好装得下，而不是丢掉尾巴。教材自己的结构在这条线以下就照它来——把作者分好的小节并成更少的页，只会让每页要概括的原文成倍上涨。成本交给构建前的账单让用户判断，不靠压小上限来省。
 - **判据落在分片上，不落在页码上。** 页码粒度太粗：几段各查几页就能凑满整本书，漏的是页里的分片。旧实现在页码判据下是全绿的，实际每份教材只读到了一半分片。回归测试因此断言"每个分片都被某一节读到"，并在真实教材上按 2 / 4 / 7 / 50 几档节点上限各跑一遍。
 
-其余三条硬约束：**只用教材原文**（写不出来就少写一条，不许拿通用知识补）、**增量刷新**（证据指纹 `source_hash` 没变就跳过，省 token 也省得每次生成一个不一样的版本）、**手写区不动**（`HANDWRITTEN_MARKER` 以下归用户，重新生成只换上半部分）。页面 frontmatter 记 `concept_id / material_id / parent_id / level / order / source_hash / prompt_version / source_refs`；掌握度不写进文件，读页时现算才不会过期。
+其余三条硬约束：**只用教材原文**（写不出来就少写一条，不许拿通用知识补）、**增量刷新**（证据指纹 `source_hash` 没变就跳过，省 token 也省得每次生成一个不一样的版本）、**手写区不动**（`HANDWRITTEN_MARKER` 以下归用户，重新生成只换上半部分）。页 id 按**教材加教材内位置**派生（`section_<hash>`，key 是节名加同名位次，无目录时是首个分片的序号）：同一门课的两份教材有同名小节时各自成页，不再互吞；重建索引后同一节仍是同一个 id，增量刷新认得出来。落盘也照目录嵌成可读路径 `wiki/<课程>/<教材名>/01-章名/01.1-节名.md`，编号是树内位次、零填充宽度由同级数量决定，同名教材的顶层目录加序号避让。页面 frontmatter 记 `concept_id / concept_name / material_id / parent_id / level / order / source_hash / prompt_version / updated_at / source_refs`；掌握度不写进文件，读页时现算才不会过期。
 
 构建前后都要把覆盖率说出来：`GET /materials/{id}/wiki/estimate` 离线跑一次切段，报预计页数、模型调用次数和耗时（实测约 5 秒一页）；作业结束时回一行 `wiki_coverage concepts=… pages=… written=… skipped=… merged=… empty=… pruned=… issues=… outline=…`，界面按字段渲染。静默截断读起来像"这本书就这些"。
 `issues` 是体检发现的条数，体检没跑成时这个字段整个不出现——0 是"查过、没问题"的结论，不能拿来顶替。
@@ -650,7 +641,7 @@ model tool call
 
 | Agent profile | 可见工具 | 说明 |
 | --- | --- | --- |
-| 主 Agent（无前台 skill） | `search_materials`、`list_materials`、`concept_search`、`wiki_index`、`wiki_read`、`get_plan`、`plan_update`、`get_archive`、`history_read`、`note_read`、`note_write`、`memory_patch`、`emit_evidence`、`calculator`、`web_search`、`web_fetch`、`use_skill`、`ask_user`、`delegate` | 覆盖讲解、规划、档案维护、能力加载和派子任务 |
+| 主 Agent（无前台 skill） | `search_materials`、`list_materials`、`concept_search`、`wiki_index`、`wiki_read`、`get_plan`、`plan_update`、`get_archive`、`history_read`、`note_read`、`note_write`、`memory_patch`、`emit_evidence`、`calculator`、`web_search`、`web_fetch`、`use_skill`、`ask_user`、`delegate`、`mcp_propose` | 覆盖讲解、规划、档案维护、能力加载、派子任务和提议接 MCP |
 | `practice` profile | `search_materials`、`list_materials`、`concept_search`、`get_archive`、`history_read`、`web_search`、`web_fetch`、`emit_evidence`、`artifact_read`、`artifact_append`（+ 基座工具） | 使用通用 artifact 保存必要事实与私有 answer key；看不到计划与笔记写工具 |
 | 其余内置 skill | 各自 frontmatter 声明的集合（+ 基座工具） | `research` 加联网与 `delegate`、`mistake_review` 加档案读、`flashcards` / `diagram` 加笔记读写 |
 | 用户 Skill | 其 frontmatter 请求集合与白名单的交集 | 默认关闭；`memory_patch` / `plan_update` / `use_skill` / `delegate` 一律不授予，也不能获得 Shell、任意文件、数据库、调度或未注册工具 |
@@ -771,9 +762,8 @@ SQLite 单文件（`data/users/<user_id>/coursepilot.db`，WAL），核心表：
 | `mastery` | 投影 | 每概念当前 BKT/FSRS 投影、样本数与 `algorithm_version`；可从 evidence_events 重建 |
 | `review_queue` | 投影 | FSRS card state 和下次复习时间 |
 | `plans` / `plan_items` / `plan_revisions` | 可变 / append-only | 当前计划、条目与每次变更 diff；历史条目不覆盖 |
-| `channel_bindings` / `deliveries` | 可变 / append-oriented | 外部用户身份映射与推送去重回执；IM 渠道不保存当前课程 |
-| `domain_outbox` | append-oriented | 带版本领域事件、投递状态、attempt 与 next_attempt_at；模块间可靠异步联动，不引入外部消息队列 |
-| `tool_audits` | append-only | 工具可见性、policy、审批、幂等与执行审计 |
+
+完整表清单以 `backend/core/store.py` 的 `MIGRATIONS` 为准，上表只列核心表。工具调用的审计落在 trace 里，不单独建表。
 
 - **SQLite 事务**：证据事件写入与当前 mastery / review_queue 投影更新在同一事务内完成；投影失败则整体回滚。所有表由显式 schema migration 管理，不在运行时隐式改表。
 - **连接与并发**：启动时固定设置 `journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout`。Store 层串行化短写事务，读请求可并发。每个 session 同时只执行一个 turn；用户 session 与课程隐藏 system session 使用独立锁。
@@ -859,13 +849,12 @@ class Channel(Protocol):
 | `POST` | `/sessions/{session_id}/attachments` | 上传当前会话的图片附件；vision 未配置时返回 `feature_disabled` |
 | `POST` | `/sessions/{session_id}/turns` | 发起一轮 Agent 执行，通过 SSE 返回 |
 | `POST` | `/courses/{course_id}/knowledge/search` | 知识库中对用户明确选定课程做检索验证；通用对话不能绕过 Resolver 调用 |
-| `GET` | `/turns/{request_id}` | 查询 turn 最终状态；断线后用于区分完成、中断与进程重启失败 |
-| `POST` | `/turns/{request_id}/approvals/{approval_id}` | 确认或拒绝待执行工具；resolve 当前进程内 future，原 SSE 继续 |
 | `GET` | `/skills` | 列出内建与用户导入 Skill、版本、作用域和启用状态 |
-| `POST` | `/skills/import` | 上传 `SKILL.md` 或受限 zip，完成安全校验后生成不可变版本 |
-| `PATCH` | `/skills/{skill_id}` | 设置全局/课程作用域与启用状态 |
-| `GET` | `/skills/{skill_id}/export` | 导出用户 Skill 的当前不可变版本；内建 Skill 只读预览 |
-| `DELETE` | `/skills/{skill_id}` | 删除用户 Skill；内建 Skill 不允许删除 |
+| `POST` | `/skills` | 上传 `SKILL.md` 或受限 zip，完成安全校验后落库 |
+| `PATCH` | `/skills/{name}` | 设置启用状态 |
+| `DELETE` | `/skills/{name}` | 删除用户 Skill；内建 Skill 不允许删除 |
+
+完整路由清单以 `backend/app/http/` 为准，上表只列核心链路。
 
 ```json
 {
@@ -967,7 +956,7 @@ course-pilot/
 │  ├─ app/                      # composition root：bootstrap.py 是唯一装配点，http/ 放 FastAPI 与 SSE
 │  ├─ contracts/                # 跨层 Port 与 DTO：llm / knowledge / embedding / reranker / web
 │  ├─ core/                     # settings、SQLite store 与 migrations、身份、硬件探测
-│  ├─ adapters/                 # openai_compatible / vision_ocr / demo、BGE 向量与重排、联网
+│  ├─ adapters/                 # llm/（http_chat 基座 + openai_compatible / responses_api / vision_ocr / demo）、BGE 向量与重排、联网
 │  └─ modules/
 │     ├─ agent/                 # 主循环、上下文投影、系统提示、工具系统、trace
 │     ├─ courses/ sessions/     # 课程工作区、会话与 Course Resolver
